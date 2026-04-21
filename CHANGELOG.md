@@ -28,6 +28,8 @@ Semantic Versioning.
 
 - Pattern negation (leading `!`) is now rejected at the API boundary with a clear 400 response instead of being silently partially supported.
 - Zero-match claim scopes now emit a warning with a case-insensitive hint when a near-match exists.
+- Dependabot grouping tightened: dev tools (pytest, pytest-asyncio, ruff, mypy) bundle into one PR across all version types; production deps keep minor+patch grouped with majors separate; docker base image groups all updates. Schedule moved from weekly to monthly (security advisories still fire immediately). Cuts GitHub Actions consumption on routine dependency sweeps.
+- `make check` now runs ruff + mypy + pytest; new `make verify` adds a container smoke. Opt-in pre-push hook at `scripts/git-hooks/pre-push` runs local checks before `git push`.
 
 ### Fixed
 

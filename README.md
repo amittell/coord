@@ -141,13 +141,21 @@ Start with `docs/integrations/claude-code.md` if your team is primarily on Claud
 ## Development
 
 ```bash
-make install
-make run
-make init
-make doctor
-make lint
-make test
+make install       # create .venv and install dev deps
+make check         # ruff + mypy + pytest (~30s)     - run before pushing
+make verify        # check + docker-smoke (~2min)    - full local CI equivalent
+make test-fast     # pytest without integration tests - fast inner loop
+make docker-smoke  # build image, probe /readyz, stop
 ```
+
+To run `make check` automatically before every push, install the shipped hook:
+
+```bash
+ln -sf ../../scripts/git-hooks/pre-push .git/hooks/pre-push
+chmod +x .git/hooks/pre-push
+```
+
+Bypass a specific push with `git push --no-verify` (docs-only changes, etc.).
 
 ## Docker
 
