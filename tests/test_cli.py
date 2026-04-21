@@ -449,8 +449,15 @@ def test_version_flag_prints_package_version(
 
     assert excinfo.value.code == 0
     out = capsys.readouterr().out
-    assert out.startswith("coord ")
+    # Banner is decorative; the machine-readable part must contain the
+    # literal string "coord <version>" somewhere on its own line and the
+    # output must still end with the version number for scripts that
+    # tail-read it.
+    assert f"coord {coordination.__version__}" in out
     assert out.rstrip("\n").endswith(coordination.__version__)
+    # Banner sanity: the figlet-style letterforms use slashes and
+    # underscores; at least one of each should appear.
+    assert "/" in out and "_" in out
 
 
 def test_version_in_parser_does_not_conflict_with_subcommands(

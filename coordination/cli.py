@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 
-from coordination import __version__
+from coordination import BANNER, __version__
 from coordination.cli_doctor import run_doctor
 from coordination.cli_init import run_init
 from coordination.cli_ops import run_claims, run_release, run_status, run_stop
@@ -34,7 +34,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--version",
         action="version",
-        version=f"coord {__version__}",
+        version=(
+            f"{BANNER}\n"
+            f"  multi-agent coordination service\n"
+            f"  coord {__version__}"
+        ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
