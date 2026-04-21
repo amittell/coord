@@ -1,0 +1,87 @@
+[project]
+name = "multi-agent-coordination"
+version = "0.1.0"
+description = "Coordination service for multi-engineer agent teams (HTTP API + MCP + dashboard)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.6.0",
+    "mcp>=1.2.0",
+    "httpx>=0.28.0",
+    "pathspec>=0.12.1",
+    "aiosqlite>=0.20.0",
+    "pyyaml>=6.0.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.8.0",
+    "mypy>=1.10.0",
+]
+
+[project.scripts]
+coord = "coordination.cli:main"
+coord-mcp = "coordination.mcp_server:main"
+coord-api = "coordination.main:run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["coordination"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "coordination",
+    "README.md",
+    "pyproject.toml",
+    "docs",
+    "templates",
+    "scripts",
+    ".env.example",
+    "compose.yaml",
+    "Dockerfile",
+    ".github",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+strict = false
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+check_untyped_defs = true
+disallow_incomplete_defs = false
+no_implicit_optional = true
+disable_error_code = ["import-untyped"]
+exclude = [
+    "^\\.venv/",
+    "^build/",
+    "^dist/",
+    "^tests/",
+]
+
+[[tool.mypy.overrides]]
+module = "mcp.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "yaml"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "integration: end-to-end tests that spawn real processes (deselect with -m 'not integration')",
+]

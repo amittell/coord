@@ -1,0 +1,10 @@
+[mcp_servers.coord]
+command = "coord-mcp"
+args = []
+enabled = true
+required = false
+tool_timeout_sec = 30
+
+# Set in your shell (recommended):
+#   export COORD_API_URL="https://YOUR_COORD_SERVICE.example"
+#   export COORD_AUTH_TOKEN="..."

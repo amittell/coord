@@ -1,0 +1,21 @@
+---
+description: Coordination rules for multi-engineer agent teams
+globs: ["**/*"]
+alwaysApply: true
+---
+
+You have access to the `coord` MCP server with tools:
+`list_claims`, `claim_files`, `release_claims`, `check_conflicts`.
+
+## Mandatory protocol
+
+1. **Task start**: call `list_claims`, then `claim_files` for the files/globs you plan to edit.
+2. **If conflicts are returned**: STOP. Tell the user who holds the conflicting claim and suggest narrowing scope, waiting for TTL expiry, or human coordination.
+3. **Before edits outside your claimed scope**: call `check_conflicts` for those paths.
+4. **Task end**: call `release_claims` for your claim IDs.
+
+## Hard rules
+
+- Do not edit paths outside your active claims.
+- Do not opportunistically refactor unrelated files.
+- Treat shared config / schema / lockfiles as high risk: do not edit without explicit user approval.

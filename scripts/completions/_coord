@@ -1,0 +1,79 @@
+#compdef coord
+#
+# Zsh completion for coord
+#
+# To enable: place on any directory in $fpath (typically /usr/local/share/zsh/site-functions/)
+#   sudo cp scripts/completions/_coord /usr/local/share/zsh/site-functions/
+#   autoload -U compinit && compinit
+
+_coord() {
+    local curcontext="$curcontext" state line
+    typeset -A opt_args
+
+    local -a subcommands
+    subcommands=(
+        'start:Start a local coordination service'
+        'init:Initialize coordination in the current repo'
+        'doctor:Check repo and service health'
+        'stop:Stop a background coordination service'
+        'status:Show service health and active claim count'
+        'claims:List active claims'
+        'release:Release a claim by id'
+    )
+
+    _arguments -C \
+        '(- *)--version[Print version and exit]' \
+        '(- *)'{-h,--help}'[Show help and exit]' \
+        '1: :->sub' \
+        '*:: :->args' \
+        && return 0
+
+    case "$state" in
+        sub)
+            _describe -t commands 'coord subcommand' subcommands
+            ;;
+        args)
+            case "$line[1]" in
+                start)
+                    _arguments \
+                        '--host=[Bind address]:host:' \
+                        '--port=[Port to listen on]:port:' \
+                        '--background[Run in the background]' \
+                        '--open-dashboard[Open dashboard URL after startup]' \
+                        '--json[Emit startup state as JSON]' \
+                        {-h,--help}'[Show help and exit]'
+                    ;;
+                init)
+                    _arguments \
+                        '--tool=[Primary coding tool]:tool:(claude codex cursor)' \
+                        '--mode=[local or remote]:mode:(local remote)' \
+                        '--service-url=[Base URL of the coordination service]:url:' \
+                        '--yes[Skip interactive prompts]' \
+                        '--no-hook[Skip installing the pre-push git hook]' \
+                        '--no-owners[Skip writing starter owners.yaml]' \
+                        '--force[Overwrite existing managed files]' \
+                        '--root=[Base path where .coordination/ is written]:path:_files -/' \
+                        {-h,--help}'[Show help and exit]'
+                    ;;
+                doctor|stop|status)
+                    _arguments {-h,--help}'[Show help and exit]'
+                    ;;
+                claims)
+                    _arguments \
+                        '--engineer=[Only show claims for this engineer id]:engineer:' \
+                        '--all[Include expired claims]' \
+                        '--json[Print raw JSON]' \
+                        {-h,--help}'[Show help and exit]'
+                    ;;
+                release)
+                    _arguments \
+                        '--engineer=[Engineer id that owns the claim]:engineer:' \
+                        '1:claim_id:' \
+                        {-h,--help}'[Show help and exit]'
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_coord "$@"

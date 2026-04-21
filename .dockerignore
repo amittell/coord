@@ -1,0 +1,53 @@
+# Version control
+.git
+.gitignore
+.gitattributes
+
+# Python build / cache
+.venv
+venv
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.tox
+.coverage
+htmlcov
+dist
+build
+*.egg-info
+**/*.egg-info
+
+# Local data / SQLite
+data
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.*
+!.env.example
+
+# Repo-only tooling / docs / CI / deploy manifests
+tests
+docs
+.github
+deploy
+scripts
+templates
+.remember
+Makefile
+compose.yaml
+
+# Editor / OS cruft
+.vscode
+.idea
+.cursor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo

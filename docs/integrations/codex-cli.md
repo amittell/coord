@@ -1,0 +1,70 @@
+# Codex CLI Integration
+
+Codex CLI can use the coordination bridge through MCP as a local command.
+
+## 1. Easiest path
+
+Inside the application repo:
+
+```bash
+coord init --tool codex --mode local --yes
+coord doctor
+```
+
+That will create `.coordination/config.toml`, `.coordination/local.env`, `.coordination/owners.yaml`, `.codex/config.toml`, and `AGENTS.md`.
+
+## 2. Install the MCP bridge locally
+
+From a checkout of this repo (or by installing the published package):
+
+```bash
+source .venv/bin/activate
+pip install -e .
+```
+
+## 3. Configure Codex manually
+
+Copy `templates/.codex/config.toml.example` into the appropriate Codex config location and make sure the environment variables are set in the shell that launches Codex.
+
+Recommended shell setup:
+
+```bash
+export COORD_API_URL="https://coordination.internal.example"
+export COORD_AUTH_TOKEN="replace-me"
+```
+
+The example config is:
+
+```toml
+[mcp_servers.coord]
+command = "coord-mcp"
+args = []
+enabled = true
+required = false
+tool_timeout_sec = 30
+```
+
+## 4. Add repo instructions
+
+Append `templates/AGENTS.md.snippet.md` to the application repo's `AGENTS.md`.
+
+That gives Codex a clear coordination protocol to follow.
+
+## 5. Use a unique engineer ID per worker
+
+Suggested IDs:
+
+- `alex/codex/main`
+- `alex/codex/fix-tests`
+- `alex/codex/reviewer`
+
+## 6. Verify tool access
+
+Within Codex, confirm the `coord` MCP server exposes:
+
+- `list_claims`
+- `check_conflicts`
+- `claim_files`
+- `release_claims`
+
+If the tools show up but fail at runtime, double-check `COORD_API_URL` and `COORD_AUTH_TOKEN` in the shell environment that starts Codex.

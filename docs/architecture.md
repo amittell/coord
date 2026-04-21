@@ -1,0 +1,141 @@
+# Architecture
+
+## High-level model
+
+The coordination service sits beside your application repo and acts as a shared control plane for agent work.
+
+```mermaid
+flowchart LR
+    A[Claude Code / Codex CLI / Cursor] --> B[coord-mcp stdio bridge]
+    B --> C[FastAPI coordination service]
+    D[curl / hooks / CI] --> C
+    C --> E[(SQLite)]
+    C --> F[HTML dashboard]
+    C -. optional .-> G[Application repo checkout via COORD_REPO_ROOT]
+```
+
+## Components
+
+### FastAPI app
+
+The ASGI app object is `coordination.main:app`. In the shipped container it is launched by `coord-api` (a thin wrapper around `uvicorn coordination.main:app`); you can also point any ASGI server at the same import path if you are running outside the image.
+
+The API handles:
+
+- claim creation and release
+- conflict checks
+- ownership config upload and retrieval
+- readiness/metadata endpoints
+- dashboard rendering
+
+### SQLite database
+
+SQLite stores:
+
+- active and historical claims
+- conflict log entries
+- ownership YAML
+
+WAL mode is enabled so reads and writes behave better under normal team concurrency.
+
+At startup the service takes an advisory `fcntl.flock` on `<database_path>.lock`, a sibling file in the same directory as the SQLite database. The lock is held for the process lifetime and auto-releases on exit, so a second coord process pointed at the same DB refuses to start with a clear error rather than silently racing on in-process caches. Set `COORD_DISABLE_INSTANCE_LOCK=true` to bypass (NFS-backed volumes, debugging). Note: flock is advisory and depends on the underlying filesystem honouring it. Native Linux kernels (production containers) enforce it across processes and containers; Docker Desktop on Mac and Windows does not propagate flock across containers sharing a host bind mount, so dev-time on those hosts should rely on orchestrator-level single-replica constraints instead.
+
+### MCP bridge
+
+The MCP server runs as a stdio process with `coord-mcp`. It proxies tool calls to the HTTP API using `COORD_API_URL` and `COORD_AUTH_TOKEN`.
+
+This is the intended integration path for Claude Code, Codex CLI, and Cursor. You usually do not expose a separate remote MCP endpoint.
+
+### Templates
+
+The `templates/` directory is the rollout kit for the application repo:
+
+- MCP configs
+- agent-rule snippets
+- ownership YAML example
+- pre-push hook
+- CI/merge queue notes
+
+## Request flow
+
+### Conflict check
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant API
+    participant DB
+    participant Repo as Repo Root
+
+    Client->>API: GET /conflicts?engineer=...&pattern=...
+    API->>DB: list active claims
+    API->>Repo: optional git-backed overlap expansion
+    API-->>Client: safe / conflicts / suggestion
+```
+
+### Claim creation
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant API
+    participant DB
+
+    Client->>API: POST /claims
+    API->>DB: expire stale claims
+    API->>DB: read active claims
+    API->>API: compute overlaps and ownership severity
+    alt conflict found
+        API->>DB: log conflict
+        API-->>Client: 409 with conflicts and options
+    else safe
+        API->>DB: insert claims
+        API-->>Client: 200 with claim_ids
+    end
+```
+
+## Auth model
+
+- Preferred mode: bearer-token protected API using `COORD_AUTH_TOKEN`
+- Optional local/demo mode: `COORD_ALLOW_INSECURE_NO_AUTH=true`
+
+The system does not currently implement a full identity provider or per-user ACL model. The `engineer` field is a client-supplied identifier used for coordination and release ownership.
+
+## Accuracy model
+
+Overlap detection works in two modes:
+
+- repo-aware mode: uses `git ls-files` from `COORD_REPO_ROOT` to enumerate real tracked files, then checks which ones match each pattern via `pathspec` (gitignore semantics). This is the most accurate mode and is preferred when you want the returned overlap list to contain real paths.
+- heuristic mode: used when `COORD_REPO_ROOT` is unset or does not point at a git checkout. Each pattern is reduced to exactly one synthetic concrete path that the pattern provably matches, by substituting every wildcard token with a deterministic literal. `**` segments become unique single-directory probes (`ds0`, `ds1`, ...), `*` segments become `x`, `?` becomes `a`, and `[...]` character classes are parsed and replaced with a literal member of the class (for negated classes like `[!.]`, a character guaranteed to be outside the excluded set). The patterns overlap iff either synthetic path is also matched by the peer's `PathSpec`. Because pathspec natively understands that `**` matches zero or more directories, a single probe per side is sufficient at arbitrary depth; there is no combinatorial depth cap and no exponential candidate blowup.
+
+Examples the heuristic handles correctly without a repo checkout:
+
+- `src/**` overlaps `src/auth/login.ts`: the synthetic path from `src/**` is matched by the literal-peer path via the native `**` semantics.
+- `src/auth_v2/**` does not overlap `src/auth/**`: path-segment boundaries are preserved so `src/auth` is not treated as a prefix of `src/auth_v2`.
+- `src/auth/*` matches `src/auth/login.ts` but not `src/auth/deep/file.ts`: single-star produces one synthetic segment, so the nested path is correctly excluded.
+- `a/**/b/**/c/**/deep.ts` overlaps `a/x/b/y/c/z/deep.ts` but not `a/x/b/y/deep.ts`: arbitrary numbers of `**` segments are handled without a depth cap.
+- `src/[ab]/*.ts` overlaps `src/a/foo.ts` but not `src/c/foo.ts`; `src/[a-c]/file.ts` covers `src/b/file.ts`; `src/[!.]/file.ts` covers `src/a/file.ts` but not `src/.hidden/file.ts`: character classes, ranges, and negated classes all behave as gitignore specifies.
+
+Negation patterns (leading `!`) are explicitly rejected by both `heuristic_overlap` and `compute_overlap` with a `ValueError`. Gitignore negations mean "exclude these paths" and have no defensible overlap interpretation; rejecting at the boundary is clearer than silently returning surprising results. Callers supplying user-supplied claim patterns should either validate up front or let the engine raise.
+
+Repo-aware mode remains preferred when callers want real file paths in the overlap response. The heuristic returns the sentinel `<unknown>` in the overlap list to signal "overlap detected without a repo-backed file list available".
+
+Pattern matching is **case-sensitive** in both modes, regardless of whether the underlying filesystem is case-sensitive. Git itself treats paths as case-sensitive (APFS on macOS and NTFS on Windows are typically case-insensitive, but git records the case you committed), and this service follows gitignore semantics, which are also case-sensitive. A claim on `src/Auth/**` will not overlap a peer claim on `src/auth/**` even if both resolve to the same directory on a case-insensitive volume. Keep casing consistent with whatever you actually committed.
+
+## Scaling notes
+
+This design is meant for small and medium teams coordinating work on one repo or a small set of repos.
+
+Good fit:
+
+- one team or org-level shared service
+- dozens of active claims
+- short-lived TTL-based coordination
+
+Less ideal:
+
+- globally distributed locking
+- strict transactional guarantees across many concurrent writers
+- cross-region HA requirements
+
+If you outgrow SQLite or need stronger guarantees, keep the HTTP and MCP contracts and replace the storage layer first.

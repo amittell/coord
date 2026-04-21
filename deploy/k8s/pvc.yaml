@@ -1,0 +1,17 @@
+# Persistent storage for the SQLite database and its WAL/SHM sidecars.
+# 1Gi is plenty for a normal team's claim traffic. Pick the storageClassName
+# that matches your cluster (omit the field to use the cluster default).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: coord-data
+  labels:
+    app.kubernetes.io/name: coord
+    app.kubernetes.io/component: storage
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  # storageClassName: standard

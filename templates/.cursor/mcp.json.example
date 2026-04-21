@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "coord": {
+      "command": "coord-mcp",
+      "args": [],
+      "env": {
+        "COORD_API_URL": "https://YOUR_COORD_SERVICE.example",
+        "COORD_AUTH_TOKEN": "REPLACE_ME"
+      }
+    }
+  }
+}

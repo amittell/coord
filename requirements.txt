@@ -1,0 +1,46 @@
+# Pinned production dependencies for the coord container image.
+# Generated from a clean install of the project (no dev extras) and
+# pruned of the editable self-install. Regenerate by:
+#   python3.12 -m venv /tmp/coord-scratch
+#   /tmp/coord-scratch/bin/pip install .
+#   /tmp/coord-scratch/bin/pip freeze
+# then drop the "multi-agent-coordination" self-reference line and
+# copy the rest here.
+aiosqlite==0.22.1
+annotated-doc==0.0.4
+annotated-types==0.7.0
+anyio==4.13.0
+attrs==26.1.0
+certifi==2026.2.25
+cffi==2.0.0
+click==8.3.2
+cryptography==46.0.7
+fastapi==0.136.0
+h11==0.16.0
+httpcore==1.0.9
+httptools==0.7.1
+httpx==0.28.1
+httpx-sse==0.4.3
+idna==3.11
+jsonschema==4.26.0
+jsonschema-specifications==2025.9.1
+mcp==1.27.0
+pathspec==1.0.4
+pycparser==3.0
+pydantic==2.13.2
+pydantic-settings==2.13.1
+pydantic_core==2.46.2
+PyJWT==2.12.1
+python-dotenv==1.2.2
+python-multipart==0.0.26
+PyYAML==6.0.3
+referencing==0.37.0
+rpds-py==0.30.0
+sse-starlette==3.3.4
+starlette==1.0.0
+typing-inspection==0.4.2
+typing_extensions==4.15.0
+uvicorn==0.44.0
+uvloop==0.22.1
+watchfiles==1.1.1
+websockets==16.0

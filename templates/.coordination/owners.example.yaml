@@ -1,0 +1,25 @@
+# Map existing directories to owners. Evolve this as you modularize.
+# Upload to the coordination service:
+#   curl -X POST "$COORD_SERVICE_URL/config/ownership" -H "Authorization: Bearer $COORD_TOKEN" --data-binary @.coordination/owners.yaml
+
+areas:
+  example-auth:
+    paths:
+      - "src/controllers/auth/**"
+      - "src/middleware/auth.ts"
+    owners: [alice, bob]
+
+  example-billing:
+    paths:
+      - "src/controllers/billing/**"
+      - "src/services/stripe/**"
+    owners: [carol]
+
+  shared-danger:
+    paths:
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "prisma/schema.prisma"
+      - "src/config/**"
+    severity: hard
+    owners: [all]

@@ -1,0 +1,31 @@
+# Copy to: .github/workflows/coordination-semantic.yml
+# Purpose: PR + merge-group CI template for semantic conflict detection.
+
+name: coordination-semantic
+
+on:
+  pull_request:
+  merge_group:
+
+jobs:
+  semantic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies (example)
+        run: |
+          if [[ -f package-lock.json ]]; then npm ci; fi
+
+      - name: Typecheck (example)
+        run: |
+          if npm run | grep -q '^  typecheck'; then npm run typecheck; fi
+
+      - name: Unit tests (example)
+        run: |
+          if npm run | grep -q '^  test'; then npm test -- --ci; fi
