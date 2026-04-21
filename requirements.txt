@@ -27,9 +27,9 @@ jsonschema-specifications==2025.9.1
 mcp==1.27.0
 pathspec==1.0.4
 pycparser==3.0
-pydantic==2.13.2
-pydantic-settings==2.13.1
-pydantic_core==2.46.2
+pydantic==2.13.3
+pydantic-settings==2.14.0
+pydantic_core==2.46.3
 PyJWT==2.12.1
 python-dotenv==1.2.2
 python-multipart==0.0.26
@@ -40,7 +40,7 @@ sse-starlette==3.3.4
 starlette==1.0.0
 typing-inspection==0.4.2
 typing_extensions==4.15.0
-uvicorn==0.44.0
+uvicorn==0.45.0
 uvloop==0.22.1
 watchfiles==1.1.1
 websockets==16.0
