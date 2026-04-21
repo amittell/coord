@@ -154,8 +154,14 @@ jobs:
       # Install cosign for keyless signing. The installer fetches a fixed
       # cosign CLI release and puts it on PATH. Pinned by SHA per the
       # project's third-party action pinning policy.
+      #
+      # Each of the four supply-chain signals (buildkit-sbom, buildkit-
+      # provenance, attest-build-provenance, cosign) is independent. We
+      # guard cosign with `always() && SKIP_SIGNING != true` so a failure
+      # in an earlier signal (e.g. attest-build-provenance on a private
+      # user-owned repo) does not cascade-skip the remaining signals.
       - name: Install cosign
-        if: ${{ vars.SKIP_SIGNING != 'true' }}
+        if: ${{ always() && vars.SKIP_SIGNING != 'true' && steps.build.outputs.digest != '' }}
         uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003  # v4.1.1
         with:
           cosign-release: "v3.0.6"
@@ -169,7 +175,7 @@ jobs:
       # <image>@<digest>`. Gated behind SKIP_SIGNING=true for operators on
       # networks that cannot reach the Sigstore public good instance.
       - name: Sign image with cosign (keyless)
-        if: ${{ vars.SKIP_SIGNING != 'true' }}
+        if: ${{ always() && vars.SKIP_SIGNING != 'true' && steps.build.outputs.digest != '' }}
         env:
           COSIGN_EXPERIMENTAL: "1"
           IMAGE_AND_DIGEST: "${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}"

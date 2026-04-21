@@ -108,10 +108,17 @@ case, store the PAT as a repo secret and swap `password:` in the
 rather than a hard requirement - try the default token first.
 
 `actions/attest-build-provenance@v2` requires **GitHub Enterprise
-Server 3.10 or later** with the attestations feature enabled. On older
-GHE, or where the feature is disabled, set the repo or org Actions
+Server 3.10 or later** with the attestations feature enabled, OR a
+public repository, OR a private repository owned by an organization
+on a plan that supports attestations. It **does NOT work on personal
+(user-owned) private repositories** - the step fails with
+"Feature not available for user-owned private repositories".
+
+In any of those unsupported cases, set the repo or org Actions
 variable `SKIP_ATTESTATION=true` and the provenance step will be
-skipped cleanly. The image push itself is unaffected either way.
+skipped cleanly. The image push, BuildKit-native SBOM/provenance
+attestations, and cosign signing are all unaffected. This project's
+own `amittell/coord` repo (user-owned private) sets this var.
 
 ```
 Settings -> Secrets and variables -> Actions -> Variables

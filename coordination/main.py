@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from uuid import uuid4
 
@@ -16,11 +17,12 @@ from coordination.config import get_settings
 from coordination.dashboard import render_dashboard
 from coordination.db import acquire_instance_lock
 from coordination.deps import get_service
-from coordination.logging import configure_logging, request_id_var
+from coordination.logging import ACCESS_LOGGER_NAME, configure_logging, request_id_var
 from coordination.ownership import parse_ownership_yaml
 from coordination.schemas import CreateClaimsRequest, ExtendClaimRequest, ReleaseClaimsRequest
 
 logger = logging.getLogger(__name__)
+access_logger = logging.getLogger(ACCESS_LOGGER_NAME)
 
 
 @asynccontextmanager
@@ -99,6 +101,41 @@ async def _count_http_requests(request: Request, call_next):
         method=request.method,
         path=path_label,
         status=str(response.status_code),
+    )
+    return response
+
+
+@app.middleware("http")
+async def _access_log_middleware(request: Request, call_next):
+    """Emit one structured access-log record per HTTP request.
+
+    Registered last so it wraps the other middlewares; this means
+    ``call_next`` unwinds through the request_id middleware (which
+    stamps ``X-Request-ID`` on the response) before we emit the log.
+    Reading the request id off the response header rather than the
+    contextvar keeps the middleware order-independent: the contextvar
+    is already ``reset`` by the time we log, but the header value is
+    still on the response.
+
+    Uses the matched route template for ``path`` (e.g.
+    ``/claims/{claim_id}``) so downstream log aggregators see bounded
+    cardinality; falls back to the raw URL path when routing did not
+    attach a matched route (404s, static endpoints like ``/metrics``)."""
+    start = time.monotonic()
+    response = await call_next(request)
+    duration_ms = (time.monotonic() - start) * 1000.0
+    route = request.scope.get("route")
+    path_label = getattr(route, "path", None) or request.url.path
+    access_logger.info(
+        "http_request",
+        extra={
+            "event": "http_request",
+            "method": request.method,
+            "path": path_label,
+            "status": response.status_code,
+            "duration_ms": round(duration_ms, 2),
+            "request_id": response.headers.get("X-Request-ID", ""),
+        },
     )
     return response
 

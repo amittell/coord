@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
@@ -8,6 +9,37 @@ from httpx import ASGITransport, AsyncClient
 
 from coordination.db import Database
 from coordination.main import app
+
+
+class _RecordingHandler(logging.Handler):
+    """Capture log records emitted on the coordination.access logger.
+
+    We install this directly on the ``coordination.access`` logger
+    because :func:`configure_logging` sets ``propagate=False`` on the
+    parent ``coordination`` logger, which prevents pytest's ``caplog``
+    (rooted at the root logger) from observing access-log records.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:  # noqa: D401
+        self.records.append(record)
+
+
+@pytest.fixture()
+def access_log_records() -> list[logging.LogRecord]:
+    logger = logging.getLogger("coordination.access")
+    handler = _RecordingHandler()
+    prior_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    try:
+        yield handler.records
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(prior_level)
 
 
 @pytest.fixture()
@@ -185,3 +217,94 @@ async def test_request_id_survives_an_http_exception(client: AsyncClient) -> Non
     r = await client.get("/claims", headers={"X-Request-ID": "err-trace-42"})
     assert r.status_code == 401
     assert r.headers.get("X-Request-ID") == "err-trace-42"
+
+
+@pytest.mark.asyncio
+async def test_access_log_emitted_per_request(
+    client: AsyncClient, access_log_records: list[logging.LogRecord]
+) -> None:
+    r = await client.get("/health")
+    assert r.status_code == 200
+
+    access_records = [
+        rec for rec in access_log_records if rec.name == "coordination.access"
+    ]
+    assert len(access_records) == 1, (
+        f"expected exactly one access log record, got {len(access_records)}"
+    )
+    rec = access_records[0]
+    assert rec.levelno == logging.INFO
+    assert getattr(rec, "event", None) == "http_request"
+    assert getattr(rec, "method", None) == "GET"
+    assert getattr(rec, "path", None) == "/health"
+    assert getattr(rec, "status", None) == 200
+    duration = getattr(rec, "duration_ms", None)
+    assert isinstance(duration, (int, float))
+    assert duration >= 0.0
+
+
+@pytest.mark.asyncio
+async def test_access_log_includes_request_id(
+    client: AsyncClient, access_log_records: list[logging.LogRecord]
+) -> None:
+    r = await client.get("/health", headers={"X-Request-ID": "custom-xyz"})
+    assert r.status_code == 200
+    access_records = [
+        rec for rec in access_log_records if rec.name == "coordination.access"
+    ]
+    assert len(access_records) == 1
+    assert getattr(access_records[0], "request_id", None) == "custom-xyz"
+
+
+@pytest.mark.asyncio
+async def test_access_log_uses_matched_route_template_for_path(
+    client: AsyncClient, access_log_records: list[logging.LogRecord]
+) -> None:
+    # Create a claim first so we can address it by id
+    h = {"Authorization": "Bearer test-token"}
+    r = await client.post(
+        "/claims",
+        json={
+            "engineer": "alice",
+            "claims": [{"type": "file", "pattern": "src/routing/one.ts"}],
+        },
+        headers=h,
+    )
+    assert r.status_code == 200
+    claim_id = r.json()["claim_ids"][0]
+
+    # Reset captured records so we only inspect the DELETE call below
+    access_log_records.clear()
+
+    r2 = await client.delete(f"/claims/{claim_id}", headers=h)
+    assert r2.status_code == 200
+
+    access_records = [
+        rec for rec in access_log_records if rec.name == "coordination.access"
+    ]
+    assert len(access_records) == 1
+    rec = access_records[0]
+    # Matched route template, not the substituted path; this keeps
+    # label cardinality bounded for log aggregation.
+    assert getattr(rec, "path", None) == "/claims/{claim_id}"
+    assert getattr(rec, "method", None) == "DELETE"
+    assert getattr(rec, "status", None) == 200
+
+
+@pytest.mark.asyncio
+async def test_access_log_records_non_2xx_status(
+    client: AsyncClient, access_log_records: list[logging.LogRecord]
+) -> None:
+    # Auth-gated endpoint without a bearer token -> 401. Middleware
+    # must still emit an access log line for the failed request.
+    r = await client.get("/claims")
+    assert r.status_code == 401
+
+    access_records = [
+        rec for rec in access_log_records if rec.name == "coordination.access"
+    ]
+    assert len(access_records) == 1
+    rec = access_records[0]
+    assert getattr(rec, "status", None) == 401
+    assert getattr(rec, "method", None) == "GET"
+    assert getattr(rec, "path", None) == "/claims"

@@ -32,6 +32,12 @@ request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
     "coord_request_id", default=""
 )
 
+# Dedicated logger name for per-request access logs. Lives under the
+# ``coordination`` namespace so it inherits handler and level
+# configuration, but can be targeted independently by log aggregators
+# (e.g. drop or route just the access stream).
+ACCESS_LOGGER_NAME = "coordination.access"
+
 
 # LogRecord has a known set of built-in attributes. Anything else the
 # caller attached via ``logger.info(..., extra={...})`` is considered

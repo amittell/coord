@@ -78,3 +78,35 @@ def test_configure_logging_defaults_to_plain(monkeypatch: pytest.MonkeyPatch) ->
     handlers = logging.getLogger("coordination").handlers
     assert handlers
     assert not any(isinstance(h.formatter, coord_logging.JsonFormatter) for h in handlers)
+
+
+def test_access_log_record_has_event_field() -> None:
+    """An access-log record passed through JsonFormatter must round-trip
+    the structured extras used by the middleware (method, path, status,
+    duration_ms, request_id, event=http_request)."""
+    formatter = coord_logging.JsonFormatter()
+    record = logging.LogRecord(
+        name="coordination.access",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="http_request",
+        args=(),
+        exc_info=None,
+    )
+    record.event = "http_request"
+    record.method = "GET"
+    record.path = "/health"
+    record.status = 200
+    record.duration_ms = 1.23
+    record.request_id = "rid-abc"
+
+    out = formatter.format(record)
+    parsed = json.loads(out)
+    assert parsed["event"] == "http_request"
+    assert parsed["method"] == "GET"
+    assert parsed["path"] == "/health"
+    assert parsed["status"] == 200
+    assert parsed["duration_ms"] == 1.23
+    assert parsed["request_id"] == "rid-abc"
+    assert parsed["logger"] == "coordination.access"
