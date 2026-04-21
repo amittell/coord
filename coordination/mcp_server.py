@@ -42,10 +42,14 @@ async def list_claims(
 @mcp.tool()
 async def check_conflicts(files: list[str], engineer: str) -> dict[str, Any]:
     """Check whether planned file paths conflict with other engineers' active claims."""
-    params = [("pattern", f) for f in files]
+    # Annotated with the broader value type httpx.AsyncClient.get accepts so
+    # mypy sees an invariant-compatible list when we pass it as `params`.
+    params: list[tuple[str, str | int | float | bool | None]] = [
+        ("pattern", f) for f in files
+    ]
     params.append(("engineer", engineer))
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.get(f"{_base_url()}/conflicts", params=params, headers=_headers())  # type: ignore[arg-type]
+        r = await client.get(f"{_base_url()}/conflicts", params=params, headers=_headers())
         r.raise_for_status()
         return r.json()
 

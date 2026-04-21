@@ -220,6 +220,66 @@ async def test_check_conflicts_returns_body_verbatim(
 
 
 @pytest.mark.asyncio
+async def test_check_conflicts_passes_params_as_list_of_tuples_preserving_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard: the local `params` list in check_conflicts is typed as
+    list[tuple[str, str | int | float | bool | None]] (httpx's accepted type).
+    Monkeypatch AsyncClient.get to capture the exact object passed so we can
+    assert it is handed through as a list-of-tuples without mutation. This
+    regression-guards the broader type annotation: if anyone retightens the
+    local to list[tuple[str, str]], this test still passes (behavior is the
+    same), but the mypy check IS the type regression test. What this test
+    guards is that we never silently switch to a dict/mapping (which would
+    collapse the duplicate `pattern` keys)."""
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+
+    captured_params: list[Any] = []
+
+    real_async_client = httpx.AsyncClient
+
+    class _RecordingClient(real_async_client):  # type: ignore[misc,valid-type]
+        async def get(self, url, *args, **kwargs):  # type: ignore[no-untyped-def]
+            captured_params.append(kwargs.get("params"))
+            return await super().get(url, *args, **kwargs)
+
+    def factory(**kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = httpx.MockTransport(
+            lambda _req: httpx.Response(
+                200,
+                json={
+                    "has_conflicts": False,
+                    "conflicts": [],
+                    "safe_to_proceed": True,
+                    "safe": True,
+                    "suggestion": None,
+                },
+            )
+        )
+        return _RecordingClient(**kwargs)
+
+    monkeypatch.setattr(mcp_server.httpx, "AsyncClient", factory)
+
+    files = ["a.py", "b.py", "c.py"]
+    await mcp_server.check_conflicts(files=files, engineer="alice")
+
+    assert len(captured_params) == 1
+    params = captured_params[0]
+    # Must be a list (not a dict/mapping) to preserve duplicate `pattern` keys.
+    assert isinstance(params, list)
+    # Each entry must be a 2-tuple.
+    assert all(isinstance(p, tuple) and len(p) == 2 for p in params)
+    # Order and contents must match: one ("pattern", f) per file, then engineer.
+    assert params == [
+        ("pattern", "a.py"),
+        ("pattern", "b.py"),
+        ("pattern", "c.py"),
+        ("engineer", "alice"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_check_conflicts_raises_on_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

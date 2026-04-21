@@ -9,10 +9,15 @@ Runs on every push to `main` and every pull request.
 Jobs:
 
 1. `test` (matrix: Ubuntu + Python 3.11, Ubuntu + Python 3.12,
-   macOS + Python 3.12, Windows + Python 3.12) - installs the project
-   with dev extras, runs `ruff check .`, then `pytest -q`. All runners
-   use `bash` as the default shell so quoting and pipelines behave
-   consistently on Windows (via Git for Windows' bash).
+   Ubuntu + Python 3.14, macOS + Python 3.12, Windows + Python 3.12) -
+   installs the project with dev extras, runs `ruff check .`, then
+   `pytest -q`. All runners use `bash` as the default shell so quoting
+   and pipelines behave consistently on Windows (via Git for Windows'
+   bash). The 3.14 row matches the Python version shipped in the
+   release container (`python:3.14-slim`) so CI exercises what we
+   ship; 3.11 is kept as the baseline per `requires-python = ">=3.11"`
+   in `pyproject.toml`. 3.14 is Ubuntu-only to avoid tripling runner
+   usage for incremental coverage.
 2. `lint-workflows` - runs `actionlint` (via `reviewdog/action-actionlint@v1`)
    over `.github/workflows/` to catch YAML and Actions mistakes.
 3. `type-check` - runs `mypy coordination` against Python 3.12 with a
