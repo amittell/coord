@@ -235,9 +235,20 @@ def run_stop(_args) -> int:
             return 0
         time.sleep(0.1)
 
-    # Force kill.
+    # Force kill. SIGKILL is POSIX-only; on Windows signal.SIGKILL does not
+    # exist and Python's os.kill translates SIGTERM into TerminateProcess,
+    # which is already forceful, so the POSIX escalation has no Windows
+    # counterpart. Report the timeout and leave the PID file in place so the
+    # operator can investigate.
+    force_kill_signal = getattr(signal, "SIGKILL", None)
+    if force_kill_signal is None:
+        print(
+            f"Process {pid} did not exit within 5s of SIGTERM. Investigate "
+            "manually; SIGKILL is not available on this platform."
+        )
+        return 1
     try:
-        os.kill(pid, signal.SIGKILL)
+        os.kill(pid, force_kill_signal)
     except ProcessLookupError:
         pass
     # Give it a moment.

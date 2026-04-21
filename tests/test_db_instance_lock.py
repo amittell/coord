@@ -12,12 +12,24 @@ import pytest
 from coordination import db as db_mod
 
 
+# fcntl.flock is POSIX-only. On Windows, acquire_instance_lock is a
+# documented no-op that returns a sentinel. The tests below actively
+# exercise the flock semantics (real fd, cross-process contention) so
+# they only make sense on POSIX. The Windows no-op path is covered
+# separately by test_acquire_lock_windows_skip at the bottom of this file.
+_POSIX_ONLY = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="fcntl.flock is POSIX-only; Windows takes the documented no-op path",
+)
+
+
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Ensure the bypass env var does not leak from other tests."""
     monkeypatch.delenv("COORD_DISABLE_INSTANCE_LOCK", raising=False)
 
 
+@_POSIX_ONLY
 def test_acquire_lock_succeeds_when_uncontested(tmp_path: Path) -> None:
     db_path = tmp_path / "db.sqlite"
     fd = db_mod.acquire_instance_lock(db_path)
@@ -29,6 +41,7 @@ def test_acquire_lock_succeeds_when_uncontested(tmp_path: Path) -> None:
         os.close(fd)
 
 
+@_POSIX_ONLY
 def test_acquire_lock_second_call_raises_with_pid(tmp_path: Path) -> None:
     db_path = tmp_path / "db.sqlite"
     fd = db_mod.acquire_instance_lock(db_path)
@@ -42,6 +55,7 @@ def test_acquire_lock_second_call_raises_with_pid(tmp_path: Path) -> None:
         os.close(fd)
 
 
+@_POSIX_ONLY
 def test_acquire_lock_released_on_fd_close(tmp_path: Path) -> None:
     db_path = tmp_path / "db.sqlite"
     fd = db_mod.acquire_instance_lock(db_path)
@@ -53,6 +67,7 @@ def test_acquire_lock_released_on_fd_close(tmp_path: Path) -> None:
         os.close(fd2)
 
 
+@_POSIX_ONLY
 def test_acquire_lock_subprocess_contention(tmp_path: Path) -> None:
     db_path = tmp_path / "db.sqlite"
     ready_marker = tmp_path / "child.ready"
@@ -93,6 +108,7 @@ def test_acquire_lock_subprocess_contention(tmp_path: Path) -> None:
         proc.wait(timeout=5)
 
 
+@_POSIX_ONLY
 def test_acquire_lock_bypass_via_env_var(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     db_path = tmp_path / "db.sqlite"
     fd = db_mod.acquire_instance_lock(db_path)

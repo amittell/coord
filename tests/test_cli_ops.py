@@ -64,7 +64,22 @@ class _FakeCompleted:
         self.returncode = returncode
 
 
-def test_pid_belongs_to_coord_calls_ps(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.fixture()
+def _force_posix_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force the cli_ops platform dispatcher to take the POSIX branch.
+
+    The six tests below are pinning POSIX-specific behavior (argv shape,
+    error handling) regardless of the host running them. Without this,
+    they would take the Windows branch on a Windows CI runner and fail
+    for the wrong reason (mismatched command vector). The dedicated
+    Windows-branch tests sit in `test_pid_belongs_to_coord_windows_*`.
+    """
+    monkeypatch.setattr("coordination.cli_ops.sys.platform", "linux")
+
+
+def test_pid_belongs_to_coord_calls_ps(
+    monkeypatch: pytest.MonkeyPatch, _force_posix_platform: None
+) -> None:
     """Verifies the helper shells out to `ps` with the expected argv and
     returns True only when the marker is present in ps output."""
     from coordination.cli_ops import _pid_belongs_to_coord
@@ -92,7 +107,7 @@ def test_pid_belongs_to_coord_calls_ps(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_pid_belongs_to_coord_returns_false_when_marker_absent(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, _force_posix_platform: None
 ) -> None:
     from coordination.cli_ops import _pid_belongs_to_coord
 
@@ -104,7 +119,7 @@ def test_pid_belongs_to_coord_returns_false_when_marker_absent(
 
 
 def test_pid_belongs_to_coord_returns_false_when_ps_errors(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, _force_posix_platform: None
 ) -> None:
     from coordination.cli_ops import _pid_belongs_to_coord
 
@@ -116,7 +131,7 @@ def test_pid_belongs_to_coord_returns_false_when_ps_errors(
 
 
 def test_pid_belongs_to_coord_returns_false_on_empty_stdout(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, _force_posix_platform: None
 ) -> None:
     from coordination.cli_ops import _pid_belongs_to_coord
 
@@ -128,7 +143,7 @@ def test_pid_belongs_to_coord_returns_false_on_empty_stdout(
 
 
 def test_pid_belongs_to_coord_returns_false_on_timeout(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, _force_posix_platform: None
 ) -> None:
     from coordination.cli_ops import _pid_belongs_to_coord
 
@@ -140,7 +155,7 @@ def test_pid_belongs_to_coord_returns_false_on_timeout(
 
 
 def test_pid_belongs_to_coord_returns_false_on_oserror(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, _force_posix_platform: None
 ) -> None:
     from coordination.cli_ops import _pid_belongs_to_coord
 
@@ -348,6 +363,10 @@ def test_legacy_pid_file_is_rejected_politely(
     assert (home / "coord.pid").exists()
 
 
+@pytest.mark.skipif(
+    not hasattr(signal, "SIGKILL"),
+    reason="SIGKILL is POSIX-only; coord stop has no SIGKILL escalation on Windows",
+)
 def test_stop_refuses_when_marker_missing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -467,6 +486,10 @@ def test_stop_with_stale_pid_file_is_cleaned(
     assert not (home / "coord.pid").exists()
 
 
+@pytest.mark.skipif(
+    not hasattr(signal, "SIGKILL"),
+    reason="SIGKILL is POSIX-only; coord stop has no SIGKILL escalation on Windows",
+)
 def test_stop_sends_sigterm_then_sigkill(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
