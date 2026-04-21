@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # --- Builder stage: install pinned deps into a venv, then add the app ---
-FROM python:3.12-slim AS builder
+FROM python:3.14-slim AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -25,7 +25,7 @@ COPY coordination /build/coordination
 RUN pip install --no-deps .
 
 # --- Runtime stage: clean slim base, non-root user, app + venv copied in ---
-FROM python:3.12-slim AS runtime
+FROM python:3.14-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
