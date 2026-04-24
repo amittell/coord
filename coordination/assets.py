@@ -49,9 +49,13 @@ COORD_URL="${COORD_SERVICE_URL:-${COORD_URL:-http://127.0.0.1:8080}}"
 COORD_URL="${COORD_URL%/}"
 TOKEN="${COORD_TOKEN:-${COORD_AUTH_TOKEN:-}}"
 
-if [[ -z "${TOKEN}" ]]; then
-  echo "coordination pre-push: COORD_TOKEN (or COORD_AUTH_TOKEN) not set; skipping" >&2
-  exit 0
+# When the service is in COORD_ALLOW_INSECURE_NO_AUTH mode the token is
+# deliberately empty. In that case we still want to run the conflict check,
+# just without an Authorization header. Only skip auth -- never skip the
+# check itself -- so the hook keeps protecting pushes.
+CURL_AUTH=()
+if [[ -n "${TOKEN}" ]]; then
+  CURL_AUTH=(-H "Authorization: Bearer ${TOKEN}")
 fi
 
 if ! command -v jq >/dev/null 2>&1; then
@@ -82,7 +86,7 @@ while IFS= read -r file; do
   [[ -z "${file}" ]] && continue
   enc="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${file}")"
   resp="$(curl -fsS \\
-    -H "Authorization: Bearer ${TOKEN}" \\
+    "${CURL_AUTH[@]}" \\
     "${COORD_URL}/conflicts?pattern=${enc}&engineer=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${ENGINEER}")" \\
     || true)"
   has="$(printf '%s' "${resp}" | jq -r '.has_conflicts // empty' 2>/dev/null || true)"
