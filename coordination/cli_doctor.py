@@ -58,30 +58,45 @@ def _check_service(config: RepoConfig, token: str) -> list[CheckResult]:
         )
         return out
 
+    # When the local env defines no token, send no Authorization header at
+    # all rather than an invalid `Bearer ` with a trailing space. A 200 from
+    # /claims with no auth header means the server is running with
+    # COORD_ALLOW_INSECURE_NO_AUTH=true (or is otherwise happy with
+    # unauthenticated reads) -- that matches the user's stated configuration
+    # and counts as a pass.
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    label = "auth token works" if token else "unauthenticated access works"
+    hint = (
+        "Check COORD_AUTH_TOKEN or regenerate the token via 'coord start'."
+        if token
+        else (
+            "Service rejected an unauthenticated request. Either set "
+            "COORD_AUTH_TOKEN in .coordination/local.env or run the service "
+            "with COORD_ALLOW_INSECURE_NO_AUTH=true."
+        )
+    )
     try:
         claims = httpx.get(
             f"{config.service_url}/claims",
-            headers={"Authorization": f"Bearer {token}"},
+            headers=headers,
             timeout=5.0,
         )
         ok = claims.status_code == 200
         out.append(
             CheckResult(
-                "auth token works",
+                label,
                 ok,
                 "" if ok else f"status {claims.status_code}",
-                "" if ok else (
-                    "Check COORD_AUTH_TOKEN or regenerate the token via 'coord start'."
-                ),
+                "" if ok else hint,
             )
         )
     except httpx.HTTPError as exc:
         out.append(
             CheckResult(
-                "auth token works",
+                label,
                 False,
                 str(exc),
-                "Check COORD_AUTH_TOKEN or regenerate the token via 'coord start'.",
+                hint,
             )
         )
     return out
