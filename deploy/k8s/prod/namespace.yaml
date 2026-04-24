@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: coord
+  labels:
+    app.kubernetes.io/name: coord
+    app.kubernetes.io/part-of: coord

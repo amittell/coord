@@ -1,0 +1,23 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: coord
+  namespace: coord
+  labels:
+    app.kubernetes.io/name: coord
+    app.kubernetes.io/component: ingress
+  annotations:
+    kubernetes.io/ingress.class: traefik
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: coord.kebabrack.lan
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: coord
+                port:
+                  number: 8080
