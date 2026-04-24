@@ -127,6 +127,14 @@ def test_init_claude_creates_repo_files(
     gitignore_text = (repo / ".gitignore").read_text(encoding="utf-8")
     assert ".coordination/local.env" in gitignore_text
 
+    # local.env must carry the service URL (under both names) and the token.
+    # Without the URL, the pre-push hook silently falls back to localhost.
+    local_env_text = (repo / ".coordination" / "local.env").read_text(encoding="utf-8")
+    assert local_env_text.count("COORD_API_URL=") == 1
+    assert local_env_text.count("COORD_SERVICE_URL=") == 1
+    assert local_env_text.count("COORD_AUTH_TOKEN=") == 1
+    assert "COORD_API_URL=http://127.0.0.1:8080" in local_env_text
+
 
 def test_init_is_idempotent_for_managed_files(
     tmp_path: Path,

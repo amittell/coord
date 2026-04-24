@@ -45,7 +45,20 @@ Before edits:
 PRE_PUSH_SCRIPT = """#!/usr/bin/env bash
 set -euo pipefail
 
-COORD_URL="${COORD_SERVICE_URL:-${COORD_URL:-http://127.0.0.1:8080}}"
+# Source .coordination/local.env so the hook picks up the service URL and
+# token written by `coord init`, not whichever stale values happen to be
+# in the pushing shell's environment. Without this, a remote-mode repo
+# would silently fall back to http://127.0.0.1:8080 and quietly soft-pass
+# every push.
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [[ -n "${REPO_ROOT}" && -f "${REPO_ROOT}/.coordination/local.env" ]]; then
+  set -a
+  # shellcheck disable=SC1090,SC1091
+  source "${REPO_ROOT}/.coordination/local.env"
+  set +a
+fi
+
+COORD_URL="${COORD_API_URL:-${COORD_SERVICE_URL:-${COORD_URL:-http://127.0.0.1:8080}}}"
 COORD_URL="${COORD_URL%/}"
 TOKEN="${COORD_TOKEN:-${COORD_AUTH_TOKEN:-}}"
 

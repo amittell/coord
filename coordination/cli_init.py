@@ -100,14 +100,23 @@ def _write_repo_config(repo_root: Path, tool: str, mode: str, service_url: str) 
     path.write_text(config.to_toml(), encoding="utf-8")
 
 
-def _write_local_env(repo_root: Path, mode: str) -> None:
+def _write_local_env(repo_root: Path, mode: str, service_url: str) -> None:
     if mode == "local":
         token = ensure_token_file(state_paths()["token_file"])
     else:
         token = os.environ.get("COORD_AUTH_TOKEN", "set-me")
     path = repo_root / ".coordination" / "local.env"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f"COORD_AUTH_TOKEN={token}\n", encoding="utf-8")
+    # COORD_API_URL powers coord-mcp and user shells; COORD_SERVICE_URL is
+    # what the pre-push hook reads. Emit both so whichever tool sources
+    # this file picks up the right endpoint -- this is what stops a remote
+    # deployment from silently falling back to http://127.0.0.1:8080.
+    path.write_text(
+        f"COORD_API_URL={service_url}\n"
+        f"COORD_SERVICE_URL={service_url}\n"
+        f"COORD_AUTH_TOKEN={token}\n",
+        encoding="utf-8",
+    )
 
 
 def _update_mcp_json(path: Path, service_url: str, token: str) -> None:
@@ -227,11 +236,16 @@ def run_init(args) -> int:
     _write_repo_config(repo_root, tool, mode, service_url)
     written.append(".coordination/config.toml")
 
-    _write_local_env(repo_root, mode)
+    _write_local_env(repo_root, mode, service_url)
     written.append(".coordination/local.env")
 
-    local_env_text = (repo_root / ".coordination" / "local.env").read_text(encoding="utf-8")
-    token = local_env_text.split("=", 1)[1].strip()
+    # Pick the COORD_AUTH_TOKEN line specifically rather than the first line,
+    # which after this change is COORD_API_URL.
+    token = ""
+    for line in (repo_root / ".coordination" / "local.env").read_text(encoding="utf-8").splitlines():
+        if line.startswith("COORD_AUTH_TOKEN="):
+            token = line.split("=", 1)[1].strip()
+            break
 
     if not args.no_owners:
         owners_path = repo_root / ".coordination" / "owners.yaml"
