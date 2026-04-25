@@ -66,6 +66,9 @@ TOKEN="${COORD_TOKEN:-${COORD_AUTH_TOKEN:-}}"
 # deliberately empty. In that case we still want to run the conflict check,
 # just without an Authorization header. Only skip auth -- never skip the
 # check itself -- so the hook keeps protecting pushes.
+# Empty-array expansion under `set -u` is unbound on bash 3.2 (the macOS
+# system bash), so guard with the ${var+...} fallback whenever we expand
+# CURL_AUTH below.
 CURL_AUTH=()
 if [[ -n "${TOKEN}" ]]; then
   CURL_AUTH=(-H "Authorization: Bearer ${TOKEN}")
@@ -99,7 +102,7 @@ while IFS= read -r file; do
   [[ -z "${file}" ]] && continue
   enc="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${file}")"
   resp="$(curl -fsS \\
-    "${CURL_AUTH[@]}" \\
+    ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} \\
     "${COORD_URL}/conflicts?pattern=${enc}&engineer=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${ENGINEER}")" \\
     || true)"
   has="$(printf '%s' "${resp}" | jq -r '.has_conflicts // empty' 2>/dev/null || true)"

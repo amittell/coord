@@ -13,10 +13,46 @@ def test_script_runs_conflict_check_when_token_is_empty() -> None:
     # skipping" whenever the token was empty, which silently disabled the
     # hook for services running with COORD_ALLOW_INSECURE_NO_AUTH=true.
     assert "not set; skipping" not in PRE_PUSH_SCRIPT
-    # The fix wraps the Authorization header in a conditional array and
-    # expands it via "${CURL_AUTH[@]}". Both markers must be present.
+    # The fix wraps the Authorization header in a conditional array. The
+    # expansion site MUST use the ${var[@]+"${var[@]}"} form so empty
+    # arrays don't trip `set -u` on bash 3.2 (macOS system bash).
     assert 'CURL_AUTH=()' in PRE_PUSH_SCRIPT
-    assert '${CURL_AUTH[@]}' in PRE_PUSH_SCRIPT
+    assert '${CURL_AUTH[@]+"${CURL_AUTH[@]}"}' in PRE_PUSH_SCRIPT
+
+
+def test_script_runs_under_bash_3_2_set_u(tmp_path) -> None:
+    # Regression test for a bug where ${CURL_AUTH[@]} expanded under
+    # `set -u` on bash 3.2 raised "unbound variable" and broke pushes on
+    # stock macOS. We can't easily install bash 3.2 in CI, but we can
+    # exercise the relevant fragment under whichever bash we have plus
+    # the ${var[@]+...} guard, which is what makes 3.2 happy too.
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("bash not available on this platform")
+    fragment = tmp_path / "fragment.sh"
+    fragment.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "CURL_AUTH=()\n"
+        "TOKEN=\"\"\n"
+        'if [[ -n "${TOKEN}" ]]; then\n'
+        '  CURL_AUTH=(-H "Authorization: Bearer ${TOKEN}")\n'
+        "fi\n"
+        # Use the same expansion form the real hook does.
+        'printf "%s\\n" ${CURL_AUTH[@]+"${CURL_AUTH[@]}"}\n'
+        'echo "ok"\n',
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [bash, str(fragment)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, (
+        f"empty-array expansion broke under set -u: {result.stderr}"
+    )
+    assert "ok" in result.stdout
 
 
 def test_script_is_syntactically_valid_bash(tmp_path) -> None:
