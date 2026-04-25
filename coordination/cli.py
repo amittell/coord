@@ -7,6 +7,7 @@ from coordination.cli_doctor import run_doctor
 from coordination.cli_init import run_init
 from coordination.cli_ops import run_claims, run_release, run_status, run_stop
 from coordination.cli_start import run_start
+from coordination.cli_upgrade import run_upgrade
 from coordination.main import run as run_api
 
 
@@ -21,6 +22,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  coord start       Run the service locally (preferred entry point)\n"
             "  coord stop        Stop a background service started by 'coord start'\n"
             "  coord init        Wire the current repo for Claude Code, Codex, or Cursor\n"
+            "  coord upgrade     Refresh managed artefacts after pulling a new coord version\n"
             "  coord doctor      Verify repo wiring and service connectivity\n"
             "  coord status      Print health of the configured service\n"
             "  coord claims      List active claims\n"
@@ -128,6 +130,26 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     init.set_defaults(func=run_init)
+
+    upgrade = sub.add_parser(
+        "upgrade",
+        help="Refresh managed coordination artefacts in this repo",
+        description=(
+            "Re-render the pre-push hook, MCP config, and managed CLAUDE.md / "
+            "AGENTS.md / cursor block from the latest coord package, preserving "
+            ".coordination/config.toml, .coordination/owners.yaml, and the "
+            "existing COORD_AUTH_TOKEN. Run this in each repo after pulling a "
+            "new version of the coord package so hook-level fixes propagate."
+        ),
+    )
+    upgrade.add_argument(
+        "--root",
+        help=(
+            "Base path where .coordination/ lives (absolute or relative to cwd). "
+            "Defaults to the enclosing git repo root."
+        ),
+    )
+    upgrade.set_defaults(func=run_upgrade)
 
     doctor = sub.add_parser(
         "doctor",
