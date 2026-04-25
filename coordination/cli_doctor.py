@@ -6,7 +6,18 @@ import shutil
 
 import httpx
 
-from coordination.cli_shared import MANAGED_BEGIN, find_repo_root, local_coord_mcp_path
+from coordination.assets import (
+    AGENTS_SNIPPET,
+    CLAUDE_SNIPPET,
+    CURSOR_RULE,
+    PRE_PUSH_SCRIPT,
+)
+from coordination.cli_shared import (
+    MANAGED_BEGIN,
+    MANAGED_END,
+    find_repo_root,
+    local_coord_mcp_path,
+)
 from coordination.ownership import parse_ownership_yaml
 from coordination.repo_config import RepoConfig
 
@@ -102,6 +113,80 @@ def _check_service(config: RepoConfig, token: str) -> list[CheckResult]:
     return out
 
 
+def _extract_managed_block(text: str) -> str | None:
+    """Return the *content* (without the marker lines) of the managed
+    block, or None if no block is found.
+    """
+    start = text.find(MANAGED_BEGIN)
+    if start < 0:
+        return None
+    end = text.find(MANAGED_END, start)
+    if end < 0:
+        return None
+    block = text[start + len(MANAGED_BEGIN) : end]
+    return block.strip()
+
+
+def _check_asset_drift(repo_root: Path, config: RepoConfig) -> list[CheckResult]:
+    """Flag any managed artefact whose contents differ from the snippet
+    this version of the coord package would generate. The fix is always
+    `coord upgrade`, so the hint is identical for every drift result.
+    """
+    out: list[CheckResult] = []
+    upgrade_hint = (
+        "Run 'coord upgrade' to refresh managed artefacts to the version "
+        "this coord package ships."
+    )
+
+    hook_path = repo_root / ".coordination" / "hooks" / "pre-push"
+    if hook_path.exists():
+        hook_text = hook_path.read_text(encoding="utf-8")
+        if hook_text == PRE_PUSH_SCRIPT:
+            out.append(CheckResult("pre-push hook is up to date", True))
+        else:
+            out.append(
+                CheckResult(
+                    "pre-push hook is up to date",
+                    False,
+                    "managed hook differs from packaged version",
+                    upgrade_hint,
+                )
+            )
+
+    if config.tool == "claude":
+        block_path = repo_root / "CLAUDE.md"
+        snippet = CLAUDE_SNIPPET
+        label_root = "CLAUDE.md"
+    elif config.tool == "codex":
+        block_path = repo_root / "AGENTS.md"
+        snippet = AGENTS_SNIPPET
+        label_root = "AGENTS.md"
+    else:
+        block_path = repo_root / ".cursor" / "rules" / "coordination.mdc"
+        snippet = CURSOR_RULE
+        label_root = ".cursor/rules/coordination.mdc"
+
+    if block_path.exists():
+        existing_block = _extract_managed_block(
+            block_path.read_text(encoding="utf-8")
+        )
+        if existing_block is not None:
+            label = f"{label_root} managed block is up to date"
+            if existing_block == snippet.strip():
+                out.append(CheckResult(label, True))
+            else:
+                out.append(
+                    CheckResult(
+                        label,
+                        False,
+                        "block content differs from packaged snippet",
+                        upgrade_hint,
+                    )
+                )
+
+    return out
+
+
 def _print_results(results: list[CheckResult]) -> None:
     for result in results:
         status = "OK" if result.ok else "FAIL"
@@ -154,6 +239,8 @@ def run_doctor(args) -> int:
 
     mcp_bin = shutil.which("coord-mcp") or str(local_coord_mcp_path())
     results.append(CheckResult("coord-mcp command available", Path(mcp_bin).exists()))
+
+    results.extend(_check_asset_drift(repo_root, config))
 
     token = _load_token(repo_root, config)
     results.extend(_check_service(config, token))
