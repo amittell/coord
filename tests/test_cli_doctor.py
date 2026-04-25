@@ -167,6 +167,74 @@ def test_drift_check_skips_block_when_file_missing(tmp_path):
     assert "CLAUDE.md managed block is up to date" not in labels
 
 
+def test_version_check_ok_when_versions_match(monkeypatch, tmp_path):
+    def get(url, **kw):
+        client = httpx.Client(transport=httpx.MockTransport(
+            lambda r: httpx.Response(200, json={"name": "multi-agent-coordination", "version": "0.1.0"})
+            if r.url.path == "/meta" else httpx.Response(200)
+        ))
+        return client.get(url, **kw)
+
+    monkeypatch.setattr(cli_doctor.httpx, "get", get)
+    result = cli_doctor._check_server_version(_config(tmp_path), client_version="0.1.0")
+    assert result is not None
+    assert result.ok is True
+    assert "0.1.0" in result.label
+
+
+def test_version_check_flags_when_server_is_newer(monkeypatch, tmp_path):
+    def get(url, **kw):
+        return httpx.Client(transport=httpx.MockTransport(
+            lambda r: httpx.Response(200, json={"version": "0.2.0"})
+        )).get(url, **kw)
+
+    monkeypatch.setattr(cli_doctor.httpx, "get", get)
+    result = cli_doctor._check_server_version(_config(tmp_path), client_version="0.1.0")
+    assert result is not None
+    assert result.ok is False
+    # Hint must direct them to update the CLI, not the server.
+    assert "upgrade" in result.hint.lower() or "newer" in result.detail.lower()
+    assert "0.2.0" in result.detail
+
+
+def test_version_check_flags_when_client_is_newer(monkeypatch, tmp_path):
+    def get(url, **kw):
+        return httpx.Client(transport=httpx.MockTransport(
+            lambda r: httpx.Response(200, json={"version": "0.1.0"})
+        )).get(url, **kw)
+
+    monkeypatch.setattr(cli_doctor.httpx, "get", get)
+    result = cli_doctor._check_server_version(_config(tmp_path), client_version="0.5.0")
+    assert result is not None
+    assert result.ok is False
+    # Hint must direct them to bump the cluster image, not upgrade the client.
+    combined = (result.detail + " " + result.hint).lower()
+    assert "older" in combined or "image tag" in combined
+
+
+def test_version_check_skips_when_meta_lacks_version(monkeypatch, tmp_path):
+    def get(url, **kw):
+        return httpx.Client(transport=httpx.MockTransport(
+            lambda r: httpx.Response(200, json={"name": "x"})
+        )).get(url, **kw)
+
+    monkeypatch.setattr(cli_doctor.httpx, "get", get)
+    result = cli_doctor._check_server_version(_config(tmp_path), client_version="0.1.0")
+    # No actionable signal -- skip silently rather than spuriously fail.
+    assert result is None
+
+
+def test_version_check_skips_when_meta_unreachable(monkeypatch, tmp_path):
+    def raising_get(url, **kw):
+        raise httpx.ConnectError("dead")
+
+    monkeypatch.setattr(cli_doctor.httpx, "get", raising_get)
+    result = cli_doctor._check_server_version(_config(tmp_path), client_version="0.1.0")
+    # Existing 'service reachable' check already reports unreachability.
+    # Don't double-report here.
+    assert result is None
+
+
 def test_drift_check_uses_agents_md_for_codex(tmp_path):
     from coordination.assets import AGENTS_SNIPPET, PRE_PUSH_SCRIPT
 

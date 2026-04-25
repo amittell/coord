@@ -6,6 +6,9 @@ import shutil
 
 import httpx
 
+from packaging.version import InvalidVersion, Version
+
+from coordination import __version__
 from coordination.assets import (
     AGENTS_SNIPPET,
     CLAUDE_SNIPPET,
@@ -187,6 +190,55 @@ def _check_asset_drift(repo_root: Path, config: RepoConfig) -> list[CheckResult]
     return out
 
 
+def _check_server_version(config: RepoConfig, client_version: str) -> CheckResult | None:
+    """Compare the running service's version (via /meta) to the locally
+    installed coord package. Returns None when no actionable signal is
+    available (server unreachable, /meta returns no version, version
+    strings unparseable) so we don't double-report or spuriously fail.
+    """
+    try:
+        meta = httpx.get(f"{config.service_url}/meta", timeout=5.0)
+    except httpx.HTTPError:
+        return None
+    if meta.status_code != 200:
+        return None
+    try:
+        body = meta.json()
+    except ValueError:
+        return None
+    server_version_str = body.get("version") if isinstance(body, dict) else None
+    if not server_version_str:
+        return None
+    try:
+        server_v = Version(server_version_str)
+        client_v = Version(client_version)
+    except InvalidVersion:
+        return None
+
+    if server_v == client_v:
+        return CheckResult(
+            f"client/server versions match ({client_version})",
+            True,
+        )
+    if server_v > client_v:
+        return CheckResult(
+            "coord CLI matches running service",
+            False,
+            f"server is newer ({server_version_str}) than CLI ({client_version})",
+            "Update your local coord install (e.g. 'cd ~/git/coord && git pull' "
+            "for an editable install) so 'coord upgrade' renders artefacts at "
+            "the version the cluster runs.",
+        )
+    return CheckResult(
+        "coord CLI matches running service",
+        False,
+        f"CLI is newer ({client_version}) than server ({server_version_str})",
+        "Cluster pod is older than your local CLI. Bump the image tag in "
+        "deploy/k8s/prod/deployment.yaml and let argocd roll, or accept the "
+        "version skew if intentional.",
+    )
+
+
 def _print_results(results: list[CheckResult]) -> None:
     for result in results:
         status = "OK" if result.ok else "FAIL"
@@ -244,6 +296,11 @@ def run_doctor(args) -> int:
 
     token = _load_token(repo_root, config)
     results.extend(_check_service(config, token))
+
+    version_result = _check_server_version(config, client_version=__version__)
+    if version_result is not None:
+        results.append(version_result)
+
     _print_results(results)
     return 0 if all(r.ok for r in results) else 1
 
