@@ -7,6 +7,7 @@ from coordination.cli_doctor import run_doctor
 from coordination.cli_init import run_init
 from coordination.cli_ops import run_claims, run_release, run_status, run_stop
 from coordination.cli_start import run_start
+from coordination.cli_update_notice import maybe_emit_update_notice
 from coordination.cli_upgrade import run_upgrade
 from coordination.main import run as run_api
 
@@ -230,7 +231,17 @@ def _run_internal_server() -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return args.func(args)
+    rc = args.func(args)
+    # Run after the user's command finishes so a slow check can't make
+    # the command itself feel slow. The notice is throttled and silent
+    # on failure -- see coordination.cli_update_notice for skip rules.
+    try:
+        maybe_emit_update_notice(client_version=__version__, subcommand=args.command)
+    except Exception:
+        # Belt and braces: maybe_emit_update_notice already swallows
+        # everything, but a never-crash-the-CLI guard is cheap.
+        pass
+    return rc
 
 
 if __name__ == "__main__":
