@@ -9,6 +9,37 @@ Semantic Versioning.
 
 ### Added
 
+- (none recorded yet)
+
+### Changed
+
+- (none recorded yet)
+
+### Fixed
+
+- (none recorded yet)
+
+## [0.2.0] - 2026-04-27
+
+### Added
+
+- `coord upgrade` command refreshes the pre-push hook, MCP config, and managed CLAUDE.md / AGENTS.md / cursor block from the latest packaged assets while preserving `.coordination/config.toml`, `.coordination/owners.yaml`, and the existing `COORD_AUTH_TOKEN`.
+- `coord doctor` now flags managed asset drift (in-repo hook or managed block content does not match the packaged snippet) and points at `coord upgrade`.
+- `coord doctor` now compares the locally installed CLI version against the running service's `/meta` and reports skew in either direction with an actionable hint (update local install, or bump the cluster image).
+- Proactive once-per-24h update notice on every CLI command. When the configured service reports a newer version than the local install, `coord` prints a single stderr line pointing at `coord upgrade`. Throttled via a timestamp file, silent on failure, opt-out with `COORD_NO_UPDATE_CHECK=1`, skipped for `init` / `start` / `_serve` / `doctor` and outside coord-initialised repos.
+- `deploy/k8s/prod/` overlay for kebabrack k3s: namespace, Traefik ingress, local-path PVC, two `VaultStaticSecret` resources (auth token + GHCR pull credentials rendered as `kubernetes.io/dockerconfigjson`), and a pinned image digest. Argocd-managed.
+
+### Fixed
+
+- Pre-push hook silently skipped the conflict check when `COORD_AUTH_TOKEN` was empty, disabling protection for any service running in `COORD_ALLOW_INSECURE_NO_AUTH` mode. Now omits the Authorization header instead of skipping, so the check still runs and a 401 is the only failure path.
+- Pre-push hook ignored the repo's `.coordination/local.env` and silently fell back to `http://127.0.0.1:8080` whenever the pushing shell had no `COORD_SERVICE_URL` exported. The hook now sources `local.env` first and `coord init` writes `COORD_API_URL` and `COORD_SERVICE_URL` into it. URL fallback chain becomes: `COORD_API_URL` -> `COORD_SERVICE_URL` -> `COORD_URL` -> `http://127.0.0.1:8080`.
+- Pre-push hook crashed under bash 3.2 (the macOS system bash) with `CURL_AUTH[@]: unbound variable` when the auth token was empty. Switched the auth-header expansion site to the portable `${var[@]+"${var[@]}"}` form so empty arrays no longer trip `set -u`.
+- `coord doctor`'s auth probe sent `Authorization: Bearer ` (trailing space) when the token was empty, which httpx rejects as an illegal header value. Doctor now sends no Authorization header in that case and renames the check to `unauthenticated access works` with a hint pointing at `COORD_ALLOW_INSECURE_NO_AUTH`.
+
+## [0.1.0] - 2026-04-21
+
+### Added
+
 - Core HTTP API for claims, conflicts, ownership configuration, and a bundled dashboard.
 - MCP stdio bridge (`coord-mcp`) so Claude Code, Codex CLI, and Cursor can talk to the service as a native tool.
 - `coord` CLI with `start`, `init`, `doctor`, `stop`, `status`, `claims`, and `release` subcommands.

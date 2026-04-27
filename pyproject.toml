@@ -1,6 +1,6 @@
 [project]
 name = "multi-agent-coordination"
-version = "0.1.0"
+version = "0.2.0"
 description = "Coordination service for multi-engineer agent teams (HTTP API + MCP + dashboard)"
 readme = "README.md"
 requires-python = ">=3.11"
