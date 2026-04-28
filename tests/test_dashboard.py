@@ -8,7 +8,13 @@ import pytest
 
 from coordination import deps
 from coordination.config import Settings
-from coordination.dashboard import _bucket, _esc, _remaining, render_dashboard
+from coordination.dashboard import (
+    _bucket,
+    _esc,
+    _recent_activity,
+    _remaining,
+    render_dashboard,
+)
 from coordination.db import Database
 from coordination.service import CoordinationService
 
@@ -62,6 +68,79 @@ async def svc(
 
 def _iso(dt: datetime) -> str:
     return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+async def _insert_claim_raw(
+    svc: CoordinationService,
+    *,
+    engineer: str,
+    pattern: str,
+    created_at: str,
+    expires_at: str,
+    claim_type: str = "file",
+    severity: str = "soft",
+    description: str | None = None,
+    branch: str | None = None,
+    released_at: str | None = None,
+    claim_id: str = "",
+) -> str:
+    """Insert a claim with a fully-controlled created_at via raw SQL.
+
+    Database.insert_claims_batch always stamps created_at = now, so it can't
+    be used to seed the 24h activity window with old claims.
+    """
+    import aiosqlite
+    from uuid import uuid4
+
+    cid = claim_id or str(uuid4())
+    async with aiosqlite.connect(svc.db.path) as conn:
+        await conn.execute(
+            """
+            INSERT INTO claims (
+                id, engineer, branch, description, claim_type, pattern,
+                severity, created_at, expires_at, released_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                cid,
+                engineer,
+                branch,
+                description,
+                claim_type,
+                pattern,
+                severity,
+                created_at,
+                expires_at,
+                released_at,
+            ),
+        )
+        await conn.commit()
+    return cid
+
+
+async def _insert_conflict_raw(
+    svc: CoordinationService,
+    *,
+    claim_id: str,
+    attempted_by: str,
+    attempted_pattern: str,
+    created_at: str,
+    resolution: str | None = None,
+) -> None:
+    """Insert a conflict_log row with a controlled created_at."""
+    import aiosqlite
+    from uuid import uuid4
+
+    async with aiosqlite.connect(svc.db.path) as conn:
+        await conn.execute(
+            """
+            INSERT INTO conflict_log (
+                id, claim_id, attempted_by, attempted_pattern, resolution, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (str(uuid4()), claim_id, attempted_by, attempted_pattern, resolution, created_at),
+        )
+        await conn.commit()
 
 
 async def _insert_claim(
@@ -249,3 +328,203 @@ def test_remaining_formats_minutes_under_an_hour() -> None:
     out = _remaining(exp)
     assert "m" in out
     assert "h" not in out
+
+
+# ---------------------------------------------------------------------------
+# _recent_activity - pure helper
+# ---------------------------------------------------------------------------
+
+
+def _claim(*, engineer: str, pattern: str, created_at: str) -> dict[str, str]:
+    return {"engineer": engineer, "pattern": pattern, "created_at": created_at}
+
+
+def _conflict(*, attempted_by: str, created_at: str) -> dict[str, str]:
+    return {"attempted_by": attempted_by, "created_at": created_at}
+
+
+def test_recent_activity_counts_claims_and_conflicts_in_window() -> None:
+    now = datetime(2026, 4, 28, 12, 0, 0, tzinfo=UTC)
+    in_window = _iso(now - timedelta(hours=2))
+    out_of_window = _iso(now - timedelta(hours=30))
+
+    summary = _recent_activity(
+        claims=[
+            _claim(engineer="alice", pattern="src/auth.py", created_at=in_window),
+            _claim(engineer="bob", pattern="src/auth.py", created_at=in_window),
+            _claim(engineer="charlie", pattern="src/auth.py", created_at=out_of_window),
+        ],
+        conflicts=[
+            _conflict(attempted_by="bob", created_at=in_window),
+            _conflict(attempted_by="charlie", created_at=out_of_window),
+        ],
+        now=now,
+    )
+    assert summary["claims"] == 2
+    assert summary["conflicts"] == 1
+    assert summary["engineers"] == 2  # alice, bob
+
+
+def test_recent_activity_empty_when_nothing_in_window() -> None:
+    now = datetime(2026, 4, 28, 12, 0, 0, tzinfo=UTC)
+    old = _iso(now - timedelta(days=2))
+    summary = _recent_activity(
+        claims=[_claim(engineer="alice", pattern="src/a.py", created_at=old)],
+        conflicts=[_conflict(attempted_by="bob", created_at=old)],
+        now=now,
+    )
+    assert summary["claims"] == 0
+    assert summary["conflicts"] == 0
+    assert summary["engineers"] == 0
+    # top_modules is a list and should be empty when there are no in-window claims
+    assert summary["top_modules"] == []
+
+
+def test_recent_activity_top_modules_ranked_by_count() -> None:
+    now = datetime(2026, 4, 28, 12, 0, 0, tzinfo=UTC)
+    t = _iso(now - timedelta(hours=1))
+
+    summary = _recent_activity(
+        claims=[
+            _claim(engineer="a", pattern="services/x.py", created_at=t),
+            _claim(engineer="b", pattern="services/y.py", created_at=t),
+            _claim(engineer="c", pattern="services/z.py", created_at=t),
+            _claim(engineer="a", pattern="data_models/foo.py", created_at=t),
+            _claim(engineer="d", pattern="tests/foo.py", created_at=t),
+        ],
+        conflicts=[],
+        now=now,
+    )
+    # services has 3, data_models has 1, tests has 1. services should rank first.
+    modules = summary["top_modules"]
+    assert modules[0]["prefix"] == "services"
+    assert modules[0]["count"] == 3
+    # The remaining two are tied at 1; ordering between them isn't load-bearing,
+    # but both must be present.
+    remaining = {m["prefix"] for m in modules[1:]}
+    assert remaining == {"data_models", "tests"}
+
+
+def test_recent_activity_includes_distinct_engineers_per_module() -> None:
+    now = datetime(2026, 4, 28, 12, 0, 0, tzinfo=UTC)
+    t = _iso(now - timedelta(hours=1))
+    summary = _recent_activity(
+        claims=[
+            _claim(engineer="alice", pattern="services/x.py", created_at=t),
+            _claim(engineer="bob", pattern="services/y.py", created_at=t),
+            # Same engineer twice in one module should not double-count engineers.
+            _claim(engineer="alice", pattern="services/z.py", created_at=t),
+        ],
+        conflicts=[],
+        now=now,
+    )
+    services = next(m for m in summary["top_modules"] if m["prefix"] == "services")
+    assert services["count"] == 3
+    assert set(services["engineers"]) == {"alice", "bob"}
+
+
+def test_recent_activity_skips_rows_with_invalid_timestamps() -> None:
+    now = datetime(2026, 4, 28, 12, 0, 0, tzinfo=UTC)
+    in_window = _iso(now - timedelta(hours=1))
+    summary = _recent_activity(
+        claims=[
+            _claim(engineer="alice", pattern="src/a.py", created_at=in_window),
+            # Bogus timestamp: must not crash and must not count.
+            _claim(engineer="bob", pattern="src/b.py", created_at="not-a-date"),
+            _claim(engineer="carol", pattern="src/c.py", created_at=""),
+        ],
+        conflicts=[
+            _conflict(attempted_by="x", created_at="also-bogus"),
+        ],
+        now=now,
+    )
+    assert summary["claims"] == 1
+    assert summary["conflicts"] == 0
+    assert summary["engineers"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Recent activity panel - rendered HTML
+# ---------------------------------------------------------------------------
+
+
+async def test_dashboard_renders_recent_activity_panel(svc: CoordinationService) -> None:
+    """Even with no active claims, the dashboard summarises the last 24h."""
+    now = datetime.now(UTC)
+    fresh = _iso(now - timedelta(hours=2))
+    expired = _iso(now - timedelta(hours=1))
+
+    cid = await _insert_claim_raw(
+        svc,
+        engineer="l7-mitre-thread-agent",
+        pattern="services/foo.py",
+        created_at=fresh,
+        expires_at=expired,
+        released_at=expired,
+    )
+    await _insert_claim_raw(
+        svc,
+        engineer="l7-host-tokens-agent",
+        pattern="services/bar.py",
+        created_at=fresh,
+        expires_at=expired,
+        released_at=expired,
+    )
+    await _insert_conflict_raw(
+        svc,
+        claim_id=cid,
+        attempted_by="l7-host-tokens-agent",
+        attempted_pattern="services/foo.py",
+        created_at=fresh,
+    )
+
+    html_out = await render_dashboard()
+    # The new section appears with a recognisable header.
+    assert "Recent activity (last 24h)" in html_out
+    # Two claims, one conflict, two distinct engineers.
+    # Cells live in <td>N</td>; check raw substrings to keep the test
+    # resilient to minor formatting tweaks.
+    activity_section_start = html_out.index("Recent activity (last 24h)")
+    activity_section_end = html_out.index("Active claims")
+    activity = html_out[activity_section_start:activity_section_end]
+    assert "<td>2</td>" in activity  # claims and engineers both = 2
+    assert "<td>1</td>" in activity  # conflicts = 1
+    # Top module is "services" with 2 claims from 2 engineers.
+    assert "<code>services</code>" in activity
+    assert "l7-mitre-thread-agent" in activity
+    assert "l7-host-tokens-agent" in activity
+
+
+async def test_dashboard_recent_activity_renders_zero_state(svc: CoordinationService) -> None:
+    """Empty database: panel still renders with zeros (does not disappear)."""
+    html_out = await render_dashboard()
+    assert "Recent activity (last 24h)" in html_out
+    activity_start = html_out.index("Recent activity (last 24h)")
+    activity_end = html_out.index("Active claims")
+    activity = html_out[activity_start:activity_end]
+    # Every numeric stat reads zero.
+    assert "<td>0</td>" in activity
+    # And there's a clear "no recent activity" message in the modules block.
+    assert "No activity in the last 24h" in activity
+
+
+async def test_dashboard_recent_activity_excludes_old_claims(svc: CoordinationService) -> None:
+    """Claims older than the window must not appear in the activity panel."""
+    now = datetime.now(UTC)
+    very_old = _iso(now - timedelta(days=3))
+    await _insert_claim_raw(
+        svc,
+        engineer="ancient-agent",
+        pattern="services/dusty.py",
+        created_at=very_old,
+        expires_at=very_old,
+        released_at=very_old,
+    )
+    html_out = await render_dashboard()
+    activity_start = html_out.index("Recent activity (last 24h)")
+    activity_end = html_out.index("Active claims")
+    activity = html_out[activity_start:activity_end]
+    # The old engineer must not appear in the recent activity panel
+    # (the timeline section below may still show them).
+    assert "ancient-agent" not in activity
+    assert "<td>0</td>" in activity

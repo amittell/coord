@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import html
-from collections import Counter
-from datetime import UTC, datetime
+from collections import Counter, defaultdict
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from coordination.deps import get_service
 
@@ -31,6 +32,60 @@ def _remaining(expires_at: str | None) -> str:
     return f"{s}s"
 
 
+def _parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _recent_activity(
+    *,
+    claims: list[dict[str, Any]],
+    conflicts: list[dict[str, Any]],
+    now: datetime,
+    window_hours: int = 24,
+) -> dict[str, Any]:
+    """Summarise the last `window_hours` of claim and conflict activity.
+
+    Pure function over already-fetched rows so the dashboard renderer can stay
+    composed of small testable pieces. Rows with missing or malformed
+    timestamps are silently dropped rather than crashing the whole panel.
+    """
+    cutoff = now - timedelta(hours=window_hours)
+
+    fresh_claims = [
+        c for c in claims if (ts := _parse_iso(c.get("created_at"))) and ts >= cutoff
+    ]
+    fresh_conflicts = [
+        c for c in conflicts if (ts := _parse_iso(c.get("created_at"))) and ts >= cutoff
+    ]
+
+    engineers = {c.get("engineer") for c in fresh_claims if c.get("engineer")}
+
+    by_module: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for c in fresh_claims:
+        by_module[_bucket(c.get("pattern"))].append(c)
+
+    top_modules: list[dict[str, Any]] = []
+    for prefix, items in by_module.items():
+        eng_set: set[str] = {str(name) for i in items if (name := i.get("engineer"))}
+        top_modules.append(
+            {"prefix": prefix, "count": len(items), "engineers": sorted(eng_set)}
+        )
+    # Sort by claim count desc, then prefix asc for stable ordering.
+    top_modules.sort(key=lambda m: (-m["count"], m["prefix"]))
+
+    return {
+        "claims": len(fresh_claims),
+        "conflicts": len(fresh_conflicts),
+        "engineers": len(engineers),
+        "top_modules": top_modules[:5],
+    }
+
+
 def _bucket(pattern: str | None) -> str:
     p = (pattern or "").replace("\\", "/").strip("./")
     if not p:
@@ -43,8 +98,12 @@ def _bucket(pattern: str | None) -> str:
 async def render_dashboard() -> str:
     svc = get_service()
     rows = await svc.list_claims(active_only=True)
-    conflicts = await svc.db.recent_conflicts(30)
-    recent = await svc.db.list_recent_claims(40)
+    # Pull a wider window than what the timeline displays so the 24h activity
+    # panel can summarise busier days without missing rows. The timeline
+    # itself still renders only the most recent slice below.
+    conflicts = await svc.db.recent_conflicts(500)
+    recent = await svc.db.list_recent_claims(500)
+    activity = _recent_activity(claims=recent, conflicts=conflicts, now=datetime.now(UTC))
 
     rows_html = ""
     for r in rows:
@@ -91,7 +150,7 @@ async def render_dashboard() -> str:
         conf_html = "<tr><td colspan='4'>No recent conflict attempts logged</td></tr>"
 
     timeline_html = ""
-    for r in recent:
+    for r in recent[:40]:
         timeline_html += (
             "<tr>"
             f"<td>{_esc(r.get('created_at'))}</td>"
@@ -103,6 +162,21 @@ async def render_dashboard() -> str:
         )
     if not timeline_html:
         timeline_html = "<tr><td colspan='5'>No claim history yet</td></tr>"
+
+    activity_modules_html = ""
+    for m in activity["top_modules"]:
+        engineers_label = ", ".join(_esc(e) for e in m["engineers"]) or ""
+        activity_modules_html += (
+            "<tr>"
+            f"<td><code>{_esc(m['prefix'])}</code></td>"
+            f"<td>{m['count']}</td>"
+            f"<td>{engineers_label}</td>"
+            "</tr>"
+        )
+    if not activity_modules_html:
+        activity_modules_html = (
+            "<tr><td colspan='3'>No activity in the last 24h</td></tr>"
+        )
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -123,7 +197,16 @@ async def render_dashboard() -> str:
 </head>
 <body>
   <h1>Coordination Dashboard</h1>
-  <p class="muted">Active claims, path-prefix heatmap, recent conflict log, and claim timeline.</p>
+  <p class="muted">Recent activity, active claims, path-prefix heatmap, recent conflict log, and claim timeline.</p>
+  <h2>Recent activity (last 24h)</h2>
+  <table>
+    <thead><tr><th>Claims created</th><th>Conflicts logged</th><th>Engineers active</th></tr></thead>
+    <tbody><tr><td>{activity["claims"]}</td><td>{activity["conflicts"]}</td><td>{activity["engineers"]}</td></tr></tbody>
+  </table>
+  <table>
+    <thead><tr><th>Top module (last 24h)</th><th>Claims</th><th>Engineers</th></tr></thead>
+    <tbody>{activity_modules_html}</tbody>
+  </table>
   <h2>Active claims</h2>
   <table>
     <thead><tr><th>Engineer</th><th>Pattern</th><th>Description</th><th>Expires (UTC)</th><th>Time left</th><th>Severity</th></tr></thead>
