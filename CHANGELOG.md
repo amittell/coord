@@ -19,6 +19,12 @@ Semantic Versioning.
 
 - (none recorded yet)
 
+## [0.2.1] - 2026-04-28
+
+### Added
+
+- Dashboard now opens with a "Recent activity (last 24h)" panel that summarises claims created, conflicts logged, distinct engineers active, and the top modules touched in the rolling 24h window. Computed from the existing claim and conflict tables, no schema changes. Closes the gap where the headline "Active claims" and "Module heatmap" sections both rendered empty between active sessions and made the page look dead.
+
 ## [0.2.0] - 2026-04-27
 
 ### Added
