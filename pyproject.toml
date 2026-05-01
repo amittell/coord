@@ -5,13 +5,13 @@ description = "Coordination service for multi-engineer agent teams (HTTP API + M
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "fastapi>=0.115.0",
-    "uvicorn[standard]>=0.45.0",
+    "fastapi>=0.136.1",
+    "uvicorn[standard]>=0.46.0",
     "pydantic>=2.13.3",
     "pydantic-settings>=2.14.0",
     "mcp>=1.2.0",
     "httpx>=0.28.0",
-    "pathspec>=0.12.1",
+    "pathspec>=1.1.1",
     "aiosqlite>=0.20.0",
     "pyyaml>=6.0.2",
 ]
