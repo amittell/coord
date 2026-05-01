@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -87,20 +89,69 @@ def _starter_owners(repo_root: Path) -> str:
     return "\n".join(lines)
 
 
-def _write_repo_config(repo_root: Path, tool: str, mode: str, service_url: str) -> None:
+def _detect_repo_id(repo_root: Path) -> str:
+    """Best-effort repo identifier for a coord-managed repo.
+
+    Order of preference:
+    1. ``owner/repo`` slug parsed from ``git remote get-url origin``.
+       Handles both HTTPS (``https://github.com/owner/repo.git``) and
+       SSH (``git@github.com:owner/repo.git``) forms.
+    2. The directory basename, when no origin remote is configured or
+       the directory is not a git work tree.
+
+    Never raises: a reliable repo id is more useful than a precise one,
+    and the user can always override the value with an explicit
+    ``repo_id`` in ``.coordination/config.toml``.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=repo_root,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, OSError):
+        return repo_root.name
+
+    if result.returncode != 0:
+        return repo_root.name
+
+    url = result.stdout.strip()
+    # SSH form: git@host:owner/repo(.git)
+    m = re.match(r"^[^@]+@[^:]+:([^/]+/[^/]+?)(?:\.git)?$", url)
+    if m:
+        return m.group(1)
+    # HTTPS / git protocol form: scheme://host/path/owner/repo(.git)
+    m = re.match(r"^[a-zA-Z]+://[^/]+/(?:[^/]+/)*([^/]+/[^/]+?)(?:\.git)?$", url)
+    if m:
+        return m.group(1)
+    return repo_root.name
+
+
+def _write_repo_config(
+    repo_root: Path,
+    tool: str,
+    mode: str,
+    service_url: str,
+    repo_id: str | None = None,
+) -> None:
     config = RepoConfig(
         version=1,
         tool=tool,
         mode=mode,
         service_url=service_url,
         ownership_file=".coordination/owners.yaml",
+        repo_id=repo_id or _detect_repo_id(repo_root),
     )
     path = repo_root / ".coordination" / "config.toml"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(config.to_toml(), encoding="utf-8")
 
 
-def _write_local_env(repo_root: Path, mode: str, service_url: str) -> None:
+def _write_local_env(
+    repo_root: Path, mode: str, service_url: str, repo_id: str | None = None
+) -> None:
     if mode == "local":
         token = ensure_token_file(state_paths()["token_file"])
     else:
@@ -111,15 +162,20 @@ def _write_local_env(repo_root: Path, mode: str, service_url: str) -> None:
     # what the pre-push hook reads. Emit both so whichever tool sources
     # this file picks up the right endpoint -- this is what stops a remote
     # deployment from silently falling back to http://127.0.0.1:8080.
-    path.write_text(
+    body = (
         f"COORD_API_URL={service_url}\n"
         f"COORD_SERVICE_URL={service_url}\n"
-        f"COORD_AUTH_TOKEN={token}\n",
-        encoding="utf-8",
+        f"COORD_AUTH_TOKEN={token}\n"
     )
+    rid = repo_id or _detect_repo_id(repo_root)
+    if rid:
+        body += f"COORD_REPO_ID={rid}\n"
+    path.write_text(body, encoding="utf-8")
 
 
-def _update_mcp_json(path: Path, service_url: str, token: str) -> None:
+def _update_mcp_json(
+    path: Path, service_url: str, token: str, repo_id: str | None = None
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         try:
@@ -129,13 +185,16 @@ def _update_mcp_json(path: Path, service_url: str, token: str) -> None:
     else:
         data = {}
     servers = data.setdefault("mcpServers", {})
+    env: dict[str, str] = {
+        "COORD_API_URL": service_url,
+        "COORD_AUTH_TOKEN": token,
+    }
+    if repo_id:
+        env["COORD_REPO_ID"] = repo_id
     servers["coord"] = {
         "command": "coord-mcp",
         "args": [],
-        "env": {
-            "COORD_API_URL": service_url,
-            "COORD_AUTH_TOKEN": token,
-        },
+        "env": env,
     }
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
@@ -233,10 +292,11 @@ def run_init(args) -> int:
 
     written: list[str] = []
 
-    _write_repo_config(repo_root, tool, mode, service_url)
+    repo_id = _detect_repo_id(repo_root)
+    _write_repo_config(repo_root, tool, mode, service_url, repo_id=repo_id)
     written.append(".coordination/config.toml")
 
-    _write_local_env(repo_root, mode, service_url)
+    _write_local_env(repo_root, mode, service_url, repo_id=repo_id)
     written.append(".coordination/local.env")
 
     # Pick the COORD_AUTH_TOKEN line specifically rather than the first line,
@@ -255,7 +315,9 @@ def run_init(args) -> int:
             written.append(".coordination/owners.yaml")
 
     if tool == "claude":
-        _update_mcp_json(repo_root / ".mcp.json", service_url, token)
+        _update_mcp_json(
+            repo_root / ".mcp.json", service_url, token, repo_id=repo_id
+        )
         ensure_managed_block(repo_root / "CLAUDE.md", CLAUDE_SNIPPET)
         written.extend([".mcp.json", "CLAUDE.md (managed block)"])
     elif tool == "codex":
@@ -263,7 +325,9 @@ def run_init(args) -> int:
         ensure_managed_block(repo_root / "AGENTS.md", AGENTS_SNIPPET)
         written.extend([".codex/config.toml", "AGENTS.md (managed block)"])
     else:
-        _update_mcp_json(repo_root / ".cursor" / "mcp.json", service_url, token)
+        _update_mcp_json(
+            repo_root / ".cursor" / "mcp.json", service_url, token, repo_id=repo_id
+        )
         ensure_managed_block(repo_root / ".cursor" / "rules" / "coordination.mdc", CURSOR_RULE)
         written.extend([".cursor/mcp.json", ".cursor/rules/coordination.mdc"])
 
@@ -277,6 +341,7 @@ def run_init(args) -> int:
 
     print(f"Initialized coordination for {repo_root}")
     print(f"Tool: {tool}    Mode: {mode}    Service: {service_url}")
+    print(f"Repo id: {repo_id}")
     print("")
     print("Wrote or updated:")
     for path in written:

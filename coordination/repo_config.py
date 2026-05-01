@@ -13,10 +13,12 @@ class RepoConfig:
     service_url: str
     ownership_file: str
     local_env_file: str = ".coordination/local.env"
+    repo_id: str | None = None
 
     @classmethod
     def load(cls, path: Path) -> "RepoConfig":
         data = tomllib.loads(path.read_text(encoding="utf-8"))
+        repo_id_raw = data.get("repo_id")
         return cls(
             version=int(data.get("version", 1)),
             tool=str(data["tool"]),
@@ -24,10 +26,11 @@ class RepoConfig:
             service_url=str(data["service_url"]),
             ownership_file=str(data.get("ownership_file", ".coordination/owners.yaml")),
             local_env_file=str(data.get("local_env_file", ".coordination/local.env")),
+            repo_id=str(repo_id_raw) if repo_id_raw else None,
         )
 
     def to_toml(self) -> str:
-        return (
+        body = (
             f"version = {self.version}\n"
             f'tool = "{self.tool}"\n'
             f'mode = "{self.mode}"\n'
@@ -35,4 +38,7 @@ class RepoConfig:
             f'ownership_file = "{self.ownership_file}"\n'
             f'local_env_file = "{self.local_env_file}"\n'
         )
+        if self.repo_id:
+            body += f'repo_id = "{self.repo_id}"\n'
+        return body
 

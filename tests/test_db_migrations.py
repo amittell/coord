@@ -233,6 +233,138 @@ async def test_two_database_instances_same_path(tmp_path: Path) -> None:
     assert rows[0][0] == CURRENT_SCHEMA_VERSION
 
 
+async def test_v2_adds_repo_column_to_claims(tmp_path: Path) -> None:
+    """Migration v2 introduces a nullable `repo` column on claims."""
+    db_path = tmp_path / "v2.sqlite"
+    db = Database(db_path)
+    await db.init()
+
+    # Inspect the column list via PRAGMA table_info.
+    rows = await _fetch_all(db_path, "PRAGMA table_info(claims)")
+    cols = {r[1] for r in rows}  # column name is index 1
+    assert "repo" in cols, f"claims table missing repo column; saw: {cols}"
+
+    # Verify the column is nullable: the notnull flag (index 3) must be 0.
+    repo_row = next(r for r in rows if r[1] == "repo")
+    assert repo_row[3] == 0, "repo column must be nullable for backfill"
+
+
+async def test_v1_to_v2_preserves_existing_claims_with_null_repo(tmp_path: Path) -> None:
+    """A pre-v2 DB with claims must migrate cleanly: rows are preserved,
+    repo column appears, and old rows get repo=NULL by default."""
+    db_path = tmp_path / "legacy_to_v2.sqlite"
+
+    # Pre-create a v1 database with a claim row but no repo column.
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.executescript(
+            """
+            CREATE TABLE schema_version (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                version INTEGER NOT NULL
+            );
+            CREATE TABLE claims (
+                id TEXT PRIMARY KEY,
+                engineer TEXT NOT NULL,
+                branch TEXT,
+                description TEXT,
+                claim_type TEXT NOT NULL,
+                pattern TEXT NOT NULL,
+                severity TEXT NOT NULL DEFAULT 'soft',
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                released_at TEXT
+            );
+            CREATE TABLE conflict_log (
+                id TEXT PRIMARY KEY,
+                claim_id TEXT NOT NULL,
+                attempted_by TEXT NOT NULL,
+                attempted_pattern TEXT NOT NULL,
+                resolution TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (claim_id) REFERENCES claims(id)
+            );
+            CREATE TABLE ownership_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                yaml_text TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            INSERT INTO schema_version (id, version) VALUES (1, 1);
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO claims (
+                id, engineer, branch, description, claim_type, pattern,
+                severity, created_at, expires_at, released_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            """,
+            (
+                "legacy-claim-1",
+                "alice",
+                "alice/feature",
+                "pre-v2 claim",
+                "file",
+                "src/legacy.py",
+                "soft",
+                "2026-01-01T00:00:00Z",
+                "2099-01-01T00:00:00Z",
+            ),
+        )
+        await conn.commit()
+
+    db = Database(db_path)
+    await db.init()
+
+    # Schema must be at v2 (or higher) now.
+    row = await _fetch_one(db_path, "SELECT version FROM schema_version")
+    assert row is not None
+    assert row[0] >= 2
+
+    # The legacy row must still exist and have repo=NULL.
+    row = await _fetch_one(
+        db_path, "SELECT id, repo FROM claims WHERE id = 'legacy-claim-1'"
+    )
+    assert row is not None
+    assert row[0] == "legacy-claim-1"
+    assert row[1] is None
+
+
+async def test_v2_allows_inserting_claim_with_repo(tmp_path: Path) -> None:
+    """After v2, new claim inserts can include a repo value."""
+    db_path = tmp_path / "v2_insert.sqlite"
+    db = Database(db_path)
+    await db.init()
+
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.execute(
+            """
+            INSERT INTO claims (
+                id, engineer, branch, description, claim_type, pattern,
+                severity, created_at, expires_at, released_at, repo
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+            """,
+            (
+                "new-claim-1",
+                "alice",
+                None,
+                "first repo-tagged claim",
+                "file",
+                "src/foo.py",
+                "soft",
+                "2026-05-01T12:00:00Z",
+                "2026-05-01T16:00:00Z",
+                "amittell/coord",
+            ),
+        )
+        await conn.commit()
+
+    row = await _fetch_one(
+        db_path, "SELECT repo FROM claims WHERE id = 'new-claim-1'"
+    )
+    assert row is not None
+    assert row[0] == "amittell/coord"
+
+
 async def test_init_sets_busy_timeout_pragma(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

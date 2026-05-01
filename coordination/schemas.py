@@ -14,6 +14,14 @@ class CreateClaimsRequest(BaseModel):
     description: str | None = None
     claims: list[ClaimItem]
     ttl_hours: int | None = None
+    repo: str | None = Field(
+        default=None,
+        description=(
+            "Identifier for the repo this claim came from "
+            "(e.g. 'amittell/bastionx'). Optional for backward compat; "
+            "supplied automatically by coord-mcp when set in the repo's config."
+        ),
+    )
 
 
 class ConflictingClaim(BaseModel):

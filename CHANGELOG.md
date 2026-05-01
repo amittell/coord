@@ -19,6 +19,19 @@ Semantic Versioning.
 
 - (none recorded yet)
 
+## [0.3.0] - 2026-05-01
+
+### Added
+
+- Per-repo claim tracking. Each claim now carries a repo identifier ("amittell/coord"-style slug). The MCP bridge reads `COORD_REPO_ID` and includes it on every `claim_files` call; `coord init` and `coord upgrade` derive the value from `git remote get-url origin` (HTTPS or SSH) and persist it in `.coordination/config.toml`, `.coordination/local.env`, and the tool-specific MCP config. Existing repos pick up the value on their next `coord upgrade`.
+- New GET `/repos` endpoint returns one row per repo with active claim count, claims and engineers in the rolling 24h window, and last-activity timestamp.
+- GET `/claims` now accepts `?repo=` to filter to a single repo's claims.
+- Dashboard adds a "Repositories" panel listing every repo using the service so operators can see at a glance who's coordinating where.
+
+### Changed
+
+- Database schema bumped to v2 via a forwards-only migration that adds a nullable `claims.repo` column. Pre-v2 claims keep `repo=NULL` and are excluded from the per-repo aggregations.
+
 ## [0.2.1] - 2026-04-28
 
 ### Added

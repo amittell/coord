@@ -4,7 +4,7 @@ import asyncio
 import os
 import sqlite3
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -140,13 +140,16 @@ CREATE INDEX IF NOT EXISTS idx_claims_engineer ON claims (engineer);
 """
 
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 # Migration registry: list of (version, upgrade_sql) tuples applied in order.
 # Entry for version N is the SQL that upgrades a DB from version N-1 to N.
 # Version 1 creates the initial core schema; future versions append here.
 MIGRATIONS: list[tuple[int, str]] = [
     (1, SCHEMA),
+    # v2: capture which repo a claim came from. Nullable for backfill: existing
+    # claims pre-dating this column show up under "(unattributed)" in repo views.
+    (2, "ALTER TABLE claims ADD COLUMN repo TEXT;"),
 ]
 
 
@@ -397,6 +400,7 @@ class Database:
         branch: str | None,
         description: str | None,
         items: list[tuple[str, str, str, str, str]],  # id, claim_type, pattern, severity, expires_at
+        repo: str | None = None,
     ) -> list[str]:
         now = _utcnow()
         await self.init()
@@ -408,10 +412,21 @@ class Database:
                     """
                     INSERT INTO claims (
                         id, engineer, branch, description, claim_type, pattern, severity,
-                        created_at, expires_at, released_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                        created_at, expires_at, released_at, repo
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
                     """,
-                    (cid, engineer, branch, description, claim_type, pattern, severity, now, expires_at),
+                    (
+                        cid,
+                        engineer,
+                        branch,
+                        description,
+                        claim_type,
+                        pattern,
+                        severity,
+                        now,
+                        expires_at,
+                        repo,
+                    ),
                 )
             await conn.commit()
         return [i[0] for i in items]
@@ -546,6 +561,65 @@ class Database:
             rows = await cur.fetchall()
             await conn.commit()
             return [dict(r) for r in rows]
+
+    async def list_repos(
+        self,
+        *,
+        window_hours: int = 24,
+        now: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Aggregate claim activity per repo.
+
+        Returns one row per distinct repo seen in the claims table
+        (excluding NULL repo, which we treat as legacy / unattributed).
+        Each row reports counts inside the rolling ``window_hours`` window
+        plus a ``last_activity`` timestamp from the most recent claim.
+
+        ``active_claims`` is window-independent: it counts claims that
+        are unreleased and not yet expired right now, regardless of
+        when they were created.
+        """
+        await self.init()
+        now = now or datetime.now(UTC)
+        cutoff = (now - timedelta(hours=window_hours)).replace(microsecond=0)
+        cutoff_iso = cutoff.isoformat().replace("+00:00", "Z")
+        now_iso = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                """
+                SELECT
+                    repo,
+                    MAX(created_at) AS last_activity,
+                    SUM(CASE WHEN datetime(created_at) >= datetime(?)
+                             THEN 1 ELSE 0 END) AS claims_in_window,
+                    COUNT(DISTINCT CASE WHEN datetime(created_at) >= datetime(?)
+                                        THEN engineer END) AS engineers_in_window,
+                    SUM(CASE WHEN released_at IS NULL
+                                  AND datetime(expires_at) > datetime(?)
+                             THEN 1 ELSE 0 END) AS active_claims
+                FROM claims
+                WHERE repo IS NOT NULL
+                GROUP BY repo
+                ORDER BY active_claims DESC, claims_in_window DESC, repo ASC
+                """,
+                (cutoff_iso, cutoff_iso, now_iso),
+            )
+            rows = await cur.fetchall()
+            await conn.commit()
+
+        return [
+            {
+                "repo": r["repo"],
+                "last_activity": r["last_activity"],
+                "claims_24h": int(r["claims_in_window"] or 0),
+                "engineers_24h": int(r["engineers_in_window"] or 0),
+                "active_claims": int(r["active_claims"] or 0),
+            }
+            for r in rows
+        ]
 
     async def list_recent_claims(self, limit: int = 200) -> list[dict[str, Any]]:
         await self.init()

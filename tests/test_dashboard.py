@@ -508,6 +508,63 @@ async def test_dashboard_recent_activity_renders_zero_state(svc: CoordinationSer
     assert "No activity in the last 24h" in activity
 
 
+async def test_dashboard_renders_repos_panel(svc: CoordinationService) -> None:
+    """The Repositories panel summarises distinct repos using the service."""
+    now = datetime.now(UTC)
+    fresh = _iso(now - timedelta(hours=2))
+    expires = _iso(now + timedelta(hours=2))
+
+    # Two repos, with multiple claims and engineers each.
+    await _insert_claim_raw(
+        svc,
+        engineer="alice",
+        pattern="services/x.py",
+        created_at=fresh,
+        expires_at=expires,
+    )
+    # Tag this raw insert with a repo by updating the row directly.
+    import aiosqlite
+
+    async with aiosqlite.connect(svc.db.path) as conn:
+        await conn.execute(
+            "UPDATE claims SET repo = ? WHERE engineer = 'alice'",
+            ("amittell/bastionx",),
+        )
+        await conn.commit()
+
+    cid = await _insert_claim_raw(
+        svc,
+        engineer="bob",
+        pattern="coordination/foo.py",
+        created_at=fresh,
+        expires_at=expires,
+    )
+    async with aiosqlite.connect(svc.db.path) as conn:
+        await conn.execute(
+            "UPDATE claims SET repo = ? WHERE id = ?",
+            ("amittell/coord", cid),
+        )
+        await conn.commit()
+
+    html_out = await render_dashboard()
+    assert "Repositories" in html_out
+    repos_start = html_out.index("Repositories")
+    repos_end = html_out.index("Recent activity (last 24h)")
+    section = html_out[repos_start:repos_end]
+    assert "amittell/bastionx" in section
+    assert "amittell/coord" in section
+
+
+async def test_dashboard_repos_panel_zero_state(svc: CoordinationService) -> None:
+    """Empty database renders the panel with a placeholder."""
+    html_out = await render_dashboard()
+    assert "Repositories" in html_out
+    repos_start = html_out.index("Repositories")
+    repos_end = html_out.index("Recent activity (last 24h)")
+    section = html_out[repos_start:repos_end]
+    assert "No repos using this service yet" in section
+
+
 async def test_dashboard_recent_activity_excludes_old_claims(svc: CoordinationService) -> None:
     """Claims older than the window must not appear in the activity panel."""
     now = datetime.now(UTC)

@@ -75,6 +75,9 @@ async def claim_files(
     }
     if ttl_hours is not None:
         body["ttl_hours"] = ttl_hours
+    repo_id = os.environ.get("COORD_REPO_ID", "").strip()
+    if repo_id:
+        body["repo"] = repo_id
     async with httpx.AsyncClient(timeout=30.0) as client:
         r = await client.post(f"{_base_url()}/claims", json=body, headers={**_headers(), "Content-Type": "application/json"})
         if r.status_code in (400, 409):

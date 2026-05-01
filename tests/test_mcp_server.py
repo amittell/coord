@@ -337,6 +337,44 @@ async def test_claim_files_posts_correct_body_with_all_optional_fields(
 
 
 @pytest.mark.asyncio
+async def test_claim_files_includes_repo_id_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.setenv("COORD_REPO_ID", "amittell/coord")
+    captured = _install_mock_transport(
+        monkeypatch, _json_handler(200, {"claim_ids": ["c"], "conflicts": [], "warnings": [], "options": []})
+    )
+
+    await mcp_server.claim_files(engineer="alice", patterns=["src/**"])
+
+    import json as _json
+
+    body = _json.loads(captured[0].content.decode("utf-8"))
+    assert body["repo"] == "amittell/coord"
+
+
+@pytest.mark.asyncio
+async def test_claim_files_omits_repo_when_env_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.delenv("COORD_REPO_ID", raising=False)
+    captured = _install_mock_transport(
+        monkeypatch, _json_handler(200, {"claim_ids": ["c"], "conflicts": [], "warnings": [], "options": []})
+    )
+
+    await mcp_server.claim_files(engineer="alice", patterns=["src/**"])
+
+    import json as _json
+
+    body = _json.loads(captured[0].content.decode("utf-8"))
+    assert "repo" not in body
+
+
+@pytest.mark.asyncio
 async def test_claim_files_omits_ttl_when_unset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

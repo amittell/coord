@@ -266,6 +266,7 @@ class CoordinationService:
             branch=body.branch,
             description=body.description,
             items=ids,
+            repo=body.repo,
         )
         # Count one tick per successfully inserted claim. We look back at
         # the computed severity for each item so the label distribution

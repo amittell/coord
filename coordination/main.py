@@ -223,6 +223,7 @@ async def list_claims(
     active: bool = Query(default=True, alias="active_only"),
     engineer: str | None = None,
     module: str | None = None,
+    repo: str | None = None,
     _: None = Depends(require_auth),
 ) -> dict:
     rows = await get_service().list_claims(
@@ -230,7 +231,17 @@ async def list_claims(
         engineer=engineer,
         module_substring=module,
     )
+    if repo is not None:
+        rows = [r for r in rows if r.get("repo") == repo]
     return {"claims": rows, "count": len(rows)}
+
+
+@app.get("/repos")
+async def list_repos(_: None = Depends(require_auth)) -> dict:
+    """Per-repo activity summary: one row for each distinct repo that has
+    ever submitted a claim with a non-null repo identifier."""
+    rows = await get_service().db.list_repos()
+    return {"repos": rows, "count": len(rows)}
 
 
 @app.get("/conflicts")

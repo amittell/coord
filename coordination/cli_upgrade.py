@@ -41,14 +41,21 @@ def _read_existing_token(local_env: Path) -> str:
     return ""
 
 
-def _rewrite_local_env(local_env: Path, service_url: str, token: str) -> None:
+def _rewrite_local_env(
+    local_env: Path,
+    service_url: str,
+    token: str,
+    repo_id: str | None = None,
+) -> None:
     local_env.parent.mkdir(parents=True, exist_ok=True)
-    local_env.write_text(
+    body = (
         f"COORD_API_URL={service_url}\n"
         f"COORD_SERVICE_URL={service_url}\n"
-        f"COORD_AUTH_TOKEN={token}\n",
-        encoding="utf-8",
+        f"COORD_AUTH_TOKEN={token}\n"
     )
+    if repo_id:
+        body += f"COORD_REPO_ID={repo_id}\n"
+    local_env.write_text(body, encoding="utf-8")
 
 
 def run_upgrade(args) -> int:
@@ -70,14 +77,21 @@ def run_upgrade(args) -> int:
     config = RepoConfig.load(config_path)
     local_env = repo_root / ".coordination" / "local.env"
     token = _read_existing_token(local_env)
+    # Backfill: pre-v0.3 configs have no repo_id. Re-detect from git remote
+    # so existing repos pick up a repo identifier on their next upgrade.
+    from coordination.cli_init import _detect_repo_id
+
+    repo_id = config.repo_id or _detect_repo_id(repo_root)
 
     written: list[str] = []
 
-    _rewrite_local_env(local_env, config.service_url, token)
+    _rewrite_local_env(local_env, config.service_url, token, repo_id=repo_id)
     written.append(".coordination/local.env (URL refreshed, token preserved)")
 
     if config.tool == "claude":
-        _update_mcp_json(repo_root / ".mcp.json", config.service_url, token)
+        _update_mcp_json(
+            repo_root / ".mcp.json", config.service_url, token, repo_id=repo_id
+        )
         ensure_managed_block(repo_root / "CLAUDE.md", CLAUDE_SNIPPET)
         written.extend([".mcp.json", "CLAUDE.md (managed block)"])
     elif config.tool == "codex":
@@ -85,7 +99,12 @@ def run_upgrade(args) -> int:
         ensure_managed_block(repo_root / "AGENTS.md", AGENTS_SNIPPET)
         written.extend([".codex/config.toml", "AGENTS.md (managed block)"])
     else:
-        _update_mcp_json(repo_root / ".cursor" / "mcp.json", config.service_url, token)
+        _update_mcp_json(
+            repo_root / ".cursor" / "mcp.json",
+            config.service_url,
+            token,
+            repo_id=repo_id,
+        )
         ensure_managed_block(
             repo_root / ".cursor" / "rules" / "coordination.mdc", CURSOR_RULE
         )

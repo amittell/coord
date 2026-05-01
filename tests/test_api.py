@@ -292,6 +292,114 @@ async def test_access_log_uses_matched_route_template_for_path(
 
 
 @pytest.mark.asyncio
+async def test_create_claim_accepts_repo_and_persists_it(
+    client: AsyncClient,
+) -> None:
+    h = {"Authorization": "Bearer test-token"}
+    r = await client.post(
+        "/claims",
+        headers=h,
+        json={
+            "engineer": "alice",
+            "repo": "amittell/coord",
+            "claims": [{"type": "file", "pattern": "src/foo.py"}],
+        },
+    )
+    assert r.status_code == 200, r.text
+    claim_ids = r.json()["claim_ids"]
+    assert len(claim_ids) == 1
+
+    # Read back via the API and confirm repo round-trips.
+    r = await client.get("/claims?active_only=true", headers=h)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["count"] == 1
+    assert body["claims"][0]["repo"] == "amittell/coord"
+
+
+@pytest.mark.asyncio
+async def test_create_claim_without_repo_stores_null(client: AsyncClient) -> None:
+    """Backward compat: clients that don't supply repo still work."""
+    h = {"Authorization": "Bearer test-token"}
+    r = await client.post(
+        "/claims",
+        headers=h,
+        json={
+            "engineer": "alice",
+            "claims": [{"type": "file", "pattern": "src/foo.py"}],
+        },
+    )
+    assert r.status_code == 200, r.text
+    r = await client.get("/claims?active_only=true", headers=h)
+    body = r.json()
+    assert body["claims"][0]["repo"] is None
+
+
+@pytest.mark.asyncio
+async def test_list_claims_filters_by_repo(client: AsyncClient) -> None:
+    h = {"Authorization": "Bearer test-token"}
+
+    for repo, pat in [
+        ("amittell/coord", "src/a.py"),
+        ("amittell/coord", "src/b.py"),
+        ("amittell/bastionx", "services/x.py"),
+    ]:
+        r = await client.post(
+            "/claims",
+            headers=h,
+            json={
+                "engineer": "alice",
+                "repo": repo,
+                "claims": [{"type": "file", "pattern": pat}],
+            },
+        )
+        assert r.status_code == 200, r.text
+
+    r = await client.get(
+        "/claims?active_only=true&repo=amittell/coord", headers=h
+    )
+    body = r.json()
+    assert body["count"] == 2
+    assert all(c["repo"] == "amittell/coord" for c in body["claims"])
+
+
+@pytest.mark.asyncio
+async def test_repos_endpoint_aggregates_per_repo_stats(client: AsyncClient) -> None:
+    h = {"Authorization": "Bearer test-token"}
+
+    for repo, eng, pat in [
+        ("amittell/coord", "alice", "src/a.py"),
+        ("amittell/coord", "bob", "src/b.py"),
+        ("amittell/bastionx", "alice", "services/x.py"),
+    ]:
+        r = await client.post(
+            "/claims",
+            headers=h,
+            json={
+                "engineer": eng,
+                "repo": repo,
+                "claims": [{"type": "file", "pattern": pat}],
+            },
+        )
+        assert r.status_code == 200, r.text
+
+    r = await client.get("/repos", headers=h)
+    assert r.status_code == 200
+    body = r.json()
+    by_name = {x["repo"]: x for x in body["repos"]}
+    assert by_name["amittell/coord"]["claims_24h"] == 2
+    assert by_name["amittell/coord"]["engineers_24h"] == 2
+    assert by_name["amittell/coord"]["active_claims"] == 2
+    assert by_name["amittell/bastionx"]["claims_24h"] == 1
+
+
+@pytest.mark.asyncio
+async def test_repos_endpoint_requires_auth(client: AsyncClient) -> None:
+    r = await client.get("/repos")
+    assert r.status_code == 401
+
+
+@pytest.mark.asyncio
 async def test_access_log_records_non_2xx_status(
     client: AsyncClient, access_log_records: list[logging.LogRecord]
 ) -> None:

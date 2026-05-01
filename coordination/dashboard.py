@@ -104,6 +104,7 @@ async def render_dashboard() -> str:
     conflicts = await svc.db.recent_conflicts(500)
     recent = await svc.db.list_recent_claims(500)
     activity = _recent_activity(claims=recent, conflicts=conflicts, now=datetime.now(UTC))
+    repos = await svc.db.list_repos()
 
     rows_html = ""
     for r in rows:
@@ -163,6 +164,20 @@ async def render_dashboard() -> str:
     if not timeline_html:
         timeline_html = "<tr><td colspan='5'>No claim history yet</td></tr>"
 
+    repos_html = ""
+    for r in repos:
+        repos_html += (
+            "<tr>"
+            f"<td><code>{_esc(r['repo'])}</code></td>"
+            f"<td>{r['active_claims']}</td>"
+            f"<td>{r['claims_24h']}</td>"
+            f"<td>{r['engineers_24h']}</td>"
+            f"<td>{_esc(r['last_activity'])}</td>"
+            "</tr>"
+        )
+    if not repos_html:
+        repos_html = "<tr><td colspan='5'>No repos using this service yet</td></tr>"
+
     activity_modules_html = ""
     for m in activity["top_modules"]:
         engineers_label = ", ".join(_esc(e) for e in m["engineers"]) or ""
@@ -197,7 +212,12 @@ async def render_dashboard() -> str:
 </head>
 <body>
   <h1>Coordination Dashboard</h1>
-  <p class="muted">Recent activity, active claims, path-prefix heatmap, recent conflict log, and claim timeline.</p>
+  <p class="muted">Repositories, recent activity, active claims, path-prefix heatmap, recent conflict log, and claim timeline.</p>
+  <h2>Repositories</h2>
+  <table>
+    <thead><tr><th>Repo</th><th>Active</th><th>Claims (24h)</th><th>Engineers (24h)</th><th>Last activity (UTC)</th></tr></thead>
+    <tbody>{repos_html}</tbody>
+  </table>
   <h2>Recent activity (last 24h)</h2>
   <table>
     <thead><tr><th>Claims created</th><th>Conflicts logged</th><th>Engineers active</th></tr></thead>
