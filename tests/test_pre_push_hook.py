@@ -70,11 +70,34 @@ def test_script_is_syntactically_valid_bash(tmp_path) -> None:
     assert result.returncode == 0, result.stderr
 
 
-def test_script_still_skips_on_missing_jq_and_unreachable_upstream() -> None:
-    # These remain intentional soft-fail paths -- document via assertion so
-    # future edits don't silently remove them.
-    assert "jq not installed; skipping" in PRE_PUSH_SCRIPT
-    assert "could not determine diff base; skipping" in PRE_PUSH_SCRIPT
+def test_script_fails_closed_on_missing_jq() -> None:
+    """v0.7 inverted the missing-jq path. Pre-v0.7 silently exited 0 when
+    jq wasn't installed, which let a developer push without the conflict
+    check ever running. v0.7 refuses the push so the operator must
+    install jq or pass --no-verify deliberately."""
+    assert "jq not installed; refusing to push" in PRE_PUSH_SCRIPT
+    assert "jq not installed; skipping" not in PRE_PUSH_SCRIPT
+
+
+def test_script_fails_closed_on_curl_error() -> None:
+    """v0.7 also closed the silent-bypass on transport errors. Pre-v0.7
+    wrapped the curl call in '|| true', so a transient network glitch
+    produced an empty response and the check passed by default. v0.7
+    explicitly checks curl's exit code and refuses on failure."""
+    assert "conflict check failed for ${file}; refusing to push" in PRE_PUSH_SCRIPT
+    # The blanket '|| true' on the curl invocation is gone.
+    assert "|| true)\"\n  has=" not in PRE_PUSH_SCRIPT
+
+
+def test_script_consumes_push_stdin_for_per_ref_diffs() -> None:
+    """git push hands the hook ref-update info on stdin, one line per
+    ref in the form '<local_ref> <local_sha> <remote_ref> <remote_sha>'.
+    The hook must read this so non-HEAD pushes, multi-ref pushes, and
+    deleted-branch pushes all get the right diff base."""
+    assert "PUSH_INPUT" in PRE_PUSH_SCRIPT
+    assert "while read -r local_ref local_sha remote_ref remote_sha" in PRE_PUSH_SCRIPT
+    # Empty-tree fallback for first-push scenarios where triple-dot fails.
+    assert "EMPTY_TREE" in PRE_PUSH_SCRIPT
 
 
 def test_script_sources_local_env_before_reading_config() -> None:

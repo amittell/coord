@@ -19,6 +19,26 @@ Semantic Versioning.
 
 - (none recorded yet)
 
+## [0.7.0] - 2026-05-02
+
+### Changed (behaviour-affecting)
+
+- Pre-push hook now fails closed instead of silently skipping when prerequisites are missing or transport fails. Three previously-silent bypass paths are now hard refusals:
+  - `jq` not installed: was `exit 0` with a "skipping" message; is now `exit 1` with a hint to install jq or pass `--no-verify`.
+  - `curl` error talking to the service: was wrapped in `|| true` so a transient network glitch produced an empty response and the check passed by default. The curl exit code is now checked explicitly; any error refuses the push.
+  - Unparseable response from `/conflicts`: was treated as "no conflict"; is now refused with the raw body printed for diagnosis.
+- Pre-push hook now consumes the ref-update stream that `git push` hands the hook on stdin (`<local_ref> <local_sha> <remote_ref> <remote_sha>`) and computes the diff per ref. Pre-v0.7 always diffed `HEAD...origin/HEAD` regardless of what was actually being pushed, which silently missed multi-ref pushes, non-HEAD pushes, and deleted-branch pushes. Falls back to the old HEAD-based path when run interactively without stdin.
+- First-push scenarios (no remote tracking branch yet) now diff against `git hash-object -t tree /dev/null` (the empty tree). Triple-dot diff fails with the empty tree, which is why the pre-v0.7 hook punted with "could not determine diff base; skipping" in that case -- yet another silent bypass.
+- Conflict-check response parsing is stricter: `.has_conflicts` must be `true` or `false`. An empty / null / unexpected value is treated as a server bug and refuses the push.
+
+### Migration
+
+The behaviour change only matters for environments where the hook was previously hitting a silent-skip path. If you've been relying on `jq`-missing as a tacit bypass, install jq or use `--no-verify` deliberately. Existing repos pick up the new hook on their next `coord upgrade`.
+
+### Credits
+
+The hook redesign was prompted by an agent in astrowars rewriting the hook on its own to close these holes. The diff was reviewed and ported upstream verbatim, with comments expanded.
+
 ## [0.6.2] - 2026-05-02
 
 ### Fixed
