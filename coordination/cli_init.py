@@ -199,21 +199,52 @@ def _update_mcp_json(
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
-def _update_codex_config(path: Path) -> None:
+def _update_codex_config(
+    path: Path,
+    service_url: str | None = None,
+    token: str = "",
+    repo_id: str | None = None,
+) -> None:
+    """Write Codex's MCP server entry for coord, including an inline env
+    block. Codex spawns ``coord-mcp`` without sourcing ``.coordination/local.env``,
+    so without an explicit ``[mcp_servers.coord.env]`` block the child
+    inherits whatever the user's shell happened to have, falls back to
+    ``http://127.0.0.1:8080``, and surfaces "All connection attempts
+    failed" to the operator. Embedding the env in the TOML makes the
+    config self-contained, matching how ``.mcp.json`` works for Claude.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    content = (
-        "[mcp_servers.coord]\n"
-        'command = "coord-mcp"\n'
-        "args = []\n"
-        "enabled = true\n"
-        "required = false\n"
-        "tool_timeout_sec = 30\n"
-        "\n"
-        "# Set in your shell or .coordination/local.env:\n"
-        '#   export COORD_API_URL="https://YOUR_COORD_SERVICE.example"\n'
-        '#   export COORD_AUTH_TOKEN="..."\n'
-    )
-    path.write_text(content, encoding="utf-8")
+    parts = [
+        "[mcp_servers.coord]\n",
+        'command = "coord-mcp"\n',
+        "args = []\n",
+        "enabled = true\n",
+        "required = false\n",
+        "tool_timeout_sec = 30\n",
+    ]
+    # Only emit the env table when we actually have at least one value to
+    # set; legacy callers that don't pass service_url get the bare server
+    # entry (and an explanatory comment) so behaviour is unchanged for
+    # them.
+    if service_url or token or repo_id:
+        parts.append("\n[mcp_servers.coord.env]\n")
+        if service_url:
+            parts.append(f'COORD_API_URL = "{service_url}"\n')
+        # Always emit the token line so the user can see where to slot
+        # the real value in if they leave it blank during init.
+        parts.append(f'COORD_AUTH_TOKEN = "{token}"\n')
+        if repo_id:
+            parts.append(f'COORD_REPO_ID = "{repo_id}"\n')
+    else:
+        parts.extend(
+            [
+                "\n",
+                "# Set in your shell or .coordination/local.env:\n",
+                '#   export COORD_API_URL="https://YOUR_COORD_SERVICE.example"\n',
+                '#   export COORD_AUTH_TOKEN="..."\n',
+            ]
+        )
+    path.write_text("".join(parts), encoding="utf-8")
 
 
 def _install_hook(repo_root: Path, force: bool) -> None:
@@ -321,7 +352,12 @@ def run_init(args) -> int:
         ensure_managed_block(repo_root / "CLAUDE.md", CLAUDE_SNIPPET)
         written.extend([".mcp.json", "CLAUDE.md (managed block)"])
     elif tool == "codex":
-        _update_codex_config(repo_root / ".codex" / "config.toml")
+        _update_codex_config(
+            repo_root / ".codex" / "config.toml",
+            service_url=service_url,
+            token=token,
+            repo_id=repo_id,
+        )
         ensure_managed_block(repo_root / "AGENTS.md", AGENTS_SNIPPET)
         written.extend([".codex/config.toml", "AGENTS.md (managed block)"])
     else:

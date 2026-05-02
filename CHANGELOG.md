@@ -19,6 +19,12 @@ Semantic Versioning.
 
 - (none recorded yet)
 
+## [0.4.1] - 2026-05-02
+
+### Fixed
+
+- Codex MCP setup now writes an explicit `[mcp_servers.coord.env]` block in `.codex/config.toml` carrying `COORD_API_URL`, `COORD_AUTH_TOKEN`, and `COORD_REPO_ID`. The previous codex template embedded only a comment hint pointing at `.coordination/local.env`, which Codex never sources, so the MCP child silently fell back to `http://127.0.0.1:8080` and surfaced "All connection attempts failed" to operators on remote-mode repos. `coord init` and `coord upgrade` both populate the env block; existing codex repos pick up the fix on their next `coord upgrade`.
+
 ## [0.4.0] - 2026-05-01
 
 ### Changed

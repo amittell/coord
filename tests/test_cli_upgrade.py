@@ -163,6 +163,39 @@ def test_upgrade_codex_refreshes_codex_config(tmp_path: Path) -> None:
     assert 'command = "coord-mcp"' in codex_cfg
 
 
+def test_upgrade_codex_writes_env_block_so_mcp_can_reach_service(
+    tmp_path: Path,
+) -> None:
+    """Regression: codex spawns coord-mcp without sourcing .coordination/local.env,
+    so the MCP child has no COORD_API_URL and silently dials 127.0.0.1:8080 with
+    "All connection attempts failed". The codex MCP config MUST embed an [env]
+    block, the same way Claude's .mcp.json does."""
+    _seed_initialised_repo(
+        tmp_path, tool="codex", service_url="http://coord.example.lan",
+        token="prod-token-xyz",
+    )
+    cli_upgrade.run_upgrade(_make_args(tmp_path))
+    codex_cfg = (tmp_path / ".codex" / "config.toml").read_text(encoding="utf-8")
+    assert "[mcp_servers.coord.env]" in codex_cfg
+    assert 'COORD_API_URL = "http://coord.example.lan"' in codex_cfg
+    assert 'COORD_AUTH_TOKEN = "prod-token-xyz"' in codex_cfg
+
+
+def test_upgrade_codex_embeds_repo_id_when_known(tmp_path: Path) -> None:
+    """When the repo has a detectable origin, codex's env block should also
+    carry COORD_REPO_ID so per-repo claim tagging works without the user
+    manually sourcing local.env."""
+    _seed_initialised_repo(tmp_path, tool="codex")
+    # Add a fake origin so _detect_repo_id resolves.
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:amittell/widgets.git"],
+        cwd=tmp_path, check=True,
+    )
+    cli_upgrade.run_upgrade(_make_args(tmp_path))
+    codex_cfg = (tmp_path / ".codex" / "config.toml").read_text(encoding="utf-8")
+    assert 'COORD_REPO_ID = "amittell/widgets"' in codex_cfg
+
+
 def test_upgrade_skips_owners_yaml_even_if_force_flag_unused(tmp_path: Path) -> None:
     # The whole point of upgrade is that owners.yaml is never touched, so
     # there should be no --force flag plumbed through.

@@ -95,7 +95,12 @@ def run_upgrade(args) -> int:
         ensure_managed_block(repo_root / "CLAUDE.md", CLAUDE_SNIPPET)
         written.extend([".mcp.json", "CLAUDE.md (managed block)"])
     elif config.tool == "codex":
-        _update_codex_config(repo_root / ".codex" / "config.toml")
+        _update_codex_config(
+            repo_root / ".codex" / "config.toml",
+            service_url=config.service_url,
+            token=token,
+            repo_id=repo_id,
+        )
         ensure_managed_block(repo_root / "AGENTS.md", AGENTS_SNIPPET)
         written.extend([".codex/config.toml", "AGENTS.md (managed block)"])
     else:
