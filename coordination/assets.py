@@ -61,6 +61,11 @@ fi
 COORD_URL="${COORD_API_URL:-${COORD_SERVICE_URL:-${COORD_URL:-http://127.0.0.1:8080}}}"
 COORD_URL="${COORD_URL%/}"
 TOKEN="${COORD_TOKEN:-${COORD_AUTH_TOKEN:-}}"
+# COORD_REPO_ID is written by `coord init` / `coord upgrade` into
+# .coordination/local.env. When set, the hook scopes the conflict check
+# to that repo so cross-repo path collisions don't false-positive against
+# unrelated services on the same coord instance.
+REPO_ID="${COORD_REPO_ID:-}"
 
 # When the service is in COORD_ALLOW_INSECURE_NO_AUTH mode the token is
 # deliberately empty. In that case we still want to run the conflict check,
@@ -98,12 +103,17 @@ if [[ -z "${MODIFIED//[$'\\t\\r\\n ']/}" ]]; then
   exit 0
 fi
 
+REPO_QS=""
+if [[ -n "${REPO_ID}" ]]; then
+  REPO_QS="&repo=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${REPO_ID}")"
+fi
+
 while IFS= read -r file; do
   [[ -z "${file}" ]] && continue
   enc="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${file}")"
   resp="$(curl -fsS \\
     ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} \\
-    "${COORD_URL}/conflicts?pattern=${enc}&engineer=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${ENGINEER}")" \\
+    "${COORD_URL}/conflicts?pattern=${enc}&engineer=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${ENGINEER}")${REPO_QS}" \\
     || true)"
   has="$(printf '%s' "${resp}" | jq -r '.has_conflicts // empty' 2>/dev/null || true)"
   if [[ "${has}" == "true" ]]; then

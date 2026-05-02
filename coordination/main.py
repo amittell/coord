@@ -248,12 +248,15 @@ async def list_repos(_: None = Depends(require_auth)) -> dict:
 async def conflicts(
     pattern: list[str] | None = Query(default=None),
     engineer: str = Query(...),
+    repo: str | None = Query(default=None),
     _: None = Depends(require_auth),
 ) -> dict:
     if not pattern:
         raise HTTPException(status_code=400, detail="Provide one or more pattern= query params")
     try:
-        result = await get_service().check_conflicts(patterns=pattern, engineer=engineer)
+        result = await get_service().check_conflicts(
+            patterns=pattern, engineer=engineer, repo=repo,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return result.model_dump()

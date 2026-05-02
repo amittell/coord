@@ -86,3 +86,14 @@ def test_script_sources_local_env_before_reading_config() -> None:
     # URL precedence must prefer COORD_API_URL (written by `coord init`)
     # over the legacy COORD_SERVICE_URL / COORD_URL names.
     assert '"${COORD_API_URL:-${COORD_SERVICE_URL:-${COORD_URL:-' in PRE_PUSH_SCRIPT
+
+
+def test_script_passes_repo_id_to_conflicts_endpoint() -> None:
+    # v0.4.0: when COORD_REPO_ID is set (sourced from local.env), the hook
+    # must forward it as &repo=<id> on the /conflicts query so the server
+    # scopes the conflict check to claims from the same repo. Without
+    # this, cross-repo path collisions false-positive.
+    assert "COORD_REPO_ID" in PRE_PUSH_SCRIPT
+    # The query string must include &repo=... only when repo id is
+    # non-empty; the hook must not send a literal "&repo=" trailing the URL.
+    assert "&repo=" in PRE_PUSH_SCRIPT

@@ -400,6 +400,67 @@ async def test_repos_endpoint_requires_auth(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_create_claims_no_cross_repo_conflict(client: AsyncClient) -> None:
+    """End-to-end: same pattern under different repos must not 409."""
+    h = {"Authorization": "Bearer test-token"}
+
+    r = await client.post(
+        "/claims",
+        headers=h,
+        json={
+            "engineer": "bob",
+            "repo": "amittell/coord",
+            "claims": [{"type": "module", "pattern": "client/js/**"}],
+        },
+    )
+    assert r.status_code == 200, r.text
+
+    r = await client.post(
+        "/claims",
+        headers=h,
+        json={
+            "engineer": "alice",
+            "repo": "amittell/astrowars",
+            "claims": [{"type": "module", "pattern": "client/js/**"}],
+        },
+    )
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.asyncio
+async def test_conflicts_endpoint_filters_by_repo(client: AsyncClient) -> None:
+    """GET /conflicts?repo=X must only consider claims from repo X."""
+    h = {"Authorization": "Bearer test-token"}
+
+    r = await client.post(
+        "/claims",
+        headers=h,
+        json={
+            "engineer": "bob",
+            "repo": "amittell/coord",
+            "claims": [{"type": "module", "pattern": "client/js/**"}],
+        },
+    )
+    assert r.status_code == 200, r.text
+
+    # Cross-repo: clean.
+    r = await client.get(
+        "/conflicts?pattern=client/js/foo.ts&engineer=alice&repo=amittell/astrowars",
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["has_conflicts"] is False
+
+    # Same-repo: still flagged.
+    r = await client.get(
+        "/conflicts?pattern=client/js/foo.ts&engineer=alice&repo=amittell/coord",
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["has_conflicts"] is True
+
+
+@pytest.mark.asyncio
 async def test_access_log_records_non_2xx_status(
     client: AsyncClient, access_log_records: list[logging.LogRecord]
 ) -> None:

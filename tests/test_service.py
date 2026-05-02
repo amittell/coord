@@ -307,3 +307,212 @@ async def test_check_conflicts_passes_scope_to_engine(
     assert resp.has_conflicts is True
     assert captured["scope"] == "svc-a"
     assert captured["repo_root"] == tmp_path
+
+
+# --- Repo-scoped conflict detection (v0.4.0) -------------------------------
+#
+# Pre-v0.4.0 the conflict check ran across the whole claims pool, so a claim
+# in repo A holding `client/js/**` would block an unrelated claim with the
+# same path in repo B. From v0.4.0 the check partitions by the repo column
+# on each claim:
+#   - claim with repo=X only sees claims with repo=X
+#   - claim with repo=NULL (legacy / un-tagged client) only sees other
+#     repo=NULL claims
+# Legacy NULL claims age out naturally; we never spuriously match a
+# repo-tagged claim against a NULL one.
+
+
+@pytest.fixture()
+async def repo_service(tmp_path: Path) -> CoordinationService:
+    """Service fixture without a repo_scope, so create_claims doesn't
+    short-circuit on _validate_claim_scope. We want the conflict path to
+    actually run."""
+    db_path = tmp_path / "repo_svc.sqlite"
+    db = Database(db_path)
+    await db.init()
+    settings = Settings(
+        database_path=db_path,
+        allow_insecure_no_auth=True,
+        repo_root=None,
+    )
+    return CoordinationService(db=db, settings=settings)
+
+
+@pytest.mark.asyncio
+async def test_create_claims_does_not_conflict_across_repos(
+    repo_service: CoordinationService,
+) -> None:
+    """Same pattern, different repo, different engineer -> no conflict.
+    This is the cross-repo false-positive that v0.4.0 fixes."""
+    from coordination.schemas import ClaimItem, CreateClaimsRequest
+
+    # Existing active claim in repo A.
+    await repo_service.db.insert_claims_batch(
+        engineer="bob",
+        branch="feat",
+        description=None,
+        items=[("cidA", "module", "client/js/**", "soft", "2099-01-01T00:00:00Z")],
+        repo="amittell/coord",
+    )
+
+    # Alice tries to claim the same path under a different repo.
+    result = await repo_service.create_claims(
+        CreateClaimsRequest(
+            engineer="alice",
+            repo="amittell/astrowars",
+            claims=[ClaimItem(type="module", pattern="client/js/**")],
+        )
+    )
+    assert result.conflicts == [], (
+        f"cross-repo claims must not conflict; got {result.conflicts!r}"
+    )
+    assert result.claim_ids, "claim should have been created"
+
+
+@pytest.mark.asyncio
+async def test_create_claims_still_conflicts_within_same_repo(
+    repo_service: CoordinationService,
+) -> None:
+    """Same pattern, same repo, different engineer -> conflict (regression)."""
+    from coordination.schemas import ClaimItem, CreateClaimsRequest
+
+    await repo_service.db.insert_claims_batch(
+        engineer="bob",
+        branch="feat",
+        description=None,
+        items=[("cid_same", "module", "client/js/**", "soft", "2099-01-01T00:00:00Z")],
+        repo="amittell/coord",
+    )
+
+    result = await repo_service.create_claims(
+        CreateClaimsRequest(
+            engineer="alice",
+            repo="amittell/coord",
+            claims=[ClaimItem(type="module", pattern="client/js/**")],
+        )
+    )
+    assert result.conflicts, "same-repo overlap must still conflict"
+    assert result.claim_ids == []
+
+
+@pytest.mark.asyncio
+async def test_create_claims_null_repo_isolated_from_repo_tagged(
+    repo_service: CoordinationService,
+) -> None:
+    """A legacy NULL-repo claim must not block a repo-tagged claim with
+    the same pattern, and vice versa. NULL forms its own bucket."""
+    from coordination.schemas import ClaimItem, CreateClaimsRequest
+
+    await repo_service.db.insert_claims_batch(
+        engineer="bob",
+        branch="feat",
+        description=None,
+        items=[("cid_null", "module", "client/js/**", "soft", "2099-01-01T00:00:00Z")],
+        repo=None,
+    )
+
+    result = await repo_service.create_claims(
+        CreateClaimsRequest(
+            engineer="alice",
+            repo="amittell/astrowars",
+            claims=[ClaimItem(type="module", pattern="client/js/**")],
+        )
+    )
+    assert result.conflicts == [], (
+        f"NULL-repo claim must not block repo-tagged client; got {result.conflicts!r}"
+    )
+    assert result.claim_ids
+
+
+@pytest.mark.asyncio
+async def test_create_claims_null_repo_conflicts_with_other_null_repo(
+    repo_service: CoordinationService,
+) -> None:
+    """Legacy clients (no repo) keep their own self-consistent pool: a
+    NULL claim still conflicts with another NULL claim on overlapping
+    patterns. This is the back-compat half of the partition."""
+    from coordination.schemas import ClaimItem, CreateClaimsRequest
+
+    await repo_service.db.insert_claims_batch(
+        engineer="bob",
+        branch="feat",
+        description=None,
+        items=[("cid_n1", "module", "client/js/**", "soft", "2099-01-01T00:00:00Z")],
+        repo=None,
+    )
+
+    result = await repo_service.create_claims(
+        CreateClaimsRequest(
+            engineer="alice",
+            # No repo supplied -> defaults to None (legacy client).
+            claims=[ClaimItem(type="module", pattern="client/js/**")],
+        )
+    )
+    assert result.conflicts, "NULL vs NULL on the same pattern must still conflict"
+
+
+@pytest.mark.asyncio
+async def test_check_conflicts_filters_by_repo(
+    repo_service: CoordinationService,
+) -> None:
+    """check_conflicts(repo=X) returns clean against a claim in repo Y."""
+    await repo_service.db.insert_claims_batch(
+        engineer="bob",
+        branch="feat",
+        description=None,
+        items=[("cid_other_repo", "module", "client/js/**", "soft", "2099-01-01T00:00:00Z")],
+        repo="amittell/coord",
+    )
+
+    resp = await repo_service.check_conflicts(
+        patterns=["client/js/**"],
+        engineer="alice",
+        repo="amittell/astrowars",
+    )
+    assert resp.has_conflicts is False
+    assert resp.conflicts == []
+    assert resp.safe is True
+
+
+@pytest.mark.asyncio
+async def test_check_conflicts_same_repo_still_flags(
+    repo_service: CoordinationService,
+) -> None:
+    await repo_service.db.insert_claims_batch(
+        engineer="bob",
+        branch="feat",
+        description=None,
+        items=[("cid_same_repo", "module", "client/js/**", "soft", "2099-01-01T00:00:00Z")],
+        repo="amittell/coord",
+    )
+
+    resp = await repo_service.check_conflicts(
+        patterns=["client/js/**"],
+        engineer="alice",
+        repo="amittell/coord",
+    )
+    assert resp.has_conflicts is True
+    assert len(resp.conflicts) == 1
+
+
+@pytest.mark.asyncio
+async def test_check_conflicts_no_repo_arg_is_legacy_null_bucket(
+    repo_service: CoordinationService,
+) -> None:
+    """Calling check_conflicts without repo defaults to the legacy NULL
+    bucket and must not surface claims from any tagged repo."""
+    await repo_service.db.insert_claims_batch(
+        engineer="bob",
+        branch="feat",
+        description=None,
+        items=[("cid_tagged", "module", "client/js/**", "soft", "2099-01-01T00:00:00Z")],
+        repo="amittell/coord",
+    )
+
+    resp = await repo_service.check_conflicts(
+        patterns=["client/js/**"],
+        engineer="alice",
+    )
+    assert resp.has_conflicts is False, (
+        "untagged caller must not see tagged claims"
+    )

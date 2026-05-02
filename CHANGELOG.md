@@ -19,6 +19,14 @@ Semantic Versioning.
 
 - (none recorded yet)
 
+## [0.4.0] - 2026-05-01
+
+### Changed
+
+- Conflict detection is now repo-scoped. A claim with `repo=X` is only checked against other claims with `repo=X`; a claim with `repo=NULL` (legacy / un-tagged client) is only checked against other `repo=NULL` claims. Closes the cross-repo false-positive where, for example, a `client/js/**` claim from `amittell/astrowars` would block any push touching `client/js/**` in unrelated services on the same coord instance. Both `POST /claims` and `GET /conflicts` apply the partition.
+- `GET /conflicts` accepts a new `repo=` query parameter so the pre-push hook can scope its check.
+- Pre-push hook reads `COORD_REPO_ID` from `.coordination/local.env` and forwards it as `&repo=` on every `/conflicts` call. Existing repos pick up the behaviour on their next `coord upgrade`.
+
 ## [0.3.0] - 2026-05-01
 
 ### Added

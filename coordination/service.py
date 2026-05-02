@@ -139,6 +139,7 @@ class CoordinationService:
         *,
         patterns: list[str],
         engineer: str,
+        repo: str | None = None,
     ) -> ConflictCheckResponse:
         for pat in patterns:
             err = _validate_pattern_syntax(pat)
@@ -146,6 +147,11 @@ class CoordinationService:
                 raise ValueError(err)
         await self.db.expire_stale_claims()
         active = await self.db.list_active_claims_rows(exclude_engineer=engineer)
+        # Repo-scoped check (v0.4.0): only consider claims from the same
+        # repo as the caller. NULL repo forms its own legacy bucket so
+        # tagged callers never collide with un-tagged historical claims
+        # and vice versa.
+        active = [r for r in active if r.get("repo") == repo]
         conflicts: list[dict[str, Any]] = []
         for pat in patterns:
             for row in active:
@@ -210,6 +216,8 @@ class CoordinationService:
 
         conflicts: list[ConflictEntry] = []
         active = await self.db.list_active_claims_rows(exclude_engineer=body.engineer)
+        # Repo-scoped check (v0.4.0): see check_conflicts for rationale.
+        active = [r for r in active if r.get("repo") == body.repo]
         for item in body.claims:
             for row in active:
                 overlap = await compute_overlap(
