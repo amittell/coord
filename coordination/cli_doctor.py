@@ -156,37 +156,144 @@ def _check_asset_drift(repo_root: Path, config: RepoConfig) -> list[CheckResult]
                 )
             )
 
-    if config.tool == "claude":
-        block_path = repo_root / "CLAUDE.md"
-        snippet = CLAUDE_SNIPPET
-        label_root = "CLAUDE.md"
-    elif config.tool == "codex":
-        block_path = repo_root / "AGENTS.md"
-        snippet = AGENTS_SNIPPET
-        label_root = "AGENTS.md"
-    else:
-        block_path = repo_root / ".cursor" / "rules" / "coordination.mdc"
-        snippet = CURSOR_RULE
-        label_root = ".cursor/rules/coordination.mdc"
+    # Multi-tool aware: check the managed block of every tool that's
+    # wired into this repo, not just the one named in config.toml. A
+    # repo with both claude and codex active should surface drift in
+    # whichever doc has gone stale, since `coord upgrade` will refresh
+    # both anyway.
+    tool_targets: list[tuple[Path, str, str]] = []
+    if (repo_root / ".mcp.json").exists() or config.tool == "claude":
+        tool_targets.append(
+            (repo_root / "CLAUDE.md", CLAUDE_SNIPPET, "CLAUDE.md")
+        )
+    if (repo_root / ".codex" / "config.toml").exists() or config.tool == "codex":
+        tool_targets.append(
+            (repo_root / "AGENTS.md", AGENTS_SNIPPET, "AGENTS.md")
+        )
+    if (
+        (repo_root / ".cursor" / "mcp.json").exists()
+        or config.tool == "cursor"
+    ):
+        tool_targets.append(
+            (
+                repo_root / ".cursor" / "rules" / "coordination.mdc",
+                CURSOR_RULE,
+                ".cursor/rules/coordination.mdc",
+            )
+        )
 
-    if block_path.exists():
+    for block_path, snippet, label_root in tool_targets:
+        if not block_path.exists():
+            continue
         existing_block = _extract_managed_block(
             block_path.read_text(encoding="utf-8")
         )
-        if existing_block is not None:
-            label = f"{label_root} managed block is up to date"
-            if existing_block == snippet.strip():
-                out.append(CheckResult(label, True))
-            else:
-                out.append(
-                    CheckResult(
-                        label,
-                        False,
-                        "block content differs from packaged snippet",
-                        upgrade_hint,
-                    )
+        if existing_block is None:
+            continue
+        label = f"{label_root} managed block is up to date"
+        if existing_block == snippet.strip():
+            out.append(CheckResult(label, True))
+        else:
+            out.append(
+                CheckResult(
+                    label,
+                    False,
+                    "block content differs from packaged snippet",
+                    upgrade_hint,
                 )
+            )
 
+    return out
+
+
+def _extract_mcp_json_token(path: Path) -> str | None:
+    """Read the embedded COORD_AUTH_TOKEN from a Claude/Cursor-style
+    .mcp.json. Returns None if the file or env entry is absent so the
+    caller can skip the check rather than reporting spurious drift."""
+    import json
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    env = (
+        data.get("mcpServers", {})
+        .get("coord", {})
+        .get("env", {})
+    )
+    if not isinstance(env, dict):
+        return None
+    val = env.get("COORD_AUTH_TOKEN")
+    return val if isinstance(val, str) else None
+
+
+def _extract_codex_token(path: Path) -> str | None:
+    """Read the embedded COORD_AUTH_TOKEN out of a Codex-format TOML
+    config. We do a string-level extraction rather than a full TOML
+    parse so doctor stays dependency-free; the line we look for is
+    always emitted exactly as ``COORD_AUTH_TOKEN = "<value>"`` by
+    `_update_codex_config`."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    in_env_section = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("[") and line.endswith("]"):
+            in_env_section = line == "[mcp_servers.coord.env]"
+            continue
+        if not in_env_section:
+            continue
+        if line.startswith("COORD_AUTH_TOKEN"):
+            _, _, rhs = line.partition("=")
+            return rhs.strip().strip('"').strip("'")
+    return None
+
+
+def _check_token_consistency(
+    repo_root: Path, config: RepoConfig, token: str
+) -> list[CheckResult]:
+    """Surface drift between ``.coordination/local.env``'s
+    ``COORD_AUTH_TOKEN`` and the copy embedded in each tool's MCP
+    config. The hook reads local.env directly, but Claude/Codex/Cursor
+    spawn the MCP child with the env baked into their tool config -- if
+    the user rotates the token in local.env without running
+    ``coord upgrade``, the MCP child silently authenticates with the
+    old key. The fix is always ``coord upgrade``.
+    """
+    out: list[CheckResult] = []
+    upgrade_hint = (
+        "Run 'coord upgrade' so the embedded token matches the one in "
+        ".coordination/local.env."
+    )
+
+    for path, label, extractor in (
+        (
+            repo_root / ".mcp.json",
+            ".mcp.json token matches local.env",
+            _extract_mcp_json_token,
+        ),
+        (
+            repo_root / ".codex" / "config.toml",
+            ".codex/config.toml token matches local.env",
+            _extract_codex_token,
+        ),
+        (
+            repo_root / ".cursor" / "mcp.json",
+            ".cursor/mcp.json token matches local.env",
+            _extract_mcp_json_token,
+        ),
+    ):
+        if not path.exists():
+            continue
+        embedded = extractor(path)
+        if embedded is None:
+            continue
+        if embedded == token:
+            out.append(CheckResult(label, True))
+        else:
+            out.append(CheckResult(label, False, "embedded token differs", upgrade_hint))
     return out
 
 
@@ -295,6 +402,7 @@ def run_doctor(args) -> int:
     results.extend(_check_asset_drift(repo_root, config))
 
     token = _load_token(repo_root, config)
+    results.extend(_check_token_consistency(repo_root, config, token))
     results.extend(_check_service(config, token))
 
     version_result = _check_server_version(config, client_version=__version__)

@@ -153,6 +153,120 @@ def test_drift_check_flags_stale_claude_block(tmp_path):
     assert "coord upgrade" in block_result.hint
 
 
+def test_drift_check_flags_each_tool_block_independently(tmp_path):
+    """Multi-tool repos: when both .mcp.json and .codex/config.toml are
+    wired, doctor must check CLAUDE.md AND AGENTS.md drift, not just the
+    one named in config.toml. Otherwise stale snippets in the secondary
+    tool's docs slip past upgrade reminders."""
+    from coordination.assets import (
+        AGENTS_SNIPPET,
+        CLAUDE_SNIPPET,
+        PRE_PUSH_SCRIPT,
+    )
+
+    _seed_drift_repo(
+        tmp_path, hook=PRE_PUSH_SCRIPT, managed_block=CLAUDE_SNIPPET
+    )
+    # AGENTS.md exists with a stale block, simulating a repo that has
+    # codex wired alongside claude.
+    (tmp_path / "AGENTS.md").write_text(
+        "# AGENTS\n\n<!-- coord:begin -->\nstale agents block\n<!-- coord:end -->\n",
+        encoding="utf-8",
+    )
+    # Also drop a stub .codex/config.toml so doctor knows codex is wired.
+    (tmp_path / ".codex").mkdir()
+    (tmp_path / ".codex" / "config.toml").write_text(
+        "[mcp_servers.coord]\ncommand = \"coord-mcp\"\n", encoding="utf-8"
+    )
+    config = _config(tmp_path)
+    object.__setattr__(config, "tool", "claude")  # primary
+
+    results = cli_doctor._check_asset_drift(tmp_path, config)
+    by_label = {r.label: r for r in results}
+    assert by_label["CLAUDE.md managed block is up to date"].ok is True
+    # AGENTS.md drift must surface even though config.tool says claude.
+    assert "AGENTS.md managed block is up to date" in by_label, (
+        f"expected AGENTS.md drift check; got labels: {list(by_label)}"
+    )
+    assert by_label["AGENTS.md managed block is up to date"].ok is False
+    assert AGENTS_SNIPPET  # used to silence import unused warning
+
+
+def test_token_consistency_check_flags_stale_mcp_token(tmp_path):
+    """If the user rotates COORD_AUTH_TOKEN in .coordination/local.env
+    but forgets to run `coord upgrade`, the embedded copy of the token
+    in .mcp.json (and .codex/config.toml) goes stale. Doctor must flag
+    this so the user doesn't silently authenticate as a previous
+    rotation key."""
+    coord_dir = tmp_path / ".coordination"
+    coord_dir.mkdir(parents=True)
+    (coord_dir / "local.env").write_text(
+        "COORD_API_URL=http://coord.example\n"
+        "COORD_AUTH_TOKEN=fresh-token-2026-05\n",
+        encoding="utf-8",
+    )
+    (tmp_path / ".mcp.json").write_text(
+        '{"mcpServers":{"coord":{"command":"coord-mcp","args":[],'
+        '"env":{"COORD_API_URL":"http://coord.example",'
+        '"COORD_AUTH_TOKEN":"stale-token-from-q1"}}}}',
+        encoding="utf-8",
+    )
+    config = _config(tmp_path)
+    object.__setattr__(config, "tool", "claude")
+
+    results = cli_doctor._check_token_consistency(
+        tmp_path, config, token="fresh-token-2026-05"
+    )
+    by_label = {r.label: r for r in results}
+    assert ".mcp.json token matches local.env" in by_label
+    drift = by_label[".mcp.json token matches local.env"]
+    assert drift.ok is False
+    assert "coord upgrade" in drift.hint
+
+
+def test_token_consistency_check_passes_when_in_sync(tmp_path):
+    coord_dir = tmp_path / ".coordination"
+    coord_dir.mkdir(parents=True)
+    (coord_dir / "local.env").write_text(
+        "COORD_AUTH_TOKEN=match-me\n", encoding="utf-8"
+    )
+    (tmp_path / ".mcp.json").write_text(
+        '{"mcpServers":{"coord":{"command":"coord-mcp","args":[],'
+        '"env":{"COORD_AUTH_TOKEN":"match-me"}}}}',
+        encoding="utf-8",
+    )
+    config = _config(tmp_path)
+    object.__setattr__(config, "tool", "claude")
+
+    results = cli_doctor._check_token_consistency(
+        tmp_path, config, token="match-me"
+    )
+    assert all(r.ok for r in results)
+
+
+def test_token_consistency_check_covers_codex_too(tmp_path):
+    coord_dir = tmp_path / ".coordination"
+    coord_dir.mkdir(parents=True)
+    (coord_dir / "local.env").write_text(
+        "COORD_AUTH_TOKEN=fresh\n", encoding="utf-8"
+    )
+    (tmp_path / ".codex").mkdir()
+    (tmp_path / ".codex" / "config.toml").write_text(
+        "[mcp_servers.coord]\n"
+        'command = "coord-mcp"\n'
+        "[mcp_servers.coord.env]\n"
+        'COORD_AUTH_TOKEN = "stale"\n',
+        encoding="utf-8",
+    )
+    config = _config(tmp_path)
+    object.__setattr__(config, "tool", "codex")
+
+    results = cli_doctor._check_token_consistency(tmp_path, config, token="fresh")
+    by_label = {r.label: r for r in results}
+    assert ".codex/config.toml token matches local.env" in by_label
+    assert by_label[".codex/config.toml token matches local.env"].ok is False
+
+
 def test_drift_check_skips_block_when_file_missing(tmp_path):
     # No CLAUDE.md at all -- the existing 'managed block found' check
     # already reports that. Drift check must not double-report failure.

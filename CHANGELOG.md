@@ -19,6 +19,14 @@ Semantic Versioning.
 
 - (none recorded yet)
 
+## [0.4.2] - 2026-05-02
+
+### Fixed
+
+- `coord upgrade` now refreshes every tool config that exists on disk in the repo, not just the one named in `.coordination/config.toml`. A repo that wired both Claude (`.mcp.json`) and Codex (`.codex/config.toml`) by running `coord init` twice with different `--tool` values used to have only the most-recent tool's config refreshed by upgrade; the other silently kept its stale URL/token/repo id. Cursor configs are handled the same way. Upgrade still falls back to creating the tool named in `config.toml` when its file is missing, so deleting a config and re-running upgrade restores it.
+- `coord doctor` now flags managed-block drift in CLAUDE.md, AGENTS.md, and the cursor rules file independently, so multi-tool repos see a drift warning for whichever doc has gone stale (previously only the primary tool from `config.toml` was checked).
+- `coord doctor` now compares the embedded `COORD_AUTH_TOKEN` in each tool's MCP config against `.coordination/local.env` and reports drift. Pre-fix, rotating the token in `local.env` without running `coord upgrade` left the MCP child authenticating with the old key with no warning.
+
 ## [0.4.1] - 2026-05-02
 
 ### Fixed

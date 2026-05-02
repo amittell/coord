@@ -181,6 +181,90 @@ def test_upgrade_codex_writes_env_block_so_mcp_can_reach_service(
     assert 'COORD_AUTH_TOKEN = "prod-token-xyz"' in codex_cfg
 
 
+def test_upgrade_refreshes_all_tool_configs_present_on_disk(
+    tmp_path: Path,
+) -> None:
+    """Multi-tool repos: a project that wired both claude and codex (by
+    running ``coord init`` twice) must have BOTH ``.mcp.json`` and
+    ``.codex/config.toml`` refreshed by a single ``coord upgrade``.
+
+    The pre-fix behaviour read ``tool = "codex"`` from
+    ``.coordination/config.toml`` and silently skipped ``.mcp.json``,
+    leaving stale URLs/tokens in the claude config every time the user
+    rotated the cluster or bumped a managed snippet."""
+    _seed_initialised_repo(
+        tmp_path, tool="codex", service_url="http://coord.fresh.lan",
+        token="rotated-token-123",
+    )
+
+    # Pre-existing claude artefact from an earlier ``coord init --tool claude``
+    # run. The seeded URL/token here are intentionally stale; upgrade should
+    # bring them in line with the current local.env state.
+    mcp = tmp_path / ".mcp.json"
+    mcp.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "coord": {
+                        "command": "coord-mcp",
+                        "args": [],
+                        "env": {
+                            "COORD_API_URL": "http://stale.example",
+                            "COORD_AUTH_TOKEN": "stale-token",
+                        },
+                    }
+                }
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "CLAUDE.md").write_text(
+        "# Project notes\n\n<!-- coord:begin -->\nstale managed content\n<!-- coord:end -->\n",
+        encoding="utf-8",
+    )
+
+    cli_upgrade.run_upgrade(_make_args(tmp_path))
+
+    # Codex side stays correct.
+    codex_cfg = (tmp_path / ".codex" / "config.toml").read_text(encoding="utf-8")
+    assert 'COORD_API_URL = "http://coord.fresh.lan"' in codex_cfg
+    assert 'COORD_AUTH_TOKEN = "rotated-token-123"' in codex_cfg
+
+    # Claude side ALSO refreshes even though config.toml says tool=codex.
+    mcp_data = json.loads(mcp.read_text(encoding="utf-8"))
+    env = mcp_data["mcpServers"]["coord"]["env"]
+    assert env["COORD_API_URL"] == "http://coord.fresh.lan"
+    assert env["COORD_AUTH_TOKEN"] == "rotated-token-123"
+
+    # CLAUDE.md managed block was rewritten too (no stale content).
+    assert "stale" not in (tmp_path / "CLAUDE.md").read_text(encoding="utf-8")
+    assert "Coordination protocol" in (tmp_path / "CLAUDE.md").read_text(encoding="utf-8")
+
+
+def test_upgrade_does_not_create_tool_configs_that_were_never_initialised(
+    tmp_path: Path,
+) -> None:
+    """Upgrade refreshes what's there. It must not silently bring up a
+    claude config (or AGENTS.md / CLAUDE.md) just because the package
+    knows how to. Otherwise running upgrade on a codex-only repo would
+    spam unwanted artefacts."""
+    _seed_initialised_repo(tmp_path, tool="codex")
+
+    cli_upgrade.run_upgrade(_make_args(tmp_path))
+
+    assert not (tmp_path / ".mcp.json").exists(), (
+        "upgrade must not synthesize a claude config when the user never "
+        "ran `coord init --tool claude`"
+    )
+    assert not (tmp_path / "CLAUDE.md").exists(), (
+        "CLAUDE.md should only get a managed block when claude is actually wired"
+    )
+    assert not (tmp_path / ".cursor").exists(), (
+        "cursor config must not be synthesized either"
+    )
+
+
 def test_upgrade_codex_embeds_repo_id_when_known(tmp_path: Path) -> None:
     """When the repo has a detectable origin, codex's env block should also
     carry COORD_REPO_ID so per-repo claim tagging works without the user

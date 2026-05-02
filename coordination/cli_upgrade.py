@@ -88,27 +88,41 @@ def run_upgrade(args) -> int:
     _rewrite_local_env(local_env, config.service_url, token, repo_id=repo_id)
     written.append(".coordination/local.env (URL refreshed, token preserved)")
 
-    if config.tool == "claude":
-        _update_mcp_json(
-            repo_root / ".mcp.json", config.service_url, token, repo_id=repo_id
-        )
+    # Multi-tool aware: refresh every tool config that already exists on
+    # disk, regardless of which tool is recorded in config.toml. The
+    # `tool = "..."` field captures the most recent `coord init --tool X`
+    # invocation, but a repo can have several tools wired (running init
+    # twice with different --tool values is supported and additive). The
+    # pre-fix behaviour single-dispatched on config.tool and silently
+    # skipped the others, so a token rotation or URL change refreshed
+    # one tool's config and left the rest stale.
+    #
+    # We also refresh the tool named by config.tool even when its config
+    # file is missing -- this is the recovery case where a user has
+    # accidentally deleted .mcp.json / .codex/config.toml etc and runs
+    # coord upgrade to put it back. Without this fallback, upgrade would
+    # silently no-op when given a half-erased repo.
+    mcp_json = repo_root / ".mcp.json"
+    if mcp_json.exists() or config.tool == "claude":
+        _update_mcp_json(mcp_json, config.service_url, token, repo_id=repo_id)
         ensure_managed_block(repo_root / "CLAUDE.md", CLAUDE_SNIPPET)
         written.extend([".mcp.json", "CLAUDE.md (managed block)"])
-    elif config.tool == "codex":
+
+    codex_cfg = repo_root / ".codex" / "config.toml"
+    if codex_cfg.exists() or config.tool == "codex":
         _update_codex_config(
-            repo_root / ".codex" / "config.toml",
+            codex_cfg,
             service_url=config.service_url,
             token=token,
             repo_id=repo_id,
         )
         ensure_managed_block(repo_root / "AGENTS.md", AGENTS_SNIPPET)
         written.extend([".codex/config.toml", "AGENTS.md (managed block)"])
-    else:
+
+    cursor_cfg = repo_root / ".cursor" / "mcp.json"
+    if cursor_cfg.exists() or config.tool == "cursor":
         _update_mcp_json(
-            repo_root / ".cursor" / "mcp.json",
-            config.service_url,
-            token,
-            repo_id=repo_id,
+            cursor_cfg, config.service_url, token, repo_id=repo_id
         )
         ensure_managed_block(
             repo_root / ".cursor" / "rules" / "coordination.mdc", CURSOR_RULE
