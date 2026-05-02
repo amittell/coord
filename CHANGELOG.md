@@ -19,6 +19,20 @@ Semantic Versioning.
 
 - (none recorded yet)
 
+## [0.7.1] - 2026-05-02
+
+### Fixed
+
+- `coord init --force` no longer silently destroys a tracked pre-push hook when `.git/hooks/pre-push` is a symlink to a repo file. `pathlib.Path.write_text` follows symlinks, so the previous code wrote the coord shim *through* the symlink and clobbered the target -- typically `scripts/git-hooks/pre-push` carrying real CI / lint / deploy logic. Init now detects symlinks before any write and refuses to follow them, printing actionable guidance for chaining coord's check into the user's existing hook. The non-symlink overwrite path (force=True over an existing non-coord hook) now writes a `.bak` of the previous content first.
+- `coord doctor` adds a check that `.coordination/hooks/pre-push` exists. The shim in `.git/hooks/pre-push` exec's that target; if the target is missing every push silently exits zero, so deploy commits stay local without surfacing -- which is exactly how requesthub's deploys broke. The new check fails loud with a `coord upgrade` hint when the target is missing.
+
+### Migration
+
+Repos that have a tracked pre-push hook should chain coord's check into it with these two lines (no auto-magic; explicit beats clobbering):
+
+    COORD_HOOK="$(git rev-parse --show-toplevel)/.coordination/hooks/pre-push"
+    [ -x "$COORD_HOOK" ] && "$COORD_HOOK" "$@"
+
 ## [0.7.0] - 2026-05-02
 
 ### Changed (behaviour-affecting)

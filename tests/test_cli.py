@@ -136,6 +136,51 @@ def test_init_claude_creates_repo_files(
     assert "COORD_API_URL=http://127.0.0.1:8080" in local_env_text
 
 
+def test_init_does_not_clobber_pre_push_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Regression: the user's `.git/hooks/pre-push` may be a symlink to
+    a tracked repo file (e.g. `scripts/git-hooks/pre-push`) carrying
+    real CI logic. coord init must NEVER write through that symlink --
+    `pathlib.Path.write_text` follows symlinks, which silently
+    overwrites the target file. The previously-tracked hook is then
+    lost (until restored from git) and the user's CI / lint / deploy
+    guardrails stop running."""
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("COORD_HOME", str(tmp_path / ".coord-home"))
+
+    # Set up a symlinked .git/hooks/pre-push, where the target carries
+    # the user's real (non-coord) hook content.
+    (repo / "scripts" / "git-hooks").mkdir(parents=True)
+    real_hook = repo / "scripts" / "git-hooks" / "pre-push"
+    real_hook.write_text(
+        "#!/usr/bin/env bash\n# user's CI lint hook\nset -e\necho ci-checks\n",
+        encoding="utf-8",
+    )
+    git_hook = repo / ".git" / "hooks" / "pre-push"
+    git_hook.parent.mkdir(parents=True, exist_ok=True)
+    git_hook.symlink_to(real_hook)
+
+    pre_init_content = real_hook.read_text(encoding="utf-8")
+    exit_code = cli.main(
+        ["init", "--tool", "claude", "--mode", "local", "--yes", "--force"]
+    )
+
+    assert exit_code == 0, "init should not fail when .git/hooks/pre-push is a symlink"
+    # The user's tracked hook content is untouched.
+    assert real_hook.read_text(encoding="utf-8") == pre_init_content, (
+        "coord init clobbered the symlink target; tracked hook content was overwritten"
+    )
+    # Coord still printed actionable guidance so the user can wire the
+    # chain themselves.
+    err = capsys.readouterr().err
+    assert ".git/hooks/pre-push is a symlink" in err
+    assert ".coordination/hooks/pre-push" in err
+
+
 def test_init_is_idempotent_for_managed_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

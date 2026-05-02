@@ -411,6 +411,27 @@ def run_doctor(args) -> int:
     hook_ok = (repo_root / ".git" / "hooks" / "pre-push").exists()
     results.append(CheckResult("pre-push hook installed", hook_ok))
 
+    # The .git/hooks/pre-push (or whatever the user wired up) typically
+    # delegates to .coordination/hooks/pre-push. If that target file is
+    # missing, every push silently no-ops -- which is exactly the
+    # requesthub failure mode where commits stayed local because the
+    # exec target had been deleted out from under the shim. Surface
+    # this before it bites a deploy.
+    managed_hook = repo_root / ".coordination" / "hooks" / "pre-push"
+    results.append(
+        CheckResult(
+            ".coordination/hooks/pre-push exists",
+            managed_hook.exists(),
+            "" if managed_hook.exists() else "missing exec target for the pre-push shim",
+            (
+                ""
+                if managed_hook.exists()
+                else "Run 'coord upgrade' (or 'coord init --force' if config.toml is also missing) "
+                "to restore the managed hook script."
+            ),
+        )
+    )
+
     mcp_bin = shutil.which("coord-mcp") or str(local_coord_mcp_path())
     results.append(CheckResult("coord-mcp command available", Path(mcp_bin).exists()))
 

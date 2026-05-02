@@ -255,9 +255,56 @@ def _install_hook(repo_root: Path, force: bool) -> None:
         "#!/usr/bin/env bash\n"
         'exec "$(git rev-parse --show-toplevel)/.coordination/hooks/pre-push" "$@"\n'
     )
+
+    # CRITICAL: never follow a symlink with write_text. The target is
+    # often a tracked repo file (e.g. scripts/git-hooks/pre-push) with
+    # real CI / lint / deploy logic; writing the shim through the
+    # symlink silently destroys that content. We refuse and print
+    # guidance so the user can chain coord into their existing hook
+    # explicitly. The same logic applies under --force: --force is for
+    # overwriting *coord's* own files, not the user's tracked hooks.
+    if git_hook.is_symlink():
+        target = os.readlink(git_hook)
+        print(
+            f"Warning: .git/hooks/pre-push is a symlink to {target!r}.\n"
+            f"  coord did not modify it (writing would clobber the symlink target,\n"
+            f"  which is often a tracked repo file with real CI logic).\n"
+            f"  To run coord's conflict check alongside your existing hook, add\n"
+            f"  this near the end of {target}:\n"
+            f"\n"
+            f"    COORD_HOOK=\"$(git rev-parse --show-toplevel)/.coordination/hooks/pre-push\"\n"
+            f"    [ -x \"$COORD_HOOK\" ] && \"$COORD_HOOK\" \"$@\"\n",
+            file=sys.stderr,
+        )
+        return
+
     if git_hook.exists() and "coordination/hooks/pre-push" not in git_hook.read_text(encoding="utf-8"):
         if not force:
+            print(
+                "Note: .git/hooks/pre-push exists and is not the coord shim;\n"
+                "  leaving it untouched. Re-run with --force to overwrite, or\n"
+                "  chain coord's check by adding this line near the end of\n"
+                "  your existing hook:\n"
+                "\n"
+                "    COORD_HOOK=\"$(git rev-parse --show-toplevel)/.coordination/hooks/pre-push\"\n"
+                "    [ -x \"$COORD_HOOK\" ] && \"$COORD_HOOK\" \"$@\"\n",
+                file=sys.stderr,
+            )
             return
+        # Force-overwrite: keep a backup so the user can recover if this
+        # was unintended.
+        backup = git_hook.with_suffix(git_hook.suffix + ".bak")
+        try:
+            backup.write_text(
+                git_hook.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+            print(
+                f"Note: previous .git/hooks/pre-push backed up to {backup.name}.",
+                file=sys.stderr,
+            )
+        except OSError:
+            pass
+
     write_executable(git_hook, shim)
 
 
