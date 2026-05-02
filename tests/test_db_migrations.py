@@ -396,3 +396,101 @@ async def test_init_sets_busy_timeout_pragma(
 
     # Silence unused imports if other tests evolve.
     _ = (sqlite3, threading, time, asyncio)
+
+
+async def test_v3_adds_session_id_column_to_claims(tmp_path: Path) -> None:
+    """Migration v3 introduces a nullable `session_id` column on claims
+    so the conflict check can self-exclude a session's prior claims even
+    when subagent engineer names differ."""
+    db_path = tmp_path / "v3.sqlite"
+    db = Database(db_path)
+    await db.init()
+
+    rows = await _fetch_all(db_path, "PRAGMA table_info(claims)")
+    cols = {r[1] for r in rows}
+    assert "session_id" in cols, (
+        f"claims table missing session_id column; saw: {cols}"
+    )
+    sid_row = next(r for r in rows if r[1] == "session_id")
+    assert sid_row[3] == 0, "session_id column must be nullable for back-compat"
+
+
+async def test_v2_to_v3_preserves_existing_claims_with_null_session(
+    tmp_path: Path,
+) -> None:
+    """A v2 DB with claim rows must migrate cleanly to v3 with old rows
+    keeping session_id=NULL."""
+    db_path = tmp_path / "v2_to_v3.sqlite"
+
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.executescript(
+            """
+            CREATE TABLE schema_version (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                version INTEGER NOT NULL
+            );
+            CREATE TABLE claims (
+                id TEXT PRIMARY KEY,
+                engineer TEXT NOT NULL,
+                branch TEXT,
+                description TEXT,
+                claim_type TEXT NOT NULL,
+                pattern TEXT NOT NULL,
+                severity TEXT NOT NULL DEFAULT 'soft',
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                released_at TEXT,
+                repo TEXT
+            );
+            CREATE TABLE conflict_log (
+                id TEXT PRIMARY KEY,
+                claim_id TEXT NOT NULL,
+                attempted_by TEXT NOT NULL,
+                attempted_pattern TEXT NOT NULL,
+                resolution TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (claim_id) REFERENCES claims(id)
+            );
+            CREATE TABLE ownership_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                yaml_text TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            INSERT INTO schema_version (id, version) VALUES (1, 2);
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO claims (
+                id, engineer, branch, description, claim_type, pattern,
+                severity, created_at, expires_at, released_at, repo
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+            """,
+            (
+                "v2-claim-1",
+                "alice",
+                None,
+                "v2-era claim",
+                "file",
+                "src/x.py",
+                "soft",
+                "2026-04-01T00:00:00Z",
+                "2099-01-01T00:00:00Z",
+                "amittell/coord",
+            ),
+        )
+        await conn.commit()
+
+    db = Database(db_path)
+    await db.init()
+
+    row = await _fetch_one(db_path, "SELECT version FROM schema_version")
+    assert row is not None
+    assert row[0] >= 3
+
+    row = await _fetch_one(
+        db_path,
+        "SELECT id, repo, session_id FROM claims WHERE id = 'v2-claim-1'",
+    )
+    assert row is not None
+    assert row == ("v2-claim-1", "amittell/coord", None)

@@ -140,6 +140,7 @@ class CoordinationService:
         patterns: list[str],
         engineer: str,
         repo: str | None = None,
+        session_id: str | None = None,
     ) -> ConflictCheckResponse:
         for pat in patterns:
             err = _validate_pattern_syntax(pat)
@@ -152,6 +153,13 @@ class CoordinationService:
         # tagged callers never collide with un-tagged historical claims
         # and vice versa.
         active = [r for r in active if r.get("repo") == repo]
+        # Session-scoped self-exclusion (v0.5.0): when the caller passes
+        # a session_id (coord-mcp generates one per process), drop any
+        # active claim that shares that session_id. This makes subagents
+        # within one Codex/Claude run cooperative even when they use
+        # distinct engineer names. Different sessions remain adversarial.
+        if session_id:
+            active = [r for r in active if r.get("session_id") != session_id]
         conflicts: list[dict[str, Any]] = []
         for pat in patterns:
             for row in active:
@@ -218,6 +226,9 @@ class CoordinationService:
         active = await self.db.list_active_claims_rows(exclude_engineer=body.engineer)
         # Repo-scoped check (v0.4.0): see check_conflicts for rationale.
         active = [r for r in active if r.get("repo") == body.repo]
+        # Session-scoped self-exclusion (v0.5.0): see check_conflicts.
+        if body.session_id:
+            active = [r for r in active if r.get("session_id") != body.session_id]
         for item in body.claims:
             for row in active:
                 overlap = await compute_overlap(
@@ -275,6 +286,7 @@ class CoordinationService:
             description=body.description,
             items=ids,
             repo=body.repo,
+            session_id=body.session_id,
         )
         # Count one tick per successfully inserted claim. We look back at
         # the computed severity for each item so the label distribution

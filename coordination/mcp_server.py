@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import uuid
 from typing import Any
 
 import httpx
@@ -19,6 +20,30 @@ def _headers() -> dict[str, str]:
     if token:
         h["Authorization"] = f"Bearer {token}"
     return h
+
+
+def _resolve_session_id() -> str:
+    """Compute the session id this MCP process should advertise.
+
+    Honours an explicit ``COORD_SESSION_ID`` (useful for pinning the id
+    across a restart, or for tests). Otherwise mints a fresh 16-char hex
+    id once and reuses it for the lifetime of the process. Subagents
+    spawned by Codex / Claude Code share the same MCP child process and
+    therefore the same session id, which is the whole point: subagents
+    inside one session must never block each other on overlapping
+    claims, even when they pick distinct engineer names.
+    """
+    explicit = os.environ.get("COORD_SESSION_ID", "").strip()
+    if explicit:
+        return explicit
+    return uuid.uuid4().hex[:16]
+
+
+# Resolved exactly once per coord-mcp process. The conflict check on the
+# server side self-excludes any active claim whose session_id matches
+# this constant, so subagents spawned by the same parent are
+# cooperative.
+_SESSION_ID = _resolve_session_id()
 
 
 @mcp.tool()
@@ -78,6 +103,7 @@ async def claim_files(
     repo_id = os.environ.get("COORD_REPO_ID", "").strip()
     if repo_id:
         body["repo"] = repo_id
+    body["session_id"] = _SESSION_ID
     async with httpx.AsyncClient(timeout=30.0) as client:
         r = await client.post(f"{_base_url()}/claims", json=body, headers={**_headers(), "Content-Type": "application/json"})
         if r.status_code in (400, 409):
@@ -94,6 +120,26 @@ async def release_claims(claim_ids: list[str], engineer: str | None = None) -> d
             f"{_base_url()}/claims/release",
             json={"claim_ids": claim_ids, "engineer": engineer},
             headers={**_headers(), "Content-Type": "application/json"},
+        )
+        r.raise_for_status()
+        return r.json()
+
+
+@mcp.tool()
+async def release_session(session_id: str | None = None) -> dict[str, Any]:
+    """Release every active claim that this MCP session created.
+
+    Defaults to the current process's session id, so calling this with
+    no arguments at end of work tears down every claim the parent agent
+    and its subagents produced -- one call, no need to track ids or
+    walk every engineer name. Pass an explicit session_id to clean up
+    a different session (e.g. an orphaned session from a previous
+    Codex restart whose id was logged elsewhere)."""
+    sid = session_id if session_id is not None else _SESSION_ID
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.post(
+            f"{_base_url()}/sessions/{sid}/release",
+            headers=_headers(),
         )
         r.raise_for_status()
         return r.json()

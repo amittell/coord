@@ -249,17 +249,34 @@ async def conflicts(
     pattern: list[str] | None = Query(default=None),
     engineer: str = Query(...),
     repo: str | None = Query(default=None),
+    session_id: str | None = Query(default=None),
     _: None = Depends(require_auth),
 ) -> dict:
     if not pattern:
         raise HTTPException(status_code=400, detail="Provide one or more pattern= query params")
     try:
         result = await get_service().check_conflicts(
-            patterns=pattern, engineer=engineer, repo=repo,
+            patterns=pattern,
+            engineer=engineer,
+            repo=repo,
+            session_id=session_id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return result.model_dump()
+
+
+@app.post("/sessions/{session_id}/release")
+async def release_session(
+    session_id: str,
+    _: None = Depends(require_auth),
+) -> dict:
+    """Release every active claim that was created with the given
+    session_id. Intended for end-of-work cleanup so a single call from
+    coord-mcp tears down everything the agent and its subagents
+    produced, regardless of engineer name."""
+    n = await get_service().db.release_for_session(session_id)
+    return {"released": n}
 
 
 @app.delete("/claims/{claim_id}")

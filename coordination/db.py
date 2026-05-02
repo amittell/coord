@@ -140,7 +140,7 @@ CREATE INDEX IF NOT EXISTS idx_claims_engineer ON claims (engineer);
 """
 
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 # Migration registry: list of (version, upgrade_sql) tuples applied in order.
 # Entry for version N is the SQL that upgrades a DB from version N-1 to N.
@@ -150,6 +150,11 @@ MIGRATIONS: list[tuple[int, str]] = [
     # v2: capture which repo a claim came from. Nullable for backfill: existing
     # claims pre-dating this column show up under "(unattributed)" in repo views.
     (2, "ALTER TABLE claims ADD COLUMN repo TEXT;"),
+    # v3: per-MCP-process session id so subagents inside one Codex/Claude
+    # session don't conflict with each other when they use distinct
+    # engineer names. Nullable -- pre-v3 claims keep session_id=NULL and
+    # behave like the legacy engineer-only self-exclusion path.
+    (3, "ALTER TABLE claims ADD COLUMN session_id TEXT;"),
 ]
 
 
@@ -401,6 +406,7 @@ class Database:
         description: str | None,
         items: list[tuple[str, str, str, str, str]],  # id, claim_type, pattern, severity, expires_at
         repo: str | None = None,
+        session_id: str | None = None,
     ) -> list[str]:
         now = _utcnow()
         await self.init()
@@ -412,8 +418,8 @@ class Database:
                     """
                     INSERT INTO claims (
                         id, engineer, branch, description, claim_type, pattern, severity,
-                        created_at, expires_at, released_at, repo
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+                        created_at, expires_at, released_at, repo, session_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
                     """,
                     (
                         cid,
@@ -426,10 +432,35 @@ class Database:
                         now,
                         expires_at,
                         repo,
+                        session_id,
                     ),
                 )
             await conn.commit()
         return [i[0] for i in items]
+
+    async def release_for_session(self, session_id: str) -> int:
+        """Release every active claim that was created with the given
+        session_id, regardless of engineer name. Returns the count of
+        rows actually closed. Intended for end-of-work cleanup so an
+        agent process can reliably tear down everything it produced
+        even when it spawned subagents under multiple engineer names.
+        """
+        if not session_id:
+            return 0
+        now = _utcnow()
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                """
+                UPDATE claims SET released_at = ?
+                WHERE session_id = ? AND released_at IS NULL
+                """,
+                (now, session_id),
+            )
+            await conn.commit()
+            return cur.rowcount or 0
 
     async def release_claims(self, claim_ids: list[str], engineer: str | None = None) -> int:
         now = _utcnow()

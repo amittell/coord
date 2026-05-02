@@ -461,6 +461,112 @@ async def test_conflicts_endpoint_filters_by_repo(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_create_claims_self_excludes_within_session(client: AsyncClient) -> None:
+    """End-to-end: a subagent with the same session_id but a different
+    engineer name is not blocked by the prior subagent's overlapping claim."""
+    h = {"Authorization": "Bearer test-token"}
+
+    r = await client.post(
+        "/claims",
+        headers=h,
+        json={
+            "engineer": "codex-server",
+            "repo": "amittell/astrowars",
+            "session_id": "sess-xyz",
+            "claims": [{"type": "module", "pattern": "server/**"}],
+        },
+    )
+    assert r.status_code == 200, r.text
+
+    r = await client.post(
+        "/claims",
+        headers=h,
+        json={
+            "engineer": "codex-shared",
+            "repo": "amittell/astrowars",
+            "session_id": "sess-xyz",
+            "claims": [{"type": "module", "pattern": "server/**"}],
+        },
+    )
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.asyncio
+async def test_conflicts_endpoint_honors_session_id(client: AsyncClient) -> None:
+    h = {"Authorization": "Bearer test-token"}
+
+    r = await client.post(
+        "/claims",
+        headers=h,
+        json={
+            "engineer": "codex-foo",
+            "repo": "amittell/astrowars",
+            "session_id": "sess-1",
+            "claims": [{"type": "module", "pattern": "server/**"}],
+        },
+    )
+    assert r.status_code == 200, r.text
+
+    # Same session, different engineer name: clean.
+    r = await client.get(
+        "/conflicts?pattern=server/x.js&engineer=codex-bar"
+        "&repo=amittell/astrowars&session_id=sess-1",
+        headers=h,
+    )
+    assert r.status_code == 200
+    assert r.json()["has_conflicts"] is False
+
+    # Different session: adversarial.
+    r = await client.get(
+        "/conflicts?pattern=server/x.js&engineer=codex-bar"
+        "&repo=amittell/astrowars&session_id=sess-2",
+        headers=h,
+    )
+    assert r.json()["has_conflicts"] is True
+
+
+@pytest.mark.asyncio
+async def test_release_session_endpoint_releases_all_session_claims(
+    client: AsyncClient,
+) -> None:
+    h = {"Authorization": "Bearer test-token"}
+
+    for engineer, pat in [
+        ("codex-a", "src/a.py"),
+        ("codex-b", "src/b.py"),
+    ]:
+        r = await client.post(
+            "/claims",
+            headers=h,
+            json={
+                "engineer": engineer,
+                "repo": "amittell/coord",
+                "session_id": "release-me",
+                "claims": [{"type": "file", "pattern": pat}],
+            },
+        )
+        assert r.status_code == 200, r.text
+
+    r = await client.post(
+        "/sessions/release-me/release", headers=h
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["released"] == 2
+
+    # Active claims for the session are now empty.
+    r = await client.get("/claims?active_only=true", headers=h)
+    body = r.json()
+    in_session = [c for c in body["claims"] if c.get("session_id") == "release-me"]
+    assert in_session == []
+
+
+@pytest.mark.asyncio
+async def test_release_session_endpoint_requires_auth(client: AsyncClient) -> None:
+    r = await client.post("/sessions/anything/release")
+    assert r.status_code == 401
+
+
+@pytest.mark.asyncio
 async def test_access_log_records_non_2xx_status(
     client: AsyncClient, access_log_records: list[logging.LogRecord]
 ) -> None:

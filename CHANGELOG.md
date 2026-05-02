@@ -19,6 +19,14 @@ Semantic Versioning.
 
 - (none recorded yet)
 
+## [0.5.0] - 2026-05-02
+
+### Added
+
+- Per-MCP-process session id. The conflict check now self-excludes any active claim whose `session_id` matches the caller's, so subagents spawned by a single Codex/Claude Code/Cursor process never block each other when they pick distinct engineer names. Different sessions remain adversarial. coord-mcp generates a 16-char hex id at module load and sends it on every `claim_files` call; operators can pin a stable value with `COORD_SESSION_ID`. Schema bumped to v3 via a forwards-only migration adding a nullable `claims.session_id` column; pre-v3 claims keep `session_id=NULL` and behave like the legacy engineer-only self-exclusion path. Closes the orphaned-claim trap where a parent agent left claims under engineer `codex` and its subagents (using names like `codex-server-review`) were locked out of overlapping scope until TTL expiry.
+- `GET /conflicts` accepts a new `session_id=` query parameter mirroring the field on `POST /claims`.
+- `POST /sessions/{session_id}/release` releases every active claim with the given session_id in one call. coord-mcp exposes this as a `release_session` tool whose default form takes no arguments and uses the current process's session id, so end-of-work cleanup is one MCP call regardless of how many engineer names the agent used.
+
 ## [0.4.2] - 2026-05-02
 
 ### Fixed

@@ -22,6 +22,16 @@ class CreateClaimsRequest(BaseModel):
             "supplied automatically by coord-mcp when set in the repo's config."
         ),
     )
+    session_id: str | None = Field(
+        default=None,
+        description=(
+            "Per-MCP-process session id. When set, the conflict check "
+            "self-excludes any active claim with the same session_id, "
+            "even if its engineer name differs. coord-mcp generates one "
+            "automatically at startup so subagents within the same "
+            "Codex/Claude process don't block each other."
+        ),
+    )
 
 
 class ConflictingClaim(BaseModel):

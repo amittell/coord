@@ -562,3 +562,92 @@ def test_headers_omit_bearer_when_token_empty(monkeypatch: pytest.MonkeyPatch) -
 def test_headers_omit_bearer_when_token_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("COORD_AUTH_TOKEN", raising=False)
     assert "Authorization" not in mcp_server._headers()
+
+
+# ---------------------------------------------------------------------------
+# session_id (v0.5.0)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_claim_files_includes_session_id_from_module_constant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each MCP process generates exactly one session_id at module load
+    and reuses it for the lifetime of the process. claim_files must send
+    that id on every POST so subagents share the same session."""
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.setattr(mcp_server, "_SESSION_ID", "test-session-deadbeef")
+    captured = _install_mock_transport(
+        monkeypatch, _json_handler(200, {"claim_ids": ["c"], "conflicts": [], "warnings": [], "options": []})
+    )
+
+    await mcp_server.claim_files(engineer="alice", patterns=["src/**"])
+
+    import json as _json
+    body = _json.loads(captured[0].content.decode("utf-8"))
+    assert body["session_id"] == "test-session-deadbeef"
+
+
+@pytest.mark.asyncio
+async def test_claim_files_session_id_overridable_via_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Operators can pin a stable session id by setting COORD_SESSION_ID
+    before launching the MCP server. The module-level constant is
+    re-evaluated through the helper so tests / advanced users can
+    override it."""
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.setenv("COORD_SESSION_ID", "explicit-session-7777")
+    # Force re-resolution.
+    monkeypatch.setattr(
+        mcp_server, "_SESSION_ID", mcp_server._resolve_session_id()
+    )
+    captured = _install_mock_transport(
+        monkeypatch, _json_handler(200, {"claim_ids": ["c"], "conflicts": [], "warnings": [], "options": []})
+    )
+
+    await mcp_server.claim_files(engineer="alice", patterns=["src/**"])
+
+    import json as _json
+    body = _json.loads(captured[0].content.decode("utf-8"))
+    assert body["session_id"] == "explicit-session-7777"
+
+
+@pytest.mark.asyncio
+async def test_release_session_tool_posts_to_sessions_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """release_session releases every claim with the caller's current
+    session_id. Default form takes no arguments and uses the module-level
+    session id - the typical 'wrap up the session' call at end of work."""
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.setattr(mcp_server, "_SESSION_ID", "wrap-this-up")
+    captured = _install_mock_transport(
+        monkeypatch, _json_handler(200, {"released": 5})
+    )
+
+    result = await mcp_server.release_session()
+
+    assert result == {"released": 5}
+    assert len(captured) == 1
+    req = captured[0]
+    assert req.method == "POST"
+    assert str(req.url) == "http://svc:8080/sessions/wrap-this-up/release"
+
+
+def test_resolve_session_id_uses_env_when_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("COORD_SESSION_ID", "from-env")
+    assert mcp_server._resolve_session_id() == "from-env"
+
+
+def test_resolve_session_id_generates_hex_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("COORD_SESSION_ID", raising=False)
+    sid = mcp_server._resolve_session_id()
+    assert len(sid) == 16
+    int(sid, 16)  # parses as hex
