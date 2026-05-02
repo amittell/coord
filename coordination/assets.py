@@ -2,32 +2,26 @@ from __future__ import annotations
 
 CLAUDE_SNIPPET = """## Coordination protocol (mandatory)
 
-This repo uses a shared coordination service to prevent multi-agent / multi-engineer file collisions.
+Multi-agent file coordination via the `coord` MCP server. Required calls:
 
-Use the `coord` MCP tools:
+1. `claim_files` before editing.
+2. `pending_requests` periodically (someone else may be blocked on your scope; release if yes).
+3. `release_session` when done.
 
-1. `list_claims` then `claim_files` at task start.
-2. Periodically (between operations, before going idle) call `pending_requests` to see if anyone else has been blocked on your scope. If yes, consider releasing the affected claims so they can proceed.
-3. If `claim_files` returns conflicts: stop and ask the user.
-4. `release_session` when done (releases every claim this MCP session created in one call, regardless of subagent engineer name).
+If `claim_files` returns conflicts, stop and ask the user. No edits outside claimed scope; no opportunistic refactors; shared config edits only with explicit user approval.
 
-Hard rules: no edits outside claimed scope; no opportunistic refactors; shared config edits only with explicit user approval.
-
-**Claude Code sub-agents:** when using the Task tool, include the protocol above in the sub-agent task text (sub-agents may not inherit full `CLAUDE.md` context).
+**Sub-agents (Task tool):** include this protocol in the sub-agent task text; sub-agents do not inherit `CLAUDE.md`.
 """
 
 AGENTS_SNIPPET = """## Coordination protocol (mandatory)
 
-This repo uses a shared coordination service to prevent multi-agent / multi-engineer file collisions.
+Multi-agent file coordination via the `coord` MCP server. Required calls:
 
-Use the `coord` MCP tools:
+1. `claim_files` before editing.
+2. `pending_requests` periodically (someone else may be blocked on your scope; release if yes).
+3. `release_session` when done.
 
-1. `list_claims` then `claim_files` at task start.
-2. Periodically (between operations, before going idle) call `pending_requests` to see if anyone else has been blocked on your scope. If yes, consider releasing the affected claims so they can proceed.
-3. If `claim_files` returns conflicts: stop and ask the user.
-4. `release_session` when done (releases every claim this MCP session created in one call, regardless of subagent engineer name).
-
-Hard rules: no edits outside claimed scope; no opportunistic refactors; shared config edits only with explicit user approval.
+If `claim_files` returns conflicts, stop and ask the user. No edits outside claimed scope; no opportunistic refactors; shared config edits only with explicit user approval.
 """
 
 CURSOR_RULE = """---
@@ -35,14 +29,13 @@ description: Coordination protocol for shared repos
 alwaysApply: false
 ---
 
-This repo uses the `coord` MCP server for multi-agent coordination.
+Multi-agent file coordination via the `coord` MCP server. Required calls:
 
-Before edits:
-1. Use `list_claims` or `check_conflicts`.
-2. Use `claim_files` before changing files.
-3. Between operations call `pending_requests` to see if anyone else has been blocked on your scope; release voluntarily if yes.
-4. If conflicts are returned, stop and ask the user.
-5. Call `release_session` when done.
+1. `claim_files` before editing.
+2. `pending_requests` periodically (someone else may be blocked on your scope; release if yes).
+3. `release_session` when done.
+
+If `claim_files` returns conflicts, stop and ask the user.
 """
 
 PRE_PUSH_SCRIPT = """#!/usr/bin/env bash

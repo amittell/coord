@@ -117,17 +117,32 @@ def _check_service(config: RepoConfig, token: str) -> list[CheckResult]:
 
 
 def _extract_managed_block(text: str) -> str | None:
-    """Return the *content* (without the marker lines) of the managed
-    block, or None if no block is found.
+    """Return the *content* (without the marker lines and the
+    AUTO-GENERATED warning line, if present) of the managed block,
+    or None if no block is found. Accepts either marker style so
+    drift detection still fires on legacy or hand-edited blocks.
     """
-    start = text.find(MANAGED_BEGIN)
-    if start < 0:
-        return None
-    end = text.find(MANAGED_END, start)
-    if end < 0:
-        return None
-    block = text[start + len(MANAGED_BEGIN) : end]
-    return block.strip()
+    from coordination.cli_shared import MANAGED_HASH_BEGIN, MANAGED_HASH_END
+
+    for begin, end in (
+        (MANAGED_BEGIN, MANAGED_END),
+        (MANAGED_HASH_BEGIN, MANAGED_HASH_END),
+    ):
+        start = text.find(begin)
+        if start < 0:
+            continue
+        stop = text.find(end, start)
+        if stop < 0:
+            continue
+        block = text[start + len(begin) : stop].strip()
+        # Drop the AUTO-GENERATED warning line if it's the first line --
+        # callers compare the remainder against the packaged snippet,
+        # which doesn't carry the warning text.
+        lines = block.splitlines()
+        if lines and "AUTO-GENERATED" in lines[0]:
+            block = "\n".join(lines[1:]).strip()
+        return block
+    return None
 
 
 def _check_asset_drift(repo_root: Path, config: RepoConfig) -> list[CheckResult]:
