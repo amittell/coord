@@ -123,26 +123,32 @@ async def test_future_version_raises(tmp_path: Path) -> None:
 async def test_migration_registry_runs_in_order(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Synthetic migrations beyond the current schema version must apply
+    in registry order. Use versions one and two beyond CURRENT_SCHEMA_VERSION
+    so we don't collide with real migrations -- adding a duplicate (2, ...)
+    entry would re-apply the real v2 SQL during the test."""
     db_path = tmp_path / "multi.sqlite"
+    next_v1 = db_module.CURRENT_SCHEMA_VERSION + 1
+    next_v2 = db_module.CURRENT_SCHEMA_VERSION + 2
 
     extra_migrations = [
-        (2, "CREATE TABLE mig_v2 (id INTEGER PRIMARY KEY);"),
-        (3, "CREATE TABLE mig_v3 (id INTEGER PRIMARY KEY);"),
+        (next_v1, f"CREATE TABLE mig_v{next_v1} (id INTEGER PRIMARY KEY);"),
+        (next_v2, f"CREATE TABLE mig_v{next_v2} (id INTEGER PRIMARY KEY);"),
     ]
 
     real_registry = list(db_module.MIGRATIONS)
     monkeypatch.setattr(db_module, "MIGRATIONS", real_registry + extra_migrations)
-    monkeypatch.setattr(db_module, "CURRENT_SCHEMA_VERSION", 3)
+    monkeypatch.setattr(db_module, "CURRENT_SCHEMA_VERSION", next_v2)
 
     db = Database(db_path)
     await db.init()
 
     row = await _fetch_one(db_path, "SELECT version FROM schema_version")
     assert row is not None
-    assert row[0] == 3
+    assert row[0] == next_v2
 
-    assert await _table_exists(db_path, "mig_v2")
-    assert await _table_exists(db_path, "mig_v3")
+    assert await _table_exists(db_path, f"mig_v{next_v1}")
+    assert await _table_exists(db_path, f"mig_v{next_v2}")
 
 
 async def test_partial_migration_failure_is_atomic(
@@ -413,6 +419,35 @@ async def test_v3_adds_session_id_column_to_claims(tmp_path: Path) -> None:
     )
     sid_row = next(r for r in rows if r[1] == "session_id")
     assert sid_row[3] == 0, "session_id column must be nullable for back-compat"
+
+
+async def test_v4_adds_last_activity_column_and_pending_columns(
+    tmp_path: Path,
+) -> None:
+    """Migration v4 introduces:
+    - claims.last_activity TEXT NULL: idle-expiration timestamp,
+      bumped on every coord call from the session.
+    - conflict_log.attempted_session_id TEXT NULL: lets the holder
+      see which session tried to claim their scope.
+    Both are nullable for backfill safety.
+    """
+    db_path = tmp_path / "v4.sqlite"
+    db = Database(db_path)
+    await db.init()
+
+    rows = await _fetch_all(db_path, "PRAGMA table_info(claims)")
+    cols = {r[1] for r in rows}
+    assert "last_activity" in cols, (
+        f"claims missing last_activity column; saw: {cols}"
+    )
+    last_activity = next(r for r in rows if r[1] == "last_activity")
+    assert last_activity[3] == 0, "last_activity must be nullable"
+
+    rows = await _fetch_all(db_path, "PRAGMA table_info(conflict_log)")
+    cols = {r[1] for r in rows}
+    assert "attempted_session_id" in cols, (
+        f"conflict_log missing attempted_session_id; saw: {cols}"
+    )
 
 
 async def test_v2_to_v3_preserves_existing_claims_with_null_session(

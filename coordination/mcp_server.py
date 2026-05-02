@@ -58,6 +58,10 @@ async def list_claims(
         params["engineer"] = engineer
     if module:
         params["module"] = module
+    # Session_id doubles as an activity ping on the server side: a
+    # session that is actively listing claims is alive, so its held
+    # claims should not idle-expire.
+    params["session_id"] = _SESSION_ID
     async with httpx.AsyncClient(timeout=30.0) as client:
         r = await client.get(f"{_base_url()}/claims", params=params, headers=_headers())
         r.raise_for_status()
@@ -73,6 +77,10 @@ async def check_conflicts(files: list[str], engineer: str) -> dict[str, Any]:
         ("pattern", f) for f in files
     ]
     params.append(("engineer", engineer))
+    # Session_id makes the conflict check session-aware (so an agent's
+    # own subagents don't false-positive against each other) and acts
+    # as an activity ping for idle expiration on the server side.
+    params.append(("session_id", _SESSION_ID))
     async with httpx.AsyncClient(timeout=30.0) as client:
         r = await client.get(f"{_base_url()}/conflicts", params=params, headers=_headers())
         r.raise_for_status()
@@ -120,6 +128,26 @@ async def release_claims(claim_ids: list[str], engineer: str | None = None) -> d
             f"{_base_url()}/claims/release",
             json={"claim_ids": claim_ids, "engineer": engineer},
             headers={**_headers(), "Content-Type": "application/json"},
+        )
+        r.raise_for_status()
+        return r.json()
+
+
+@mcp.tool()
+async def pending_requests(session_id: str | None = None) -> dict[str, Any]:
+    """List recent attempts by other sessions to claim files I currently hold.
+
+    Each entry tells you who tried to take overlapping scope and what
+    pattern they tried, so you can decide whether to release voluntarily.
+    Call this between operations or before going idle. Defaults to the
+    current process's session id; pass an explicit value only to inspect
+    a different session's inbox.
+    """
+    sid = session_id if session_id is not None else _SESSION_ID
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.get(
+            f"{_base_url()}/sessions/{sid}/pending_requests",
+            headers=_headers(),
         )
         r.raise_for_status()
         return r.json()

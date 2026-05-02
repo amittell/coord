@@ -146,7 +146,13 @@ class CoordinationService:
             err = _validate_pattern_syntax(pat)
             if err:
                 raise ValueError(err)
-        await self.db.expire_stale_claims()
+        await self.db.expire_stale_claims(self.settings.idle_timeout_sec)
+        # Activity ping: a session that's actively checking conflicts is
+        # still alive even if it isn't creating new claims, so refresh
+        # last_activity for everything it currently holds before we
+        # decide what counts as "stale".
+        if session_id:
+            await self.db.touch_session_activity(session_id)
         active = await self.db.list_active_claims_rows(exclude_engineer=engineer)
         # Repo-scoped check (v0.4.0): only consider claims from the same
         # repo as the caller. NULL repo forms its own legacy bucket so
@@ -199,7 +205,12 @@ class CoordinationService:
         )
 
     async def create_claims(self, body: CreateClaimsRequest) -> CreateClaimsResponse:
-        await self.db.expire_stale_claims()
+        await self.db.expire_stale_claims(self.settings.idle_timeout_sec)
+        # Activity ping: making a claim is the strongest possible
+        # liveness signal -- bump last_activity for every claim this
+        # session already holds before we decide what's stale.
+        if body.session_id:
+            await self.db.touch_session_activity(body.session_id)
         rules = await self._rules()
         patterns = [c.pattern for c in body.claims]
         for pat in patterns:
@@ -258,6 +269,7 @@ class CoordinationService:
                     attempted_by=body.engineer,
                     attempted_pattern=item.pattern,
                     resolution=None,
+                    attempted_session_id=body.session_id,
                 )
                 metrics.claims_conflicts_total.inc()
 
@@ -307,8 +319,14 @@ class CoordinationService:
         active_only: bool = True,
         engineer: str | None = None,
         module_substring: str | None = None,
+        session_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        await self.db.expire_stale_claims()
+        await self.db.expire_stale_claims(self.settings.idle_timeout_sec)
+        # Activity ping: an agent reading the claim list is still alive,
+        # so keep its claims warm. No-op when session_id is unset
+        # (legacy / non-MCP callers).
+        if session_id:
+            await self.db.touch_session_activity(session_id)
         if active_only:
             rows = await self.db.list_active_claims_rows(exclude_engineer=None)
         else:
@@ -319,6 +337,14 @@ class CoordinationService:
             m = module_substring.lower()
             rows = [r for r in rows if m in (r.get("pattern") or "").lower()]
         return rows
+
+    async def pending_requests(self, session_id: str) -> list[dict[str, Any]]:
+        """Return the inbox of recent conflict-log entries logged
+        against claims this session currently holds. Active holders
+        poll this between operations to discover whether anyone has
+        been blocked on their scope, so they can voluntarily release.
+        """
+        return await self.db.pending_requests_for_session(session_id)
 
     async def release_claims(self, claim_ids: list[str], engineer: str | None) -> int:
         n = await self.db.release_claims(claim_ids, engineer)

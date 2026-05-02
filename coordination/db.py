@@ -140,7 +140,7 @@ CREATE INDEX IF NOT EXISTS idx_claims_engineer ON claims (engineer);
 """
 
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 # Migration registry: list of (version, upgrade_sql) tuples applied in order.
 # Entry for version N is the SQL that upgrades a DB from version N-1 to N.
@@ -155,6 +155,17 @@ MIGRATIONS: list[tuple[int, str]] = [
     # engineer names. Nullable -- pre-v3 claims keep session_id=NULL and
     # behave like the legacy engineer-only self-exclusion path.
     (3, "ALTER TABLE claims ADD COLUMN session_id TEXT;"),
+    # v4: idle-expiration timestamp on claims (bumped on every coord call
+    # from the holder's session) plus the requester's session_id on
+    # conflict_log entries so the holder can distinguish foreign sessions
+    # from its own subagents in the pending-requests inbox. Both nullable
+    # for backfill -- legacy rows keep last_activity=NULL and skip idle
+    # expiration entirely, falling back to the TTL-only behaviour.
+    (
+        4,
+        "ALTER TABLE claims ADD COLUMN last_activity TEXT;\n"
+        "ALTER TABLE conflict_log ADD COLUMN attempted_session_id TEXT;",
+    ),
 ]
 
 
@@ -407,8 +418,24 @@ class Database:
         items: list[tuple[str, str, str, str, str]],  # id, claim_type, pattern, severity, expires_at
         repo: str | None = None,
         session_id: str | None = None,
+        last_activity: str | None = None,
     ) -> list[str]:
+        """Insert a batch of claims atomically.
+
+        ``last_activity`` is stamped only when the caller supplies a
+        ``session_id``: idle expiration is opt-in via session-tagging.
+        Legacy NULL-session inserts get ``last_activity = NULL`` and so
+        keep the pre-v0.6 TTL-only behaviour. Tests and the recovery
+        path can pass ``last_activity`` explicitly; the service layer
+        leaves it as ``None`` and we default to "now" so the standard
+        flow doesn't have to think about it.
+        """
         now = _utcnow()
+        # Stamp activity only when this is a session-tagged claim; idle
+        # expiration is opt-in.
+        activity_value: str | None = None
+        if session_id:
+            activity_value = last_activity if last_activity is not None else now
         await self.init()
         async with aiosqlite.connect(self.path) as conn:
             conn.row_factory = aiosqlite.Row
@@ -418,8 +445,8 @@ class Database:
                     """
                     INSERT INTO claims (
                         id, engineer, branch, description, claim_type, pattern, severity,
-                        created_at, expires_at, released_at, repo, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                        created_at, expires_at, released_at, repo, session_id, last_activity
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
                     """,
                     (
                         cid,
@@ -433,10 +460,67 @@ class Database:
                         expires_at,
                         repo,
                         session_id,
+                        activity_value,
                     ),
                 )
             await conn.commit()
         return [i[0] for i in items]
+
+    async def touch_session_activity(self, session_id: str) -> int:
+        """Bump ``last_activity`` on every active claim that belongs to
+        the given session. Returns the rowcount so callers can log /
+        verify. No-op when ``session_id`` is empty.
+        """
+        if not session_id:
+            return 0
+        now = _utcnow()
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                """
+                UPDATE claims SET last_activity = ?
+                WHERE session_id = ? AND released_at IS NULL
+                """,
+                (now, session_id),
+            )
+            await conn.commit()
+            return cur.rowcount or 0
+
+    async def pending_requests_for_session(
+        self, session_id: str, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """Return recent conflict-log entries logged against active
+        claims that this session currently holds. Used by the holder
+        to poll "has anyone been blocked on my scope?" so they can
+        decide whether to release.
+        """
+        if not session_id:
+            return []
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                """
+                SELECT cl.id, cl.claim_id, cl.attempted_by,
+                       cl.attempted_pattern, cl.attempted_session_id,
+                       cl.created_at,
+                       c.pattern AS holder_pattern,
+                       c.engineer AS holder_engineer
+                FROM conflict_log cl
+                JOIN claims c ON cl.claim_id = c.id
+                WHERE c.session_id = ?
+                  AND c.released_at IS NULL
+                ORDER BY datetime(cl.created_at) DESC
+                LIMIT ?
+                """,
+                (session_id, limit),
+            )
+            rows = await cur.fetchall()
+            await conn.commit()
+        return [dict(r) for r in rows]
 
     async def release_for_session(self, session_id: str) -> int:
         """Release every active claim that was created with the given
@@ -499,24 +583,42 @@ class Database:
             await conn.commit()
             return (cur.rowcount or 0) > 0
 
-    async def expire_stale_claims(self) -> int:
+    async def expire_stale_claims(self, idle_timeout_sec: int = 0) -> int:
+        """Close claims whose hard TTL has passed, plus any
+        session-tagged claim whose ``last_activity`` is older than
+        ``idle_timeout_sec``. Idle expiration only fires when both the
+        timeout is positive AND the row has a non-NULL last_activity,
+        so legacy NULL-session claims keep their TTL-only behaviour.
+        """
         now = _utcnow()
+        cutoff = datetime.now(UTC)
+        idle_cutoff: datetime | None = None
+        if idle_timeout_sec and idle_timeout_sec > 0:
+            idle_cutoff = cutoff - timedelta(seconds=idle_timeout_sec)
         await self.init()
         async with aiosqlite.connect(self.path) as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(
-                "SELECT id, expires_at FROM claims WHERE released_at IS NULL",
+                "SELECT id, expires_at, last_activity FROM claims WHERE released_at IS NULL",
             )
             rows = await cur.fetchall()
             await conn.commit()
 
         to_close: list[str] = []
-        cutoff = datetime.now(UTC)
         for r in rows:
             exp = datetime.fromisoformat(str(r["expires_at"]).replace("Z", "+00:00"))
             if exp <= cutoff:
                 to_close.append(str(r["id"]))
+                continue
+            la_raw = r["last_activity"]
+            if idle_cutoff is not None and la_raw:
+                try:
+                    la = datetime.fromisoformat(str(la_raw).replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                if la <= idle_cutoff:
+                    to_close.append(str(r["id"]))
         if not to_close:
             return 0
 
@@ -540,6 +642,7 @@ class Database:
         attempted_by: str,
         attempted_pattern: str,
         resolution: str | None,
+        attempted_session_id: str | None = None,
     ) -> None:
         await self.init()
         async with aiosqlite.connect(self.path) as conn:
@@ -547,10 +650,21 @@ class Database:
             await _configure_sqlite(conn)
             await conn.execute(
                 """
-                INSERT INTO conflict_log (id, claim_id, attempted_by, attempted_pattern, resolution, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO conflict_log (
+                    id, claim_id, attempted_by, attempted_pattern,
+                    resolution, created_at, attempted_session_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (str(uuid4()), claim_id, attempted_by, attempted_pattern, resolution, _utcnow()),
+                (
+                    str(uuid4()),
+                    claim_id,
+                    attempted_by,
+                    attempted_pattern,
+                    resolution,
+                    _utcnow(),
+                    attempted_session_id,
+                ),
             )
             await conn.commit()
 

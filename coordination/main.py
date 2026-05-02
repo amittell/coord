@@ -224,12 +224,14 @@ async def list_claims(
     engineer: str | None = None,
     module: str | None = None,
     repo: str | None = None,
+    session_id: str | None = None,
     _: None = Depends(require_auth),
 ) -> dict:
     rows = await get_service().list_claims(
         active_only=active,
         engineer=engineer,
         module_substring=module,
+        session_id=session_id,
     )
     if repo is not None:
         rows = [r for r in rows if r.get("repo") == repo]
@@ -277,6 +279,20 @@ async def release_session(
     produced, regardless of engineer name."""
     n = await get_service().db.release_for_session(session_id)
     return {"released": n}
+
+
+@app.get("/sessions/{session_id}/pending_requests")
+async def pending_requests(
+    session_id: str,
+    _: None = Depends(require_auth),
+) -> dict:
+    """Return recent conflict-log entries logged against active claims
+    this session currently holds. An active holder polls this between
+    operations so they can see who has been blocked on their scope and
+    voluntarily release. Coord-mcp exposes this as a `pending_requests`
+    tool."""
+    rows = await get_service().pending_requests(session_id)
+    return {"pending": rows, "count": len(rows)}
 
 
 @app.delete("/claims/{claim_id}")

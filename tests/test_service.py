@@ -713,3 +713,260 @@ async def test_release_for_session_releases_all_claims_in_session(
     assert "cid_r1" not in remaining_ids
     assert "cid_r2" not in remaining_ids
     assert "cid_r3" not in remaining_ids
+
+
+# --- Activity-based auto-expiration & pending-requests inbox (v0.6.0) -----
+#
+# v0.6 closes the "agent walked away with claims still held" failure mode
+# by tracking last_activity on each session-tagged claim and expiring it
+# when the session has been silent for longer than COORD_IDLE_TIMEOUT_SEC.
+# It also surfaces a pending-requests inbox so an active holder can see
+# who has been blocked on its scope and decide whether to release.
+
+
+@pytest.fixture()
+async def idle_service(tmp_path: Path) -> CoordinationService:
+    """Service with a small idle timeout so tests can exercise the
+    expiration path without sleeping."""
+    db_path = tmp_path / "idle_svc.sqlite"
+    db = Database(db_path)
+    await db.init()
+    settings = Settings(
+        database_path=db_path,
+        allow_insecure_no_auth=True,
+        repo_root=None,
+        idle_timeout_sec=60,
+    )
+    return CoordinationService(db=db, settings=settings)
+
+
+@pytest.mark.asyncio
+async def test_create_claims_sets_last_activity_when_session_id_given(
+    idle_service: CoordinationService,
+) -> None:
+    from coordination.schemas import ClaimItem, CreateClaimsRequest
+
+    result = await idle_service.create_claims(
+        CreateClaimsRequest(
+            engineer="alice",
+            repo="amittell/coord",
+            session_id="sess-1",
+            claims=[ClaimItem(type="file", pattern="src/foo.py")],
+        )
+    )
+    assert result.claim_ids
+    rows = await idle_service.db.list_active_claims_rows()
+    row = next(r for r in rows if r["id"] == result.claim_ids[0])
+    assert row.get("last_activity") is not None, (
+        "session-tagged claim must have last_activity stamped on insert"
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_null_session_claims_have_null_last_activity(
+    idle_service: CoordinationService,
+) -> None:
+    """Pre-v0.5 clients (no session_id) should not be subject to idle
+    expiration. The simplest way to express that is to leave
+    last_activity NULL on insert."""
+    from coordination.schemas import ClaimItem, CreateClaimsRequest
+
+    result = await idle_service.create_claims(
+        CreateClaimsRequest(
+            engineer="alice",
+            repo="amittell/coord",
+            claims=[ClaimItem(type="file", pattern="src/foo.py")],
+        )
+    )
+    rows = await idle_service.db.list_active_claims_rows()
+    row = next(r for r in rows if r["id"] == result.claim_ids[0])
+    assert row.get("last_activity") is None
+
+
+@pytest.mark.asyncio
+async def test_idle_session_claims_get_expired(
+    idle_service: CoordinationService,
+) -> None:
+    """A session that hasn't pinged activity for longer than
+    idle_timeout_sec should have its claims released by the next
+    expire_stale_claims sweep, even though their TTL is far in the
+    future."""
+    # Direct DB insert with a stale last_activity.
+    from datetime import UTC, datetime, timedelta
+
+    stale = (datetime.now(UTC) - timedelta(seconds=300)).replace(microsecond=0)
+    stale_iso = stale.isoformat().replace("+00:00", "Z")
+    far_future = "2099-01-01T00:00:00Z"
+
+    await idle_service.db.insert_claims_batch(
+        engineer="alice",
+        branch=None,
+        description=None,
+        items=[("idle-cid", "file", "src/foo.py", "soft", far_future)],
+        repo="amittell/coord",
+        session_id="sess-idle",
+        last_activity=stale_iso,
+    )
+
+    n = await idle_service.db.expire_stale_claims(
+        idle_service.settings.idle_timeout_sec
+    )
+    assert n >= 1
+    rows = await idle_service.db.list_active_claims_rows()
+    assert "idle-cid" not in {r["id"] for r in rows}
+
+
+@pytest.mark.asyncio
+async def test_active_session_claims_survive_idle_sweep(
+    idle_service: CoordinationService,
+) -> None:
+    """Activity ping keeps the claim alive."""
+    from datetime import UTC, datetime
+
+    fresh_iso = (
+        datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    )
+    far_future = "2099-01-01T00:00:00Z"
+
+    await idle_service.db.insert_claims_batch(
+        engineer="alice",
+        branch=None,
+        description=None,
+        items=[("active-cid", "file", "src/foo.py", "soft", far_future)],
+        repo="amittell/coord",
+        session_id="sess-active",
+        last_activity=fresh_iso,
+    )
+
+    await idle_service.db.expire_stale_claims(
+        idle_service.settings.idle_timeout_sec
+    )
+    rows = await idle_service.db.list_active_claims_rows()
+    assert "active-cid" in {r["id"] for r in rows}
+
+
+@pytest.mark.asyncio
+async def test_check_conflicts_bumps_last_activity_for_session(
+    idle_service: CoordinationService,
+) -> None:
+    """Calling check_conflicts from a session must refresh the
+    last_activity of every active claim that session holds, otherwise
+    a session that stops creating new claims but is still actively
+    *checking* gets unfairly idle-expired."""
+    from datetime import UTC, datetime, timedelta
+
+    # Seed last_activity 30s ago: within the 60s idle window (so the
+    # claim survives the expire sweep) but distinct from "now" so we
+    # can detect the touch.
+    stale_iso = (
+        (datetime.now(UTC) - timedelta(seconds=30)).replace(microsecond=0)
+        .isoformat().replace("+00:00", "Z")
+    )
+    far_future = "2099-01-01T00:00:00Z"
+
+    await idle_service.db.insert_claims_batch(
+        engineer="alice",
+        branch=None,
+        description=None,
+        items=[("touch-me", "file", "src/foo.py", "soft", far_future)],
+        repo="amittell/coord",
+        session_id="sess-touch",
+        last_activity=stale_iso,
+    )
+
+    await idle_service.check_conflicts(
+        patterns=["src/bar.py"],
+        engineer="alice",
+        repo="amittell/coord",
+        session_id="sess-touch",
+    )
+
+    rows = await idle_service.db.list_active_claims_rows()
+    row = next(r for r in rows if r["id"] == "touch-me")
+    new_activity = row["last_activity"]
+    assert new_activity != stale_iso, (
+        "check_conflicts must bump last_activity for session-tagged claims"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pending_requests_returns_conflicts_against_held_claims(
+    idle_service: CoordinationService,
+) -> None:
+    """When a different session is blocked by my session's claim, my
+    `pending_requests` view must include that attempt with the
+    requester's engineer and pattern, so I can decide whether to
+    release."""
+    from coordination.schemas import ClaimItem, CreateClaimsRequest
+
+    holder = await idle_service.create_claims(
+        CreateClaimsRequest(
+            engineer="alice",
+            repo="amittell/coord",
+            session_id="holder-sess",
+            claims=[ClaimItem(type="module", pattern="server/**")],
+        )
+    )
+    assert holder.claim_ids
+
+    # Different session attempts overlapping pattern; gets blocked.
+    blocked = await idle_service.create_claims(
+        CreateClaimsRequest(
+            engineer="bob",
+            repo="amittell/coord",
+            session_id="requester-sess",
+            claims=[ClaimItem(type="module", pattern="server/**")],
+        )
+    )
+    assert blocked.conflicts, "second session should have been blocked"
+
+    pending = await idle_service.pending_requests("holder-sess")
+    assert len(pending) >= 1, f"holder must see the blocked attempt; got {pending}"
+    one = pending[0]
+    assert one["attempted_by"] == "bob"
+    assert one["attempted_pattern"] == "server/**"
+    # The conflict log records which session attempted, so the holder
+    # can distinguish its own subagents from a foreign session.
+    assert one.get("attempted_session_id") == "requester-sess"
+
+
+@pytest.mark.asyncio
+async def test_pending_requests_excludes_other_sessions_inbox(
+    idle_service: CoordinationService,
+) -> None:
+    """My pending-requests inbox must only show conflicts logged
+    against MY claims. Conflicts on someone else's claims must not
+    leak into my view."""
+    from coordination.schemas import ClaimItem, CreateClaimsRequest
+
+    # Two unrelated sessions each hold something.
+    for sess, eng, pat in [
+        ("session-a", "alice", "a/**"),
+        ("session-b", "bob", "b/**"),
+    ]:
+        await idle_service.create_claims(
+            CreateClaimsRequest(
+                engineer=eng,
+                repo="amittell/coord",
+                session_id=sess,
+                claims=[ClaimItem(type="module", pattern=pat)],
+            )
+        )
+
+    # A third session conflicts against session-a only.
+    await idle_service.create_claims(
+        CreateClaimsRequest(
+            engineer="carol",
+            repo="amittell/coord",
+            session_id="session-c",
+            claims=[ClaimItem(type="module", pattern="a/**")],
+        )
+    )
+
+    a_pending = await idle_service.pending_requests("session-a")
+    b_pending = await idle_service.pending_requests("session-b")
+
+    assert any(p["attempted_by"] == "carol" for p in a_pending)
+    assert all(p["attempted_by"] != "carol" for p in b_pending), (
+        f"session-b must not see conflicts against session-a; got {b_pending}"
+    )

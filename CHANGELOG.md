@@ -19,6 +19,19 @@ Semantic Versioning.
 
 - (none recorded yet)
 
+## [0.6.0] - 2026-05-02
+
+### Added
+
+- Pending-requests inbox. New `GET /sessions/{session_id}/pending_requests` returns recent conflict-log entries logged against active claims a session currently holds, so an active holder can poll "has anyone been blocked on my scope?" between operations and release voluntarily. coord-mcp exposes this as a `pending_requests` tool whose default form takes no arguments and uses the current process's session id. The CLAUDE.md / AGENTS.md / cursor managed snippets have been updated to recommend polling between operations.
+- Activity-based auto-expiration. Session-tagged claims now carry a `last_activity` timestamp that gets bumped on every coord call from the holder's session (`claim_files`, `check_conflicts`, `list_claims`). The cleanup sweep auto-releases any session-tagged claim that has been silent for longer than `COORD_IDLE_TIMEOUT_SEC` (default 1800 seconds / 30 minutes), catching agents that walked away without releasing. Legacy NULL-session claims keep `last_activity = NULL` and are unaffected -- they continue to use TTL only. Set `COORD_IDLE_TIMEOUT_SEC=0` to disable idle expiration cluster-wide.
+- Conflict log records the requester's `session_id` (`conflict_log.attempted_session_id`), so the holder can distinguish foreign sessions from its own subagents in the pending-requests inbox.
+
+### Changed
+
+- coord-mcp's `list_claims` and `check_conflicts` tools now include `session_id` on every call. The conflict check itself was already session-aware in v0.5; the new wiring lets these calls also act as activity pings on the server side, keeping the holder's claims warm while it's actively reasoning rather than only when it's creating new claims.
+- Schema bumped to v4 via a forwards-only migration adding nullable `claims.last_activity` and `conflict_log.attempted_session_id` columns. Pre-v4 data is preserved with NULLs.
+
 ## [0.5.0] - 2026-05-02
 
 ### Added

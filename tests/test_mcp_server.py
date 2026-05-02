@@ -262,6 +262,7 @@ async def test_check_conflicts_passes_params_as_list_of_tuples_preserving_order(
     monkeypatch.setattr(mcp_server.httpx, "AsyncClient", factory)
 
     files = ["a.py", "b.py", "c.py"]
+    monkeypatch.setattr(mcp_server, "_SESSION_ID", "fixed-test-session")
     await mcp_server.check_conflicts(files=files, engineer="alice")
 
     assert len(captured_params) == 1
@@ -270,12 +271,15 @@ async def test_check_conflicts_passes_params_as_list_of_tuples_preserving_order(
     assert isinstance(params, list)
     # Each entry must be a 2-tuple.
     assert all(isinstance(p, tuple) and len(p) == 2 for p in params)
-    # Order and contents must match: one ("pattern", f) per file, then engineer.
+    # Order: pattern entries first (preserved relative to input order), then
+    # engineer, then session_id. Session_id is appended last as the
+    # activity-ping signal.
     assert params == [
         ("pattern", "a.py"),
         ("pattern", "b.py"),
         ("pattern", "c.py"),
         ("engineer", "alice"),
+        ("session_id", "fixed-test-session"),
     ]
 
 
@@ -651,3 +655,72 @@ def test_resolve_session_id_generates_hex_when_unset(
     sid = mcp_server._resolve_session_id()
     assert len(sid) == 16
     int(sid, 16)  # parses as hex
+
+
+# ---------------------------------------------------------------------------
+# pending_requests + session id propagation (v0.6.0)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pending_requests_tool_uses_current_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.setattr(mcp_server, "_SESSION_ID", "my-session-aaaa")
+    captured = _install_mock_transport(
+        monkeypatch, _json_handler(200, {"pending": [], "count": 0})
+    )
+
+    result = await mcp_server.pending_requests()
+
+    assert result == {"pending": [], "count": 0}
+    assert len(captured) == 1
+    req = captured[0]
+    assert req.method == "GET"
+    assert (
+        str(req.url)
+        == "http://svc:8080/sessions/my-session-aaaa/pending_requests"
+    )
+
+
+@pytest.mark.asyncio
+async def test_check_conflicts_passes_session_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The activity-touch on the server side keys off session_id, so
+    coord-mcp must include it on every check_conflicts call too -- not
+    just on claim_files."""
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.setattr(mcp_server, "_SESSION_ID", "live-session-bbbb")
+    captured = _install_mock_transport(
+        monkeypatch,
+        _json_handler(200, {"has_conflicts": False, "conflicts": [], "safe_to_proceed": True, "safe": True, "suggestion": None}),
+    )
+
+    await mcp_server.check_conflicts(files=["src/x.py"], engineer="alice")
+
+    req = captured[0]
+    assert req.url.params.get("session_id") == "live-session-bbbb"
+
+
+@pytest.mark.asyncio
+async def test_list_claims_passes_session_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Likewise list_claims is an activity signal; the server uses the
+    session_id query param to refresh last_activity for the caller's
+    held claims."""
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.setattr(mcp_server, "_SESSION_ID", "live-session-cccc")
+    captured = _install_mock_transport(
+        monkeypatch, _json_handler(200, {"claims": [], "count": 0})
+    )
+
+    await mcp_server.list_claims()
+
+    req = captured[0]
+    assert req.url.params.get("session_id") == "live-session-cccc"

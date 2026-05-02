@@ -567,6 +567,55 @@ async def test_release_session_endpoint_requires_auth(client: AsyncClient) -> No
 
 
 @pytest.mark.asyncio
+async def test_pending_requests_endpoint_returns_inbox(client: AsyncClient) -> None:
+    """GET /sessions/{id}/pending_requests returns recent conflict-log
+    entries against claims that session holds, so an active holder can
+    poll for 'has anyone been blocked on my scope?'"""
+    h = {"Authorization": "Bearer test-token"}
+
+    r = await client.post(
+        "/claims",
+        headers=h,
+        json={
+            "engineer": "alice",
+            "repo": "amittell/coord",
+            "session_id": "holder-1",
+            "claims": [{"type": "module", "pattern": "server/**"}],
+        },
+    )
+    assert r.status_code == 200, r.text
+
+    # Foreign session attempts overlapping pattern; gets blocked.
+    r = await client.post(
+        "/claims",
+        headers=h,
+        json={
+            "engineer": "bob",
+            "repo": "amittell/coord",
+            "session_id": "requester-1",
+            "claims": [{"type": "module", "pattern": "server/x.js"}],
+        },
+    )
+    assert r.status_code == 409, r.text
+
+    # Holder polls its inbox.
+    r = await client.get("/sessions/holder-1/pending_requests", headers=h)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["count"] >= 1
+    one = body["pending"][0]
+    assert one["attempted_by"] == "bob"
+    assert one["attempted_pattern"] == "server/x.js"
+    assert one["attempted_session_id"] == "requester-1"
+
+
+@pytest.mark.asyncio
+async def test_pending_requests_endpoint_requires_auth(client: AsyncClient) -> None:
+    r = await client.get("/sessions/whatever/pending_requests")
+    assert r.status_code == 401
+
+
+@pytest.mark.asyncio
 async def test_access_log_records_non_2xx_status(
     client: AsyncClient, access_log_records: list[logging.LogRecord]
 ) -> None:

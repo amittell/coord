@@ -20,6 +20,12 @@ class Settings(BaseSettings):
     cleanup_interval_sec: int = 900
     default_ttl_hours: int = 4
     shared_ttl_hours: int = 2
+    # Session-tagged claims auto-release when their holder has been
+    # silent for this many seconds. Catches agents that walked away
+    # without releasing. Legacy NULL-session claims are unaffected;
+    # they continue to use TTL only. Set to 0 to disable idle expiry
+    # cluster-wide.
+    idle_timeout_sec: int = 1800
 
     @property
     def auth_mode(self) -> str:

@@ -7,8 +7,9 @@ This repo uses a shared coordination service to prevent multi-agent / multi-engi
 Use the `coord` MCP tools:
 
 1. `list_claims` then `claim_files` at task start.
-2. If conflicts are returned: stop and ask the user.
-3. `release_claims` when done.
+2. Periodically (between operations, before going idle) call `pending_requests` to see if anyone else has been blocked on your scope. If yes, consider releasing the affected claims so they can proceed.
+3. If `claim_files` returns conflicts: stop and ask the user.
+4. `release_session` when done (releases every claim this MCP session created in one call, regardless of subagent engineer name).
 
 Hard rules: no edits outside claimed scope; no opportunistic refactors; shared config edits only with explicit user approval.
 
@@ -22,8 +23,9 @@ This repo uses a shared coordination service to prevent multi-agent / multi-engi
 Use the `coord` MCP tools:
 
 1. `list_claims` then `claim_files` at task start.
-2. If conflicts are returned: stop and ask the user.
-3. `release_claims` when done.
+2. Periodically (between operations, before going idle) call `pending_requests` to see if anyone else has been blocked on your scope. If yes, consider releasing the affected claims so they can proceed.
+3. If `claim_files` returns conflicts: stop and ask the user.
+4. `release_session` when done (releases every claim this MCP session created in one call, regardless of subagent engineer name).
 
 Hard rules: no edits outside claimed scope; no opportunistic refactors; shared config edits only with explicit user approval.
 """
@@ -38,8 +40,9 @@ This repo uses the `coord` MCP server for multi-agent coordination.
 Before edits:
 1. Use `list_claims` or `check_conflicts`.
 2. Use `claim_files` before changing files.
-3. If conflicts are returned, stop and ask the user.
-4. Use `release_claims` when done.
+3. Between operations call `pending_requests` to see if anyone else has been blocked on your scope; release voluntarily if yes.
+4. If conflicts are returned, stop and ask the user.
+5. Call `release_session` when done.
 """
 
 PRE_PUSH_SCRIPT = """#!/usr/bin/env bash
