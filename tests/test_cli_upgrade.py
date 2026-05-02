@@ -155,6 +155,34 @@ def test_upgrade_preserves_claude_md_content_outside_managed_block(tmp_path: Pat
     assert "Coordination protocol" in after
 
 
+def test_upgrade_migrates_gitignore_markers_to_hash_style(tmp_path: Path) -> None:
+    """Repos initialised by pre-v0.6.1 coord have HTML-comment markers
+    in `.gitignore` (not valid gitignore comment syntax). Running
+    `coord upgrade` must migrate the block to `# coord:begin` /
+    `# coord:end` markers in place, without losing or duplicating the
+    entry."""
+    _seed_initialised_repo(tmp_path, tool="claude")
+    # Overwrite the seeded .gitignore (if any) with the legacy HTML
+    # marker style we want to migrate from.
+    (tmp_path / ".gitignore").write_text(
+        "node_modules/\n\n"
+        "<!-- coord:begin -->\n"
+        ".coordination/local.env\n"
+        "<!-- coord:end -->\n",
+        encoding="utf-8",
+    )
+
+    cli_upgrade.run_upgrade(_make_args(tmp_path))
+
+    text = (tmp_path / ".gitignore").read_text(encoding="utf-8")
+    assert "# coord:begin" in text
+    assert "# coord:end" in text
+    assert "<!-- coord:begin -->" not in text
+    assert "<!-- coord:end -->" not in text
+    assert text.count(".coordination/local.env") == 1
+    assert "node_modules/" in text
+
+
 def test_upgrade_codex_refreshes_codex_config(tmp_path: Path) -> None:
     _seed_initialised_repo(tmp_path, tool="codex")
     cli_upgrade.run_upgrade(_make_args(tmp_path))

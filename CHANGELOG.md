@@ -19,6 +19,12 @@ Semantic Versioning.
 
 - (none recorded yet)
 
+## [0.6.2] - 2026-05-02
+
+### Fixed
+
+- `coord upgrade` now refreshes `.gitignore` too. v0.6.1 fixed the marker style for fresh repos, but the upgrade path didn't touch `.gitignore`, so existing repos couldn't migrate to the new `# coord:` markers without re-running `coord init`. Upgrade now calls `ensure_gitignore_entry` alongside the rest of the asset refresh; the in-place detection accepts either marker style, so the migration is idempotent and never duplicates the entry.
+
 ## [0.6.1] - 2026-05-02
 
 ### Fixed

@@ -28,7 +28,7 @@ from coordination.cli_init import (
     _update_codex_config,
     _update_mcp_json,
 )
-from coordination.cli_shared import ensure_managed_block
+from coordination.cli_shared import ensure_gitignore_entry, ensure_managed_block
 from coordination.repo_config import RepoConfig
 
 
@@ -134,6 +134,14 @@ def run_upgrade(args) -> int:
     _install_hook(repo_root, force=True)
     written.append(".coordination/hooks/pre-push")
     written.append(".git/hooks/pre-push (shim)")
+
+    # Refresh the .gitignore managed block so marker-style and warning
+    # changes from the coord package make their way into existing repos
+    # (pre-v0.6.1 wrote HTML-comment markers in .gitignore, which aren't
+    # valid gitignore syntax). Init populates this; upgrade now also
+    # rewrites it to track package-level changes.
+    ensure_gitignore_entry(repo_root, ".coordination/local.env")
+    written.append(".gitignore (managed block)")
 
     print(f"Upgraded coordination artefacts in {repo_root}")
     print(f"Tool: {config.tool}    Mode: {config.mode}    Service: {config.service_url}")
