@@ -16,3 +16,4 @@ build/
 .coord/
 .remember/
 .DS_Store
+.claude/
