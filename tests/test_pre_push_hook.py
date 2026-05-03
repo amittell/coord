@@ -89,6 +89,23 @@ def test_script_fails_closed_on_curl_error() -> None:
     assert "|| true)\"\n  has=" not in PRE_PUSH_SCRIPT
 
 
+def test_script_refuses_when_stdin_redirected_but_empty() -> None:
+    """v0.7.2: when an outer wrapper hook backgrounds us (or otherwise
+    drops git's pre-push ref-update stream), stdin is redirected (not
+    a TTY) but PUSH_INPUT comes back empty. The pre-v0.7.2 hook
+    silently fell through to a HEAD-vs-origin/HEAD diff in this case,
+    which misses non-HEAD pushes, multi-ref pushes, and new-branch
+    pushes -- exactly the failure mode astrowars's run_child wrapper
+    introduced. Refuse loudly with actionable guidance instead."""
+    # The script must contain the strict refusal message and the
+    # actionable hint about forwarding stdin.
+    assert "stdin was redirected but empty" in PRE_PUSH_SCRIPT
+    assert "Refusing rather than" in PRE_PUSH_SCRIPT
+    # The fallback HEAD-based path is gated behind a TTY check now
+    # (hand-running for tests is fine).
+    assert "[[ -t 0 ]]" in PRE_PUSH_SCRIPT or "[ -t 0 ]" in PRE_PUSH_SCRIPT
+
+
 def test_script_consumes_push_stdin_for_per_ref_diffs() -> None:
     """git push hands the hook ref-update info on stdin, one line per
     ref in the form '<local_ref> <local_sha> <remote_ref> <remote_sha>'.

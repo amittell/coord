@@ -138,8 +138,33 @@ diff_for_ref() {
 }
 
 PUSH_INPUT=""
-if [[ ! -t 0 ]]; then
+STDIN_IS_TTY=0
+if [[ -t 0 ]]; then
+  STDIN_IS_TTY=1
+else
   PUSH_INPUT="$(cat || true)"
+fi
+
+# Redirected-but-empty stdin is the signature of an outer wrapper hook
+# that backgrounded us (e.g. astrowars's run_child function pre-fix) or
+# otherwise dropped git's pre-push ref-update stream. The pre-v0.7.2
+# hook silently fell through to a HEAD-vs-origin/HEAD diff here, which
+# misses non-HEAD pushes, multi-ref pushes, new-branch pushes, and
+# deletions -- so we refuse rather than soft-checking the wrong file
+# set. A TTY stdin means "hand-run for testing"; the fallback below
+# only runs in that case.
+if [[ ${STDIN_IS_TTY} -eq 0 && -z "${PUSH_INPUT//[$'\\t\\r\\n ']/}" ]]; then
+  echo "coordination pre-push: stdin was redirected but empty;" >&2
+  echo "  this normally means an outer wrapper hook backgrounded us or did" >&2
+  echo "  not forward git's ref-update stream. Refusing rather than" >&2
+  echo "  silently checking only HEAD vs ${UPSTREAM}/HEAD (would miss" >&2
+  echo "  non-HEAD, new-branch, multi-ref, and deletion pushes)." >&2
+  echo "  Outer-hook fix: cache stdin once into a tempfile and redirect" >&2
+  echo "  the coord call from it, e.g.:" >&2
+  echo "    PUSH_REFS=\\"\\$(mktemp)\\"" >&2
+  echo "    [ ! -t 0 ] && cat > \\"\\$PUSH_REFS\\"" >&2
+  echo "    bash \\"\\$COORD_HOOK\\" \\"\\$@\\" < \\"\\$PUSH_REFS\\"" >&2
+  exit 1
 fi
 
 MODIFIED=""
@@ -150,8 +175,14 @@ if [[ -n "${PUSH_INPUT//[$'\\t\\r\\n ']/}" ]]; then
     MODIFIED+="${files}"$'\\n'
   done <<< "${PUSH_INPUT}"
 else
-  # No stdin (e.g. running the hook by hand for testing): fall back to
-  # comparing HEAD against origin/HEAD or the empty tree.
+  # Hand-run from a terminal (stdin is a TTY). git push always pipes
+  # ref-updates via stdin, so this branch only triggers when a human is
+  # exercising the hook manually for testing. Best-effort HEAD-based
+  # fallback with a noisy heads-up so the operator knows it's not the
+  # real push code-path.
+  echo "coordination pre-push: hand-run mode (stdin is a TTY); falling back" >&2
+  echo "  to HEAD vs ${UPSTREAM}/HEAD diff. Real pushes use the ref-update" >&2
+  echo "  stream from stdin -- this path is for testing only." >&2
   if git rev-parse "${UPSTREAM}/HEAD" >/dev/null 2>&1; then
     if ! BASE="$(git merge-base HEAD "${UPSTREAM}/HEAD")"; then
       echo "coordination pre-push: could not find merge base for ${BRANCH} and ${UPSTREAM}/HEAD" >&2

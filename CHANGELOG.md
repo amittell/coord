@@ -19,6 +19,26 @@ Semantic Versioning.
 
 - (none recorded yet)
 
+## [0.7.2] - 2026-05-02
+
+### Fixed
+
+- Pre-push hook now refuses loudly when stdin is redirected but empty (an outer wrapper hook backgrounded the coord call or otherwise dropped git's ref-update stream). The pre-v0.7.2 hook silently fell through to a HEAD-vs-origin/HEAD diff in this case, which misses non-HEAD pushes, multi-ref pushes, new-branch pushes, and deletions -- exactly the failure mode that surfaced in astrowars where a project-level `run_child` wrapper was backgrounding coord with `"$@" &`. The hand-run fallback (TTY stdin) is preserved for testing, but now prints a noisy heads-up that it's the test path. The refusal message includes a worked example of the right outer-hook wiring (cache stdin once into a tempfile and redirect the coord child from it).
+
+### Wrapping coord's hook from another pre-push hook
+
+If your repo already has a tracked pre-push hook and you want to chain coord's check into it:
+
+    # near the top, cache git's ref-update stream once
+    PUSH_REFS="$(mktemp)"
+    trap 'rm -f "$PUSH_REFS"' EXIT
+    [ ! -t 0 ] && cat > "$PUSH_REFS"
+
+    # at the call site, redirect stdin from the cache
+    bash "$REPO_ROOT/.coordination/hooks/pre-push" "$@" < "$PUSH_REFS"
+
+The hook reads `<local_ref> <local_sha> <remote_ref> <remote_sha>` lines off stdin to compute a per-ref diff. Without that input it can't tell what's actually being pushed.
+
 ## [0.7.1] - 2026-05-02
 
 ### Fixed
