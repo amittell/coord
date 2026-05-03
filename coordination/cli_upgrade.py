@@ -135,12 +135,14 @@ def run_upgrade(args) -> int:
     written.append(".coordination/hooks/pre-push")
     written.append(".git/hooks/pre-push (shim)")
 
-    # Refresh the .gitignore managed block so marker-style and warning
-    # changes from the coord package make their way into existing repos
-    # (pre-v0.6.1 wrote HTML-comment markers in .gitignore, which aren't
-    # valid gitignore syntax). Init populates this; upgrade now also
-    # rewrites it to track package-level changes.
-    ensure_gitignore_entry(repo_root, ".coordination/local.env")
+    # Refresh the .gitignore managed block so marker-style and entry
+    # changes from the coord package make their way into existing repos.
+    # Pre-v0.6.1 wrote HTML-comment markers (invalid gitignore syntax);
+    # pre-v0.8.1 wrote only the narrow .coordination/local.env rule
+    # which left the rest of the dir vulnerable to `git stash -u`
+    # cycles dropping the hook implementation. The wide rule plus the
+    # in-place marker migration makes the upgrade idempotent.
+    ensure_gitignore_entry(repo_root, "/.coordination/")
     written.append(".gitignore (managed block)")
 
     print(f"Upgraded coordination artefacts in {repo_root}")

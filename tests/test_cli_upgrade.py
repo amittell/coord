@@ -179,7 +179,10 @@ def test_upgrade_migrates_gitignore_markers_to_hash_style(tmp_path: Path) -> Non
     assert "# coord:end" in text
     assert "<!-- coord:begin -->" not in text
     assert "<!-- coord:end -->" not in text
-    assert text.count(".coordination/local.env") == 1
+    # v0.8.1 widened the entry from .coordination/local.env to the
+    # whole directory; the migration rewrites the entry too.
+    assert "/.coordination/" in text
+    assert text.count("/.coordination/") == 1
     assert "node_modules/" in text
 
 

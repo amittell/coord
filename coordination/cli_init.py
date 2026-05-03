@@ -419,7 +419,16 @@ def run_init(args) -> int:
         written.append(".coordination/hooks/pre-push")
         written.append(".git/hooks/pre-push (shim)")
 
-    ensure_gitignore_entry(repo_root, ".coordination/local.env")
+    # Ignore the entire .coordination/ directory rather than just
+    # local.env. Hard-won lesson: `git stash -u` includes untracked
+    # files but skips ignored ones, so a narrow rule left config.toml
+    # / owners.yaml / hooks/ exposed to stash-pop conflicts that
+    # silently dropped them, leaving a partial-install state where
+    # the pre-push shim exec'd a missing target. Widening to the
+    # whole directory makes that failure mode impossible by design;
+    # everything under .coordination/ is per-developer state generated
+    # by `coord init` and should never be committed.
+    ensure_gitignore_entry(repo_root, "/.coordination/")
     written.append(".gitignore (managed block)")
 
     print(f"Initialized coordination for {repo_root}")
