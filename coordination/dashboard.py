@@ -41,6 +41,129 @@ def _parse_iso(value: str | None) -> datetime | None:
         return None
 
 
+def _ago(value: str | None, now: datetime | None = None) -> str:
+    """Render an ISO timestamp as a compact 'Xs/Xm/Xh/Xd ago' string.
+
+    The dashboard is read in a hurry; absolute UTC strings make every
+    reader compute the delta in their head. Relative time + an absolute
+    on hover (via <time title=...>) is the readable default. Returns
+    "?" for unparseable input.
+    """
+    ts = _parse_iso(value)
+    if ts is None:
+        return "?"
+    now = now or datetime.now(UTC)
+    sec = int((now - ts).total_seconds())
+    if sec < 0:
+        return "now"
+    if sec < 60:
+        return f"{sec}s ago"
+    m, s = divmod(sec, 60)
+    if m < 60:
+        return f"{m}m ago"
+    h, m = divmod(m, 60)
+    if h < 24:
+        return f"{h}h ago"
+    d, h = divmod(h, 24)
+    return f"{d}d ago"
+
+
+def _resolution_for_conflict(
+    *,
+    conflict: dict[str, Any],
+    claim: dict[str, Any] | None,
+    idle_timeout_sec: int,
+    now: datetime,
+) -> tuple[str, str]:
+    """Derive a useful resolution status for a conflict at render time.
+
+    The conflict_log.resolution column is reserved for an explicit
+    resolver action that nothing in the codebase currently writes, so
+    in practice it is always NULL and the dashboard column was a dead
+    space. Compute a status from the linked claim's state instead.
+
+    Returns (status_slug, human_label). Status values:
+
+    * ``blocked`` -- holder still has the claim, requester is still
+      stuck. The actionable state.
+    * ``stale`` -- claim's TTL has passed but the cleanup sweep has not
+      run yet, so released_at is still NULL. Effectively resolved; the
+      next sweep will close it. Worth surfacing because it indicates
+      cleanup lag.
+    * ``ttl-expired`` -- claim was closed by the TTL sweep without the
+      holder doing anything.
+    * ``idle-released`` -- claim was closed by activity-based expiration
+      because the holder's session went silent for longer than
+      ``idle_timeout_sec``.
+    * ``released`` -- claim was released voluntarily, well before TTL or
+      idle thresholds. Most often: the holder saw the conflict in
+      ``pending_requests`` and called ``release_session`` / explicit
+      release.
+    * ``missing`` -- conflict references a claim_id we don't have. The
+      claim aged out of the recent-claims window we fetch, or was
+      deleted manually. Surface so an operator notices schema drift.
+    """
+    if claim is None:
+        return ("missing", "claim record not in recent window")
+
+    released = _parse_iso(claim.get("released_at"))
+    expires = _parse_iso(claim.get("expires_at"))
+    last_activity = _parse_iso(claim.get("last_activity"))
+
+    if released is None:
+        if expires is not None and expires <= now:
+            return ("stale", "TTL passed; cleanup sweep pending")
+        return ("blocked", "holder still has the claim")
+
+    # Released. Discriminate why.
+    if expires is not None and released >= expires:
+        return ("ttl-expired", "TTL sweep closed the claim")
+
+    # Idle expiration: released_at is roughly idle_timeout_sec after
+    # last_activity, well before TTL. Allow some slack for the
+    # cleanup-loop interval (the sweep doesn't run continuously).
+    if (
+        idle_timeout_sec
+        and idle_timeout_sec > 0
+        and last_activity is not None
+        and (released - last_activity).total_seconds() >= idle_timeout_sec - 60
+    ):
+        return ("idle-released", f"session idle > {idle_timeout_sec}s")
+
+    return ("released", "holder released the claim")
+
+
+def _bucket(pattern: str | None) -> str:
+    p = (pattern or "").replace("\\", "/").strip("./")
+    if not p:
+        return "(root)"
+    if p.startswith("**"):
+        return "**"
+    return p.split("/")[0]
+
+
+def _heat_bar(count: int, max_count: int, width: int = 20) -> str:
+    """Render a Unicode-block density bar.
+
+    Eight intermediate widths thanks to ``▏▎▍▌▋▊▉█`` give a smoother
+    gradient than the old ``####....`` ASCII bar -- still terminal-safe
+    and copy-paste-friendly, but visually closer to a proper sparkline.
+    """
+    if max_count <= 0:
+        return "·" * width
+    fraction = count / max_count
+    full = int(fraction * width)
+    rem = (fraction * width) - full
+    partial = ""
+    if full < width:
+        partial_chars = "▏▎▍▌▋▊▉"
+        idx = int(rem * len(partial_chars))
+        if idx > 0:
+            partial = partial_chars[idx - 1]
+    bar = "█" * full + partial
+    return bar.ljust(width, "·")
+
+
 def _recent_activity(
     *,
     claims: list[dict[str, Any]],
@@ -75,7 +198,6 @@ def _recent_activity(
         top_modules.append(
             {"prefix": prefix, "count": len(items), "engineers": sorted(eng_set)}
         )
-    # Sort by claim count desc, then prefix asc for stable ordering.
     top_modules.sort(key=lambda m: (-m["count"], m["prefix"]))
 
     return {
@@ -86,112 +208,588 @@ def _recent_activity(
     }
 
 
-def _bucket(pattern: str | None) -> str:
-    p = (pattern or "").replace("\\", "/").strip("./")
-    if not p:
-        return "(root)"
-    if p.startswith("**"):
-        return "**"
-    return p.split("/")[0]
+# ---------------------------------------------------------------------------
+# CSS / HTML scaffolding
+# ---------------------------------------------------------------------------
+#
+# Aesthetic: phosphor terminal × Bloomberg ops console × Edward Tufte.
+# Dense, monospace, sharp edges, color reserved for signal not decoration.
+# Type pairing: Major Mono Display for ALL-CAPS structural headings,
+# JetBrains Mono for everything else. Both are free Google Fonts and
+# distinct from the usual Inter/Space-Grotesk/Roboto defaults.
+
+_CSS = """
+@import url('https://fonts.googleapis.com/css2?family=Major+Mono+Display&family=JetBrains+Mono:wght@300;400;500;700&display=swap');
+
+:root {
+  --bg: #0a0a08;
+  --surface: #15140f;
+  --surface-2: #1c1b15;
+  --hairline: #2a2820;
+  --hairline-bright: #3a382f;
+  --fg: #dcd6c1;
+  --fg-bright: #f4eed8;
+  --muted: #7a7560;
+  --muted-2: #5a5a52;
+  --phosphor: #7fffa1;
+  --amber: #ffba4d;
+  --red: #ff5e5e;
+  --cyan: #6cf0ff;
+  --grid: 8px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 13px;
+  line-height: 1.55;
+  font-feature-settings: 'liga' 0, 'calt' 0;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Subtle film-grain noise overlay -- adds tactile depth without dominating.
+   The data URI is a 200x200 SVG of fractal noise at low opacity. */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1000;
+  opacity: 0.05;
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='200' height='200'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/></filter><rect width='100%25' height='100%25' filter='url(%23n)' opacity='0.6'/></svg>");
+}
+
+main {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: calc(var(--grid) * 4) calc(var(--grid) * 3);
+}
+
+/* ----- Console-line status bar ------------------------------------------ */
+
+.statusbar {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--grid) * 2);
+  padding: calc(var(--grid) * 1.5) calc(var(--grid) * 2);
+  border: 1px solid var(--hairline-bright);
+  background: var(--surface);
+  margin-bottom: calc(var(--grid) * 4);
+  font-size: 12px;
+  color: var(--muted);
+  letter-spacing: 0.04em;
+  animation: panel-in 600ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+
+.statusbar .seg { white-space: nowrap; }
+.statusbar .seg strong { color: var(--fg-bright); font-weight: 500; }
+.statusbar .sep { color: var(--hairline-bright); }
+.statusbar .live::before {
+  content: '●';
+  color: var(--phosphor);
+  margin-right: 6px;
+  animation: pulse 2.4s ease-in-out infinite;
+  text-shadow: 0 0 8px rgba(127, 255, 161, 0.6);
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+/* ----- Title ------------------------------------------------------------ */
+
+.title {
+  font-family: 'Major Mono Display', monospace;
+  font-size: 28px;
+  font-weight: 400;
+  letter-spacing: 0.02em;
+  color: var(--fg-bright);
+  margin: 0 0 calc(var(--grid) * 0.5);
+  text-transform: lowercase;
+}
+
+.subtitle {
+  color: var(--muted);
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  margin: 0 0 calc(var(--grid) * 4);
+  max-width: 680px;
+}
+
+/* ----- Big-number stat blocks ------------------------------------------- */
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1px;
+  background: var(--hairline);
+  border: 1px solid var(--hairline-bright);
+  margin-bottom: calc(var(--grid) * 4);
+}
+
+.stats .block {
+  background: var(--surface);
+  padding: calc(var(--grid) * 2.5) calc(var(--grid) * 2);
+  display: flex;
+  flex-direction: column;
+  gap: calc(var(--grid) * 0.5);
+  animation: panel-in 700ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+.stats .block:nth-child(1) { animation-delay: 60ms; }
+.stats .block:nth-child(2) { animation-delay: 120ms; }
+.stats .block:nth-child(3) { animation-delay: 180ms; }
+.stats .block:nth-child(4) { animation-delay: 240ms; }
+
+.stats .block .label {
+  font-family: 'Major Mono Display', monospace;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  text-transform: lowercase;
+}
+.stats .block .num {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 36px;
+  font-weight: 300;
+  color: var(--fg-bright);
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+.stats .block .num.phosphor { color: var(--phosphor); text-shadow: 0 0 16px rgba(127, 255, 161, 0.25); }
+.stats .block .num.amber { color: var(--amber); }
+.stats .block .num.red { color: var(--red); }
+.stats .block .delta {
+  font-size: 11px;
+  color: var(--muted);
+  letter-spacing: 0.04em;
+}
+
+/* ----- Panels (each section) -------------------------------------------- */
+
+.panel {
+  border: 1px solid var(--hairline-bright);
+  background: var(--surface);
+  margin-bottom: calc(var(--grid) * 4);
+  animation: panel-in 700ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+.panel:nth-of-type(1) { animation-delay: 100ms; }
+.panel:nth-of-type(2) { animation-delay: 160ms; }
+.panel:nth-of-type(3) { animation-delay: 220ms; }
+.panel:nth-of-type(4) { animation-delay: 280ms; }
+.panel:nth-of-type(5) { animation-delay: 340ms; }
+.panel:nth-of-type(6) { animation-delay: 400ms; }
+
+.panel header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: calc(var(--grid) * 1.5) calc(var(--grid) * 2);
+  border-bottom: 1px solid var(--hairline);
+  background: var(--surface-2);
+}
+.panel header h2 {
+  font-family: 'Major Mono Display', monospace;
+  font-size: 13px;
+  font-weight: 400;
+  letter-spacing: 0.1em;
+  color: var(--fg-bright);
+  margin: 0;
+  text-transform: lowercase;
+}
+.panel header h2::before {
+  content: '▌ ';
+  color: var(--phosphor);
+  text-shadow: 0 0 8px rgba(127, 255, 161, 0.4);
+}
+.panel header .meta {
+  font-size: 11px;
+  color: var(--muted);
+  letter-spacing: 0.04em;
+}
+
+@keyframes panel-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* ----- Grid (two-up layout) --------------------------------------------- */
+
+.row {
+  display: grid;
+  gap: calc(var(--grid) * 4);
+  margin-bottom: calc(var(--grid) * 4);
+}
+.row.split-7-5 { grid-template-columns: 7fr 5fr; }
+.row.split-1-1 { grid-template-columns: 1fr 1fr; }
+.row > .panel { margin-bottom: 0; }
+
+@media (max-width: 1100px) {
+  .row.split-7-5, .row.split-1-1 { grid-template-columns: 1fr; }
+  .stats { grid-template-columns: repeat(2, 1fr); }
+}
+
+/* ----- Tables ----------------------------------------------------------- */
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 12px;
+}
+thead th {
+  font-family: 'Major Mono Display', monospace;
+  font-weight: 400;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  color: var(--muted);
+  text-transform: lowercase;
+  text-align: left;
+  padding: calc(var(--grid) * 1.25) calc(var(--grid) * 2);
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--hairline);
+}
+thead th.num-col { text-align: right; }
+
+tbody td {
+  padding: calc(var(--grid) * 1.25) calc(var(--grid) * 2);
+  border-bottom: 1px solid var(--hairline);
+  vertical-align: top;
+  color: var(--fg);
+}
+tbody td.num-col {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--fg-bright);
+}
+tbody td.muted { color: var(--muted); }
+tbody td code {
+  font-family: 'JetBrains Mono', monospace;
+  color: var(--cyan);
+  background: rgba(108, 240, 255, 0.06);
+  padding: 1px 6px;
+  font-size: 11.5px;
+}
+tbody td .heat {
+  color: var(--phosphor);
+  letter-spacing: 0;
+  white-space: pre;
+  font-feature-settings: 'tnum';
+}
+tbody tr:last-child td { border-bottom: 0; }
+tbody tr:hover td { background: rgba(127, 255, 161, 0.04); }
+tbody tr td.empty {
+  color: var(--muted);
+  font-style: normal;
+  text-align: center;
+  padding: calc(var(--grid) * 3);
+}
+
+/* Status pill -- sharp rectangle with accent border, no rounded fills */
+.pill {
+  display: inline-block;
+  padding: 1px 8px;
+  border: 1px solid currentColor;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: lowercase;
+  font-family: 'Major Mono Display', monospace;
+  white-space: nowrap;
+}
+.pill.blocked { color: var(--red); }
+.pill.stale { color: var(--amber); }
+.pill.ttl-expired { color: var(--muted); }
+.pill.idle-released { color: var(--amber); }
+.pill.released { color: var(--phosphor); }
+.pill.missing { color: var(--muted-2); }
+.pill.severity-soft { color: var(--cyan); }
+.pill.severity-hard { color: var(--red); }
+.pill.severity-shared { color: var(--amber); }
+
+/* Pattern code -- give patterns a subtle distinct look from inline code */
+.pattern {
+  font-family: 'JetBrains Mono', monospace;
+  color: var(--fg-bright);
+  font-size: 11.5px;
+}
+
+/* Section footer: tiny relative-time timestamp */
+.panel footer {
+  padding: calc(var(--grid) * 1) calc(var(--grid) * 2);
+  border-top: 1px solid var(--hairline);
+  font-size: 10px;
+  color: var(--muted-2);
+  letter-spacing: 0.06em;
+  display: flex;
+  justify-content: flex-end;
+  gap: calc(var(--grid) * 2);
+}
+
+/* Top-modules inline list (compact alt to a table) */
+.top-modules {
+  display: flex;
+  flex-direction: column;
+  padding: calc(var(--grid) * 1.5) 0;
+}
+.top-modules li {
+  display: grid;
+  grid-template-columns: 4ch 1fr auto;
+  gap: calc(var(--grid) * 2);
+  padding: calc(var(--grid) * 1) calc(var(--grid) * 2);
+  font-size: 12px;
+  list-style: none;
+  border-bottom: 1px solid var(--hairline);
+}
+.top-modules li:last-child { border-bottom: 0; }
+.top-modules .count {
+  color: var(--phosphor);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  font-weight: 500;
+}
+.top-modules .prefix { color: var(--cyan); }
+.top-modules .engineers {
+  color: var(--muted);
+  font-size: 11px;
+  text-align: right;
+}
+
+/* Footer credit line */
+.foot {
+  margin-top: calc(var(--grid) * 6);
+  padding-top: calc(var(--grid) * 2);
+  border-top: 1px solid var(--hairline);
+  font-size: 10px;
+  color: var(--muted-2);
+  letter-spacing: 0.08em;
+  text-transform: lowercase;
+  display: flex;
+  justify-content: space-between;
+}
+"""
+
+
+def _pill(status: str, label: str) -> str:
+    return (
+        f'<span class="pill {html.escape(status)}" title="{html.escape(label)}">'
+        f"{html.escape(status)}</span>"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Page render
+# ---------------------------------------------------------------------------
 
 
 async def render_dashboard() -> str:
     svc = get_service()
+    now = datetime.now(UTC)
+
     rows = await svc.list_claims(active_only=True)
-    # Pull a wider window than what the timeline displays so the 24h activity
-    # panel can summarise busier days without missing rows. The timeline
-    # itself still renders only the most recent slice below.
     conflicts = await svc.db.recent_conflicts(500)
     recent = await svc.db.list_recent_claims(500)
-    activity = _recent_activity(claims=recent, conflicts=conflicts, now=datetime.now(UTC))
+    activity = _recent_activity(claims=recent, conflicts=conflicts, now=now)
     repos = await svc.db.list_repos()
+    idle_timeout_sec = svc.settings.idle_timeout_sec
 
-    rows_html = ""
-    for r in rows:
-        rows_html += (
+    claims_by_id: dict[str, dict[str, Any]] = {
+        str(c["id"]): c for c in recent if c.get("id")
+    }
+
+    # ---- big-number stats ------------------------------------------------
+    open_conflicts = sum(
+        1
+        for c in conflicts
+        if _resolution_for_conflict(
+            conflict=c,
+            claim=claims_by_id.get(str(c.get("claim_id"))),
+            idle_timeout_sec=idle_timeout_sec,
+            now=now,
+        )[0]
+        == "blocked"
+    )
+    stats_html = (
+        f'<div class="block"><span class="label">repos</span>'
+        f'<span class="num phosphor">{len(repos)}</span>'
+        f'<span class="delta">{activity["engineers"]} engineers active 24h</span></div>'
+        f'<div class="block"><span class="label">active claims</span>'
+        f'<span class="num">{len(rows)}</span>'
+        f'<span class="delta">{activity["claims"]} created 24h</span></div>'
+        f'<div class="block"><span class="label">conflicts 24h</span>'
+        f'<span class="num amber">{activity["conflicts"]}</span>'
+        f'<span class="delta">{open_conflicts} still blocked</span></div>'
+        f'<div class="block"><span class="label">idle-timeout</span>'
+        f'<span class="num">{idle_timeout_sec // 60}m</span>'
+        f'<span class="delta">session auto-release</span></div>'
+    )
+
+    # ---- repos table ------------------------------------------------------
+    if repos:
+        repos_html = "".join(
             "<tr>"
-            f"<td>{_esc(r.get('engineer'))}</td>"
-            f"<td><code>{_esc(r.get('pattern'))}</code></td>"
-            f"<td>{_esc(r.get('description'))}</td>"
-            f"<td>{_esc(r.get('expires_at'))}</td>"
-            f"<td><strong>{_remaining(r.get('expires_at'))}</strong></td>"
-            f"<td>{_esc(r.get('severity'))}</td>"
+            f"<td><span class='pattern'>{_esc(r['repo'])}</span></td>"
+            f"<td class='num-col'>{r['active_claims']}</td>"
+            f"<td class='num-col'>{r['claims_24h']}</td>"
+            f"<td class='num-col'>{r['engineers_24h']}</td>"
+            f"<td class='muted'><time datetime='{_esc(r['last_activity'])}' "
+            f"title='{_esc(r['last_activity'])}'>{_esc(_ago(r['last_activity'], now))}</time></td>"
             "</tr>"
+            for r in repos
         )
-    if not rows_html:
-        rows_html = "<tr><td colspan='6'>No active claims</td></tr>"
+    else:
+        repos_html = (
+            "<tr><td class='empty' colspan='5'>"
+            "no repos using this service yet</td></tr>"
+        )
 
+    # ---- top modules (compact list, replaces the second 24h table) ------
+    if activity["top_modules"]:
+        top_modules_html = "".join(
+            f"<li><span class='count'>{m['count']}</span>"
+            f"<span class='prefix'>{_esc(m['prefix'])}</span>"
+            f"<span class='engineers'>{_esc(', '.join(m['engineers']))}</span></li>"
+            for m in activity["top_modules"]
+        )
+    else:
+        top_modules_html = "<li class='empty'>no activity in the last 24h</li>"
+
+    # ---- active claims ---------------------------------------------------
+    if rows:
+        rows_html = ""
+        for r in rows:
+            sev = (r.get("severity") or "soft").lower()
+            sev_html = (
+                f'<span class="pill severity-{html.escape(sev)}">{html.escape(sev)}</span>'
+            )
+            sess = r.get("session_id") or ""
+            sess_short = sess[:8] if sess else ""
+            sess_cell = (
+                f'<td class="muted" title="{_esc(sess)}">{_esc(sess_short)}</td>'
+                if sess_short
+                else "<td class='muted'>—</td>"
+            )
+            rem = _remaining(r.get("expires_at"))
+            rem_class = "muted" if rem == "expired" else ""
+            rows_html += (
+                "<tr>"
+                f"<td>{_esc(r.get('engineer'))}</td>"
+                f"<td>{_esc(r.get('repo')) or '<span class=muted>—</span>'}</td>"
+                f"<td><span class='pattern'>{_esc(r.get('pattern'))}</span></td>"
+                f"<td class='muted'>{_esc(r.get('description'))}</td>"
+                f"<td class='{rem_class}'>{_esc(rem)}</td>"
+                f"<td>{sev_html}</td>"
+                f"{sess_cell}"
+                "</tr>"
+            )
+    else:
+        rows_html = (
+            "<tr><td class='empty' colspan='7'>no active claims</td></tr>"
+        )
+
+    # ---- module heatmap (full unicode block bar) -------------------------
     counts = Counter(_bucket(r.get("pattern")) for r in rows)
     max_c = max(counts.values(), default=1)
-    heat_rows = ""
-    for name, n in sorted(counts.items(), key=lambda x: (-x[1], x[0])):
-        bar_w = max(1, int(12 * n / max_c))
-        bar = "#" * bar_w + "." * (12 - bar_w)
-        heat_rows += (
+    if counts:
+        heat_rows = "".join(
             "<tr>"
-            f"<td><code>{_esc(name)}</code></td>"
-            f"<td>{n}</td>"
-            f"<td><code>{_esc(bar)}</code></td>"
+            f"<td><span class='pattern'>{_esc(name)}</span></td>"
+            f"<td class='num-col'>{n}</td>"
+            f"<td><span class='heat'>{_heat_bar(n, max_c)}</span></td>"
             "</tr>"
+            for name, n in sorted(counts.items(), key=lambda x: (-x[1], x[0]))
         )
-    if not heat_rows:
-        heat_rows = "<tr><td colspan='3'>No active claims</td></tr>"
+    else:
+        heat_rows = (
+            "<tr><td class='empty' colspan='3'>no active claims</td></tr>"
+        )
 
-    conf_html = ""
-    for c in conflicts:
-        conf_html += (
-            "<tr>"
-            f"<td>{_esc(c.get('created_at'))}</td>"
-            f"<td>{_esc(c.get('attempted_by'))}</td>"
-            f"<td><code>{_esc(c.get('attempted_pattern'))}</code></td>"
-            f"<td>{_esc(c.get('resolution'))}</td>"
-            "</tr>"
+    # ---- conflict log with derived resolution ---------------------------
+    if conflicts:
+        conf_html = ""
+        for c in conflicts:
+            claim = claims_by_id.get(str(c.get("claim_id")))
+            status, label = _resolution_for_conflict(
+                conflict=c,
+                claim=claim,
+                idle_timeout_sec=idle_timeout_sec,
+                now=now,
+            )
+            holder_engineer = (claim or {}).get("engineer") or "?"
+            holder_pattern = (claim or {}).get("pattern") or "?"
+            attempted_sess = c.get("attempted_session_id") or ""
+            sess_short = attempted_sess[:8] if attempted_sess else ""
+            conf_html += (
+                "<tr>"
+                f"<td class='muted'><time datetime='{_esc(c.get('created_at'))}' "
+                f"title='{_esc(c.get('created_at'))}'>{_esc(_ago(c.get('created_at'), now))}</time></td>"
+                f"<td>{_esc(c.get('attempted_by'))}</td>"
+                f"<td><span class='pattern'>{_esc(c.get('attempted_pattern'))}</span></td>"
+                f"<td class='muted'>vs {_esc(holder_engineer)}</td>"
+                f"<td><span class='pattern'>{_esc(holder_pattern)}</span></td>"
+                f"<td>{_pill(status, label)}</td>"
+                f"<td class='muted' title='{_esc(attempted_sess)}'>{_esc(sess_short) or '—'}</td>"
+                "</tr>"
+            )
+    else:
+        conf_html = (
+            "<tr><td class='empty' colspan='7'>"
+            "no recent conflict attempts logged</td></tr>"
         )
-    if not conf_html:
-        conf_html = "<tr><td colspan='4'>No recent conflict attempts logged</td></tr>"
 
-    timeline_html = ""
-    for r in recent[:40]:
-        timeline_html += (
-            "<tr>"
-            f"<td>{_esc(r.get('created_at'))}</td>"
-            f"<td>{_esc(r.get('engineer'))}</td>"
-            f"<td><code>{_esc(r.get('pattern'))}</code></td>"
-            f"<td>{_esc(r.get('released_at') or '')}</td>"
-            f"<td>{_esc(r.get('expires_at'))}</td>"
-            "</tr>"
+    # ---- claim timeline --------------------------------------------------
+    if recent:
+        timeline_html = ""
+        for r in recent[:50]:
+            released = r.get("released_at")
+            expires = r.get("expires_at")
+            if released:
+                rel_dt = _parse_iso(released)
+                exp_dt = _parse_iso(expires)
+                last_dt = _parse_iso(r.get("last_activity"))
+                if exp_dt and rel_dt and rel_dt >= exp_dt:
+                    end_status = ("ttl-expired", "TTL")
+                elif (
+                    idle_timeout_sec
+                    and last_dt
+                    and rel_dt
+                    and (rel_dt - last_dt).total_seconds() >= idle_timeout_sec - 60
+                ):
+                    end_status = ("idle-released", "idle")
+                else:
+                    end_status = ("released", "released")
+                end_html = _pill(*end_status)
+            else:
+                end_html = _pill("blocked", "still active") if (
+                    expires
+                    and (exp := _parse_iso(expires))
+                    and exp > now
+                ) else _pill("stale", "TTL passed; cleanup pending")
+            timeline_html += (
+                "<tr>"
+                f"<td class='muted'><time datetime='{_esc(r.get('created_at'))}' "
+                f"title='{_esc(r.get('created_at'))}'>{_esc(_ago(r.get('created_at'), now))}</time></td>"
+                f"<td>{_esc(r.get('engineer'))}</td>"
+                f"<td>{_esc(r.get('repo')) or '<span class=muted>—</span>'}</td>"
+                f"<td><span class='pattern'>{_esc(r.get('pattern'))}</span></td>"
+                f"<td>{end_html}</td>"
+                f"<td class='muted'>{_esc(_ago(r.get('released_at') or r.get('expires_at'), now))}</td>"
+                "</tr>"
+            )
+    else:
+        timeline_html = (
+            "<tr><td class='empty' colspan='6'>no claim history yet</td></tr>"
         )
-    if not timeline_html:
-        timeline_html = "<tr><td colspan='5'>No claim history yet</td></tr>"
 
-    repos_html = ""
-    for r in repos:
-        repos_html += (
-            "<tr>"
-            f"<td><code>{_esc(r['repo'])}</code></td>"
-            f"<td>{r['active_claims']}</td>"
-            f"<td>{r['claims_24h']}</td>"
-            f"<td>{r['engineers_24h']}</td>"
-            f"<td>{_esc(r['last_activity'])}</td>"
-            "</tr>"
-        )
-    if not repos_html:
-        repos_html = "<tr><td colspan='5'>No repos using this service yet</td></tr>"
+    # ---- compose page ----------------------------------------------------
+    from coordination import __version__
 
-    activity_modules_html = ""
-    for m in activity["top_modules"]:
-        engineers_label = ", ".join(_esc(e) for e in m["engineers"]) or ""
-        activity_modules_html += (
-            "<tr>"
-            f"<td><code>{_esc(m['prefix'])}</code></td>"
-            f"<td>{m['count']}</td>"
-            f"<td>{engineers_label}</td>"
-            "</tr>"
-        )
-    if not activity_modules_html:
-        activity_modules_html = (
-            "<tr><td colspan='3'>No activity in the last 24h</td></tr>"
-        )
+    now_label = now.strftime("%Y-%m-%d %H:%M:%SZ")
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -199,53 +797,119 @@ async def render_dashboard() -> str:
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>Coordination Dashboard</title>
-  <style>
-    body {{ font-family: system-ui, sans-serif; margin: 2rem; background: #0b0f14; color: #e6edf3; }}
-    h1 {{ font-size: 1.5rem; }}
-    h2 {{ font-size: 1.1rem; margin-top: 2rem; }}
-    table {{ border-collapse: collapse; width: 100%; margin-top: 1rem; }}
-    th, td {{ border: 1px solid #30363d; padding: 0.5rem 0.6rem; text-align: left; vertical-align: top; }}
-    th {{ background: #161b22; }}
-    code {{ font-size: 0.85rem; }}
-    .muted {{ color: #8b949e; margin-top: 0.5rem; }}
-  </style>
+  <style>{_CSS}</style>
 </head>
 <body>
-  <h1>Coordination Dashboard</h1>
-  <p class="muted">Repositories, recent activity, active claims, path-prefix heatmap, recent conflict log, and claim timeline.</p>
-  <h2>Repositories</h2>
-  <table>
-    <thead><tr><th>Repo</th><th>Active</th><th>Claims (24h)</th><th>Engineers (24h)</th><th>Last activity (UTC)</th></tr></thead>
-    <tbody>{repos_html}</tbody>
-  </table>
-  <h2>Recent activity (last 24h)</h2>
-  <table>
-    <thead><tr><th>Claims created</th><th>Conflicts logged</th><th>Engineers active</th></tr></thead>
-    <tbody><tr><td>{activity["claims"]}</td><td>{activity["conflicts"]}</td><td>{activity["engineers"]}</td></tr></tbody>
-  </table>
-  <table>
-    <thead><tr><th>Top module (last 24h)</th><th>Claims</th><th>Engineers</th></tr></thead>
-    <tbody>{activity_modules_html}</tbody>
-  </table>
-  <h2>Active claims</h2>
-  <table>
-    <thead><tr><th>Engineer</th><th>Pattern</th><th>Description</th><th>Expires (UTC)</th><th>Time left</th><th>Severity</th></tr></thead>
-    <tbody>{rows_html}</tbody>
-  </table>
-  <h2>Module heatmap (by first path segment)</h2>
-  <table>
-    <thead><tr><th>Prefix</th><th>Active claims</th><th>Bar</th></tr></thead>
-    <tbody>{heat_rows}</tbody>
-  </table>
-  <h2>Recent conflicts (log)</h2>
-  <table>
-    <thead><tr><th>When</th><th>Attempted by</th><th>Pattern</th><th>Resolution</th></tr></thead>
-    <tbody>{conf_html}</tbody>
-  </table>
-  <h2>Claim timeline (recent)</h2>
-  <table>
-    <thead><tr><th>Created</th><th>Engineer</th><th>Pattern</th><th>Released</th><th>Expires</th></tr></thead>
-    <tbody>{timeline_html}</tbody>
-  </table>
+  <main>
+    <div class="statusbar">
+      <span class="seg live"><strong>coord</strong>/{_esc(__version__)}</span>
+      <span class="sep">│</span>
+      <span class="seg">{_esc(now_label)}</span>
+      <span class="sep">│</span>
+      <span class="seg">{len(repos)} repos</span>
+      <span class="sep">│</span>
+      <span class="seg">{len(rows)} active claims</span>
+      <span class="sep">│</span>
+      <span class="seg">{open_conflicts} blocked</span>
+    </div>
+
+    <h1 class="title">multi-agent coordination</h1>
+    <p class="subtitle">who is touching what, right now and over the last 24 hours</p>
+
+    <div class="stats">
+      {stats_html}
+    </div>
+
+    <div class="row split-7-5">
+      <section class="panel">
+        <header><h2>repositories</h2><span class="meta">{len(repos)} total</span></header>
+        <table>
+          <thead>
+            <tr>
+              <th>repo</th>
+              <th class="num-col">active</th>
+              <th class="num-col">24h claims</th>
+              <th class="num-col">24h engineers</th>
+              <th>last activity</th>
+            </tr>
+          </thead>
+          <tbody>{repos_html}</tbody>
+        </table>
+      </section>
+
+      <section class="panel">
+        <header><h2>top modules · 24h</h2><span class="meta">by claim count</span></header>
+        <ul class="top-modules">{top_modules_html}</ul>
+      </section>
+    </div>
+
+    <section class="panel">
+      <header><h2>active claims</h2><span class="meta">{len(rows)} held</span></header>
+      <table>
+        <thead>
+          <tr>
+            <th>engineer</th>
+            <th>repo</th>
+            <th>pattern</th>
+            <th>description</th>
+            <th>time left</th>
+            <th>severity</th>
+            <th>session</th>
+          </tr>
+        </thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </section>
+
+    <div class="row split-1-1">
+      <section class="panel">
+        <header><h2>module heatmap</h2><span class="meta">first path segment</span></header>
+        <table>
+          <thead><tr><th>prefix</th><th class="num-col">claims</th><th>density</th></tr></thead>
+          <tbody>{heat_rows}</tbody>
+        </table>
+      </section>
+
+      <section class="panel">
+        <header><h2>recent conflicts</h2><span class="meta">last 500 attempts</span></header>
+        <table>
+          <thead>
+            <tr>
+              <th>when</th>
+              <th>attempted by</th>
+              <th>their pattern</th>
+              <th>holder</th>
+              <th>holder pattern</th>
+              <th>status</th>
+              <th>session</th>
+            </tr>
+          </thead>
+          <tbody>{conf_html}</tbody>
+        </table>
+      </section>
+    </div>
+
+    <section class="panel">
+      <header><h2>claim timeline</h2><span class="meta">most recent 50</span></header>
+      <table>
+        <thead>
+          <tr>
+            <th>created</th>
+            <th>engineer</th>
+            <th>repo</th>
+            <th>pattern</th>
+            <th>state</th>
+            <th>updated</th>
+          </tr>
+        </thead>
+        <tbody>{timeline_html}</tbody>
+      </table>
+    </section>
+
+    <footer class="foot">
+      <span>coord · multi-agent coordination · {_esc(__version__)}</span>
+      <span>rendered {_esc(now_label)}</span>
+    </footer>
+  </main>
 </body>
 </html>"""

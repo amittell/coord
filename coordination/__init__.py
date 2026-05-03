@@ -1,6 +1,6 @@
 """Multi-agent coordination service (HTTP API + MCP + dashboard)."""
 
-__version__ = "0.7.2"
+__version__ = "0.8.0"
 
 
 # Banner shown by `coord --version`. Figlet "slant" style with a tagline

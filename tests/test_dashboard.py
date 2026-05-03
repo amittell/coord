@@ -179,9 +179,11 @@ async def _insert_claim(
 
 async def test_empty_state_renders_placeholder_rows(svc: CoordinationService) -> None:
     html_out = await render_dashboard()
-    assert "No active claims" in html_out
-    assert "No recent conflict attempts logged" in html_out
-    assert "No claim history yet" in html_out
+    # Placeholders are lowercase since the dashboard moved to the
+    # phosphor-terminal aesthetic (all-lowercase typography).
+    assert "no active claims" in html_out.lower()
+    assert "no recent conflict attempts logged" in html_out.lower()
+    assert "no claim history yet" in html_out.lower()
 
 
 async def test_active_claims_appear_in_table(svc: CoordinationService) -> None:
@@ -196,7 +198,8 @@ async def test_active_claims_appear_in_table(svc: CoordinationService) -> None:
     html_out = await render_dashboard()
     assert "alice" in html_out
     assert "src/auth/**" in html_out
-    assert exp in html_out
+    # The table now shows relative time-left ("3h ...") rather than the
+    # absolute expires_at; the absolute is only on the title attribute.
     assert "auth refactor" in html_out
 
 
@@ -218,17 +221,19 @@ async def test_heatmap_shows_prefix_bucket_counts(svc: CoordinationService) -> N
 
     html_out = await render_dashboard()
 
-    # Extract the heatmap table body.
-    start = html_out.index("Module heatmap")
-    end = html_out.index("Recent conflicts")
+    # Extract the heatmap table body. The new dashboard uses lowercase
+    # section headers ("module heatmap" / "recent conflicts").
+    start = html_out.index("module heatmap")
+    end = html_out.index("recent conflicts")
     heat = html_out[start:end]
 
-    assert "<code>src</code>" in heat
-    assert "<code>tests</code>" in heat
-    # The src bucket has three claims, tests has one. The count cell is
-    # rendered as "<td>N</td>" directly after the prefix cell.
-    assert "<code>src</code></td><td>3</td>" in heat
-    assert "<code>tests</code></td><td>1</td>" in heat
+    # Patterns are now wrapped in <span class='pattern'> rather than <code>.
+    assert "src</span>" in heat
+    assert "tests</span>" in heat
+    # The src bucket has three claims, tests has one. The numeric cell
+    # carries class='num-col' for right-alignment.
+    assert ">3<" in heat
+    assert ">1<" in heat
 
 
 async def test_remaining_shows_time_until_expiry(svc: CoordinationService) -> None:
@@ -237,10 +242,9 @@ async def test_remaining_shows_time_until_expiry(svc: CoordinationService) -> No
         svc, engineer="alice", pattern="src/auth/**", expires_at=exp
     )
     html_out = await render_dashboard()
-    # Time-left cell is inside <strong>...</strong>. The value should be
-    # "2h ..." or possibly "1h ..." if the clock drifted during the call.
-    # Accept either to keep this stable against scheduling jitter.
-    assert ("<strong>2h" in html_out) or ("<strong>1h" in html_out)
+    # Time-left cell shows "2h ..." or "1h ..." (clock drift). The new
+    # dashboard renders it as plain text in a <td>, no <strong> wrap.
+    assert ">2h" in html_out or ">1h" in html_out
 
 
 async def test_remaining_shows_expired_for_past_expiry(svc: CoordinationService) -> None:
@@ -255,28 +259,32 @@ async def test_remaining_shows_expired_for_past_expiry(svc: CoordinationService)
         svc, engineer="alice", pattern="src/auth/**", expires_at=past
     )
     html_out = await render_dashboard()
-    # Claim timeline shows the expired claim (no "No claim history yet").
-    assert "No claim history yet" not in html_out
+    assert "no claim history yet" not in html_out.lower()
     assert "alice" in html_out
-    # Active-claims table does not use it: the placeholder stays.
-    assert "No active claims" in html_out
+    assert "no active claims" in html_out.lower()
     # Helper contract: expired mapping.
     assert _remaining(past) == "expired"
 
 
 async def test_recent_conflicts_appear_in_table(svc: CoordinationService) -> None:
+    """The conflict log surfaces the requester's pattern. Resolution is
+    derived from the claim state (covered by the dedicated resolution
+    tests); this test only checks that the conflict row reaches the
+    page at all."""
     cid = await _insert_claim(svc, engineer="alice", pattern="src/auth/**")
     await svc.db.log_conflict(
         claim_id=cid,
         attempted_by="bob",
         attempted_pattern="src/auth/login.ts",
-        resolution="narrow_claim",
+        resolution=None,
     )
     html_out = await render_dashboard()
-    assert "No recent conflict attempts logged" not in html_out
+    assert "no recent conflict attempts logged" not in html_out.lower()
     assert "bob" in html_out
     assert "src/auth/login.ts" in html_out
-    assert "narrow_claim" in html_out
+    # Holder-engineer column was added in v0.8 -- conflict rows now
+    # tell you who was holding the conflicting claim.
+    assert "alice" in html_out
 
 
 async def test_dashboard_returns_html_content_type_expected_shape(
@@ -479,33 +487,42 @@ async def test_dashboard_renders_recent_activity_panel(svc: CoordinationService)
     )
 
     html_out = await render_dashboard()
-    # The new section appears with a recognisable header.
-    assert "Recent activity (last 24h)" in html_out
-    # Two claims, one conflict, two distinct engineers.
-    # Cells live in <td>N</td>; check raw substrings to keep the test
-    # resilient to minor formatting tweaks.
-    activity_section_start = html_out.index("Recent activity (last 24h)")
-    activity_section_end = html_out.index("Active claims")
-    activity = html_out[activity_section_start:activity_section_end]
-    assert "<td>2</td>" in activity  # claims and engineers both = 2
-    assert "<td>1</td>" in activity  # conflicts = 1
-    # Top module is "services" with 2 claims from 2 engineers.
-    assert "<code>services</code>" in activity
-    assert "l7-mitre-thread-agent" in activity
-    assert "l7-host-tokens-agent" in activity
+    # v0.8 moved the headline numbers into a top-of-page stats block
+    # (4 big numbers) and demoted the breakdown to a dedicated "top
+    # modules · 24h" panel. The numbers and the modules are still
+    # there -- the layout just changed.
+    assert "active claims" in html_out  # stats block label
+    assert "conflicts 24h" in html_out
+
+    stats_start = html_out.index('class="stats"')
+    stats_end = html_out.index('class="row split-7-5"')
+    stats = html_out[stats_start:stats_end]
+    # 2 claims created in the window, 2 distinct engineers, 1 conflict.
+    # The delta text reads "<N> engineers active 24h" / "<N> created 24h".
+    assert "2 engineers active 24h" in stats
+    assert "2 created 24h" in stats
+    # Conflict count is the numeric value in the amber cell.
+    assert 'class="num amber">1<' in stats
+
+    # Top-modules panel renders as a <ul class="top-modules">. Slice
+    # from the <ul> tag itself, not the literal class name (which also
+    # appears in the inlined CSS earlier on the page).
+    modules_start = html_out.index('<ul class="top-modules"')
+    modules_end = html_out.index("</ul>", modules_start)
+    modules = html_out[modules_start:modules_end]
+    assert "services" in modules
+    assert "l7-mitre-thread-agent" in modules
+    assert "l7-host-tokens-agent" in modules
 
 
 async def test_dashboard_recent_activity_renders_zero_state(svc: CoordinationService) -> None:
-    """Empty database: panel still renders with zeros (does not disappear)."""
+    """Empty database: stats block + top-modules panel still render
+    with zeros / placeholder (the page does not disappear)."""
     html_out = await render_dashboard()
-    assert "Recent activity (last 24h)" in html_out
-    activity_start = html_out.index("Recent activity (last 24h)")
-    activity_end = html_out.index("Active claims")
-    activity = html_out[activity_start:activity_end]
-    # Every numeric stat reads zero.
-    assert "<td>0</td>" in activity
-    # And there's a clear "no recent activity" message in the modules block.
-    assert "No activity in the last 24h" in activity
+    # Stats block always renders.
+    assert 'class="stats"' in html_out
+    # Top-modules panel has a "no activity" placeholder when empty.
+    assert "no activity in the last 24h" in html_out.lower()
 
 
 async def test_dashboard_renders_repos_panel(svc: CoordinationService) -> None:
@@ -547,9 +564,11 @@ async def test_dashboard_renders_repos_panel(svc: CoordinationService) -> None:
         await conn.commit()
 
     html_out = await render_dashboard()
-    assert "Repositories" in html_out
-    repos_start = html_out.index("Repositories")
-    repos_end = html_out.index("Recent activity (last 24h)")
+    # Lowercase "repositories" header in the new aesthetic.
+    assert "repositories" in html_out.lower()
+    repos_start = html_out.lower().index("repositories")
+    # The next panel is "top modules · 24h"; use that as the slice end.
+    repos_end = html_out.lower().index("top modules", repos_start)
     section = html_out[repos_start:repos_end]
     assert "amittell/bastionx" in section
     assert "amittell/coord" in section
@@ -558,15 +577,16 @@ async def test_dashboard_renders_repos_panel(svc: CoordinationService) -> None:
 async def test_dashboard_repos_panel_zero_state(svc: CoordinationService) -> None:
     """Empty database renders the panel with a placeholder."""
     html_out = await render_dashboard()
-    assert "Repositories" in html_out
-    repos_start = html_out.index("Repositories")
-    repos_end = html_out.index("Recent activity (last 24h)")
+    assert "repositories" in html_out.lower()
+    repos_start = html_out.lower().index("repositories")
+    repos_end = html_out.lower().index("top modules", repos_start)
     section = html_out[repos_start:repos_end]
-    assert "No repos using this service yet" in section
+    assert "no repos using this service yet" in section.lower()
 
 
 async def test_dashboard_recent_activity_excludes_old_claims(svc: CoordinationService) -> None:
-    """Claims older than the window must not appear in the activity panel."""
+    """Claims older than the window must not appear in the stats block
+    or the top-modules panel."""
     now = datetime.now(UTC)
     very_old = _iso(now - timedelta(days=3))
     await _insert_claim_raw(
@@ -578,10 +598,141 @@ async def test_dashboard_recent_activity_excludes_old_claims(svc: CoordinationSe
         released_at=very_old,
     )
     html_out = await render_dashboard()
-    activity_start = html_out.index("Recent activity (last 24h)")
-    activity_end = html_out.index("Active claims")
-    activity = html_out[activity_start:activity_end]
-    # The old engineer must not appear in the recent activity panel
-    # (the timeline section below may still show them).
-    assert "ancient-agent" not in activity
-    assert "<td>0</td>" in activity
+    # Stats block + top-modules region: anything from > 24h ago must
+    # not surface there.
+    stats_start = html_out.index('class="stats"')
+    activity_end = html_out.lower().index("active claims", stats_start)
+    activity_region = html_out[stats_start:activity_end]
+    assert "ancient-agent" not in activity_region
+    # The big claims-24h number must be 0 (rendered as ">0<").
+    assert ">0<" in activity_region
+
+
+# ---------------------------------------------------------------------------
+# Conflict resolution column (v0.8.0)
+# ---------------------------------------------------------------------------
+#
+# The pre-v0.8 dashboard had a "Resolution" column that was always empty
+# because nothing in the codebase ever set conflict_log.resolution to a
+# non-NULL value. v0.8 derives a useful resolution at render time by
+# joining the conflict to its claim and reading the claim's current state
+# (still held / voluntarily released / TTL-expired / idle-released /
+# missing).
+
+
+def test_resolution_blocked_when_claim_still_held() -> None:
+    """If the conflicting claim is still active (released_at IS NULL,
+    expires_at in the future), the conflict has not been resolved --
+    the requester is still blocked."""
+    from coordination.dashboard import _resolution_for_conflict
+
+    now = datetime(2026, 5, 2, 12, 0, tzinfo=UTC)
+    claim = {
+        "released_at": None,
+        "expires_at": "2099-01-01T00:00:00Z",
+        "last_activity": None,
+    }
+    status, _label = _resolution_for_conflict(
+        conflict={}, claim=claim, idle_timeout_sec=1800, now=now
+    )
+    assert status == "blocked"
+
+
+def test_resolution_released_when_voluntarily_released() -> None:
+    """released_at set, well before TTL expiry, no idle reason.
+    Holder responded to the conflict (or `release_session` was called)."""
+    from coordination.dashboard import _resolution_for_conflict
+
+    now = datetime(2026, 5, 2, 12, 0, tzinfo=UTC)
+    claim = {
+        # Released 30s ago, well before TTL.
+        "released_at": "2026-05-02T11:59:30Z",
+        "expires_at": "2026-05-02T16:00:00Z",
+        "last_activity": "2026-05-02T11:59:00Z",
+    }
+    status, _ = _resolution_for_conflict(
+        conflict={}, claim=claim, idle_timeout_sec=1800, now=now
+    )
+    assert status == "released"
+
+
+def test_resolution_ttl_expired_when_release_at_or_after_expires() -> None:
+    """If released_at >= expires_at, the cleanup sweep TTL'd the claim.
+    Different signal than a voluntary release: the holder didn't act."""
+    from coordination.dashboard import _resolution_for_conflict
+
+    now = datetime(2026, 5, 2, 12, 0, tzinfo=UTC)
+    claim = {
+        "released_at": "2026-05-02T10:00:30Z",
+        "expires_at": "2026-05-02T10:00:00Z",  # released_at past TTL
+        "last_activity": "2026-05-02T09:30:00Z",
+    }
+    status, _ = _resolution_for_conflict(
+        conflict={}, claim=claim, idle_timeout_sec=1800, now=now
+    )
+    assert status == "ttl-expired"
+
+
+def test_resolution_idle_released_when_session_idle() -> None:
+    """released_at occurred about idle_timeout_sec after last_activity,
+    well before TTL. Activity-based auto-expiration kicked in -- holder
+    walked away. Worth surfacing distinctly so an operator can see if
+    the timeout is too aggressive."""
+    from coordination.dashboard import _resolution_for_conflict
+
+    now = datetime(2026, 5, 2, 12, 0, tzinfo=UTC)
+    claim = {
+        # last_activity at 10:00; released at 10:30 (= idle_timeout_sec=1800);
+        # expires_at far in the future.
+        "released_at": "2026-05-02T10:30:00Z",
+        "expires_at": "2026-05-02T20:00:00Z",
+        "last_activity": "2026-05-02T10:00:00Z",
+    }
+    status, _ = _resolution_for_conflict(
+        conflict={}, claim=claim, idle_timeout_sec=1800, now=now
+    )
+    assert status == "idle-released"
+
+
+def test_resolution_missing_when_claim_not_in_dict() -> None:
+    """The conflict_log row references a claim id we don't have.
+    Could be schema drift, manual deletion, or a very old conflict
+    whose claim aged out of the recent-claims window. Don't crash;
+    surface the state so the operator sees something is off."""
+    from coordination.dashboard import _resolution_for_conflict
+
+    now = datetime(2026, 5, 2, 12, 0, tzinfo=UTC)
+    status, _ = _resolution_for_conflict(
+        conflict={}, claim=None, idle_timeout_sec=1800, now=now
+    )
+    assert status == "missing"
+
+
+async def test_dashboard_shows_holder_and_resolution_for_conflicts(
+    svc: CoordinationService,
+) -> None:
+    """End-to-end: a conflict where the holder still has the claim
+    surfaces the holder's name, the holder's pattern, and the
+    'blocked' resolution pill. The pre-v0.8 dashboard surfaced none
+    of these -- the resolution column was always empty and the holder
+    side of the conflict was never named."""
+    holder_id = await _insert_claim(
+        svc, engineer="holder-alice", pattern="src/auth/**"
+    )
+    await svc.db.log_conflict(
+        claim_id=holder_id,
+        attempted_by="bob",
+        attempted_pattern="src/auth/login.ts",
+        resolution=None,
+    )
+    html_out = await render_dashboard()
+    # Section header is now lowercase per the new aesthetic.
+    start = html_out.lower().index("recent conflicts")
+    end = html_out.lower().index("claim timeline")
+    conflicts_section = html_out[start:end]
+
+    # Holder's identity must appear -- the missing piece pre-v0.8.
+    assert "holder-alice" in conflicts_section
+    # Computed resolution shows the "blocked" pill since the claim is
+    # still active.
+    assert 'class="pill blocked"' in conflicts_section

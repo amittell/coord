@@ -19,6 +19,26 @@ Semantic Versioning.
 
 - (none recorded yet)
 
+## [0.8.0] - 2026-05-03
+
+### Added
+
+- Dashboard's conflict log now derives a useful resolution status per row instead of leaving the column empty. The `conflict_log.resolution` field has never been populated by anything in the codebase; v0.8 ignores it at render time and computes the status from the linked claim's current state: `blocked` (holder still has it), `released` (voluntary), `ttl-expired` (sweep closed it), `idle-released` (activity-based auto-release fired), `stale` (TTL passed but cleanup hasn't run), or `missing` (claim aged out). Each status has a distinct accent color.
+- Conflict log gains `holder` and `holder pattern` columns so a glance tells you who was holding the claim and on what scope, not just who tried and was blocked.
+- Active claims gain `repo` and `session` columns. The session column shows the first 8 chars of `session_id` with the full id on hover.
+- Claim timeline gains a state pill (same vocabulary as conflict resolution) and a relative-time `updated` column.
+- Top-of-page stats block: 4 big-number cards (repos, active claims, conflicts 24h, idle-timeout) with delta lines. Closes the gap where the headline figures were buried in a low-visibility activity table.
+
+### Changed (visual redesign)
+
+- Dashboard rewritten from scratch in a brutalist phosphor-terminal aesthetic. Type pairing: Major Mono Display for structural ALL-CAPS headings, JetBrains Mono for everything else (both Google Fonts, both deliberately distinct from the Inter/Space-Grotesk defaults). Color reserved for signal: phosphor green for activity, amber for warnings/numbers, red for blocked conflicts. Sharp hairlines instead of borders, no rounded corners except 1px on status pills, subtle SVG noise overlay for tactile depth, staggered panel reveal on load. Section headers anchored with a phosphor `▌` glyph.
+- Module heatmap density bar uses Unicode block characters (`▏▎▍▌▋▊▉█`) instead of `####....` ASCII, giving a smoother gradient at the same width.
+- Timestamps render relative ("2m ago", "0s ago") with the absolute UTC value on hover, so a glance at the page doesn't require subtracting timestamps in your head.
+
+### Changed (snippets in CLAUDE.md / AGENTS.md / cursor)
+
+- The managed coordination snippet now lists the basic three-call workflow (`list_claims` / `claim_files` / `release_claims`) as the unconditional protocol, and mentions `pending_requests` / `release_session` as enhancements to prefer when the local `coord-mcp` exposes them (v0.6.0+). The previous snippet prescribed the v0.6+ tools as the sole protocol, which an agent in astrowars correctly flagged as misleading when its MCP child happened to be running an older coord-mcp build.
+
 ## [0.7.2] - 2026-05-02
 
 ### Fixed
