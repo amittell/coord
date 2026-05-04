@@ -120,23 +120,41 @@ Start with `docs/integrations/claude-code.md` if your team is primarily on Claud
 
 ## Environment Variables
 
+### Server (the API process)
+
 | Variable | Description |
 |----------|-------------|
 | `COORD_DATABASE_PATH` | SQLite path. Default: `./data/coordination.db` |
 | `COORD_AUTH_TOKEN` | Bearer token required by the HTTP API |
 | `COORD_ALLOW_INSECURE_NO_AUTH` | Only for explicit local/demo mode; default `false` |
-| `COORD_REPO_ROOT` | Optional repo path used for accurate overlap checks via `git ls-files` |
-| `COORD_API_URL` | Base URL for the MCP stdio bridge. Default: `http://127.0.0.1:8080` |
 | `COORD_HOST` | Bind host for the API server. Default: `0.0.0.0` |
 | `COORD_PORT` | Bind port for the API server. Default: `8080` |
 | `COORD_LOG_LEVEL` | Uvicorn log level. Default: `info` |
+| `COORD_LOG_JSON` | Set truthy to emit access logs as JSON instead of text. Default: unset |
+| `COORD_REPO_ROOT` | Optional repo path used for accurate overlap checks via `git ls-files` |
+| `COORD_REPO_SCOPE` | Restrict overlap checks (and claim-ratio enforcement) to this subdirectory of `COORD_REPO_ROOT`. Default: unset |
 | `COORD_MAX_CLAIM_FILES` | Max files a single claim may cover. Default: `100` |
-| `COORD_MAX_CLAIM_RATIO` | Max fraction of repo a single claim may cover. Default: `0.2` |
+| `COORD_MAX_CLAIM_RATIO` | Max fraction of repo a single claim may cover (skipped in scope mode). Default: `0.2` |
 | `COORD_CLEANUP_INTERVAL_SEC` | Background expiration sweep interval. Default: `900` |
 | `COORD_DEFAULT_TTL_HOURS` | Default TTL for normal claims. Default: `4` |
 | `COORD_SHARED_TTL_HOURS` | TTL for shared-file claims. Default: `2` |
-| `COORD_DISABLE_BACKGROUND_CLEANUP` | Set to `true`/`1`/`yes` to skip the in-process claim expiration sweep (useful for tests or external schedulers). Default: unset |
+| `COORD_IDLE_TIMEOUT_SEC` | Session-tagged claims auto-release if the holder has been silent for this many seconds (added in v0.6.0). Set to `0` to disable idle expiration cluster-wide. Default: `1800` |
+| `COORD_DISABLE_BACKGROUND_CLEANUP` | Set truthy to skip the in-process claim expiration sweep (useful for tests or external schedulers). Default: unset |
+| `COORD_DISABLE_INSTANCE_LOCK` | Set truthy to bypass the advisory `<db>.lock` flock (useful on NFS-backed shared volumes where flock is unreliable). Default: unset |
+| `COORD_LS_FILES_CACHE_TTL_SEC` | TTL for the in-process `git ls-files` cache used during overlap checks. Default: `10` |
 | `COORD_HOME` | Base directory for `coord start` local state (token file and SQLite). Default: `~/.coord` |
+| `COORD_START_READY_TIMEOUT_SEC` | How long `coord start --background` waits for `/readyz` before giving up. Default: `30` |
+
+### MCP / client (set in `.coordination/local.env` or your shell)
+
+| Variable | Description |
+|----------|-------------|
+| `COORD_API_URL` | Base URL for the MCP stdio bridge and pre-push hook. Default: `http://127.0.0.1:8080` |
+| `COORD_SERVICE_URL` | Legacy alias for `COORD_API_URL`. Pre-push hook accepts both. |
+| `COORD_TOKEN` | Legacy alias for `COORD_AUTH_TOKEN` accepted by the pre-push hook. |
+| `COORD_REPO_ID` | Repo identifier (e.g. `amittell/bastionx`) attached to every claim from this repo (added in v0.3.0). Set automatically by `coord init` from `git remote get-url origin`. |
+| `COORD_SESSION_ID` | Pin a stable session id across coord-mcp restarts (added in v0.5.0). Otherwise coord-mcp generates a fresh 16-char hex id at startup. |
+| `COORD_NO_UPDATE_CHECK` | Set truthy to silence the once-per-24h "update available" stderr line emitted by every `coord` CLI command. Default: unset |
 
 ## Development
 
