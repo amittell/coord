@@ -32,6 +32,16 @@ Risky:
 
 Why this matters: claims from the same `engineer` are intentionally ignored during conflict checks. If you reuse one ID for multiple simultaneous workers, those workers will not block each other.
 
+From v0.5.0 onward, `coord-mcp` also generates a per-process `session_id` and tags every claim with it. The conflict check additionally self-excludes any active claim sharing your session_id, regardless of engineer name. This handles the common case of one Codex/Claude session spawning multiple subagents under different engineer names — they all share the same `session_id` and so don't false-conflict against each other. Different sessions stay adversarial.
+
+## Repo identifiers (v0.3.0+)
+
+`coord-mcp` automatically attaches a `repo` identifier (e.g. `amittell/coord`) to every claim it creates, derived by `coord init` from `git remote get-url origin` and stored as `COORD_REPO_ID` in `.coordination/local.env`. The conflict check is repo-scoped: a claim with `repo=A` only conflicts against other `repo=A` claims, so the same path pattern in two unrelated repos sharing one coord instance won't false-positive.
+
+Pre-v0.3 claims (and any `claim_files` call without a repo) live in a legacy `repo=NULL` bucket that's self-consistent: NULL conflicts with NULL, never with tagged claims.
+
+The `/repos` endpoint and the dashboard's "repositories" panel surface aggregate activity per repo.
+
 ## Claim sizing guidance
 
 Prefer the narrowest claim that still reflects the real work.
@@ -111,6 +121,50 @@ curl -X POST http://127.0.0.1:8080/claims/release \
   -H "Content-Type: application/json" \
   -d '{"claim_ids": ["<claim-id>"], "engineer": "alex/claude/main"}'
 ```
+
+Release every claim from one MCP session in a single call (v0.5.0+):
+
+```bash
+curl -X POST "http://127.0.0.1:8080/sessions/<session-id>/release" \
+  -H "Authorization: Bearer $COORD_AUTH_TOKEN"
+```
+
+Useful at end-of-work — `coord-mcp`'s `release_session` tool wraps this so the agent doesn't have to track every subagent's claim ids.
+
+## Release requests (v0.9.0+)
+
+When `claim_files` returns a `409` and the work is urgent, the requester can file an explicit request asking the holder to release. Filing shortens the holder's claim TTL to `min(remaining, COORD_REQUEST_TTL_SHORT_SEC)` (default 300s) so the claim is forced to a near-term decision.
+
+```bash
+# Requester files
+curl -X POST http://127.0.0.1:8080/requests \
+  -H "Authorization: Bearer $COORD_AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "claim_id": "<active claim id>",
+    "requester": "alex/claude/r2",
+    "reason": "hot fix #1234",
+    "urgency": "high",
+    "wait_seconds": 60
+  }'
+```
+
+By default the call long-polls for up to `wait_seconds` (60s) so a quick decision returns the answer in the same request. Pass `wait_seconds=0` to fire-and-forget; use `GET /requests/<id>` later to check status.
+
+The holder responds:
+
+```bash
+curl -X POST "http://127.0.0.1:8080/requests/<request-id>/respond" \
+  -H "Authorization: Bearer $COORD_AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"decision": "approved", "engineer": "alex/claude/main", "note": "ok"}'
+```
+
+`approved` releases the claim immediately. `denied` restores the claim's original TTL (so the holder isn't punished for the request having shortened it).
+
+The full lifecycle is recorded in an append-only `request_events` audit log queryable at `GET /requests/<id>/events`. Events: `filed`, `notified` (first time per holder session), `responded`, `expired` (shortened TTL fired before respond), `resolved` (claim released for unrelated reasons).
+
+The MCP wrappers (`request_release`, `respond_to_request`, `wait_for_request`, `my_requests`) are usually what an agent uses; the curl recipes above are useful when debugging.
 
 ## Suggested team norms
 

@@ -32,9 +32,13 @@ The API handles:
 
 SQLite stores:
 
-- active and historical claims
-- conflict log entries
+- active and historical claims (with `repo`, `session_id`, `last_activity` columns added in v0.3-v0.6)
+- conflict log entries (with `attempted_session_id` added in v0.6)
+- release requests and their immutable audit-event timeline (v0.9)
 - ownership YAML
+- forwards-only schema migration history in the `schema_version` table
+
+The schema has reached v5 as of coord v0.9.0. Migrations run inside a `BEGIN IMMEDIATE` transaction at process startup so concurrent processes serialise on the write lock instead of racing.
 
 WAL mode is enabled so reads and writes behave better under normal team concurrency.
 
@@ -93,6 +97,27 @@ sequenceDiagram
         API-->>Client: 200 with claim_ids
     end
 ```
+
+### Release requests (v0.9.0+)
+
+A requester whose `claim_files` was blocked can file a first-class request asking the holder to release. Filing shortens the holder's claim TTL and creates a tracked record in the `requests` table:
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending: filed (TTL shortened)
+    pending --> approved: holder responds (claim released)
+    pending --> denied: holder responds (TTL restored)
+    pending --> expired: shortened TTL fires
+    pending --> resolved: claim released for unrelated reason
+    approved --> [*]
+    denied --> [*]
+    expired --> [*]
+    resolved --> [*]
+```
+
+Every transition writes one row to the append-only `request_events` table with actor, session_id, timestamp, and a JSON detail blob. Operators can replay the full lifecycle of any request via `GET /requests/{id}/events`. Event types: `filed`, `notified` (first observation per holder session), `responded`, `expired`, `resolved`, plus `responded-late` when a holder tries to decide after the request has terminalised.
+
+The long-poll on `POST /requests` is implemented as a 1s DB poll loop on the request row. This works regardless of how many replicas you run; the responder's transaction lands in WAL and the poller's next read picks it up.
 
 ## Auth model
 

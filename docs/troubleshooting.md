@@ -88,3 +88,45 @@ Check:
 2. `COORD_AUTH_TOKEN` is set
 3. port `8080` is reachable inside the container
 4. the `/data` volume is writable
+
+## Subagents in one session block each other (v0.5.0+)
+
+Symptom: a parent agent spawns subagents under engineer names like `codex-server-review`, `codex-render-review`, etc. They start blocking each other on overlapping patterns.
+
+Cause: the running `coord-mcp` child is pre-v0.5 and so doesn't tag claims with a `session_id`. Without a session_id, the conflict check only self-excludes by exact engineer name, and distinct subagent names look adversarial to each other.
+
+Fix: restart the parent Claude / Codex / Cursor process so it spawns a fresh `coord-mcp` child against your locally-installed `coord` package (verify with `coord --version` matches what the cluster reports at `/meta`). New claims will carry `session_id`, the conflict check will self-exclude across subagent names, and `pending_requests` / `release_session` / `request_release` start working.
+
+Verify by inspecting an active claim:
+
+```bash
+curl "http://127.0.0.1:8080/claims?active_only=true" -H "Authorization: Bearer $COORD_AUTH_TOKEN" | jq '.claims[].session_id'
+```
+
+A non-null session id means the v0.5+ flow is live.
+
+## Pre-push hook silently skips and a deploy commit goes missing
+
+Symptom: `git push` exits zero but ArgoCD or the remote never sees your commit. Local logs show the pre-push hook ran but didn't actually check anything.
+
+Most common causes (all closed in v0.7.x):
+
+1. `jq` is not installed → pre-v0.7.0 hooks silently skipped. v0.7.0+ refuses with a clear message.
+2. The hook chain delegates to `.coordination/hooks/pre-push` and that file is missing → "partial install" state. v0.7.1+ doctor adds an explicit `.coordination/hooks/pre-push exists` check; fix with `coord upgrade` (or `coord init --force` if `config.toml` is also missing).
+3. An outer wrapper hook backgrounded the coord call (e.g. `"$@" &`), severing stdin → coord can't see git's ref-update stream. v0.7.2+ refuses loudly when stdin is redirected but empty. Wire the outer hook to forward stdin: cache `cat > $TMPFILE` once at the top, then `bash $COORD_HOOK "$@" < $TMPFILE`.
+
+Run `coord doctor` — the v0.7.1+ `.coordination/hooks/pre-push exists` check catches the most common partial-install variant.
+
+## `git stash -u` keeps wiping `.coordination/` files
+
+Symptom: every few hours `.coordination/config.toml`, `owners.yaml`, and `hooks/pre-push` disappear, but `local.env` survives.
+
+Cause (closed in v0.8.1): pre-v0.8.1 the managed `.gitignore` rule was just `.coordination/local.env` — only `local.env` was ignored. The other files were untracked-but-not-ignored, so `git stash -u` (`--include-untracked`) swept them up. A stash conflict / drop / partial-pop then lost them; only `local.env` survived because it was actually ignored.
+
+Fix: run `coord upgrade` to migrate the `.gitignore` block to `/.coordination/` (the wider rule). v0.8.1+ ignores the entire directory; nothing under it is ever stashed.
+
+## Holder won't release a claim and my work is blocked (v0.9.0+)
+
+File a release request with `request_release`. The holder's TTL shortens to ~5 min and they get notified on their next `pending_requests` poll. They can approve (claim released) or deny (TTL restored). If they don't respond, the shortened TTL fires and your `claim_files` retry succeeds.
+
+Use `urgency="blocking"` for incident work; the urgency is recorded for the operator audit even though v0.9.0 doesn't yet vary the TTL window per urgency.

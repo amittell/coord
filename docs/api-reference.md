@@ -108,11 +108,54 @@ Query params:
 
 - one or more `pattern=...`
 - `engineer=<id>`
+- `repo=<id>` (v0.4.0+) — restrict the check to claims with the same `repo` value. Without this, the service-wide pool is checked, which can false-positive across unrelated repos.
+- `session_id=<id>` (v0.6.0+) — additionally self-exclude any active claim sharing this session_id. Lets subagents inside one MCP process not block each other when they pick distinct engineer names. Also acts as an activity ping for the holder's claims (refreshes their `last_activity` so they don't idle-expire).
 
 Example:
 
 ```bash
 curl "http://127.0.0.1:8080/conflicts?engineer=alex/claude/main&pattern=src/auth/login.ts" \
+  -H "Authorization: Bearer $COORD_AUTH_TOKEN"
+```
+
+## `GET /repos` (v0.3.0+)
+
+Per-repo activity summary. One row per distinct repo that has ever attached its identifier to a claim.
+
+Returns:
+
+```json
+{
+  "repos": [
+    {
+      "repo": "amittell/coord",
+      "last_activity": "2026-05-05T01:04:00Z",
+      "claims_24h": 3,
+      "engineers_24h": 2,
+      "active_claims": 1
+    }
+  ],
+  "count": 1
+}
+```
+
+The `repo` value is automatically attached to claims by `coord-mcp` from `COORD_REPO_ID` (set by `coord init` from `git remote get-url origin`).
+
+## `GET /sessions/{session_id}/pending_requests` (v0.6.0+, extended in v0.9.0)
+
+The merged inbox a holder polls. Returns two kinds of rows distinguished by `kind`:
+
+- `kind: "request"` — first-class release requests filed against claims this session holds (v0.9+). The holder's next action is to `respond_to_request` (approve / deny). Pending requests carry `urgency`, `requested_pattern`, `requester_engineer`, `requester_session_id`.
+- `kind: "auto-conflict"` — read-only conflict-log entries logged automatically every time a `claim_files` got 409'd against one of this session's claims (v0.6).
+
+The first time per holder session that a first-class request appears in this feed, a `notified` audit event is recorded against the request so the operator can prove the holder saw it.
+
+## `POST /sessions/{session_id}/release` (v0.5.0+)
+
+Bulk-release every active claim with the given `session_id`. Used by `coord-mcp`'s `release_session` tool at end-of-work — releases claims made by every subagent under that session in one call, regardless of the engineer name they used.
+
+```bash
+curl -X POST "http://127.0.0.1:8080/sessions/sess-deadbeef/release" \
   -H "Authorization: Bearer $COORD_AUTH_TOKEN"
 ```
 
@@ -139,6 +182,73 @@ Extend an active claim owned by an engineer.
 {
   "engineer": "alex/claude/main",
   "ttl_hours": 2
+}
+```
+
+## `POST /requests` (v0.9.0+)
+
+File a release request against an active claim. Filing shortens the holder's claim TTL to `min(remaining, COORD_REQUEST_TTL_SHORT_SEC)` (default 300s) so the claim is forced to a near-term decision: the holder either responds (approve / deny) via `POST /requests/{id}/respond` or the shortened TTL fires and the claim auto-releases.
+
+By default, the server long-polls for the holder's decision: `wait_seconds=60` (override 0–600).
+
+Body:
+
+```json
+{
+  "claim_id": "<active claim id>",
+  "requester": "<engineer name>",
+  "session_id": "<optional MCP session id>",
+  "reason": "hot fix #1234",
+  "urgency": "low | normal | high | blocking",
+  "wait_seconds": 60
+}
+```
+
+Response: the request row, with `decision` either still `pending` (long-poll timed out, requester polls `/requests/{id}` to follow up) or `approved` / `denied` if the holder decided within the wait window.
+
+`404` if the `claim_id` is unknown. `409` if the claim is already released or expired (no need to file; retry the original `claim_files`).
+
+## `POST /requests/{request_id}/respond` (v0.9.0+)
+
+The holder approves or denies an open request. Approve releases the claim immediately. Deny restores the claim's original TTL (so the holder isn't punished for the request having shortened it). Both transitions are audit-logged.
+
+```json
+{
+  "decision": "approved | denied",
+  "engineer": "<holder engineer>",
+  "session_id": "<holder MCP session id>",
+  "note": "ok, releasing"
+}
+```
+
+A late respond (after the request has already terminalised) is recorded as a `responded-late` audit event but does not change state.
+
+## `GET /requests` (v0.9.0+)
+
+List requests, filterable by:
+
+- `requester=<engineer>` (the requester's view, used by `my_requests`)
+- `claim_id=<id>` (every request ever filed against a claim)
+- `decision=pending | approved | denied | expired | resolved`
+
+Each row carries the joined holder context (`holder_engineer`, `holder_pattern`, `holder_repo`).
+
+## `GET /requests/{request_id}` (v0.9.0+)
+
+Return the current state of a single request. Useful for polling `pending` requests to follow a long-poll that timed out.
+
+## `GET /requests/{request_id}/events` (v0.9.0+)
+
+Return the immutable audit timeline for a request, oldest first. Event types: `filed`, `notified`, `responded`, `expired`, `resolved`, `responded-late`. Each event has actor, session_id, timestamp, and a JSON `detail` blob with the per-event-type specifics.
+
+```json
+{
+  "events": [
+    {"event_type": "filed", "actor_engineer": "bob", "detail": "{\"urgency\":\"high\",...}"},
+    {"event_type": "notified", "actor_engineer": "alice", "detail": null},
+    {"event_type": "responded", "actor_engineer": "alice", "detail": "{\"decision\":\"approved\",\"note\":\"ok\"}"}
+  ],
+  "count": 3
 }
 ```
 
