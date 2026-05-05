@@ -154,6 +154,142 @@ async def pending_requests(session_id: str | None = None) -> dict[str, Any]:
 
 
 @mcp.tool()
+async def request_release(
+    claim_id: str,
+    reason: str,
+    urgency: str = "normal",
+    wait_seconds: int = 60,
+) -> dict[str, Any]:
+    """File an explicit release request against another agent's claim.
+
+    Use this when ``claim_files`` returned a 409 conflict and you need
+    the scope urgently. Filing shortens the holder's claim TTL (so they
+    must respond or auto-release within minutes) and surfaces in their
+    next ``pending_requests`` poll where they can approve (claim
+    released) or deny (TTL restored).
+
+    By default this blocks for up to ``wait_seconds`` (60s) waiting
+    for the holder's decision -- one tool call usually returns the
+    answer. Pass ``wait_seconds=0`` to fire-and-forget; later use
+    ``wait_for_request`` to come back and block, or ``my_requests``
+    to poll status.
+
+    The full lifecycle is audit-logged; every state transition (filed,
+    notified, responded, expired, resolved) is recorded against the
+    request id so disputes about "did the holder ever see this?" or
+    "when did they decide?" can be answered after the fact.
+    """
+    body: dict[str, Any] = {
+        "claim_id": claim_id,
+        "requester": os.environ.get("COORD_USER") or "agent",
+        "session_id": _SESSION_ID,
+        "reason": reason,
+        "urgency": urgency,
+        "wait_seconds": wait_seconds,
+    }
+    # Allow callers in pytest / non-default envs to override the
+    # requester via COORD_REQUESTER for tracebility (the env mirrors
+    # how engineer is plumbed into claim_files).
+    explicit = os.environ.get("COORD_REQUESTER", "").strip()
+    if explicit:
+        body["requester"] = explicit
+    async with httpx.AsyncClient(
+        timeout=max(30.0, wait_seconds + 30.0)
+    ) as client:
+        r = await client.post(
+            f"{_base_url()}/requests",
+            json=body,
+            headers={**_headers(), "Content-Type": "application/json"},
+        )
+        if r.status_code in (404, 409):
+            return r.json()
+        r.raise_for_status()
+        return r.json()
+
+
+@mcp.tool()
+async def respond_to_request(
+    request_id: str,
+    decision: str,
+    note: str = "",
+) -> dict[str, Any]:
+    """Approve or deny a release request filed against your claim.
+
+    ``decision`` must be ``"approved"`` (release the claim now) or
+    ``"denied"`` (keep it; the original TTL is restored). The decision
+    and an optional note are audit-logged so the requester can read
+    the reasoning later.
+    """
+    body: dict[str, Any] = {
+        "decision": decision,
+        "session_id": _SESSION_ID,
+        "note": note or None,
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.post(
+            f"{_base_url()}/requests/{request_id}/respond",
+            json=body,
+            headers={**_headers(), "Content-Type": "application/json"},
+        )
+        r.raise_for_status()
+        return r.json()
+
+
+@mcp.tool()
+async def wait_for_request(
+    request_id: str, timeout: int = 60
+) -> dict[str, Any]:
+    """Block until a previously-filed request reaches a terminal
+    state (approved / denied / expired / resolved) or ``timeout``
+    elapses. Useful when an earlier ``request_release`` was fired
+    with ``wait_seconds=0``."""
+    # Server-side wait via re-issuing GET with no client-side polling
+    # complexity -- the API doesn't expose a wait endpoint, so we poll
+    # /requests/{id} ourselves with a sleep loop and bail at deadline.
+    import asyncio as _asyncio
+
+    deadline = _asyncio.get_event_loop().time() + max(0, timeout)
+    poll_interval = 1.0
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        while True:
+            r = await client.get(
+                f"{_base_url()}/requests/{request_id}",
+                headers=_headers(),
+            )
+            if r.status_code == 404:
+                return r.json()
+            r.raise_for_status()
+            row = r.json()
+            if row.get("decision") and row["decision"] != "pending":
+                return row
+            if _asyncio.get_event_loop().time() >= deadline:
+                return row
+            await _asyncio.sleep(poll_interval)
+
+
+@mcp.tool()
+async def my_requests(decision: str = "pending") -> dict[str, Any]:
+    """List requests this engineer has filed, filtered by decision
+    state. Defaults to ``pending`` so the most useful answer ('what
+    am I still waiting on?') is the default. Pass ``decision=""`` to
+    list every request you've ever filed."""
+    requester = os.environ.get("COORD_REQUESTER", "").strip() or os.environ.get(
+        "COORD_USER", ""
+    ).strip() or "agent"
+    params: dict[str, Any] = {"requester": requester}
+    if decision:
+        params["decision"] = decision
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.get(
+            f"{_base_url()}/requests",
+            params=params,
+            headers=_headers(),
+        )
+        r.raise_for_status()
+        return r.json()
+
+
+@mcp.tool()
 async def release_session(session_id: str | None = None) -> dict[str, Any]:
     """Release every active claim that this MCP session created.
 

@@ -529,3 +529,58 @@ async def test_v2_to_v3_preserves_existing_claims_with_null_session(
     )
     assert row is not None
     assert row == ("v2-claim-1", "amittell/coord", None)
+
+
+async def test_v5_introduces_requests_and_request_events_tables(
+    tmp_path: Path,
+) -> None:
+    """v5 adds first-class release-request tracking. The `requests`
+    table holds the current state per request (pending / approved /
+    denied / expired / resolved) and the `request_events` table is an
+    append-only audit log of every transition. Splitting current state
+    from the immutable event stream keeps the operator timeline
+    queryable without modifying request rows after creation."""
+    db_path = tmp_path / "v5.sqlite"
+    db = Database(db_path)
+    await db.init()
+
+    assert await _table_exists(db_path, "requests")
+    assert await _table_exists(db_path, "request_events")
+
+    cols = {r[1] for r in await _fetch_all(db_path, "PRAGMA table_info(requests)")}
+    for required in (
+        "id",
+        "claim_id",
+        "requester_engineer",
+        "requester_session_id",
+        "requested_pattern",
+        "reason",
+        "urgency",
+        "decision",
+        "decided_at",
+        "decided_by_engineer",
+        "decided_by_session_id",
+        "note",
+        "original_expires_at",
+        "shortened_expires_at",
+        "created_at",
+    ):
+        assert required in cols, (
+            f"requests table missing column {required!r}; saw: {cols}"
+        )
+
+    cols = {
+        r[1] for r in await _fetch_all(db_path, "PRAGMA table_info(request_events)")
+    }
+    for required in (
+        "id",
+        "request_id",
+        "event_type",
+        "actor_engineer",
+        "actor_session_id",
+        "detail",
+        "created_at",
+    ):
+        assert required in cols, (
+            f"request_events table missing column {required!r}; saw: {cols}"
+        )

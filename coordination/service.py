@@ -339,12 +339,189 @@ class CoordinationService:
         return rows
 
     async def pending_requests(self, session_id: str) -> list[dict[str, Any]]:
-        """Return the inbox of recent conflict-log entries logged
-        against claims this session currently holds. Active holders
-        poll this between operations to discover whether anyone has
-        been blocked on their scope, so they can voluntarily release.
+        """Return the inbox the holder polls. Merges two streams:
+
+        - First-class release ``requests`` (decision='pending', kind='request').
+          The holder is being explicitly asked to release; their next
+          response moves the state machine. First-time-seen-by-this-session
+          fires a ``notified`` audit event so we have evidence the holder
+          saw it.
+        - Auto-conflict-log entries (kind='auto-conflict'). Recorded every
+          time someone's ``claim_files`` got 409'd against one of this
+          session's claims. Read-only; informational.
+
+        Each row in the returned list carries a ``kind`` discriminator so
+        the agent / dashboard can render them appropriately.
         """
-        return await self.db.pending_requests_for_session(session_id)
+        if not session_id:
+            return []
+        # First-class requests get the audit-event treatment so the
+        # operator can prove "the holder did/didn't see this".
+        open_requests = await self.db.list_open_requests_for_session(session_id)
+        for r in open_requests:
+            await self.db.record_request_notify(
+                r["id"],
+                holder_engineer=r.get("holder_engineer"),
+                holder_session_id=session_id,
+            )
+        request_rows = [{"kind": "request", **r} for r in open_requests]
+
+        # Auto-conflict entries (the v0.6 pre-existing inbox).
+        conflicts = await self.db.pending_requests_for_session(session_id)
+        conflict_rows = [{"kind": "auto-conflict", **c} for c in conflicts]
+        return request_rows + conflict_rows
+
+    # --- v0.9.0 release-request flow ----------------------------------
+
+    async def file_request(
+        self,
+        *,
+        claim_id: str,
+        requester: str,
+        requester_session_id: str | None,
+        reason: str | None,
+        urgency: str,
+    ) -> dict[str, Any]:
+        """Create a release request and shorten the holder's claim TTL.
+
+        Pure DB orchestration: the long-poll wait is the caller's
+        responsibility (so the API handler can use FastAPI's async
+        primitives directly without entangling them with this layer).
+        Returns the request row.
+
+        Raises:
+        - ``KeyError`` if the claim does not exist.
+        - ``ValueError`` if the claim is already released or expired.
+        """
+        from datetime import UTC, datetime, timedelta
+        from uuid import uuid4
+
+        # Lookup current claim state.
+        rows = await self.db.list_active_claims_rows()
+        claim = next((c for c in rows if str(c["id"]) == claim_id), None)
+        if claim is None:
+            # Active list excludes released and TTL-past rows. Disambiguate
+            # missing-vs-already-released for a useful error.
+            recent = await self.db.list_recent_claims(500)
+            for c in recent:
+                if str(c["id"]) == claim_id:
+                    raise ValueError(
+                        f"claim {claim_id} is no longer active "
+                        f"(released_at={c.get('released_at')}, "
+                        f"expires_at={c.get('expires_at')}); "
+                        "no need to file a request, retry your claim"
+                    )
+            raise KeyError(f"unknown claim_id {claim_id!r}")
+
+        original_expires_at = str(claim["expires_at"])
+        now = datetime.now(UTC).replace(microsecond=0)
+        shortened = (
+            now + timedelta(seconds=self.settings.request_ttl_short_sec)
+        ).isoformat().replace("+00:00", "Z")
+
+        # Never extend: if the existing expires_at is sooner than our
+        # shortened deadline, leave the claim alone.
+        try:
+            current_exp = datetime.fromisoformat(
+                original_expires_at.replace("Z", "+00:00")
+            )
+        except ValueError:
+            current_exp = None
+        new_exp = (
+            shortened
+            if current_exp is not None
+            and current_exp > datetime.fromisoformat(
+                shortened.replace("Z", "+00:00")
+            )
+            else original_expires_at
+        )
+
+        return await self.db.create_request(
+            request_id=str(uuid4()),
+            claim_id=claim_id,
+            requester_engineer=requester,
+            requester_session_id=requester_session_id,
+            requested_pattern=str(claim["pattern"]),
+            reason=reason,
+            urgency=urgency,
+            original_expires_at=original_expires_at,
+            shortened_expires_at=shortened,
+            new_claim_expires_at=new_exp,
+        )
+
+    async def respond_to_request(
+        self,
+        *,
+        request_id: str,
+        decision: str,
+        actor_engineer: str | None,
+        actor_session_id: str | None,
+        note: str | None = None,
+    ) -> dict[str, Any] | None:
+        return await self.db.respond_to_request(
+            request_id=request_id,
+            decision=decision,
+            actor_engineer=actor_engineer,
+            actor_session_id=actor_session_id,
+            note=note,
+        )
+
+    async def get_request(self, request_id: str) -> dict[str, Any] | None:
+        return await self.db.get_request(request_id)
+
+    async def list_requests(
+        self,
+        *,
+        requester_engineer: str | None = None,
+        claim_id: str | None = None,
+        decision: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        return await self.db.list_requests(
+            requester_engineer=requester_engineer,
+            claim_id=claim_id,
+            decision=decision,
+            limit=limit,
+        )
+
+    async def list_request_events(
+        self, request_id: str
+    ) -> list[dict[str, Any]]:
+        return await self.db.list_request_events(request_id)
+
+    async def wait_for_decision(
+        self,
+        request_id: str,
+        *,
+        timeout_seconds: int,
+        poll_interval_seconds: float = 1.0,
+    ) -> dict[str, Any] | None:
+        """Block until the request reaches a terminal state or
+        ``timeout_seconds`` elapses, whichever comes first.
+
+        Implemented as a tight DB poll rather than an in-process event
+        because the responder may be on a different replica (or the
+        same process but a different request handler) and we want a
+        single mechanism that works regardless. Poll interval defaults
+        to 1s; with the typical 5-minute request TTL the load is
+        bounded at ~300 selects per waiting agent.
+
+        Returns the request row when it transitions out of 'pending',
+        or the most-recent row if the timeout fired (still 'pending').
+        Returns None if the request_id never existed.
+        """
+        import asyncio
+
+        deadline = asyncio.get_event_loop().time() + max(0, timeout_seconds)
+        while True:
+            row = await self.db.get_request(request_id)
+            if row is None:
+                return None
+            if row.get("decision") and row["decision"] != "pending":
+                return row
+            if asyncio.get_event_loop().time() >= deadline:
+                return row
+            await asyncio.sleep(poll_interval_seconds)
 
     async def release_claims(self, claim_ids: list[str], engineer: str | None) -> int:
         n = await self.db.release_claims(claim_ids, engineer)

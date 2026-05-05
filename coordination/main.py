@@ -19,7 +19,13 @@ from coordination.db import acquire_instance_lock
 from coordination.deps import get_service
 from coordination.logging import ACCESS_LOGGER_NAME, configure_logging, request_id_var
 from coordination.ownership import parse_ownership_yaml
-from coordination.schemas import CreateClaimsRequest, ExtendClaimRequest, ReleaseClaimsRequest
+from coordination.schemas import (
+    CreateClaimsRequest,
+    ExtendClaimRequest,
+    FileRequestRequest,
+    ReleaseClaimsRequest,
+    RespondToRequestRequest,
+)
 
 logger = logging.getLogger(__name__)
 access_logger = logging.getLogger(ACCESS_LOGGER_NAME)
@@ -286,13 +292,120 @@ async def pending_requests(
     session_id: str,
     _: None = Depends(require_auth),
 ) -> dict:
-    """Return recent conflict-log entries logged against active claims
-    this session currently holds. An active holder polls this between
-    operations so they can see who has been blocked on their scope and
-    voluntarily release. Coord-mcp exposes this as a `pending_requests`
-    tool."""
+    """Return the merged inbox the holder polls. Includes first-class
+    release requests (``kind='request'``) and the read-only auto-conflict
+    log (``kind='auto-conflict'``). An active holder polls this between
+    operations so they can approve / deny pending release requests and
+    see who has been blocked on their scope. Coord-mcp exposes this as
+    a `pending_requests` tool."""
     rows = await get_service().pending_requests(session_id)
     return {"pending": rows, "count": len(rows)}
+
+
+@app.post("/requests")
+async def file_request(
+    body: FileRequestRequest,
+    _: None = Depends(require_auth),
+) -> JSONResponse:
+    """File a release request against an active claim. Filing shortens
+    the holder's claim TTL to ``COORD_REQUEST_TTL_SHORT_SEC`` (default
+    300s) and creates an audit-logged ``filed`` event. With
+    ``wait_seconds > 0`` (default 60) the server holds the connection
+    open until the holder responds, the shortened TTL fires, or the
+    timeout elapses -- whichever comes first.
+    """
+    svc = get_service()
+    try:
+        request = await svc.file_request(
+            claim_id=body.claim_id,
+            requester=body.requester,
+            requester_session_id=body.session_id,
+            reason=body.reason,
+            urgency=body.urgency,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    if body.wait_seconds > 0:
+        final = await svc.wait_for_decision(
+            request["id"], timeout_seconds=body.wait_seconds
+        )
+        if final is not None:
+            request = final
+
+    return JSONResponse(status_code=200, content=request)
+
+
+@app.post("/requests/{request_id}/respond")
+async def respond_to_request(
+    request_id: str,
+    body: RespondToRequestRequest,
+    _: None = Depends(require_auth),
+) -> JSONResponse:
+    """The holder approves or denies an open request. Approve releases
+    the claim immediately; deny restores the claim's original TTL. Both
+    transitions are audit-logged."""
+    if body.decision not in ("approved", "denied"):
+        raise HTTPException(
+            status_code=400,
+            detail="decision must be 'approved' or 'denied'",
+        )
+    try:
+        result = await get_service().respond_to_request(
+            request_id=request_id,
+            decision=body.decision,
+            actor_engineer=body.engineer,
+            actor_session_id=body.session_id,
+            note=body.note,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="request not found")
+    return JSONResponse(status_code=200, content=result)
+
+
+@app.get("/requests")
+async def list_requests(
+    requester: str | None = None,
+    claim_id: str | None = None,
+    decision: str | None = None,
+    _: None = Depends(require_auth),
+) -> dict:
+    """List requests filtered by requester, claim, or decision state.
+    Used by both the requester (``my_requests``) and the operator
+    dashboard."""
+    rows = await get_service().list_requests(
+        requester_engineer=requester,
+        claim_id=claim_id,
+        decision=decision,
+    )
+    return {"requests": rows, "count": len(rows)}
+
+
+@app.get("/requests/{request_id}")
+async def get_request(
+    request_id: str,
+    _: None = Depends(require_auth),
+) -> JSONResponse:
+    row = await get_service().get_request(request_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="request not found")
+    return JSONResponse(status_code=200, content=row)
+
+
+@app.get("/requests/{request_id}/events")
+async def get_request_events(
+    request_id: str,
+    _: None = Depends(require_auth),
+) -> dict:
+    """Return the immutable audit-event timeline for a request,
+    oldest first. Each row carries the actor, timestamp, and a JSON
+    detail blob with the per-event-type specifics."""
+    rows = await get_service().list_request_events(request_id)
+    return {"events": rows, "count": len(rows)}
 
 
 @app.delete("/claims/{claim_id}")

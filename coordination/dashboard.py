@@ -511,6 +511,13 @@ tbody tr td.empty {
 .pill.severity-soft { color: var(--cyan); }
 .pill.severity-hard { color: var(--red); }
 .pill.severity-shared { color: var(--amber); }
+.pill.pending { color: var(--amber); }
+.pill.approved { color: var(--phosphor); }
+.pill.denied { color: var(--red); }
+.pill.urgency-low { color: var(--muted-2); }
+.pill.urgency-normal { color: var(--cyan); }
+.pill.urgency-high { color: var(--amber); }
+.pill.urgency-blocking { color: var(--red); }
 
 /* Pattern code -- give patterns a subtle distinct look from inline code */
 .pattern {
@@ -597,6 +604,7 @@ async def render_dashboard() -> str:
     activity = _recent_activity(claims=recent, conflicts=conflicts, now=now)
     repos = await svc.db.list_repos()
     idle_timeout_sec = svc.settings.idle_timeout_sec
+    requests = await svc.list_requests(limit=200)
 
     claims_by_id: dict[str, dict[str, Any]] = {
         str(c["id"]): c for c in recent if c.get("id")
@@ -741,6 +749,52 @@ async def render_dashboard() -> str:
             "<tr><td class='empty' colspan='7'>"
             "no recent conflict attempts logged</td></tr>"
         )
+
+    # ---- release requests (v0.9.0) --------------------------------------
+    # Surface filed release-requests with their decision pill and the
+    # time-to-decision latency. Dashboard is read-only: the underlying
+    # state machine lives in /requests/{id}/respond and the audit
+    # timeline at /requests/{id}/events.
+    if requests:
+        req_html = ""
+        pending_count = 0
+        for r in requests:
+            decision = str(r.get("decision") or "pending")
+            urgency = str(r.get("urgency") or "normal")
+            decided_at = _parse_iso(r.get("decided_at"))
+            created_at = _parse_iso(r.get("created_at"))
+            if decision == "pending":
+                pending_count += 1
+                latency_label = "—"
+            elif created_at and decided_at:
+                secs = int((decided_at - created_at).total_seconds())
+                if secs < 60:
+                    latency_label = f"{secs}s"
+                elif secs < 3600:
+                    latency_label = f"{secs // 60}m {secs % 60}s"
+                else:
+                    latency_label = f"{secs // 3600}h {(secs % 3600) // 60}m"
+            else:
+                latency_label = "—"
+            req_html += (
+                "<tr>"
+                f"<td class='muted'><time datetime='{_esc(r.get('created_at'))}' "
+                f"title='{_esc(r.get('created_at'))}'>{_esc(_ago(r.get('created_at'), now))}</time></td>"
+                f"<td>{_esc(r.get('requester_engineer'))}</td>"
+                f"<td><span class='pattern'>{_esc(r.get('requested_pattern'))}</span></td>"
+                f"<td class='muted'>vs {_esc(r.get('holder_engineer') or '?')}</td>"
+                f'<td><span class="pill urgency-{html.escape(urgency)}">{html.escape(urgency)}</span></td>'
+                f"<td>{_pill(decision, decision)}</td>"
+                f"<td class='muted'>{html.escape(latency_label)}</td>"
+                "</tr>"
+            )
+        requests_meta = f"{len(requests)} total · {pending_count} pending"
+    else:
+        req_html = (
+            "<tr><td class='empty' colspan='7'>"
+            "no release requests filed yet</td></tr>"
+        )
+        requests_meta = "0 total"
 
     # ---- claim timeline --------------------------------------------------
     if recent:
@@ -888,6 +942,24 @@ async def render_dashboard() -> str:
         </table>
       </section>
     </div>
+
+    <section class="panel">
+      <header><h2>release requests</h2><span class="meta">{requests_meta}</span></header>
+      <table>
+        <thead>
+          <tr>
+            <th>when</th>
+            <th>requester</th>
+            <th>their pattern</th>
+            <th>holder</th>
+            <th>urgency</th>
+            <th>decision</th>
+            <th>latency</th>
+          </tr>
+        </thead>
+        <tbody>{req_html}</tbody>
+      </table>
+    </section>
 
     <section class="panel">
       <header><h2>claim timeline</h2><span class="meta">most recent 50</span></header>

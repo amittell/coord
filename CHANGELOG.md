@@ -19,6 +19,22 @@ Semantic Versioning.
 
 - (none recorded yet)
 
+## [0.9.0] - 2026-05-05
+
+### Added
+
+- **Release-request system.** A requester whose `claim_files` was blocked by an active claim can file an explicit release request. Filing shortens the holder's claim TTL to `min(remaining, COORD_REQUEST_TTL_SHORT_SEC)` (default 300s), surfaces in the holder's next `pending_requests` poll, and the holder responds with `respond_to_request` (decision: `approved` releases the claim now; `denied` restores the original TTL). If the shortened TTL fires before the holder responds, the request transitions to `expired` and the requester is unblocked. Releases for unrelated reasons (`release_session`, voluntary release, idle expiration) cascade open requests to `resolved`.
+- **Immutable audit log.** Every state transition is appended to `request_events` with actor, session_id, timestamp, and a JSON detail blob: `filed`, `notified` (first time per holder session), `responded`, `expired`, `resolved`, plus `responded-late` when a holder tries to decide after the request has already terminalised. Operators can replay the full lifecycle of any request via `GET /requests/{id}/events`.
+- **MCP tools:** `request_release(claim_id, reason, urgency, wait_seconds=60)` (long-polls the decision by default), `respond_to_request(request_id, decision, note)`, `wait_for_request(request_id, timeout)` (block on a previously fire-and-forget request), `my_requests(decision='pending')`. Existing `pending_requests` now returns first-class requests merged with the read-only auto-conflict-log entries, distinguished by a `kind` discriminator.
+- **HTTP endpoints:** `POST /requests`, `POST /requests/{id}/respond`, `GET /requests` (filterable by requester / claim_id / decision), `GET /requests/{id}`, `GET /requests/{id}/events`.
+- **Dashboard panel.** New "release requests" panel between recent conflicts and claim timeline. Columns: when, requester, holder, urgency pill, decision pill, time-to-decision latency. Same v0.8 phosphor aesthetic; pills use phosphor green for `approved`, red for `denied`/`urgency-blocking`, amber for `pending`/`urgency-high`, muted for `urgency-low`.
+- **Schema migration v5** adds the `requests` table (current state per request) and `request_events` table (append-only audit log). Forwards-only; pre-v5 databases migrate cleanly with no row-level data changes.
+- **Settings:** `COORD_REQUEST_TTL_SHORT_SEC` (default 300) controls the shortened-TTL window applied when a request is filed.
+
+### Changed
+
+- The managed CLAUDE.md / AGENTS.md / cursor coordination snippets now mention `request_release` and the v0.9+ flow as a graceful enhancement on top of the v0.6+ tools, with the unconditional three-call workflow (`list_claims` / `claim_files` / `release_claims`) still treated as the baseline.
+
 ## [0.8.1] - 2026-05-03
 
 ### Fixed

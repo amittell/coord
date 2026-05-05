@@ -736,3 +736,54 @@ async def test_dashboard_shows_holder_and_resolution_for_conflicts(
     # Computed resolution shows the "blocked" pill since the claim is
     # still active.
     assert 'class="pill blocked"' in conflicts_section
+
+
+# ---------------------------------------------------------------------------
+# Release requests panel (v0.9.0)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dashboard_renders_release_requests_panel(
+    svc: CoordinationService,
+) -> None:
+    """v0.9 added a 'release requests' panel below the conflict log
+    that surfaces every filed request with its decision pill and
+    time-to-decision latency."""
+    cid = await _insert_claim(svc, engineer="holder-alice", pattern="src/auth/**")
+    request = await svc.file_request(
+        claim_id=cid,
+        requester="bob",
+        requester_session_id=None,
+        reason="hot fix",
+        urgency="high",
+    )
+    # Approve the request so the panel has a non-pending row to render.
+    await svc.respond_to_request(
+        request_id=request["id"],
+        decision="approved",
+        actor_engineer="holder-alice",
+        actor_session_id=None,
+    )
+
+    html_out = await render_dashboard()
+    # Panel header is present.
+    assert "release requests" in html_out.lower()
+    # Slice the panel content.
+    start = html_out.lower().index("release requests")
+    end = html_out.lower().index("claim timeline")
+    panel = html_out[start:end]
+    # Both parties appear, and the approved decision pill is rendered.
+    assert "bob" in panel
+    assert "holder-alice" in panel
+    assert 'class="pill approved"' in panel
+    # Urgency pill is also rendered.
+    assert 'class="pill urgency-high"' in panel
+
+
+@pytest.mark.asyncio
+async def test_dashboard_release_requests_panel_zero_state(
+    svc: CoordinationService,
+) -> None:
+    html_out = await render_dashboard()
+    assert "no release requests filed yet" in html_out.lower()

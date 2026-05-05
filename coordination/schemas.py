@@ -72,3 +72,37 @@ class ReleaseClaimsRequest(BaseModel):
 class ExtendClaimRequest(BaseModel):
     engineer: str
     ttl_hours: int = 2
+
+
+class FileRequestRequest(BaseModel):
+    """A requester asking the holder of an active claim to release it."""
+
+    claim_id: str
+    requester: str
+    session_id: str | None = None
+    reason: str | None = None
+    urgency: str = Field(
+        default="normal",
+        description="low | normal | high | blocking. Recorded for the audit trail; v0.9.0 doesn't yet vary the shortened-TTL window per urgency.",
+    )
+    wait_seconds: int = Field(
+        default=60,
+        ge=0,
+        le=600,
+        description=(
+            "How long the server should hold this connection open waiting "
+            "for the holder's decision. 0 = fire-and-forget (returns "
+            "immediately with decision='pending'). The default 60s "
+            "matches a typical holder poll cycle; longer values are fine "
+            "but cap at 600s to bound HTTP-worker hold time."
+        ),
+    )
+
+
+class RespondToRequestRequest(BaseModel):
+    """The holder's decision on an open request."""
+
+    decision: str = Field(..., description="approved | denied")
+    engineer: str | None = None
+    session_id: str | None = None
+    note: str | None = None

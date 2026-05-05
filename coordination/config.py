@@ -26,6 +26,11 @@ class Settings(BaseSettings):
     # they continue to use TTL only. Set to 0 to disable idle expiry
     # cluster-wide.
     idle_timeout_sec: int = 1800
+    # Filing a release request shortens the holder's claim TTL to
+    # min(remaining, this value). Forces a near-term decision: the
+    # holder either responds (approve/deny) or the shortened TTL
+    # fires and the claim auto-releases, freeing the requester.
+    request_ttl_short_sec: int = 300
 
     @property
     def auth_mode(self) -> str:

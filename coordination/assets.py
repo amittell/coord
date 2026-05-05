@@ -10,9 +10,10 @@ Multi-agent file coordination via the `coord` MCP server. Required calls (every 
 
 If `claim_files` returns conflicts, stop and ask the user. No edits outside claimed scope; no opportunistic refactors; shared config edits only with explicit user approval.
 
-If your `coord` MCP exposes them (v0.6.0+), additionally prefer:
-- `pending_requests` between operations — see who is blocked on your scope and release voluntarily.
-- `release_session` instead of `release_claims` at end-of-work — releases every claim from this MCP session in one call, including those made by subagents under different engineer names.
+If your `coord` MCP exposes them, additionally prefer:
+- `pending_requests` (v0.6+) between operations — see who is blocked on your scope; if a holder, approve or deny pending release requests via `respond_to_request`.
+- `release_session` (v0.6+) instead of `release_claims` at end-of-work — releases every claim from this MCP session in one call, including those made by subagents under different engineer names.
+- `request_release` (v0.9+) when `claim_files` 409'd and your work is urgent — files an explicit ask against the holder's claim. The holder's TTL shortens, they get notified on their next `pending_requests` poll, and approve or deny lands back in your `my_requests` view.
 
 **Sub-agents (Task tool):** include this protocol in the sub-agent task text; sub-agents do not inherit `CLAUDE.md`.
 """
@@ -27,9 +28,10 @@ Multi-agent file coordination via the `coord` MCP server. Required calls (every 
 
 If `claim_files` returns conflicts, stop and ask the user. No edits outside claimed scope; no opportunistic refactors; shared config edits only with explicit user approval.
 
-If your `coord` MCP exposes them (v0.6.0+), additionally prefer:
-- `pending_requests` between operations — see who is blocked on your scope and release voluntarily.
-- `release_session` instead of `release_claims` at end-of-work — releases every claim from this MCP session in one call, including those made by subagents under different engineer names.
+If your `coord` MCP exposes them, additionally prefer:
+- `pending_requests` (v0.6+) between operations — see who is blocked on your scope; if a holder, approve or deny pending release requests via `respond_to_request`.
+- `release_session` (v0.6+) instead of `release_claims` at end-of-work — releases every claim from this MCP session in one call, including those made by subagents under different engineer names.
+- `request_release` (v0.9+) when `claim_files` 409'd and your work is urgent — files an explicit ask against the holder's claim. The holder's TTL shortens, they get notified on their next `pending_requests` poll, and approve or deny lands back in your `my_requests` view.
 """
 
 CURSOR_RULE = """---
@@ -45,7 +47,7 @@ Multi-agent file coordination via the `coord` MCP server. Required calls (every 
 
 If `claim_files` returns conflicts, stop and ask the user.
 
-If your `coord` MCP exposes them (v0.6.0+), prefer `pending_requests` between operations and `release_session` at end-of-work over `release_claims`.
+If your `coord` MCP exposes them, prefer `pending_requests` between operations and `release_session` at end-of-work over `release_claims` (v0.6+). When work is urgent and a `claim_files` was blocked, file `request_release` against the holder's claim and check `my_requests` for the decision (v0.9+).
 """
 
 PRE_PUSH_SCRIPT = """#!/usr/bin/env bash

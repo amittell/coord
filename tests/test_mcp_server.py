@@ -658,6 +658,100 @@ def test_resolve_session_id_generates_hex_when_unset(
 
 
 # ---------------------------------------------------------------------------
+# Release-request tools (v0.9.0)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_request_release_posts_with_session_and_returns_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.setenv("COORD_REQUESTER", "bob")
+    monkeypatch.setattr(mcp_server, "_SESSION_ID", "requester-session-aaa")
+    captured = _install_mock_transport(
+        monkeypatch,
+        _json_handler(
+            200,
+            {
+                "id": "req-1",
+                "decision": "pending",
+                "claim_id": "c-1",
+                "urgency": "high",
+            },
+        ),
+    )
+
+    result = await mcp_server.request_release(
+        claim_id="c-1",
+        reason="hot fix",
+        urgency="high",
+        wait_seconds=0,
+    )
+
+    assert result["id"] == "req-1"
+    assert result["decision"] == "pending"
+    req = captured[0]
+    assert req.method == "POST"
+    assert str(req.url) == "http://svc:8080/requests"
+    import json as _json
+
+    body = _json.loads(req.content.decode("utf-8"))
+    assert body["claim_id"] == "c-1"
+    assert body["session_id"] == "requester-session-aaa"
+    assert body["requester"] == "bob"
+    assert body["wait_seconds"] == 0
+
+
+@pytest.mark.asyncio
+async def test_respond_to_request_posts_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.setattr(mcp_server, "_SESSION_ID", "holder-session-bbb")
+    captured = _install_mock_transport(
+        monkeypatch,
+        _json_handler(200, {"id": "req-1", "decision": "approved"}),
+    )
+
+    result = await mcp_server.respond_to_request(
+        request_id="req-1",
+        decision="approved",
+        note="ok",
+    )
+
+    assert result["decision"] == "approved"
+    req = captured[0]
+    assert req.method == "POST"
+    assert str(req.url) == "http://svc:8080/requests/req-1/respond"
+    import json as _json
+
+    body = _json.loads(req.content.decode("utf-8"))
+    assert body["decision"] == "approved"
+    assert body["session_id"] == "holder-session-bbb"
+
+
+@pytest.mark.asyncio
+async def test_my_requests_filters_by_requester_and_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.setenv("COORD_REQUESTER", "alice")
+    captured = _install_mock_transport(
+        monkeypatch, _json_handler(200, {"requests": [], "count": 0})
+    )
+
+    await mcp_server.my_requests()
+
+    req = captured[0]
+    assert req.url.params.get("requester") == "alice"
+    assert req.url.params.get("decision") == "pending"
+
+
+# ---------------------------------------------------------------------------
 # pending_requests + session id propagation (v0.6.0)
 # ---------------------------------------------------------------------------
 

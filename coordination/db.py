@@ -140,7 +140,7 @@ CREATE INDEX IF NOT EXISTS idx_claims_engineer ON claims (engineer);
 """
 
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 
 # Migration registry: list of (version, upgrade_sql) tuples applied in order.
 # Entry for version N is the SQL that upgrades a DB from version N-1 to N.
@@ -165,6 +165,53 @@ MIGRATIONS: list[tuple[int, str]] = [
         4,
         "ALTER TABLE claims ADD COLUMN last_activity TEXT;\n"
         "ALTER TABLE conflict_log ADD COLUMN attempted_session_id TEXT;",
+    ),
+    # v5: first-class release-request tracking. `requests` holds the
+    # current state per request (pending / approved / denied / expired /
+    # resolved) and `request_events` is an append-only audit log -- one
+    # row per state transition with actor, timestamp, and a JSON detail
+    # blob. Splitting current state from the immutable event stream
+    # keeps the operator timeline queryable without modifying request
+    # rows after creation, and gives requesters / holders / operators
+    # a single shared source of truth for "what happened to this ask?".
+    (
+        5,
+        """
+        CREATE TABLE requests (
+            id TEXT PRIMARY KEY,
+            claim_id TEXT NOT NULL,
+            requester_engineer TEXT NOT NULL,
+            requester_session_id TEXT,
+            requested_pattern TEXT NOT NULL,
+            reason TEXT,
+            urgency TEXT NOT NULL DEFAULT 'normal',
+            decision TEXT NOT NULL DEFAULT 'pending',
+            decided_at TEXT,
+            decided_by_engineer TEXT,
+            decided_by_session_id TEXT,
+            note TEXT,
+            original_expires_at TEXT NOT NULL,
+            shortened_expires_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (claim_id) REFERENCES claims(id)
+        );
+        CREATE INDEX idx_requests_claim ON requests (claim_id);
+        CREATE INDEX idx_requests_decision ON requests (decision);
+        CREATE INDEX idx_requests_requester ON requests (requester_engineer);
+
+        CREATE TABLE request_events (
+            id TEXT PRIMARY KEY,
+            request_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            actor_engineer TEXT,
+            actor_session_id TEXT,
+            detail TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (request_id) REFERENCES requests(id)
+        );
+        CREATE INDEX idx_request_events_request ON request_events (request_id);
+        CREATE INDEX idx_request_events_created ON request_events (created_at);
+        """,
     ),
 ]
 
@@ -533,6 +580,16 @@ class Database:
             return 0
         now = _utcnow()
         await self.init()
+        # Capture which claims will close so we can cascade-resolve
+        # their open requests after the bulk update.
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                "SELECT id FROM claims WHERE session_id = ? AND released_at IS NULL",
+                (session_id,),
+            )
+            to_close = [str(r["id"]) for r in await cur.fetchall()]
         async with aiosqlite.connect(self.path) as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
@@ -544,11 +601,17 @@ class Database:
                 (now, session_id),
             )
             await conn.commit()
-            return cur.rowcount or 0
+            n = cur.rowcount or 0
+        for cid in to_close:
+            await self.cascade_resolve_requests_for_claim(
+                cid, release_kind="session-bulk", actor_engineer=None
+            )
+        return n
 
     async def release_claims(self, claim_ids: list[str], engineer: str | None = None) -> int:
         now = _utcnow()
         await self.init()
+        released_ids: list[str] = []
         async with aiosqlite.connect(self.path) as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
@@ -564,8 +627,17 @@ class Database:
                         "UPDATE claims SET released_at = ? WHERE id = ? AND released_at IS NULL",
                         (now, cid),
                     )
-                n += cur.rowcount or 0
+                if cur.rowcount and cur.rowcount > 0:
+                    released_ids.append(cid)
+                    n += cur.rowcount
             await conn.commit()
+        # Cascade-resolve any open requests against these claims.
+        # Done outside the txn so a long pending list doesn't hold the
+        # write lock; each cascade is its own short transaction.
+        for cid in released_ids:
+            await self.cascade_resolve_requests_for_claim(
+                cid, release_kind="voluntary", actor_engineer=engineer
+            )
         return n
 
     async def extend_claim(self, claim_id: str, engineer: str, new_expires_at: str) -> bool:
@@ -622,17 +694,39 @@ class Database:
         if not to_close:
             return 0
 
+        # Track which claim IDs were closed by request-shortened TTL vs
+        # other reasons (TTL-only / idle), so cascade events get the
+        # right release_kind for the audit trail.
+        ttl_shortened: set[str] = set()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                "SELECT DISTINCT claim_id FROM requests "
+                "WHERE decision = 'pending'"
+            )
+            ttl_shortened = {str(r["claim_id"]) for r in await cur.fetchall()}
+
         async with aiosqlite.connect(self.path) as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             n = 0
+            actually_closed: list[str] = []
             for cid in to_close:
                 cur = await conn.execute(
                     "UPDATE claims SET released_at = ? WHERE id = ? AND released_at IS NULL",
                     (now, cid),
                 )
-                n += cur.rowcount or 0
+                if cur.rowcount and cur.rowcount > 0:
+                    actually_closed.append(cid)
+                    n += cur.rowcount
             await conn.commit()
+
+        for cid in actually_closed:
+            kind = "ttl-shortened" if cid in ttl_shortened else "ttl-or-idle"
+            await self.cascade_resolve_requests_for_claim(
+                cid, release_kind=kind, actor_engineer=None
+            )
         return n
 
     async def log_conflict(
@@ -765,6 +859,428 @@ class Database:
             }
             for r in rows
         ]
+
+    # --- Release requests (v5) ----------------------------------------
+
+    async def create_request(
+        self,
+        *,
+        request_id: str,
+        claim_id: str,
+        requester_engineer: str,
+        requester_session_id: str | None,
+        requested_pattern: str,
+        reason: str | None,
+        urgency: str,
+        original_expires_at: str,
+        shortened_expires_at: str,
+        new_claim_expires_at: str,
+    ) -> dict[str, Any]:
+        """Atomically create a request, log the ``filed`` audit event,
+        and shorten the holder's claim TTL.
+
+        ``new_claim_expires_at`` is what the claim's ``expires_at``
+        gets updated to (the shortened deadline). ``original_expires_at``
+        is preserved on the request row so a ``denied`` decision can
+        restore the claim's full TTL. Both transitions happen in a
+        single transaction so a crash between steps can't leave the
+        claim shortened with no request to track.
+        """
+        await self.init()
+        now = _utcnow()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                # Update the claim's TTL to the shortened value -- but
+                # never extend (clamp on the existing expires_at).
+                await conn.execute(
+                    """
+                    UPDATE claims
+                    SET expires_at = ?
+                    WHERE id = ?
+                      AND released_at IS NULL
+                      AND datetime(expires_at) > datetime(?)
+                    """,
+                    (new_claim_expires_at, claim_id, new_claim_expires_at),
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO requests (
+                        id, claim_id, requester_engineer, requester_session_id,
+                        requested_pattern, reason, urgency, decision,
+                        original_expires_at, shortened_expires_at, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                    """,
+                    (
+                        request_id,
+                        claim_id,
+                        requester_engineer,
+                        requester_session_id,
+                        requested_pattern,
+                        reason,
+                        urgency,
+                        original_expires_at,
+                        shortened_expires_at,
+                        now,
+                    ),
+                )
+                await self._record_event_in_txn(
+                    conn,
+                    request_id=request_id,
+                    event_type="filed",
+                    actor_engineer=requester_engineer,
+                    actor_session_id=requester_session_id,
+                    detail={
+                        "claim_id": claim_id,
+                        "pattern": requested_pattern,
+                        "urgency": urgency,
+                        "reason": reason,
+                        "original_expires_at": original_expires_at,
+                        "shortened_expires_at": shortened_expires_at,
+                    },
+                )
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+            cur = await conn.execute(
+                "SELECT * FROM requests WHERE id = ?", (request_id,)
+            )
+            row = await cur.fetchone()
+            return dict(row) if row else {}
+
+    @staticmethod
+    async def _record_event_in_txn(
+        conn: aiosqlite.Connection,
+        *,
+        request_id: str,
+        event_type: str,
+        actor_engineer: str | None,
+        actor_session_id: str | None,
+        detail: dict[str, Any] | None,
+    ) -> None:
+        """Append a request_events row inside the caller's transaction.
+
+        Detail is JSON-encoded so the column stays TEXT and SQLite
+        can be queried via JSON1 functions if we ever need to grep
+        the audit trail by detail field. The caller commits.
+        """
+        import json as _json
+
+        await conn.execute(
+            """
+            INSERT INTO request_events (
+                id, request_id, event_type, actor_engineer,
+                actor_session_id, detail, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(uuid4()),
+                request_id,
+                event_type,
+                actor_engineer,
+                actor_session_id,
+                _json.dumps(detail) if detail is not None else None,
+                _utcnow(),
+            ),
+        )
+
+    async def respond_to_request(
+        self,
+        *,
+        request_id: str,
+        decision: str,
+        actor_engineer: str | None,
+        actor_session_id: str | None,
+        note: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Record the holder's decision and apply its side-effect.
+
+        - ``approved``: claim is released immediately.
+        - ``denied``: claim's expires_at is restored to the request's
+          ``original_expires_at`` so the holder keeps the time they
+          would have had absent the request.
+
+        The request row's ``decision`` is moved from ``pending`` only;
+        if the request already has a terminal decision the call is a
+        no-op (returns the existing row). The audit event is recorded
+        either way so an attempted late response is still visible.
+        """
+        await self.init()
+        now = _utcnow()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = await conn.execute(
+                    "SELECT * FROM requests WHERE id = ?", (request_id,)
+                )
+                req = await cur.fetchone()
+                if req is None:
+                    await conn.rollback()
+                    return None
+
+                if req["decision"] != "pending":
+                    # Already-terminal request. Record the late attempt
+                    # in the audit log so we have evidence the holder
+                    # did try to respond, but don't change state.
+                    await self._record_event_in_txn(
+                        conn,
+                        request_id=request_id,
+                        event_type="responded-late",
+                        actor_engineer=actor_engineer,
+                        actor_session_id=actor_session_id,
+                        detail={
+                            "attempted_decision": decision,
+                            "current_decision": req["decision"],
+                            "note": note,
+                        },
+                    )
+                    await conn.commit()
+                    return dict(req)
+
+                if decision == "approved":
+                    await conn.execute(
+                        "UPDATE claims SET released_at = ? "
+                        "WHERE id = ? AND released_at IS NULL",
+                        (now, req["claim_id"]),
+                    )
+                elif decision == "denied":
+                    # Restore the original TTL so the holder isn't
+                    # punished for the request having shortened it.
+                    await conn.execute(
+                        "UPDATE claims SET expires_at = ? "
+                        "WHERE id = ? AND released_at IS NULL",
+                        (req["original_expires_at"], req["claim_id"]),
+                    )
+                else:
+                    raise ValueError(
+                        f"decision must be 'approved' or 'denied', got {decision!r}"
+                    )
+
+                await conn.execute(
+                    """
+                    UPDATE requests
+                    SET decision = ?, decided_at = ?, decided_by_engineer = ?,
+                        decided_by_session_id = ?, note = ?
+                    WHERE id = ?
+                    """,
+                    (decision, now, actor_engineer, actor_session_id, note, request_id),
+                )
+                await self._record_event_in_txn(
+                    conn,
+                    request_id=request_id,
+                    event_type="responded",
+                    actor_engineer=actor_engineer,
+                    actor_session_id=actor_session_id,
+                    detail={"decision": decision, "note": note},
+                )
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+            cur = await conn.execute(
+                "SELECT * FROM requests WHERE id = ?", (request_id,)
+            )
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def cascade_resolve_requests_for_claim(
+        self,
+        claim_id: str,
+        *,
+        release_kind: str,
+        actor_engineer: str | None = None,
+    ) -> int:
+        """When a claim is released for unrelated reasons (TTL sweep,
+        idle expiration, voluntary release, release_session bulk),
+        every still-pending request against it transitions to
+        ``resolved`` (or ``expired`` if the cause was the shortened
+        request-induced TTL). Each transition is logged as an audit
+        event so the requester can see what happened.
+
+        Returns the number of requests transitioned.
+        """
+        await self.init()
+        now = _utcnow()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = await conn.execute(
+                    "SELECT id, shortened_expires_at FROM requests "
+                    "WHERE claim_id = ? AND decision = 'pending'",
+                    (claim_id,),
+                )
+                pending = await cur.fetchall()
+                count = 0
+                for row in pending:
+                    rid = row["id"]
+                    # If the shortened TTL boundary is the trigger for
+                    # this release, the request expired waiting on the
+                    # holder. Otherwise the underlying claim went away
+                    # for an unrelated reason -> resolved.
+                    is_expired = release_kind == "ttl-shortened"
+                    new_decision = "expired" if is_expired else "resolved"
+                    event_type = "expired" if is_expired else "resolved"
+                    await conn.execute(
+                        "UPDATE requests SET decision = ?, decided_at = ? "
+                        "WHERE id = ? AND decision = 'pending'",
+                        (new_decision, now, rid),
+                    )
+                    await self._record_event_in_txn(
+                        conn,
+                        request_id=rid,
+                        event_type=event_type,
+                        actor_engineer=actor_engineer,
+                        actor_session_id=None,
+                        detail={"release_kind": release_kind, "claim_id": claim_id},
+                    )
+                    count += 1
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+            return count
+
+    async def record_request_notify(
+        self,
+        request_id: str,
+        *,
+        holder_engineer: str | None,
+        holder_session_id: str | None,
+    ) -> bool:
+        """Record a ``notified`` event the FIRST time a holder session
+        sees a request via pending_requests. Subsequent polls from the
+        same session don't re-fire (a request that's polled every 30s
+        for an hour shouldn't write 120 events). Returns True iff a
+        new event was written.
+        """
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                "SELECT 1 FROM request_events "
+                "WHERE request_id = ? AND event_type = 'notified' "
+                "  AND COALESCE(actor_session_id, '') = COALESCE(?, '')",
+                (request_id, holder_session_id),
+            )
+            if await cur.fetchone() is not None:
+                return False
+            await self._record_event_in_txn(
+                conn,
+                request_id=request_id,
+                event_type="notified",
+                actor_engineer=holder_engineer,
+                actor_session_id=holder_session_id,
+                detail=None,
+            )
+            await conn.commit()
+            return True
+
+    async def get_request(self, request_id: str) -> dict[str, Any] | None:
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                "SELECT * FROM requests WHERE id = ?", (request_id,)
+            )
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def list_requests(
+        self,
+        *,
+        requester_engineer: str | None = None,
+        claim_id: str | None = None,
+        decision: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Return requests filtered by the given criteria. Joined with
+        the holder's claim row so callers can render holder/pattern
+        without an extra round trip."""
+        await self.init()
+        clauses: list[str] = []
+        args: list[Any] = []
+        if requester_engineer:
+            clauses.append("r.requester_engineer = ?")
+            args.append(requester_engineer)
+        if claim_id:
+            clauses.append("r.claim_id = ?")
+            args.append(claim_id)
+        if decision:
+            clauses.append("r.decision = ?")
+            args.append(decision)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        sql = f"""
+            SELECT r.*, c.engineer AS holder_engineer, c.pattern AS holder_pattern,
+                   c.repo AS holder_repo, c.released_at AS claim_released_at
+            FROM requests r
+            JOIN claims c ON r.claim_id = c.id
+            {where}
+            ORDER BY datetime(r.created_at) DESC
+            LIMIT ?
+        """
+        args.append(limit)
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(sql, args)
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+    async def list_open_requests_for_session(
+        self, session_id: str, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """Return open (decision='pending') requests filed against
+        claims this session currently holds. The holder's
+        pending_requests inbox merges this with the conflict-log feed."""
+        if not session_id:
+            return []
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                """
+                SELECT r.*,
+                       c.engineer AS holder_engineer,
+                       c.pattern  AS holder_pattern,
+                       c.repo     AS holder_repo
+                FROM requests r
+                JOIN claims c ON r.claim_id = c.id
+                WHERE c.session_id = ?
+                  AND c.released_at IS NULL
+                  AND r.decision = 'pending'
+                ORDER BY datetime(r.created_at) DESC
+                LIMIT ?
+                """,
+                (session_id, limit),
+            )
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+    async def list_request_events(
+        self, request_id: str, *, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        """Return the full event timeline for a request, oldest first."""
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                "SELECT * FROM request_events WHERE request_id = ? "
+                "ORDER BY datetime(created_at) ASC LIMIT ?",
+                (request_id, limit),
+            )
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
 
     async def list_recent_claims(self, limit: int = 200) -> list[dict[str, Any]]:
         await self.init()

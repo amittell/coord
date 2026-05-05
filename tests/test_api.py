@@ -615,6 +615,206 @@ async def test_pending_requests_endpoint_requires_auth(client: AsyncClient) -> N
     assert r.status_code == 401
 
 
+# --- Release-request endpoints (v0.9.0) -------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_file_request_endpoint_creates_request_and_shortens_ttl(
+    client: AsyncClient,
+) -> None:
+    """End-to-end: holder creates a claim, requester files a request
+    against it, response includes the request row and the claim's
+    expires_at has been pulled forward."""
+    h = {"Authorization": "Bearer test-token"}
+
+    r = await client.post(
+        "/claims",
+        headers=h,
+        json={
+            "engineer": "alice",
+            "repo": "amittell/coord",
+            "session_id": "holder-sess",
+            "claims": [{"type": "file", "pattern": "src/foo.py"}],
+        },
+    )
+    assert r.status_code == 200
+    cid = r.json()["claim_ids"][0]
+
+    r = await client.post(
+        "/requests",
+        headers=h,
+        json={
+            "claim_id": cid,
+            "requester": "bob",
+            "session_id": "requester-sess",
+            "reason": "hot-fix",
+            "urgency": "high",
+            "wait_seconds": 0,
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["decision"] == "pending"
+    assert body["claim_id"] == cid
+    assert body["urgency"] == "high"
+
+    # Claim TTL has been shortened.
+    r = await client.get("/claims?active_only=true", headers=h)
+    claims = r.json()["claims"]
+    claim = next(c for c in claims if c["id"] == cid)
+    assert claim["expires_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_file_request_returns_404_for_unknown_claim(
+    client: AsyncClient,
+) -> None:
+    h = {"Authorization": "Bearer test-token"}
+    r = await client.post(
+        "/requests",
+        headers=h,
+        json={
+            "claim_id": "00000000-0000-0000-0000-000000000000",
+            "requester": "bob",
+            "wait_seconds": 0,
+        },
+    )
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_respond_endpoint_approve_releases_claim(
+    client: AsyncClient,
+) -> None:
+    h = {"Authorization": "Bearer test-token"}
+
+    r = await client.post(
+        "/claims",
+        headers=h,
+        json={
+            "engineer": "alice",
+            "claims": [{"type": "file", "pattern": "src/foo.py"}],
+        },
+    )
+    cid = r.json()["claim_ids"][0]
+    r = await client.post(
+        "/requests",
+        headers=h,
+        json={
+            "claim_id": cid,
+            "requester": "bob",
+            "wait_seconds": 0,
+        },
+    )
+    rid = r.json()["id"]
+
+    r = await client.post(
+        f"/requests/{rid}/respond",
+        headers=h,
+        json={
+            "decision": "approved",
+            "engineer": "alice",
+            "note": "ok",
+        },
+    )
+    assert r.status_code == 200
+    assert r.json()["decision"] == "approved"
+
+    # Claim is no longer active.
+    r = await client.get("/claims?active_only=true", headers=h)
+    assert all(c["id"] != cid for c in r.json()["claims"])
+
+
+@pytest.mark.asyncio
+async def test_respond_endpoint_rejects_invalid_decision(
+    client: AsyncClient,
+) -> None:
+    h = {"Authorization": "Bearer test-token"}
+    r = await client.post(
+        "/requests/anything/respond",
+        headers=h,
+        json={"decision": "maybe"},
+    )
+    assert r.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_get_request_events_returns_audit_timeline(
+    client: AsyncClient,
+) -> None:
+    h = {"Authorization": "Bearer test-token"}
+
+    r = await client.post(
+        "/claims",
+        headers=h,
+        json={"engineer": "alice", "claims": [{"type": "file", "pattern": "src/x.py"}]},
+    )
+    cid = r.json()["claim_ids"][0]
+    r = await client.post(
+        "/requests",
+        headers=h,
+        json={"claim_id": cid, "requester": "bob", "wait_seconds": 0},
+    )
+    rid = r.json()["id"]
+    await client.post(
+        f"/requests/{rid}/respond",
+        headers=h,
+        json={"decision": "approved", "engineer": "alice"},
+    )
+
+    r = await client.get(f"/requests/{rid}/events", headers=h)
+    assert r.status_code == 200
+    body = r.json()
+    types = [e["event_type"] for e in body["events"]]
+    # filed and responded must both be present in chronological order.
+    assert "filed" in types
+    assert "responded" in types
+    assert types.index("filed") < types.index("responded")
+
+
+@pytest.mark.asyncio
+async def test_list_requests_filters_by_requester_and_decision(
+    client: AsyncClient,
+) -> None:
+    h = {"Authorization": "Bearer test-token"}
+
+    # Two claims, two requests, two requesters.
+    cids = []
+    for pat in ("src/a.py", "src/b.py"):
+        r = await client.post(
+            "/claims",
+            headers=h,
+            json={"engineer": "alice", "claims": [{"type": "file", "pattern": pat}]},
+        )
+        cids.append(r.json()["claim_ids"][0])
+
+    for cid, requester in zip(cids, ("bob", "carol")):
+        await client.post(
+            "/requests",
+            headers=h,
+            json={"claim_id": cid, "requester": requester, "wait_seconds": 0},
+        )
+
+    r = await client.get("/requests?requester=bob", headers=h)
+    body = r.json()
+    assert body["count"] == 1
+    assert body["requests"][0]["requester_engineer"] == "bob"
+
+
+@pytest.mark.asyncio
+async def test_request_endpoints_require_auth(client: AsyncClient) -> None:
+    r = await client.post("/requests", json={"claim_id": "x", "requester": "y"})
+    assert r.status_code == 401
+    r = await client.post("/requests/x/respond", json={"decision": "approved"})
+    assert r.status_code == 401
+    r = await client.get("/requests")
+    assert r.status_code == 401
+    r = await client.get("/requests/x")
+    assert r.status_code == 401
+    r = await client.get("/requests/x/events")
+    assert r.status_code == 401
+
+
 @pytest.mark.asyncio
 async def test_access_log_records_non_2xx_status(
     client: AsyncClient, access_log_records: list[logging.LogRecord]
