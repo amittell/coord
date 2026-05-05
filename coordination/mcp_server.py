@@ -1,7 +1,14 @@
 from __future__ import annotations
 
+import atexit
 import os
+import signal
+import subprocess
+import sys
+import tempfile
 import uuid
+from pathlib import Path
+from types import FrameType
 from typing import Any
 
 import httpx
@@ -309,7 +316,200 @@ async def release_session(session_id: str | None = None) -> dict[str, Any]:
         return r.json()
 
 
+# ---------------------------------------------------------------------------
+# sessions.live marker
+#
+# coord-mcp publishes its own session id into <repo>/.coordination/sessions.live
+# at startup. The pre-push hook reads this file and feeds each line back to
+# the server as a `session_id=` exclusion when checking for blocking claims,
+# so an agent's own subagents (which carry distinct engineer names but share
+# this MCP process's session_id) cannot false-positive on its own push.
+#
+# All filesystem operations are best-effort: a corrupt, read-only, or absent
+# .coordination/ directory must never break the MCP startup or shutdown
+# path. Agents may run from non-coord repos (no .coordination/ at all), so
+# the helpers return silently when the directory is missing rather than
+# trying to create it -- mkdir-ing one would surprise users who never opted
+# into coord on that repo.
+# ---------------------------------------------------------------------------
+
+
+def _repo_root_for_marker() -> Path | None:
+    """Return the enclosing repo's ``.coordination/`` directory if present.
+
+    Shells out to ``git rev-parse --show-toplevel`` to find the repo root.
+    Returns ``None`` if git is unavailable, the cwd is not inside a repo, or
+    the repo has no ``.coordination/`` subdirectory yet (i.e. ``coord init``
+    has not been run). Never raises -- the marker is a best-effort hint, not
+    a hard contract.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    root_str = result.stdout.strip()
+    if not root_str:
+        return None
+    coord_dir = Path(root_str) / ".coordination"
+    try:
+        if not coord_dir.is_dir():
+            return None
+    except OSError:
+        return None
+    return coord_dir
+
+
+def _read_marker_lines(path: Path) -> list[str]:
+    """Read the live session ids from the marker file.
+
+    Blank lines and ``#`` comments are dropped (the file format reserves
+    them for human annotation). Returns an empty list if the file is
+    absent or unreadable -- callers treat both as "no other sessions".
+    """
+    try:
+        content = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []
+    out: list[str] = []
+    for raw in content.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        out.append(line)
+    return out
+
+
+def _atomic_write_lines(path: Path, lines: list[str]) -> None:
+    """Write ``lines`` to ``path`` atomically.
+
+    Strategy: open a tempfile in the same directory, write + fsync, then
+    ``os.replace`` over the destination. Same-directory tempfile is
+    required for ``replace`` to be atomic on POSIX. This guarantees a
+    crash mid-write can never leave a partial line in sessions.live, so
+    the pre-push hook never sees a half-written id.
+    """
+    parent = path.parent
+    fd, tmp_str = tempfile.mkstemp(prefix=".sessions.live.", dir=str(parent))
+    tmp_path = Path(tmp_str)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            for line in lines:
+                fh.write(line + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        # Best-effort cleanup of the temp file; suppress any error here so
+        # the original exception (if any) propagates intact to the caller.
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _register_session_marker() -> None:
+    """Idempotently add ``_SESSION_ID`` to ``sessions.live`` on startup.
+
+    No-op when the ``.coordination/`` directory does not exist (the agent
+    is running outside a coord-managed repo). Any filesystem error is
+    swallowed so MCP startup is never blocked by a marker glitch.
+    """
+    try:
+        coord_dir = _repo_root_for_marker()
+        if coord_dir is None:
+            return
+        marker = coord_dir / "sessions.live"
+        existing = _read_marker_lines(marker)
+        if _SESSION_ID in existing:
+            return
+        existing.append(_SESSION_ID)
+        _atomic_write_lines(marker, existing)
+    except Exception:
+        # Marker is best-effort; never let it break MCP startup.
+        pass
+
+
+def _remove_session_marker() -> None:
+    """Idempotently drop ``_SESSION_ID`` from ``sessions.live`` on shutdown.
+
+    If our id was the only line left, the file is unlinked entirely (so a
+    fresh run starts from a clean state). Other sessions' lines are
+    preserved untouched.
+    """
+    try:
+        coord_dir = _repo_root_for_marker()
+        if coord_dir is None:
+            return
+        marker = coord_dir / "sessions.live"
+        if not marker.exists():
+            return
+        existing = _read_marker_lines(marker)
+        if _SESSION_ID not in existing:
+            return
+        remaining = [sid for sid in existing if sid != _SESSION_ID]
+        if not remaining:
+            try:
+                marker.unlink()
+            except OSError:
+                pass
+            return
+        _atomic_write_lines(marker, remaining)
+    except Exception:
+        # Marker is best-effort; never let it break MCP shutdown.
+        pass
+
+
+def _signal_remove_marker(signum: int, _frame: FrameType | None) -> None:
+    """Signal handler: remove the marker, then re-raise default behavior.
+
+    We restore the default disposition for the signal and re-send it to
+    ourselves so the process exits with the conventional 128+signum code
+    (and any wrapping shell sees the expected exit cause). atexit will
+    fire as part of normal interpreter shutdown and re-call the remove
+    helper, which is idempotent.
+    """
+    try:
+        _remove_session_marker()
+    finally:
+        signal.signal(signum, signal.SIG_DFL)
+        try:
+            os.kill(os.getpid(), signum)
+        except OSError:
+            # Fallback: explicit exit if signalling ourselves fails.
+            sys.exit(128 + signum)
+
+
+def _install_marker_handlers() -> None:
+    """Wire atexit + SIGTERM/SIGINT handlers for graceful marker cleanup.
+
+    Idempotent at the atexit layer (atexit.register on the same callable
+    twice is harmless because _remove_session_marker is itself idempotent).
+    Signal handlers can only be installed from the main thread; if we are
+    not on the main thread the install is silently skipped (the atexit
+    handler still covers normal shutdown paths).
+    """
+    atexit.register(_remove_session_marker)
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _signal_remove_marker)
+        except (ValueError, OSError):
+            # ValueError: not on main thread. OSError: signal not supported
+            # on this platform. Either way, the atexit fallback still runs.
+            pass
+
+
 def main() -> None:
+    _register_session_marker()
+    _install_marker_handlers()
     mcp.run(transport="stdio")
 
 

@@ -526,6 +526,143 @@ async def test_conflicts_endpoint_honors_session_id(client: AsyncClient) -> None
 
 
 @pytest.mark.asyncio
+async def test_conflicts_endpoint_honors_repeated_session_id_params(
+    client: AsyncClient,
+) -> None:
+    # v0.10 sharp edge: a single agent process can carry multiple live
+    # session_ids in the repo at once (parent dispatcher + per-worktree
+    # subagents). The pre-push hook reads every id from
+    # .coordination/sessions.live and forwards them all so the agent's
+    # own claims under different engineer names don't false-positive on
+    # its own push. The /conflicts endpoint must therefore exclude
+    # claims matching ANY of the supplied session_ids.
+    h = {"Authorization": "Bearer test-token"}
+
+    for engineer, sess in [
+        ("codex-a", "sess-A"),
+        ("codex-b", "sess-B"),
+    ]:
+        r = await client.post(
+            "/claims",
+            headers=h,
+            json={
+                "engineer": engineer,
+                "repo": "amittell/astrowars",
+                "session_id": sess,
+                "claims": [
+                    {"type": "module", "pattern": f"server/{engineer}/**"}
+                ],
+            },
+        )
+        assert r.status_code == 200, r.text
+
+    r = await client.get(
+        "/conflicts",
+        params=[
+            ("pattern", "server/codex-a/x.js"),
+            ("pattern", "server/codex-b/y.js"),
+            ("engineer", "outsider"),
+            ("repo", "amittell/astrowars"),
+            ("session_id", "sess-A"),
+            ("session_id", "sess-B"),
+        ],
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["has_conflicts"] is False, (
+        "claims under either supplied session_id must be excluded"
+    )
+
+    # Drop one of the two session_ids: the other session's claim is now
+    # adversarial again.
+    r = await client.get(
+        "/conflicts",
+        params=[
+            ("pattern", "server/codex-a/x.js"),
+            ("pattern", "server/codex-b/y.js"),
+            ("engineer", "outsider"),
+            ("repo", "amittell/astrowars"),
+            ("session_id", "sess-A"),
+        ],
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["has_conflicts"] is True
+    pats = {c["pattern"] for c in body["conflicts"]}
+    assert pats == {"server/codex-b/**"}, (
+        f"only sess-B's claim should remain adversarial; got {pats}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_conflicts_endpoint_single_session_id_unchanged(
+    client: AsyncClient,
+) -> None:
+    # Backward compatibility: one session_id still self-excludes that
+    # session's claims and only that session's claims.
+    h = {"Authorization": "Bearer test-token"}
+
+    r = await client.post(
+        "/claims",
+        headers=h,
+        json={
+            "engineer": "codex-foo",
+            "repo": "amittell/astrowars",
+            "session_id": "sess-only",
+            "claims": [{"type": "module", "pattern": "server/**"}],
+        },
+    )
+    assert r.status_code == 200, r.text
+
+    r = await client.get(
+        "/conflicts?pattern=server/x.js&engineer=codex-bar"
+        "&repo=amittell/astrowars&session_id=sess-only",
+        headers=h,
+    )
+    assert r.status_code == 200
+    assert r.json()["has_conflicts"] is False
+
+    r = await client.get(
+        "/conflicts?pattern=server/x.js&engineer=codex-bar"
+        "&repo=amittell/astrowars&session_id=sess-other",
+        headers=h,
+    )
+    assert r.status_code == 200
+    assert r.json()["has_conflicts"] is True
+
+
+@pytest.mark.asyncio
+async def test_conflicts_endpoint_no_session_id_unchanged(
+    client: AsyncClient,
+) -> None:
+    # Pre-v0.5 callers that omit session_id entirely must keep the
+    # legacy behaviour: no self-exclusion, every same-repo claim is
+    # adversarial.
+    h = {"Authorization": "Bearer test-token"}
+
+    r = await client.post(
+        "/claims",
+        headers=h,
+        json={
+            "engineer": "codex-foo",
+            "repo": "amittell/astrowars",
+            "session_id": "sess-legacy",
+            "claims": [{"type": "module", "pattern": "server/**"}],
+        },
+    )
+    assert r.status_code == 200, r.text
+
+    r = await client.get(
+        "/conflicts?pattern=server/x.js&engineer=codex-bar"
+        "&repo=amittell/astrowars",
+        headers=h,
+    )
+    assert r.status_code == 200
+    assert r.json()["has_conflicts"] is True
+
+
+@pytest.mark.asyncio
 async def test_release_session_endpoint_releases_all_session_claims(
     client: AsyncClient,
 ) -> None:

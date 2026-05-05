@@ -140,7 +140,7 @@ class CoordinationService:
         patterns: list[str],
         engineer: str,
         repo: str | None = None,
-        session_id: str | None = None,
+        session_ids: list[str] | None = None,
     ) -> ConflictCheckResponse:
         for pat in patterns:
             err = _validate_pattern_syntax(pat)
@@ -150,22 +150,30 @@ class CoordinationService:
         # Activity ping: a session that's actively checking conflicts is
         # still alive even if it isn't creating new claims, so refresh
         # last_activity for everything it currently holds before we
-        # decide what counts as "stale".
-        if session_id:
-            await self.db.touch_session_activity(session_id)
+        # decide what counts as "stale". v0.10 generalises this from a
+        # single session_id to a list -- one agent process can carry
+        # multiple live session_ids in the repo at once (parent
+        # dispatcher + per-worktree subagents), and every one of them
+        # needs to keep its claims warm.
+        if session_ids:
+            for sid in session_ids:
+                await self.db.touch_session_activity(sid)
         active = await self.db.list_active_claims_rows(exclude_engineer=engineer)
         # Repo-scoped check (v0.4.0): only consider claims from the same
         # repo as the caller. NULL repo forms its own legacy bucket so
         # tagged callers never collide with un-tagged historical claims
         # and vice versa.
         active = [r for r in active if r.get("repo") == repo]
-        # Session-scoped self-exclusion (v0.5.0): when the caller passes
-        # a session_id (coord-mcp generates one per process), drop any
-        # active claim that shares that session_id. This makes subagents
-        # within one Codex/Claude run cooperative even when they use
-        # distinct engineer names. Different sessions remain adversarial.
-        if session_id:
-            active = [r for r in active if r.get("session_id") != session_id]
+        # Session-scoped self-exclusion (v0.5.0, generalised in v0.10):
+        # drop any active claim whose session_id matches one of the
+        # caller's live session_ids. The pre-push hook reads every line
+        # of .coordination/sessions.live and forwards them so an
+        # agent's own subagent claims under different engineer names
+        # don't false-positive on its own push. Different sessions
+        # outside that set remain adversarial.
+        if session_ids:
+            exclude = set(session_ids)
+            active = [r for r in active if r.get("session_id") not in exclude]
         conflicts: list[dict[str, Any]] = []
         for pat in patterns:
             for row in active:

@@ -11,6 +11,7 @@ socket layer is mocked.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -818,3 +819,219 @@ async def test_list_claims_passes_session_id(
 
     req = captured[0]
     assert req.url.params.get("session_id") == "live-session-cccc"
+
+
+# ---------------------------------------------------------------------------
+# sessions.live marker (v0.10.0)
+#
+# coord-mcp publishes its own session id into <repo>/.coordination/sessions.live
+# at startup so the pre-push hook can self-exclude live sessions when checking
+# for blocking claims. The marker is removed on graceful shutdown.
+# ---------------------------------------------------------------------------
+
+
+def _read_marker_lines(path: Path) -> list[str]:
+    """Read non-blank, non-comment lines from a sessions.live file."""
+    if not path.exists():
+        return []
+    out: list[str] = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        out.append(line)
+    return out
+
+
+def test_register_session_marker_creates_file_with_session_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coord_dir = tmp_path / ".coordination"
+    coord_dir.mkdir()
+    monkeypatch.setattr(mcp_server, "_SESSION_ID", "abc123def456")
+    monkeypatch.setattr(
+        mcp_server, "_repo_root_for_marker", lambda: coord_dir
+    )
+
+    mcp_server._register_session_marker()
+
+    marker = coord_dir / "sessions.live"
+    assert marker.exists()
+    assert _read_marker_lines(marker) == ["abc123def456"]
+
+
+def test_register_session_marker_appends_when_other_sessions_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coord_dir = tmp_path / ".coordination"
+    coord_dir.mkdir()
+    marker = coord_dir / "sessions.live"
+    # Pre-existing live session belonging to a different process.
+    marker.write_text("# header comment\nother-session-aaa\n\n", encoding="utf-8")
+    monkeypatch.setattr(mcp_server, "_SESSION_ID", "my-session-bbb")
+    monkeypatch.setattr(
+        mcp_server, "_repo_root_for_marker", lambda: coord_dir
+    )
+
+    mcp_server._register_session_marker()
+
+    lines = _read_marker_lines(marker)
+    assert "other-session-aaa" in lines
+    assert "my-session-bbb" in lines
+    # Existing line preserved, ours added (no order contract beyond
+    # "both present"); guard against accidental duplicates.
+    assert len(lines) == 2
+
+
+def test_register_session_marker_is_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coord_dir = tmp_path / ".coordination"
+    coord_dir.mkdir()
+    monkeypatch.setattr(mcp_server, "_SESSION_ID", "dup-test-sid")
+    monkeypatch.setattr(
+        mcp_server, "_repo_root_for_marker", lambda: coord_dir
+    )
+
+    mcp_server._register_session_marker()
+    mcp_server._register_session_marker()
+    mcp_server._register_session_marker()
+
+    marker = coord_dir / "sessions.live"
+    assert _read_marker_lines(marker) == ["dup-test-sid"]
+
+
+def test_remove_session_marker_unlinks_file_when_only_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coord_dir = tmp_path / ".coordination"
+    coord_dir.mkdir()
+    marker = coord_dir / "sessions.live"
+    marker.write_text("solo-session\n", encoding="utf-8")
+    monkeypatch.setattr(mcp_server, "_SESSION_ID", "solo-session")
+    monkeypatch.setattr(
+        mcp_server, "_repo_root_for_marker", lambda: coord_dir
+    )
+
+    mcp_server._remove_session_marker()
+
+    assert not marker.exists()
+
+
+def test_remove_session_marker_leaves_other_sessions_intact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coord_dir = tmp_path / ".coordination"
+    coord_dir.mkdir()
+    marker = coord_dir / "sessions.live"
+    marker.write_text(
+        "first-session\nme-session\nthird-session\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(mcp_server, "_SESSION_ID", "me-session")
+    monkeypatch.setattr(
+        mcp_server, "_repo_root_for_marker", lambda: coord_dir
+    )
+
+    mcp_server._remove_session_marker()
+
+    lines = _read_marker_lines(marker)
+    assert "me-session" not in lines
+    assert "first-session" in lines
+    assert "third-session" in lines
+    assert len(lines) == 2
+
+
+def test_register_skips_silently_when_coordination_dir_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Agents may run from non-coord repos. _repo_root_for_marker returning
+    None means we have nowhere to write -- and that is fine, not an error."""
+    monkeypatch.setattr(mcp_server, "_SESSION_ID", "no-home-sid")
+    monkeypatch.setattr(mcp_server, "_repo_root_for_marker", lambda: None)
+
+    # Must not raise.
+    mcp_server._register_session_marker()
+    mcp_server._remove_session_marker()
+
+
+def test_register_skips_silently_on_filesystem_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read-only or otherwise hostile .coordination/ must never break the
+    MCP startup path: the marker is best-effort, not a hard prerequisite."""
+    coord_dir = tmp_path / ".coordination"
+    coord_dir.mkdir()
+    monkeypatch.setattr(mcp_server, "_SESSION_ID", "write-fail-sid")
+    monkeypatch.setattr(
+        mcp_server, "_repo_root_for_marker", lambda: coord_dir
+    )
+
+    def _boom(*_args: Any, **_kwargs: Any) -> None:
+        raise OSError("simulated permission denied")
+
+    monkeypatch.setattr(mcp_server, "_atomic_write_lines", _boom)
+
+    # Must not raise even though the underlying write would explode.
+    mcp_server._register_session_marker()
+
+
+def test_repo_root_for_marker_returns_none_outside_git_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_repo_root_for_marker shells out to `git rev-parse --show-toplevel`.
+    Running it from a directory that is not inside any git repo must return
+    None rather than raising or guessing. (If pytest's tmp_path happens to
+    sit inside an outer repo on the dev machine, that repo is highly
+    unlikely to have its own ``.coordination/`` directory, so the helper
+    still returns None.)"""
+    monkeypatch.chdir(tmp_path)
+    result = mcp_server._repo_root_for_marker()
+    assert result is None
+
+
+def test_repo_root_for_marker_returns_none_when_coordination_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Even inside a git repo, if there's no .coordination/ subdir (because
+    the user has not run `coord init`), the function must return None and
+    not create the directory."""
+    import subprocess
+
+    subprocess.run(["git", "init", "-q"], cwd=str(tmp_path), check=True)
+    monkeypatch.chdir(tmp_path)
+
+    assert mcp_server._repo_root_for_marker() is None
+    assert not (tmp_path / ".coordination").exists()
+
+
+def test_repo_root_for_marker_returns_coord_dir_when_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+
+    subprocess.run(["git", "init", "-q"], cwd=str(tmp_path), check=True)
+    coord_dir = tmp_path / ".coordination"
+    coord_dir.mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    result = mcp_server._repo_root_for_marker()
+    assert result is not None
+    assert result.resolve() == coord_dir.resolve()
+
+
+def test_atomic_write_lines_replaces_destination_atomically(
+    tmp_path: Path,
+) -> None:
+    """The atomic write helper must use a same-directory tempfile + replace
+    so that a crash mid-write cannot leave the destination half-written."""
+    import os as _os
+
+    target = tmp_path / "sessions.live"
+    target.write_text("old-content\n", encoding="utf-8")
+
+    mcp_server._atomic_write_lines(target, ["a", "b", "c"])
+
+    assert target.read_text(encoding="utf-8") == "a\nb\nc\n"
+    # No leftover temp files in the same directory.
+    leftovers = [p for p in _os.listdir(tmp_path) if p != "sessions.live"]
+    assert leftovers == []

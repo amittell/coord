@@ -257,17 +257,22 @@ async def conflicts(
     pattern: list[str] | None = Query(default=None),
     engineer: str = Query(...),
     repo: str | None = Query(default=None),
-    session_id: str | None = Query(default=None),
+    session_id: list[str] | None = Query(default=None),
     _: None = Depends(require_auth),
 ) -> dict:
     if not pattern:
         raise HTTPException(status_code=400, detail="Provide one or more pattern= query params")
     try:
+        # FastAPI parses repeated `session_id=` query params into a
+        # list. The pre-push hook forwards every live session_id from
+        # .coordination/sessions.live so the agent's own subagent
+        # claims under different engineer names don't false-positive
+        # on its own push.
         result = await get_service().check_conflicts(
             patterns=pattern,
             engineer=engineer,
             repo=repo,
-            session_id=session_id,
+            session_ids=session_id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

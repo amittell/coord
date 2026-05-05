@@ -654,7 +654,7 @@ async def test_check_conflicts_honors_session_id(
         patterns=["src/**"],
         engineer="codex-b",
         repo="amittell/coord",
-        session_id="sess-z",
+        session_ids=["sess-z"],
     )
     assert resp.has_conflicts is False
     assert resp.conflicts == []
@@ -664,9 +664,130 @@ async def test_check_conflicts_honors_session_id(
         patterns=["src/**"],
         engineer="codex-b",
         repo="amittell/coord",
-        session_id="sess-other",
+        session_ids=["sess-other"],
     )
     assert resp.has_conflicts is True
+
+
+@pytest.mark.asyncio
+async def test_check_conflicts_session_ids_singleton_matches_pre_v010(
+    repo_service: CoordinationService,
+) -> None:
+    # A list with exactly one session_id reproduces the pre-v0.10
+    # single-value path: that session's claim is excluded, an
+    # unrelated session's claim is still flagged.
+    await repo_service.db.insert_claims_batch(
+        engineer="codex-a",
+        branch=None,
+        description=None,
+        items=[
+            ("cid_singleton", "module", "src/**", "soft", "2099-01-01T00:00:00Z")
+        ],
+        repo="amittell/coord",
+        session_id="sess-solo",
+    )
+
+    clean = await repo_service.check_conflicts(
+        patterns=["src/**"],
+        engineer="codex-b",
+        repo="amittell/coord",
+        session_ids=["sess-solo"],
+    )
+    assert clean.has_conflicts is False
+    assert clean.conflicts == []
+
+    flagged = await repo_service.check_conflicts(
+        patterns=["src/**"],
+        engineer="codex-b",
+        repo="amittell/coord",
+        session_ids=["sess-someone-else"],
+    )
+    assert flagged.has_conflicts is True
+
+
+@pytest.mark.asyncio
+async def test_check_conflicts_session_ids_excludes_any_match(
+    repo_service: CoordinationService,
+) -> None:
+    # When the caller is one agent process carrying multiple live
+    # session_ids (parent dispatcher + per-worktree subagents), claims
+    # from any of those sessions must be excluded.
+    await repo_service.db.insert_claims_batch(
+        engineer="codex-a",
+        branch=None,
+        description=None,
+        items=[
+            ("cid_a", "module", "src/a/**", "soft", "2099-01-01T00:00:00Z")
+        ],
+        repo="amittell/coord",
+        session_id="sess-A",
+    )
+    await repo_service.db.insert_claims_batch(
+        engineer="codex-b",
+        branch=None,
+        description=None,
+        items=[
+            ("cid_b", "module", "src/b/**", "soft", "2099-01-01T00:00:00Z")
+        ],
+        repo="amittell/coord",
+        session_id="sess-B",
+    )
+    await repo_service.db.insert_claims_batch(
+        engineer="codex-c",
+        branch=None,
+        description=None,
+        items=[
+            ("cid_c", "module", "src/c/**", "soft", "2099-01-01T00:00:00Z")
+        ],
+        repo="amittell/coord",
+        session_id="sess-C",
+    )
+
+    resp = await repo_service.check_conflicts(
+        patterns=["src/a/x.py", "src/b/y.py", "src/c/z.py"],
+        engineer="outsider",
+        repo="amittell/coord",
+        session_ids=["sess-A", "sess-B"],
+    )
+    assert resp.has_conflicts is True, "sess-C is not in the exclude set"
+    flagged_ids = {c["pattern"] for c in resp.conflicts}
+    assert flagged_ids == {"src/c/**"}, (
+        f"only sess-C should remain; got {flagged_ids}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_check_conflicts_session_ids_none_or_empty_is_legacy(
+    repo_service: CoordinationService,
+) -> None:
+    # No session_ids (None or []) means no self-exclusion and no touch
+    # ping: identical to the pre-v0.5 NULL bucket behaviour.
+    await repo_service.db.insert_claims_batch(
+        engineer="codex-a",
+        branch=None,
+        description=None,
+        items=[
+            ("cid_legacy", "module", "src/**", "soft", "2099-01-01T00:00:00Z")
+        ],
+        repo="amittell/coord",
+        session_id="sess-anything",
+    )
+
+    resp_none = await repo_service.check_conflicts(
+        patterns=["src/**"],
+        engineer="codex-b",
+        repo="amittell/coord",
+        session_ids=None,
+    )
+    assert resp_none.has_conflicts is True
+
+    resp_empty = await repo_service.check_conflicts(
+        patterns=["src/**"],
+        engineer="codex-b",
+        repo="amittell/coord",
+        session_ids=[],
+    )
+    assert resp_empty.has_conflicts is True
 
 
 @pytest.mark.asyncio
@@ -878,7 +999,7 @@ async def test_check_conflicts_bumps_last_activity_for_session(
         patterns=["src/bar.py"],
         engineer="alice",
         repo="amittell/coord",
-        session_id="sess-touch",
+        session_ids=["sess-touch"],
     )
 
     rows = await idle_service.db.list_active_claims_rows()
@@ -887,6 +1008,54 @@ async def test_check_conflicts_bumps_last_activity_for_session(
     assert new_activity != stale_iso, (
         "check_conflicts must bump last_activity for session-tagged claims"
     )
+
+
+@pytest.mark.asyncio
+async def test_check_conflicts_bumps_last_activity_for_every_session_id(
+    idle_service: CoordinationService,
+) -> None:
+    # When the caller carries multiple live session_ids, every one of
+    # them must keep its claims warm, otherwise a subagent session that
+    # isn't creating new claims gets idle-expired despite the parent
+    # process being actively at work.
+    from datetime import UTC, datetime, timedelta
+
+    stale_iso = (
+        (datetime.now(UTC) - timedelta(seconds=30)).replace(microsecond=0)
+        .isoformat().replace("+00:00", "Z")
+    )
+    far_future = "2099-01-01T00:00:00Z"
+
+    await idle_service.db.insert_claims_batch(
+        engineer="alice",
+        branch=None,
+        description=None,
+        items=[("touch-A", "file", "src/a.py", "soft", far_future)],
+        repo="amittell/coord",
+        session_id="sess-A",
+        last_activity=stale_iso,
+    )
+    await idle_service.db.insert_claims_batch(
+        engineer="bob",
+        branch=None,
+        description=None,
+        items=[("touch-B", "file", "src/b.py", "soft", far_future)],
+        repo="amittell/coord",
+        session_id="sess-B",
+        last_activity=stale_iso,
+    )
+
+    await idle_service.check_conflicts(
+        patterns=["src/c.py"],
+        engineer="alice",
+        repo="amittell/coord",
+        session_ids=["sess-A", "sess-B"],
+    )
+
+    rows = await idle_service.db.list_active_claims_rows()
+    by_id = {r["id"]: r for r in rows}
+    assert by_id["touch-A"]["last_activity"] != stale_iso
+    assert by_id["touch-B"]["last_activity"] != stale_iso
 
 
 @pytest.mark.asyncio

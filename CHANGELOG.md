@@ -19,6 +19,23 @@ Semantic Versioning.
 
 - (none recorded yet)
 
+## [0.10.0] - 2026-05-05
+
+### Fixed
+
+- Pre-push hook now self-excludes every live `coord-mcp` session in the repo, not just claims matching `git config user.name`. Pre-v0.10.0 the hook passed only the git user as the engineer, so an agent's own subagent claims (under names like `codex-server-review` or `claude-l26-fix` that don't match git's user) showed up as adversarial conflicts on the agent's own push, forcing the agent to pre-release before pushing as a defensive workaround. Three coordinated changes close this:
+  - `coord-mcp` writes its `session_id` to `<repo_root>/.coordination/sessions.live` on startup (atomic temp+rename, idempotent for parallel sessions in the same repo) and removes it on graceful shutdown via `atexit` + SIGTERM/SIGINT handlers. If the file would become empty, it's unlinked. All filesystem operations are wrapped so a hostile or read-only `.coordination/` cannot break MCP startup or shutdown.
+  - The pre-push hook reads `.coordination/sessions.live` and forwards every non-empty, non-comment line as a `&session_id=<encoded>` query param on the `/conflicts` URL. Skips silently when the file is absent (legacy engineer-name self-exclusion still applies).
+  - `GET /conflicts` accepts repeated `session_id=` query params; `service.check_conflicts` now takes `session_ids: list[str] | None` and excludes any active claim whose `session_id` matches any of the supplied ids. Single-value behaviour is preserved through the same code path.
+
+### Added
+
+- `_register_session_marker` / `_remove_session_marker` helpers in `coordination/mcp_server.py` plus an `_atomic_write_lines` primitive used for the marker file.
+
+### Changed
+
+- `CoordinationService.check_conflicts` keyword renamed from `session_id` (singular) to `session_ids: list[str] | None`. Callers passing a single id now pass `[id]`. The API layer accepts both single and repeated query params and forwards either as a list, so external callers see no breaking change.
+
 ## [0.9.0] - 2026-05-05
 
 ### Added

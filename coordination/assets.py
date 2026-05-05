@@ -215,6 +215,25 @@ if [[ -n "${REPO_ID}" ]]; then
   REPO_QS="&repo=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${REPO_ID}")"
 fi
 
+# v0.10: hand the active coord-mcp session ids to /conflicts so the
+# server can self-exclude claims that originated from this very repo's
+# in-flight MCP sessions. Without this, an agent's own subagent claims
+# (created under engineer names like 'codex-server-review' that don't
+# match `git config user.name`) false-positive the agent's push.
+# coord-mcp writes one session_id per line into .coordination/sessions.live
+# on startup and removes it on graceful shutdown; missing file just means
+# no live MCP sessions for this repo, in which case we fall through to
+# the existing engineer-name self-exclusion.
+SESSION_QS=""
+if [[ -f "${REPO_ROOT}/.coordination/sessions.live" ]]; then
+  while IFS= read -r session_line || [[ -n "${session_line}" ]]; do
+    [[ -z "${session_line}" ]] && continue
+    [[ "${session_line}" == \\#* ]] && continue
+    enc_sid="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${session_line}")"
+    SESSION_QS+="&session_id=${enc_sid}"
+  done < "${REPO_ROOT}/.coordination/sessions.live"
+fi
+
 while IFS= read -r file; do
   [[ -z "${file}" ]] && continue
   enc="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${file}")"
@@ -222,7 +241,7 @@ while IFS= read -r file; do
   # made network glitches silently bypass the conflict check.
   if ! resp="$(curl -fsS \\
     ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} \\
-    "${COORD_URL}/conflicts?pattern=${enc}&engineer=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${ENGINEER}")${REPO_QS}")"; then
+    "${COORD_URL}/conflicts?pattern=${enc}&engineer=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${ENGINEER}")${REPO_QS}${SESSION_QS}")"; then
     echo "coordination pre-push: conflict check failed for ${file}; refusing to push" >&2
     exit 1
   fi

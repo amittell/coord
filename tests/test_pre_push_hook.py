@@ -137,3 +137,160 @@ def test_script_passes_repo_id_to_conflicts_endpoint() -> None:
     # The query string must include &repo=... only when repo id is
     # non-empty; the hook must not send a literal "&repo=" trailing the URL.
     assert "&repo=" in PRE_PUSH_SCRIPT
+
+
+def test_script_references_sessions_live_file() -> None:
+    # v0.10.0: coord-mcp writes its session_id to .coordination/sessions.live
+    # on startup so the pre-push hook can hand the active session ids to
+    # /conflicts as self-exclusions. Without this, an agent's own subagent
+    # claims (created under engineer names like 'codex-server-review' that
+    # don't match `git config user.name`) blow up the agent's own push.
+    assert ".coordination/sessions.live" in PRE_PUSH_SCRIPT
+
+
+def test_script_initializes_session_qs_default_empty() -> None:
+    # SESSION_QS must default to "" before the conditional file-read so a
+    # repo without sessions.live still falls through to the existing
+    # engineer-name self-exclusion path. Silently bailing out of the hook
+    # when the file is missing would be a regression.
+    assert 'SESSION_QS=""' in PRE_PUSH_SCRIPT
+    # And the curl URL must always interpolate ${SESSION_QS} (it's a no-op
+    # when empty but must be present so the missing-file path still
+    # exercises the conflict check rather than skipping it).
+    assert "${SESSION_QS}" in PRE_PUSH_SCRIPT
+    assert "${REPO_QS}${SESSION_QS}" in PRE_PUSH_SCRIPT
+
+
+def test_script_url_encodes_session_ids_via_urllib() -> None:
+    # Each session id must be URL-encoded via the same python3 -c
+    # urllib.parse.quote idiom the hook already uses for ENGINEER and
+    # REPO_ID, so unusual characters in session ids (slashes, spaces) do
+    # not corrupt the query string.
+    quote_fragment = (
+        'python3 -c "import urllib.parse,sys; '
+        'print(urllib.parse.quote(sys.argv[1]))"'
+    )
+    # The fragment is used multiple times; just confirm it shows up at
+    # least three times now (ENGINEER + REPO_ID + SESSION_ID).
+    assert PRE_PUSH_SCRIPT.count(quote_fragment) >= 3
+    # And the SESSION_QS build path must produce &session_id=<encoded>.
+    assert "&session_id=" in PRE_PUSH_SCRIPT
+
+
+def test_script_session_qs_skips_blank_and_comment_lines() -> None:
+    # Sessions.live is a line-oriented file; blank lines and lines
+    # starting with '#' must be ignored so future operator notes or
+    # accidental trailing newlines don't poison the query string.
+    # The script encodes this by checking each line for emptiness and a
+    # leading '#'.
+    assert "session_line" in PRE_PUSH_SCRIPT
+    # A leading-# guard must be present in some form. Match the literal
+    # case-pattern OR the [[ ... == \#* ]] form, whichever the
+    # implementation uses.
+    assert ("== \\#*" in PRE_PUSH_SCRIPT) or ("'#'*" in PRE_PUSH_SCRIPT)
+
+
+def _extract_session_qs_block(script: str) -> str:
+    # Pull the SESSION_QS-build fragment out of PRE_PUSH_SCRIPT so the
+    # e2e test stays in lockstep with whatever the script actually does
+    # (no copy-paste drift).
+    start_marker = 'SESSION_QS=""'
+    end_marker = "while IFS= read -r file; do"
+    start = script.index(start_marker)
+    end = script.index(end_marker, start)
+    return script[start:end]
+
+
+def test_script_session_qs_block_extractable() -> None:
+    # Sanity check that the e2e fixture below will be able to find the
+    # block; if these markers ever drift, fail loudly here rather than
+    # via a confusing bash error in the e2e test.
+    block = _extract_session_qs_block(PRE_PUSH_SCRIPT)
+    assert "sessions.live" in block
+    assert "session_id=" in block
+
+
+def test_script_session_qs_e2e_builds_expected_string(tmp_path) -> None:
+    # End-to-end: seed a fake .coordination/sessions.live with two known
+    # session ids (one plain, one with a slash to exercise URL-encoding)
+    # plus a comment line and a blank line, then run just the SESSION_QS
+    # build fragment under bash and assert SESSION_QS came out as
+    # '&session_id=<id1>&session_id=<id2>' with the slash %-encoded.
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("bash not available on this platform")
+    if not shutil.which("python3"):
+        pytest.skip("python3 not available on this platform")
+
+    coord_dir = tmp_path / ".coordination"
+    coord_dir.mkdir()
+    sessions_live = coord_dir / "sessions.live"
+    # Use a session id with a character that the default
+    # urllib.parse.quote (safe='/') will encode -- '#' becomes %23 -- so
+    # the test verifies encoding actually fires. Keep the second id
+    # plain to verify pass-through too.
+    sessions_live.write_text(
+        "# this is a comment\n"
+        "\n"
+        "session-one\n"
+        "mcp#session-two\n",
+        encoding="utf-8",
+    )
+
+    block = _extract_session_qs_block(PRE_PUSH_SCRIPT)
+
+    fragment = tmp_path / "fragment.sh"
+    fragment.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        f'REPO_ROOT="{tmp_path}"\n'
+        f"{block}"
+        'printf "%s" "${SESSION_QS}"\n',
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [bash, str(fragment)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    # '#' in 'mcp#session-two' must be %-encoded to %23. Default
+    # urllib.parse.quote leaves '/' alone (safe='/'), so we exercise '#'
+    # to confirm the encoding path actually fires.
+    assert (
+        result.stdout
+        == "&session_id=session-one&session_id=mcp%23session-two"
+    ), result.stdout
+
+
+def test_script_session_qs_e2e_empty_when_file_missing(tmp_path) -> None:
+    # When .coordination/sessions.live does not exist, SESSION_QS must
+    # come out empty (not an error). This is the no-active-MCP-sessions
+    # baseline path -- the hook still runs the conflict check, just with
+    # only the engineer-name self-exclusion.
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("bash not available on this platform")
+
+    block = _extract_session_qs_block(PRE_PUSH_SCRIPT)
+
+    fragment = tmp_path / "fragment.sh"
+    fragment.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        f'REPO_ROOT="{tmp_path}"\n'
+        f"{block}"
+        'printf "[%s]" "${SESSION_QS}"\n',
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [bash, str(fragment)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "[]", result.stdout
