@@ -2,13 +2,10 @@ from __future__ import annotations
 
 import atexit
 import os
-import signal
 import subprocess
-import sys
 import tempfile
 import uuid
 from pathlib import Path
-from types import FrameType
 from typing import Any
 
 import httpx
@@ -493,26 +490,6 @@ def _remove_session_marker() -> None:
     except Exception:
         # Marker is best-effort; never let it break MCP shutdown.
         pass
-
-
-def _signal_remove_marker(signum: int, _frame: FrameType | None) -> None:
-    """Signal handler: remove the marker, then re-raise default behavior.
-
-    We restore the default disposition for the signal and re-send it to
-    ourselves so the process exits with the conventional 128+signum code
-    (and any wrapping shell sees the expected exit cause). atexit will
-    fire as part of normal interpreter shutdown and re-call the remove
-    helper, which is idempotent.
-    """
-    try:
-        _remove_session_marker()
-    finally:
-        signal.signal(signum, signal.SIG_DFL)
-        try:
-            os.kill(os.getpid(), signum)
-        except OSError:
-            # Fallback: explicit exit if signalling ourselves fails.
-            sys.exit(128 + signum)
 
 
 def _install_marker_handlers() -> None:

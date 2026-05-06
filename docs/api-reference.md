@@ -109,7 +109,7 @@ Query params:
 - one or more `pattern=...`
 - `engineer=<id>`
 - `repo=<id>` (v0.4.0+) — restrict the check to claims with the same `repo` value. Without this, the service-wide pool is checked, which can false-positive across unrelated repos.
-- `session_id=<id>` (v0.6.0+) — additionally self-exclude any active claim sharing this session_id. Lets subagents inside one MCP process not block each other when they pick distinct engineer names. Also acts as an activity ping for the holder's claims (refreshes their `last_activity` so they don't idle-expire).
+- `session_id=<id>` (v0.6.0+, may be repeated as of v0.10.0) — additionally self-exclude any active claim sharing one of these session_ids. The pre-push hook reads every line of `.coordination/sessions.live` and forwards them all so an agent's own subagent claims under different engineer names don't false-positive on its own push. Each id also acts as an activity ping for that session's held claims.
 
 Example:
 
@@ -208,16 +208,23 @@ Response: the request row, with `decision` either still `pending` (long-poll tim
 
 `404` if the `claim_id` is unknown. `409` if the claim is already released or expired (no need to file; retry the original `claim_files`).
 
-## `POST /requests/{request_id}/respond` (v0.9.0+)
+## `POST /requests/{request_id}/respond` (v0.9.0+, extended in v0.11.0)
 
-The holder approves or denies an open request. Approve releases the claim immediately. Deny restores the claim's original TTL (so the holder isn't punished for the request having shortened it). Both transitions are audit-logged.
+The holder responds to an open request. Four decisions:
+
+- `approved` (v0.9): release the claim immediately.
+- `denied` (v0.9): keep the claim, restore the original TTL (so the holder isn't punished for the request having shortened it).
+- `narrowed` (v0.11): close the original claim and atomically open a tighter one. Pass `narrowed_pattern`. The new claim inherits the original's engineer / branch / repo / session / TTL. The server validates `narrowed_pattern` is a subset of the holder's current pattern via the `compute_overlap` synthesizer; disjoint or broader patterns return `400`.
+- `coexist` (v0.11): grant the requester a sibling claim on the same scope. Pass `coexist_pattern`. Both claims live, mutually self-excluded via `claims.coexists_with`, but still adversarial to anyone outside the pair. Cooperative not enforced -- imports and shared module-level state remain on the agents to handle.
 
 ```json
 {
-  "decision": "approved | denied",
+  "decision": "approved | denied | narrowed | coexist",
   "engineer": "<holder engineer>",
   "session_id": "<holder MCP session id>",
-  "note": "ok, releasing"
+  "note": "ok, releasing",
+  "narrowed_pattern": "<required when decision='narrowed'>",
+  "coexist_pattern": "<required when decision='coexist'>"
 }
 ```
 

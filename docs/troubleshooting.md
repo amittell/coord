@@ -127,6 +127,24 @@ Fix: run `coord upgrade` to migrate the `.gitignore` block to `/.coordination/` 
 
 ## Holder won't release a claim and my work is blocked (v0.9.0+)
 
-File a release request with `request_release`. The holder's TTL shortens to ~5 min and they get notified on their next `pending_requests` poll. They can approve (claim released) or deny (TTL restored). If they don't respond, the shortened TTL fires and your `claim_files` retry succeeds.
+File a release request with `request_release`. The holder's TTL shortens to ~5 min and they get notified on their next `pending_requests` poll. They can approve (claim released), deny (TTL restored), narrow (close + reopen on a tighter pattern, v0.11+), or coexist (sibling claim on the same scope, v0.11+). If they don't respond, the shortened TTL fires and your `claim_files` retry succeeds.
 
-Use `urgency="blocking"` for incident work; the urgency is recorded for the operator audit even though v0.9.0 doesn't yet vary the TTL window per urgency.
+Use `urgency="blocking"` for incident work; the urgency is recorded for the operator audit even though it doesn't yet vary the TTL window per urgency.
+
+Pass `requested_scope` (v0.11+) to tell the holder what you actually need -- often a sub-pattern of their claim. The holder uses it to decide between `approved` (release everything) and the narrower options.
+
+## My push silently fails because my own subagent's claims look like conflicts (v0.10.0+)
+
+Symptom: pre-v0.10 hooks passed only `git config user.name` as the engineer to `/conflicts`, so an agent's own subagent claims (under names like `codex-server-review` that don't match git's user) showed up as adversarial conflicts on the agent's own push. The agent had to pre-release defensively before pushing.
+
+Fix in v0.10.0: `coord-mcp` writes its `session_id` to `<repo_root>/.coordination/sessions.live` on startup. The pre-push hook reads every line and forwards each as `&session_id=` to `/conflicts`, which now self-excludes claims matching any of them. Once you've upgraded coord and restarted the parent agent (Claude Code / Codex / Cursor), the hook stops false-positiving. Verify by checking `cat .coordination/sessions.live` -- a fresh hex id means the new MCP child registered itself.
+
+## "Transport closed" error from coord MCP tool (v0.11.0 fix)
+
+Symptom: an agent's tool call to coord (e.g. `coord.release_session`) fails with `tool call error ... Caused by: Transport closed`, and subsequent calls keep failing; the parent (Codex / Claude Code) has a stale stdio handle to a dead MCP child.
+
+Cause (v0.10.0 only): the v0.10 implementation installed custom SIGTERM/SIGINT handlers that re-raised the signal under `SIG_DFL` after marker cleanup. That fought with FastMCP's own signal handling: any signal (including transient ones from parent watchdogs) aborted the MCP child before its stdio loop could drain.
+
+Fix in v0.11.0: drops the explicit signal handlers entirely. Marker cleanup runs from `atexit` only, which fires for both clean exits and signal-driven shutdowns through the interpreter's normal path. FastMCP keeps full ownership of signal disposition.
+
+If you're seeing this on a v0.10.0 client: upgrade to v0.11.0+ and restart the parent agent. As a one-off recovery, fall back to the `coord` CLI (`coord release ...`) which doesn't go through the MCP child.

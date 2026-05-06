@@ -38,7 +38,9 @@ SQLite stores:
 - ownership YAML
 - forwards-only schema migration history in the `schema_version` table
 
-The schema has reached v5 as of coord v0.9.0. Migrations run inside a `BEGIN IMMEDIATE` transaction at process startup so concurrent processes serialise on the write lock instead of racing.
+The schema has reached v6 as of coord v0.11.0. Migrations run inside a `BEGIN IMMEDIATE` transaction at process startup so concurrent processes serialise on the write lock instead of racing.
+
+The v6 columns (`requests.requested_scope` and `claims.coexists_with`, both nullable) underpin the v0.11 `narrowed` and `coexist` decision verbs. `coexists_with` stores a JSON array of partner claim ids; the conflict check excludes any candidate claim that's referenced by one of the caller's session's claims (so a coexist pair sees each other as cooperative, not adversarial).
 
 WAL mode is enabled so reads and writes behave better under normal team concurrency.
 

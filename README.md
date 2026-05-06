@@ -139,6 +139,7 @@ Start with `docs/integrations/claude-code.md` if your team is primarily on Claud
 | `COORD_DEFAULT_TTL_HOURS` | Default TTL for normal claims. Default: `4` |
 | `COORD_SHARED_TTL_HOURS` | TTL for shared-file claims. Default: `2` |
 | `COORD_IDLE_TIMEOUT_SEC` | Session-tagged claims auto-release if the holder has been silent for this many seconds (added in v0.6.0). Set to `0` to disable idle expiration cluster-wide. Default: `1800` |
+| `COORD_REQUEST_TTL_SHORT_SEC` | When a release request is filed, the holder's claim TTL is clamped to `min(remaining, this)` (added in v0.9.0). Forces a near-term decision so a non-responsive holder can't sit on the scope. Default: `300` |
 | `COORD_DISABLE_BACKGROUND_CLEANUP` | Set truthy to skip the in-process claim expiration sweep (useful for tests or external schedulers). Default: unset |
 | `COORD_DISABLE_INSTANCE_LOCK` | Set truthy to bypass the advisory `<db>.lock` flock (useful on NFS-backed shared volumes where flock is unreliable). Default: unset |
 | `COORD_LS_FILES_CACHE_TTL_SEC` | TTL for the in-process `git ls-files` cache used during overlap checks. Default: `10` |
