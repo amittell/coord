@@ -514,6 +514,8 @@ tbody tr td.empty {
 .pill.pending { color: var(--amber); }
 .pill.approved { color: var(--phosphor); }
 .pill.denied { color: var(--red); }
+.pill.narrowed { color: var(--phosphor); border-style: dashed; }
+.pill.coexist { color: var(--cyan); }
 .pill.urgency-low { color: var(--muted-2); }
 .pill.urgency-normal { color: var(--cyan); }
 .pill.urgency-high { color: var(--amber); }
@@ -776,12 +778,19 @@ async def render_dashboard() -> str:
                     latency_label = f"{secs // 3600}h {(secs % 3600) // 60}m"
             else:
                 latency_label = "—"
+            scope = r.get("requested_scope") or "—"
+            scope_cell = (
+                f"<td><span class='pattern'>{_esc(scope)}</span></td>"
+                if scope != "—"
+                else "<td class='muted'>—</td>"
+            )
             req_html += (
                 "<tr>"
                 f"<td class='muted'><time datetime='{_esc(r.get('created_at'))}' "
                 f"title='{_esc(r.get('created_at'))}'>{_esc(_ago(r.get('created_at'), now))}</time></td>"
                 f"<td>{_esc(r.get('requester_engineer'))}</td>"
                 f"<td><span class='pattern'>{_esc(r.get('requested_pattern'))}</span></td>"
+                f"{scope_cell}"
                 f"<td class='muted'>vs {_esc(r.get('holder_engineer') or '?')}</td>"
                 f'<td><span class="pill urgency-{html.escape(urgency)}">{html.escape(urgency)}</span></td>'
                 f"<td>{_pill(decision, decision)}</td>"
@@ -791,7 +800,7 @@ async def render_dashboard() -> str:
         requests_meta = f"{len(requests)} total · {pending_count} pending"
     else:
         req_html = (
-            "<tr><td class='empty' colspan='7'>"
+            "<tr><td class='empty' colspan='8'>"
             "no release requests filed yet</td></tr>"
         )
         requests_meta = "0 total"
@@ -951,6 +960,7 @@ async def render_dashboard() -> str:
             <th>when</th>
             <th>requester</th>
             <th>their pattern</th>
+            <th>scope</th>
             <th>holder</th>
             <th>urgency</th>
             <th>decision</th>

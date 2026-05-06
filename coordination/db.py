@@ -140,7 +140,7 @@ CREATE INDEX IF NOT EXISTS idx_claims_engineer ON claims (engineer);
 """
 
 
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 
 # Migration registry: list of (version, upgrade_sql) tuples applied in order.
 # Entry for version N is the SQL that upgrades a DB from version N-1 to N.
@@ -212,6 +212,27 @@ MIGRATIONS: list[tuple[int, str]] = [
         CREATE INDEX idx_request_events_request ON request_events (request_id);
         CREATE INDEX idx_request_events_created ON request_events (created_at);
         """,
+    ),
+    # v6: two new decision verbs on `respond_to_request` -- `narrowed`
+    # and `coexist` -- need somewhere to land their inputs.
+    #
+    # `requests.requested_scope` records the narrower target the
+    # requester actually wants, distinct from the holder's pattern.
+    # The operator timeline can then show "holder claimed src/api/**,
+    # requester wanted src/api/auth.py" without needing to reconstruct
+    # the ask from audit events.
+    #
+    # `claims.coexists_with` is a JSON array of partner claim ids
+    # (TEXT keeps SQLite happy; readers do `json.loads(row["coexists_with"])`).
+    # NULL means no partners. When two claims agree to coexist, both
+    # ids land in each other's array -- they self-exclude from each
+    # other but stay adversarial to anyone outside the pair.
+    #
+    # Both columns are nullable so existing rows backfill cleanly.
+    (
+        6,
+        "ALTER TABLE requests ADD COLUMN requested_scope TEXT;\n"
+        "ALTER TABLE claims ADD COLUMN coexists_with TEXT;",
     ),
 ]
 
@@ -602,6 +623,13 @@ class Database:
             )
             await conn.commit()
             n = cur.rowcount or 0
+        # Detach this session's released claims from any coexisting
+        # partners BEFORE cascade-resolving requests, so a partner that
+        # is about to receive a coexist-related event sees a clean
+        # graph (no dangling reference to a claim that no longer
+        # exists).
+        for cid in to_close:
+            await self._detach_coexist_partners(cid)
         for cid in to_close:
             await self.cascade_resolve_requests_for_claim(
                 cid, release_kind="session-bulk", actor_engineer=None
@@ -631,6 +659,12 @@ class Database:
                     released_ids.append(cid)
                     n += cur.rowcount
             await conn.commit()
+        # Detach the released claims from any coexisting partners
+        # BEFORE cascade-resolve, so a partner that's about to receive
+        # a coexist-related event sees a clean graph rather than a
+        # dangling reference to a claim that no longer exists.
+        for cid in released_ids:
+            await self._detach_coexist_partners(cid)
         # Cascade-resolve any open requests against these claims.
         # Done outside the txn so a long pending list doesn't hold the
         # write lock; each cascade is its own short transaction.
@@ -722,6 +756,10 @@ class Database:
                     n += cur.rowcount
             await conn.commit()
 
+        # Detach before cascade-resolve so a partner that's about to
+        # receive a coexist-related event sees a clean graph.
+        for cid in actually_closed:
+            await self._detach_coexist_partners(cid)
         for cid in actually_closed:
             kind = "ttl-shortened" if cid in ttl_shortened else "ttl-or-idle"
             await self.cascade_resolve_requests_for_claim(
@@ -875,6 +913,7 @@ class Database:
         original_expires_at: str,
         shortened_expires_at: str,
         new_claim_expires_at: str,
+        requested_scope: str | None = None,
     ) -> dict[str, Any]:
         """Atomically create a request, log the ``filed`` audit event,
         and shorten the holder's claim TTL.
@@ -885,6 +924,12 @@ class Database:
         restore the claim's full TTL. Both transitions happen in a
         single transaction so a crash between steps can't leave the
         claim shortened with no request to track.
+
+        ``requested_scope`` (v0.11+) is an optional narrower target the
+        requester actually needs, distinct from the holder's pattern.
+        The operator timeline records this so "holder claimed src/api/**,
+        requester wanted src/api/auth.py" is reconstructible from the
+        audit log without parsing free-text reason fields.
         """
         await self.init()
         now = _utcnow()
@@ -909,9 +954,10 @@ class Database:
                     """
                     INSERT INTO requests (
                         id, claim_id, requester_engineer, requester_session_id,
-                        requested_pattern, reason, urgency, decision,
-                        original_expires_at, shortened_expires_at, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                        requested_pattern, requested_scope, reason, urgency,
+                        decision, original_expires_at, shortened_expires_at,
+                        created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
                     """,
                     (
                         request_id,
@@ -919,6 +965,7 @@ class Database:
                         requester_engineer,
                         requester_session_id,
                         requested_pattern,
+                        requested_scope,
                         reason,
                         urgency,
                         original_expires_at,
@@ -935,6 +982,7 @@ class Database:
                     detail={
                         "claim_id": claim_id,
                         "pattern": requested_pattern,
+                        "requested_scope": requested_scope,
                         "urgency": urgency,
                         "reason": reason,
                         "original_expires_at": original_expires_at,
@@ -995,6 +1043,8 @@ class Database:
         actor_engineer: str | None,
         actor_session_id: str | None,
         note: str | None = None,
+        narrowed_pattern: str | None = None,
+        coexist_pattern: str | None = None,
     ) -> dict[str, Any] | None:
         """Record the holder's decision and apply its side-effect.
 
@@ -1002,14 +1052,45 @@ class Database:
         - ``denied``: claim's expires_at is restored to the request's
           ``original_expires_at`` so the holder keeps the time they
           would have had absent the request.
+        - ``narrowed`` (v0.11+): release the holder's original claim
+          and open a new claim under ``narrowed_pattern`` inheriting
+          the holder's engineer / branch / repo / session / TTL. The
+          released portion is what the requester needed; the rest
+          stays held. Requires ``narrowed_pattern``.
+        - ``coexist`` (v0.11+): grant the requester a sibling claim on
+          the same scope. Both claims persist and self-exclude from
+          each other via ``claims.coexists_with`` (a JSON array of
+          partner ids). Useful when two agents want to edit different
+          functions in the same file. Requires ``coexist_pattern``;
+          for v1 the linkage is pairwise (requester <-> holder), not
+          transitive across the holder's existing partners.
 
         The request row's ``decision`` is moved from ``pending`` only;
         if the request already has a terminal decision the call is a
         no-op (returns the existing row). The audit event is recorded
         either way so an attempted late response is still visible.
         """
+        valid = {"approved", "denied", "narrowed", "coexist"}
+        if decision not in valid:
+            raise ValueError(
+                "decision must be one of 'approved', 'denied', "
+                f"'narrowed', 'coexist', got {decision!r}"
+            )
+        if decision == "narrowed" and not narrowed_pattern:
+            raise ValueError(
+                "decision='narrowed' requires a non-empty 'narrowed_pattern' kwarg"
+            )
+        if decision == "coexist" and not coexist_pattern:
+            raise ValueError(
+                "decision='coexist' requires a non-empty 'coexist_pattern' kwarg"
+            )
+
         await self.init()
         now = _utcnow()
+        # Holds extra detail fields that narrowed / coexist branches
+        # populate (new claim id, original pattern, etc.) so the
+        # responded audit event records the full transition.
+        extra_detail: dict[str, Any] = {}
         async with aiosqlite.connect(self.path) as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
@@ -1056,9 +1137,19 @@ class Database:
                         "WHERE id = ? AND released_at IS NULL",
                         (req["original_expires_at"], req["claim_id"]),
                     )
-                else:
-                    raise ValueError(
-                        f"decision must be 'approved' or 'denied', got {decision!r}"
+                elif decision == "narrowed":
+                    extra_detail = await self._apply_narrowed(
+                        conn,
+                        request_row=req,
+                        narrowed_pattern=str(narrowed_pattern),
+                        now=now,
+                    )
+                elif decision == "coexist":
+                    extra_detail = await self._apply_coexist(
+                        conn,
+                        request_row=req,
+                        coexist_pattern=str(coexist_pattern),
+                        now=now,
                     )
 
                 await conn.execute(
@@ -1070,13 +1161,15 @@ class Database:
                     """,
                     (decision, now, actor_engineer, actor_session_id, note, request_id),
                 )
+                detail: dict[str, Any] = {"decision": decision, "note": note}
+                detail.update(extra_detail)
                 await self._record_event_in_txn(
                     conn,
                     request_id=request_id,
                     event_type="responded",
                     actor_engineer=actor_engineer,
                     actor_session_id=actor_session_id,
-                    detail={"decision": decision, "note": note},
+                    detail=detail,
                 )
                 await conn.commit()
             except Exception:
@@ -1087,6 +1180,222 @@ class Database:
             )
             row = await cur.fetchone()
             return dict(row) if row else None
+
+    @staticmethod
+    async def _apply_narrowed(
+        conn: aiosqlite.Connection,
+        *,
+        request_row: aiosqlite.Row,
+        narrowed_pattern: str,
+        now: str,
+    ) -> dict[str, Any]:
+        """Release the original claim and open a new claim under the
+        narrower pattern, all inside the caller's transaction. Returns
+        a dict of fields to merge into the responded-event detail
+        (original_pattern, narrowed_pattern, original_claim_id,
+        new_claim_id) so callers don't have to reload the rows.
+        """
+        original_claim_id = str(request_row["claim_id"])
+        cur = await conn.execute(
+            "SELECT * FROM claims WHERE id = ?", (original_claim_id,)
+        )
+        orig = await cur.fetchone()
+        if orig is None:
+            raise ValueError(
+                f"narrowed: original claim {original_claim_id!r} not found"
+            )
+        # Release the original. If it was already released we still
+        # proceed to insert the new claim so the responder isn't left
+        # in a half-finished state, but the transaction-level outcome
+        # is the same either way.
+        await conn.execute(
+            "UPDATE claims SET released_at = ? "
+            "WHERE id = ? AND released_at IS NULL",
+            (now, original_claim_id),
+        )
+        new_claim_id = str(uuid4())
+        # last_activity is stamped only when the inherited row had a
+        # session_id (matches the v0.6+ idle-expiration opt-in rule
+        # used by insert_claims_batch).
+        new_last_activity = now if orig["session_id"] else None
+        await conn.execute(
+            """
+            INSERT INTO claims (
+                id, engineer, branch, description, claim_type, pattern,
+                severity, created_at, expires_at, released_at, repo,
+                session_id, last_activity, coexists_with
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL)
+            """,
+            (
+                new_claim_id,
+                orig["engineer"],
+                orig["branch"],
+                orig["description"],
+                orig["claim_type"],
+                narrowed_pattern,
+                orig["severity"],
+                now,
+                orig["expires_at"],
+                orig["repo"],
+                orig["session_id"],
+                new_last_activity,
+            ),
+        )
+        return {
+            "narrowed_pattern": narrowed_pattern,
+            "original_pattern": str(orig["pattern"]),
+            "original_claim_id": original_claim_id,
+            "new_claim_id": new_claim_id,
+        }
+
+    @staticmethod
+    async def _apply_coexist(
+        conn: aiosqlite.Connection,
+        *,
+        request_row: aiosqlite.Row,
+        coexist_pattern: str,
+        now: str,
+    ) -> dict[str, Any]:
+        """Grant the requester a sibling claim and wire the pairwise
+        coexists_with edge between holder and requester. Returns
+        responded-event detail fields (coexist_pattern, holder_claim_id,
+        requester_claim_id).
+
+        The linkage is pairwise (holder <-> requester) for v1: we do
+        NOT add the holder's existing partners to the requester's
+        list, because each coexistence is a separate consent and
+        adding C as a partner of B because B coexisted with A would
+        bind C without C's holder agreeing.
+        """
+        import json as _json
+
+        holder_claim_id = str(request_row["claim_id"])
+        cur = await conn.execute(
+            "SELECT * FROM claims WHERE id = ?", (holder_claim_id,)
+        )
+        holder = await cur.fetchone()
+        if holder is None:
+            raise ValueError(
+                f"coexist: holder claim {holder_claim_id!r} not found"
+            )
+        requester_claim_id = str(uuid4())
+        requester_engineer = str(request_row["requester_engineer"])
+        requester_session_id = request_row["requester_session_id"]
+        requester_last_activity = now if requester_session_id else None
+        request_id = str(request_row["id"])
+
+        # Insert the requester's sibling claim. Pattern matches what
+        # the holder approved; severity is 'soft' because cooperative
+        # coexistence is the whole point of this verb.
+        await conn.execute(
+            """
+            INSERT INTO claims (
+                id, engineer, branch, description, claim_type, pattern,
+                severity, created_at, expires_at, released_at, repo,
+                session_id, last_activity, coexists_with
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
+            """,
+            (
+                requester_claim_id,
+                requester_engineer,
+                None,
+                f"coexist via request {request_id}",
+                "file",
+                coexist_pattern,
+                "soft",
+                now,
+                holder["expires_at"],
+                holder["repo"],
+                requester_session_id,
+                requester_last_activity,
+                _json.dumps([holder_claim_id]),
+            ),
+        )
+
+        # Append the requester's claim to the holder's coexists_with
+        # array (creating it if the holder had no partners before).
+        holder_partners_raw = holder["coexists_with"]
+        if holder_partners_raw:
+            holder_partners = list(_json.loads(holder_partners_raw))
+        else:
+            holder_partners = []
+        if requester_claim_id not in holder_partners:
+            holder_partners.append(requester_claim_id)
+        await conn.execute(
+            "UPDATE claims SET coexists_with = ? WHERE id = ?",
+            (_json.dumps(holder_partners), holder_claim_id),
+        )
+
+        return {
+            "coexist_pattern": coexist_pattern,
+            "holder_claim_id": holder_claim_id,
+            "requester_claim_id": requester_claim_id,
+        }
+
+    async def _detach_coexist_partners(self, claim_id: str) -> int:
+        """Walk a (recently released) claim's ``coexists_with`` array
+        and strip ``claim_id`` from each partner's array. Idempotent:
+        partners that are already gone or that don't list ``claim_id``
+        are left alone.
+
+        When a partner ends up with an empty array we write back NULL
+        rather than ``"[]"`` so the column stays semantically "no
+        partners" and any reader doing ``if row["coexists_with"]:``
+        keeps working.
+
+        Returns the number of partner rows actually updated, mostly
+        for tests / future logging.
+        """
+        import json as _json
+
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = await conn.execute(
+                    "SELECT coexists_with FROM claims WHERE id = ?", (claim_id,)
+                )
+                row = await cur.fetchone()
+                if row is None or not row["coexists_with"]:
+                    await conn.commit()
+                    return 0
+                try:
+                    partners = list(_json.loads(row["coexists_with"]))
+                except (ValueError, TypeError):
+                    # Corrupt JSON: nothing safe to do here; the column
+                    # is intentionally tolerant of NULL/empty.
+                    await conn.commit()
+                    return 0
+
+                updated = 0
+                for partner_id in partners:
+                    cur = await conn.execute(
+                        "SELECT coexists_with FROM claims WHERE id = ?",
+                        (partner_id,),
+                    )
+                    p_row = await cur.fetchone()
+                    if p_row is None or not p_row["coexists_with"]:
+                        continue
+                    try:
+                        p_partners = list(_json.loads(p_row["coexists_with"]))
+                    except (ValueError, TypeError):
+                        continue
+                    if claim_id not in p_partners:
+                        continue
+                    p_partners = [pid for pid in p_partners if pid != claim_id]
+                    new_value = _json.dumps(p_partners) if p_partners else None
+                    await conn.execute(
+                        "UPDATE claims SET coexists_with = ? WHERE id = ?",
+                        (new_value, partner_id),
+                    )
+                    updated += 1
+                await conn.commit()
+                return updated
+            except Exception:
+                await conn.rollback()
+                raise
 
     async def cascade_resolve_requests_for_claim(
         self,

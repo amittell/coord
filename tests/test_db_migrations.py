@@ -584,3 +584,39 @@ async def test_v5_introduces_requests_and_request_events_tables(
         assert required in cols, (
             f"request_events table missing column {required!r}; saw: {cols}"
         )
+
+
+async def test_v6_adds_requested_scope_to_requests(tmp_path: Path) -> None:
+    """v6 adds a nullable `requested_scope` column on requests so the
+    operator timeline records what the requester actually asked for vs
+    what the holder claimed (the holder's pattern may be broader than
+    the scope the requester needs)."""
+    db_path = tmp_path / "v6_requested_scope.sqlite"
+    db = Database(db_path)
+    await db.init()
+
+    rows = await _fetch_all(db_path, "PRAGMA table_info(requests)")
+    cols = {r[1] for r in rows}
+    assert "requested_scope" in cols, (
+        f"requests table missing requested_scope column; saw: {cols}"
+    )
+    scope_row = next(r for r in rows if r[1] == "requested_scope")
+    assert scope_row[3] == 0, "requested_scope must be nullable for backfill"
+
+
+async def test_v6_adds_coexists_with_to_claims(tmp_path: Path) -> None:
+    """v6 adds a nullable `coexists_with` column on claims that stores a
+    JSON array of partner claim ids. NULL means no coexisting partners
+    (the default for every existing claim and every fresh claim that
+    isn't a coexist sibling)."""
+    db_path = tmp_path / "v6_coexists_with.sqlite"
+    db = Database(db_path)
+    await db.init()
+
+    rows = await _fetch_all(db_path, "PRAGMA table_info(claims)")
+    cols = {r[1] for r in rows}
+    assert "coexists_with" in cols, (
+        f"claims table missing coexists_with column; saw: {cols}"
+    )
+    coex_row = next(r for r in rows if r[1] == "coexists_with")
+    assert coex_row[3] == 0, "coexists_with must be nullable for backfill"

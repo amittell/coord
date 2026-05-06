@@ -39,6 +39,62 @@ def _validate_pattern_syntax(pattern: str) -> str | None:
     return None
 
 
+def _is_subset_pattern(narrowed: str, original: str) -> bool:
+    """Return True iff every path matched by ``narrowed`` is also
+    matched by ``original``.
+
+    Strategy mirrors the heuristic-overlap path in :mod:`coordination.engine`:
+    synthesize a single concrete path that ``narrowed`` would match (via
+    ``_synthesize_candidate``), then ask the original pattern's PathSpec
+    whether it also matches. This is a sound subset proxy because the
+    engine's synthesizer is constructed to produce a representative
+    instance for any wildcard token, so a hit on the original means
+    every concrete path of ``narrowed`` lies inside ``original``. Equal
+    patterns trivially pass.
+
+    Empty / unparseable inputs short-circuit to False so the caller
+    surfaces a clear rejection instead of silently accepting nonsense.
+    """
+    import pathspec
+
+    from coordination.engine import _normalize_pattern, _synthesize_candidate
+
+    norm_narrowed = _normalize_pattern(narrowed)
+    norm_original = _normalize_pattern(original)
+    if not norm_narrowed or not norm_original:
+        return False
+    candidate = _synthesize_candidate(narrowed)
+    if candidate is None:
+        return False
+    spec_original = pathspec.PathSpec.from_lines("gitignore", [norm_original])
+    return spec_original.match_file(candidate)
+
+
+def _coexist_partner_ids_from_rows(rows: list[dict[str, Any]]) -> set[str]:
+    """Collect the union of ``coexists_with`` partner ids from a row set.
+
+    Centralised so the conflict and create paths apply identical
+    semantics: anything in any of these lists is a known coexisting
+    partner of the caller and must be invisible to the caller's
+    overlap check. Defensive against malformed JSON (treats it as no
+    partners rather than crashing the whole call).
+    """
+    import json as _json
+
+    partners: set[str] = set()
+    for row in rows:
+        cw = row.get("coexists_with")
+        if not cw:
+            continue
+        try:
+            ids = _json.loads(cw)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(ids, list):
+            partners.update(str(x) for x in ids)
+    return partners
+
+
 @dataclass
 class CoordinationService:
     db: Database
@@ -174,6 +230,25 @@ class CoordinationService:
         if session_ids:
             exclude = set(session_ids)
             active = [r for r in active if r.get("session_id") not in exclude]
+        # Coexist self-exclusion (v0.11+): if any of the caller's
+        # session(s) hold a claim that's coexisting with another claim
+        # X, X is invisible to the caller's conflict check. The pair
+        # was explicitly granted by both sides via the request flow,
+        # so an in-pair edit is cooperative not adversarial. Outsiders
+        # still see X normally because we only ever harvest partners
+        # from the caller's own claim rows.
+        if session_ids:
+            own_session_set = set(session_ids)
+            own_claims = await self.db.list_active_claims_rows(exclude_engineer=None)
+            own_claims = [
+                c
+                for c in own_claims
+                if c.get("session_id") in own_session_set
+                and c.get("repo") == repo
+            ]
+            partner_ids = _coexist_partner_ids_from_rows(own_claims)
+            if partner_ids:
+                active = [r for r in active if str(r.get("id")) not in partner_ids]
         conflicts: list[dict[str, Any]] = []
         for pat in patterns:
             for row in active:
@@ -248,6 +323,21 @@ class CoordinationService:
         # Session-scoped self-exclusion (v0.5.0): see check_conflicts.
         if body.session_id:
             active = [r for r in active if r.get("session_id") != body.session_id]
+        # Coexist self-exclusion (v0.11+): mirror check_conflicts so a
+        # coexist partner adding a NEW claim alongside their existing
+        # one isn't blocked by the partner they were explicitly granted
+        # coexistence with.
+        if body.session_id:
+            own_claims = await self.db.list_active_claims_rows(exclude_engineer=None)
+            own_claims = [
+                c
+                for c in own_claims
+                if c.get("session_id") == body.session_id
+                and c.get("repo") == body.repo
+            ]
+            partner_ids = _coexist_partner_ids_from_rows(own_claims)
+            if partner_ids:
+                active = [r for r in active if str(r.get("id")) not in partner_ids]
         for item in body.claims:
             for row in active:
                 overlap = await compute_overlap(
@@ -389,6 +479,7 @@ class CoordinationService:
         requester_session_id: str | None,
         reason: str | None,
         urgency: str,
+        requested_scope: str | None = None,
     ) -> dict[str, Any]:
         """Create a release request and shorten the holder's claim TTL.
 
@@ -396,6 +487,12 @@ class CoordinationService:
         responsibility (so the API handler can use FastAPI's async
         primitives directly without entangling them with this layer).
         Returns the request row.
+
+        ``requested_scope`` (v0.11+) is what the requester actually
+        needs, often a sub-pattern of the holder's claim pattern. It is
+        recorded on the request row and the ``filed`` audit event so
+        the holder (and the dashboard) can decide whether to narrow,
+        coexist, approve, or deny.
 
         Raises:
         - ``KeyError`` if the claim does not exist.
@@ -455,6 +552,7 @@ class CoordinationService:
             original_expires_at=original_expires_at,
             shortened_expires_at=shortened,
             new_claim_expires_at=new_exp,
+            requested_scope=requested_scope,
         )
 
     async def respond_to_request(
@@ -465,13 +563,58 @@ class CoordinationService:
         actor_engineer: str | None,
         actor_session_id: str | None,
         note: str | None = None,
+        narrowed_pattern: str | None = None,
+        coexist_pattern: str | None = None,
     ) -> dict[str, Any] | None:
+        """Forward to the DB layer with v0.11 decision verbs.
+
+        For ``decision='narrowed'`` the service enforces that
+        ``narrowed_pattern`` is a (non-strict) subset of the holder's
+        current claim pattern. A disjoint or broader pattern is a
+        contract violation that the API handler maps to 400. Coexist
+        deliberately skips the subset check because coexisting claims
+        are intentionally on the same scope (or compatible scopes the
+        holder explicitly agreed to).
+        """
+        if decision == "narrowed":
+            if not narrowed_pattern:
+                # The DB layer would reject this too, but raising here
+                # gives the API handler a clearer error message before
+                # any DB roundtrip.
+                raise ValueError(
+                    "decision='narrowed' requires a non-empty 'narrowed_pattern'"
+                )
+            request_row = await self.db.get_request(request_id)
+            if request_row is None:
+                # Surface the not-found through the DB's normal return
+                # path (None) so the handler maps it to 404.
+                return None
+            claim_id = str(request_row["claim_id"])
+            active_rows = await self.db.list_active_claims_rows(exclude_engineer=None)
+            holder_claim = next(
+                (c for c in active_rows if str(c.get("id")) == claim_id),
+                None,
+            )
+            if holder_claim is None:
+                raise ValueError(
+                    f"narrowed: holder claim {claim_id!r} is no longer active; "
+                    "the request can no longer be narrowed"
+                )
+            original_pattern = str(holder_claim["pattern"])
+            if not _is_subset_pattern(narrowed_pattern, original_pattern):
+                raise ValueError(
+                    f"narrowed_pattern {narrowed_pattern!r} is not a subset of "
+                    f"the holder's current pattern {original_pattern!r}; "
+                    "narrowing must reduce scope, not move it"
+                )
         return await self.db.respond_to_request(
             request_id=request_id,
             decision=decision,
             actor_engineer=actor_engineer,
             actor_session_id=actor_session_id,
             note=note,
+            narrowed_pattern=narrowed_pattern,
+            coexist_pattern=coexist_pattern,
         )
 
     async def get_request(self, request_id: str) -> dict[str, Any] | None:

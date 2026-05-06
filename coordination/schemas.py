@@ -85,6 +85,17 @@ class FileRequestRequest(BaseModel):
         default="normal",
         description="low | normal | high | blocking. Recorded for the audit trail; v0.9.0 doesn't yet vary the shortened-TTL window per urgency.",
     )
+    requested_scope: str | None = Field(
+        default=None,
+        description=(
+            "What the requester actually needs, often a sub-pattern of "
+            "the holder's claim pattern. Recorded for the audit trail "
+            "(v0.11+) so 'holder claimed src/api/**, requester wanted "
+            "src/api/auth.py' is reconstructible without parsing the "
+            "free-text reason field. Used by the holder to decide "
+            "whether 'narrowed' or 'coexist' is the right response."
+        ),
+    )
     wait_seconds: int = Field(
         default=60,
         ge=0,
@@ -102,7 +113,32 @@ class FileRequestRequest(BaseModel):
 class RespondToRequestRequest(BaseModel):
     """The holder's decision on an open request."""
 
-    decision: str = Field(..., description="approved | denied")
+    decision: str = Field(
+        ...,
+        description="approved | denied | narrowed | coexist",
+    )
     engineer: str | None = None
     session_id: str | None = None
     note: str | None = None
+    narrowed_pattern: str | None = Field(
+        default=None,
+        description=(
+            "Required when decision='narrowed'. The new, tighter pattern "
+            "the holder will keep claimed; the original claim is closed "
+            "and a new claim is opened under this pattern (inheriting "
+            "the holder's engineer / branch / repo / session / TTL). "
+            "Must be a subset of the holder's current pattern; the "
+            "service layer rejects disjoint or broader patterns."
+        ),
+    )
+    coexist_pattern: str | None = Field(
+        default=None,
+        description=(
+            "Required when decision='coexist'. The pattern the requester "
+            "is being granted a sibling claim on. Both holder and "
+            "requester end up with active claims, mutually self-excluded "
+            "via claims.coexists_with, but still adversarial to anyone "
+            "outside the pair. Useful when both agents want to edit "
+            "different functions in the same file."
+        ),
+    )

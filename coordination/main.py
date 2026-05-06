@@ -327,6 +327,7 @@ async def file_request(
             requester_session_id=body.session_id,
             reason=body.reason,
             urgency=body.urgency,
+            requested_scope=body.requested_scope,
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -349,13 +350,35 @@ async def respond_to_request(
     body: RespondToRequestRequest,
     _: None = Depends(require_auth),
 ) -> JSONResponse:
-    """The holder approves or denies an open request. Approve releases
-    the claim immediately; deny restores the claim's original TTL. Both
-    transitions are audit-logged."""
-    if body.decision not in ("approved", "denied"):
+    """The holder responds to an open request.
+
+    - ``approved`` releases the claim immediately.
+    - ``denied`` restores the claim's original TTL.
+    - ``narrowed`` (v0.11+) closes the original claim and opens a new
+      one under ``narrowed_pattern`` (must be a subset of the holder's
+      current pattern; rejected with 400 otherwise).
+    - ``coexist`` (v0.11+) grants the requester a sibling claim on
+      ``coexist_pattern``. Both holder and requester end up with active
+      claims, mutually self-excluded via ``claims.coexists_with``.
+
+    All transitions are audit-logged."""
+    if body.decision not in ("approved", "denied", "narrowed", "coexist"):
         raise HTTPException(
             status_code=400,
-            detail="decision must be 'approved' or 'denied'",
+            detail=(
+                "decision must be one of 'approved', 'denied', "
+                "'narrowed', 'coexist'"
+            ),
+        )
+    if body.decision == "narrowed" and not body.narrowed_pattern:
+        raise HTTPException(
+            status_code=400,
+            detail="decision='narrowed' requires a non-empty 'narrowed_pattern'",
+        )
+    if body.decision == "coexist" and not body.coexist_pattern:
+        raise HTTPException(
+            status_code=400,
+            detail="decision='coexist' requires a non-empty 'coexist_pattern'",
         )
     try:
         result = await get_service().respond_to_request(
@@ -364,6 +387,8 @@ async def respond_to_request(
             actor_engineer=body.engineer,
             actor_session_id=body.session_id,
             note=body.note,
+            narrowed_pattern=body.narrowed_pattern,
+            coexist_pattern=body.coexist_pattern,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

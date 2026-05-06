@@ -166,14 +166,20 @@ async def request_release(
     reason: str,
     urgency: str = "normal",
     wait_seconds: int = 60,
+    requested_scope: str = "",
 ) -> dict[str, Any]:
     """File an explicit release request against another agent's claim.
 
     Use this when ``claim_files`` returned a 409 conflict and you need
     the scope urgently. Filing shortens the holder's claim TTL (so they
     must respond or auto-release within minutes) and surfaces in their
-    next ``pending_requests`` poll where they can approve (claim
-    released) or deny (TTL restored).
+    next ``pending_requests`` poll where they can approve, deny,
+    narrow, or coexist (v0.11+).
+
+    ``requested_scope`` is what you actually need, often a sub-pattern
+    of the holder's claim. The holder uses it to decide whether
+    ``narrowed`` or ``coexist`` is the right response. Recorded in the
+    audit trail.
 
     By default this blocks for up to ``wait_seconds`` (60s) waiting
     for the holder's decision -- one tool call usually returns the
@@ -194,6 +200,8 @@ async def request_release(
         "urgency": urgency,
         "wait_seconds": wait_seconds,
     }
+    if requested_scope:
+        body["requested_scope"] = requested_scope
     # Allow callers in pytest / non-default envs to override the
     # requester via COORD_REQUESTER for tracebility (the env mirrors
     # how engineer is plumbed into claim_files).
@@ -219,19 +227,38 @@ async def respond_to_request(
     request_id: str,
     decision: str,
     note: str = "",
+    narrowed_pattern: str = "",
+    coexist_pattern: str = "",
 ) -> dict[str, Any]:
-    """Approve or deny a release request filed against your claim.
+    """Approve, deny, narrow, or coexist on a release request filed
+    against your claim.
 
-    ``decision`` must be ``"approved"`` (release the claim now) or
-    ``"denied"`` (keep it; the original TTL is restored). The decision
-    and an optional note are audit-logged so the requester can read
-    the reasoning later.
+    ``decision`` is one of:
+
+    - ``"approved"``: release the claim now (original v0.9 behaviour).
+    - ``"denied"``: keep the claim, restore original TTL.
+    - ``"narrowed"`` (v0.11+): close the claim and open a tighter one.
+      Pass ``narrowed_pattern`` describing what you'll keep claimed.
+      The server validates it's a subset of the original pattern and
+      400s if not.
+    - ``"coexist"`` (v0.11+): grant the requester a sibling claim on
+      the same scope. Pass ``coexist_pattern``. Both agents end up
+      with active claims, mutually self-excluded but still adversarial
+      to anyone outside the pair. Cooperative not enforced -- imports
+      and shared module-level state are still on the agents to handle.
+
+    The decision and any pattern fields are audit-logged so the
+    requester (and operators) can read the reasoning later.
     """
     body: dict[str, Any] = {
         "decision": decision,
         "session_id": _SESSION_ID,
         "note": note or None,
     }
+    if narrowed_pattern:
+        body["narrowed_pattern"] = narrowed_pattern
+    if coexist_pattern:
+        body["coexist_pattern"] = coexist_pattern
     async with httpx.AsyncClient(timeout=30.0) as client:
         r = await client.post(
             f"{_base_url()}/requests/{request_id}/respond",
@@ -489,22 +516,25 @@ def _signal_remove_marker(signum: int, _frame: FrameType | None) -> None:
 
 
 def _install_marker_handlers() -> None:
-    """Wire atexit + SIGTERM/SIGINT handlers for graceful marker cleanup.
+    """Wire atexit handler for graceful marker cleanup.
 
-    Idempotent at the atexit layer (atexit.register on the same callable
-    twice is harmless because _remove_session_marker is itself idempotent).
-    Signal handlers can only be installed from the main thread; if we are
-    not on the main thread the install is silently skipped (the atexit
-    handler still covers normal shutdown paths).
+    Idempotent (atexit.register on the same callable twice is harmless
+    because _remove_session_marker is itself idempotent).
+
+    Pre-v0.11 we ALSO installed SIGTERM/SIGINT handlers that re-raised
+    the signal under SIG_DFL after cleanup. That fought with FastMCP's
+    own signal handling: the MCP library's stdio event loop expects to
+    catch SIGINT/SIGTERM cleanly, and re-raising SIG_DFL aborted the
+    process before the library could drain its pipes. Symptom for
+    operators was a "Transport closed" error on the next tool call --
+    the parent (Codex / Claude Code) had a stale stdio handle to a
+    child that had already died on a signal it shouldn't have. atexit
+    fires for both clean exits AND signal-triggered exits via the
+    interpreter's normal shutdown path, so dropping the explicit
+    signal handlers loses no cleanup coverage and lets FastMCP own the
+    signal disposition.
     """
     atexit.register(_remove_session_marker)
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        try:
-            signal.signal(sig, _signal_remove_marker)
-        except (ValueError, OSError):
-            # ValueError: not on main thread. OSError: signal not supported
-            # on this platform. Either way, the atexit fallback still runs.
-            pass
 
 
 def main() -> None:

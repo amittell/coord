@@ -13,7 +13,8 @@ If `claim_files` returns conflicts, stop and ask the user. No edits outside clai
 If your `coord` MCP exposes them, additionally prefer:
 - `pending_requests` (v0.6+) between operations — see who is blocked on your scope; if a holder, approve or deny pending release requests via `respond_to_request`.
 - `release_session` (v0.6+) instead of `release_claims` at end-of-work — releases every claim from this MCP session in one call, including those made by subagents under different engineer names.
-- `request_release` (v0.9+) when `claim_files` 409'd and your work is urgent — files an explicit ask against the holder's claim. The holder's TTL shortens, they get notified on their next `pending_requests` poll, and approve or deny lands back in your `my_requests` view.
+- `request_release` (v0.9+) when `claim_files` 409'd and your work is urgent — files an explicit ask against the holder's claim. The holder's TTL shortens, they get notified on their next `pending_requests` poll, and the decision lands back in your `my_requests` view.
+- `respond_to_request` decisions in v0.11+: in addition to `approved` (release whole claim) and `denied` (keep it), the holder can respond with `narrowed` (close the claim, open a tighter one — pass `narrowed_pattern`) or `coexist` (let the requester have a sibling claim on the same scope — pass `coexist_pattern`). `coexist` is cooperative not enforced; agents on the same file still need to handle imports and module-level state themselves.
 
 **Sub-agents (Task tool):** include this protocol in the sub-agent task text; sub-agents do not inherit `CLAUDE.md`.
 """
@@ -31,7 +32,8 @@ If `claim_files` returns conflicts, stop and ask the user. No edits outside clai
 If your `coord` MCP exposes them, additionally prefer:
 - `pending_requests` (v0.6+) between operations — see who is blocked on your scope; if a holder, approve or deny pending release requests via `respond_to_request`.
 - `release_session` (v0.6+) instead of `release_claims` at end-of-work — releases every claim from this MCP session in one call, including those made by subagents under different engineer names.
-- `request_release` (v0.9+) when `claim_files` 409'd and your work is urgent — files an explicit ask against the holder's claim. The holder's TTL shortens, they get notified on their next `pending_requests` poll, and approve or deny lands back in your `my_requests` view.
+- `request_release` (v0.9+) when `claim_files` 409'd and your work is urgent — files an explicit ask against the holder's claim. The holder's TTL shortens, they get notified on their next `pending_requests` poll, and the decision lands back in your `my_requests` view.
+- `respond_to_request` decisions in v0.11+: in addition to `approved` (release whole claim) and `denied` (keep it), the holder can respond with `narrowed` (close the claim, open a tighter one — pass `narrowed_pattern`) or `coexist` (let the requester have a sibling claim on the same scope — pass `coexist_pattern`). `coexist` is cooperative not enforced; agents on the same file still need to handle imports and module-level state themselves.
 """
 
 CURSOR_RULE = """---

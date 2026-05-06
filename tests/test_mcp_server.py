@@ -753,6 +753,154 @@ async def test_my_requests_filters_by_requester_and_decision(
 
 
 # ---------------------------------------------------------------------------
+# v0.11.0 -- requested_scope on file_request, narrowed/coexist on respond
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_request_release_includes_requested_scope_when_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-empty ``requested_scope`` arg must surface on the body so
+    the server can record what the requester actually wanted (often a
+    sub-pattern of the holder's claim pattern)."""
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.setattr(mcp_server, "_SESSION_ID", "scope-session-zzz")
+    captured = _install_mock_transport(
+        monkeypatch,
+        _json_handler(200, {"id": "req-2", "decision": "pending"}),
+    )
+
+    await mcp_server.request_release(
+        claim_id="c-2",
+        reason="need login.py only",
+        wait_seconds=0,
+        requested_scope="src/auth/login.py",
+    )
+
+    import json as _json
+
+    body = _json.loads(captured[0].content.decode("utf-8"))
+    assert body["requested_scope"] == "src/auth/login.py"
+
+
+@pytest.mark.asyncio
+async def test_request_release_omits_requested_scope_when_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The empty default is the legacy behaviour: do not put a
+    ``requested_scope`` key on the body. Server treats absence and
+    NULL as the same thing, but a stray empty string would clutter
+    the audit log."""
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.setattr(mcp_server, "_SESSION_ID", "scope-session-yyy")
+    captured = _install_mock_transport(
+        monkeypatch,
+        _json_handler(200, {"id": "req-3", "decision": "pending"}),
+    )
+
+    await mcp_server.request_release(
+        claim_id="c-3",
+        reason="full claim please",
+        wait_seconds=0,
+    )
+
+    import json as _json
+
+    body = _json.loads(captured[0].content.decode("utf-8"))
+    assert "requested_scope" not in body
+
+
+@pytest.mark.asyncio
+async def test_respond_to_request_includes_narrowed_pattern_when_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``decision='narrowed'`` carries a ``narrowed_pattern`` that the
+    server uses to open the holder's replacement claim. Bridge must
+    pass it through verbatim."""
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.setattr(mcp_server, "_SESSION_ID", "holder-session-narrow")
+    captured = _install_mock_transport(
+        monkeypatch,
+        _json_handler(200, {"id": "req-4", "decision": "narrowed"}),
+    )
+
+    await mcp_server.respond_to_request(
+        request_id="req-4",
+        decision="narrowed",
+        narrowed_pattern="src/auth/utils.py",
+    )
+
+    import json as _json
+
+    body = _json.loads(captured[0].content.decode("utf-8"))
+    assert body["decision"] == "narrowed"
+    assert body["narrowed_pattern"] == "src/auth/utils.py"
+    # coexist_pattern must not leak in.
+    assert "coexist_pattern" not in body
+
+
+@pytest.mark.asyncio
+async def test_respond_to_request_includes_coexist_pattern_when_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``decision='coexist'`` carries a ``coexist_pattern`` that the
+    server uses to mint the requester's sibling claim."""
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.setattr(mcp_server, "_SESSION_ID", "holder-session-coex")
+    captured = _install_mock_transport(
+        monkeypatch,
+        _json_handler(200, {"id": "req-5", "decision": "coexist"}),
+    )
+
+    await mcp_server.respond_to_request(
+        request_id="req-5",
+        decision="coexist",
+        coexist_pattern="src/auth/login.py",
+    )
+
+    import json as _json
+
+    body = _json.loads(captured[0].content.decode("utf-8"))
+    assert body["decision"] == "coexist"
+    assert body["coexist_pattern"] == "src/auth/login.py"
+    # narrowed_pattern must not leak in.
+    assert "narrowed_pattern" not in body
+
+
+@pytest.mark.asyncio
+async def test_respond_to_request_omits_unused_pattern_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """For the legacy ``approved`` decision neither pattern field
+    belongs on the body. Sending empty strings would force the server
+    into pattern-validation paths that don't apply here."""
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.setattr(mcp_server, "_SESSION_ID", "holder-session-plain")
+    captured = _install_mock_transport(
+        monkeypatch,
+        _json_handler(200, {"id": "req-6", "decision": "approved"}),
+    )
+
+    await mcp_server.respond_to_request(
+        request_id="req-6",
+        decision="approved",
+    )
+
+    import json as _json
+
+    body = _json.loads(captured[0].content.decode("utf-8"))
+    assert body["decision"] == "approved"
+    assert "narrowed_pattern" not in body
+    assert "coexist_pattern" not in body
+
+
+# ---------------------------------------------------------------------------
 # pending_requests + session id propagation (v0.6.0)
 # ---------------------------------------------------------------------------
 

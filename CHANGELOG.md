@@ -19,6 +19,25 @@ Semantic Versioning.
 
 - (none recorded yet)
 
+## [0.11.0] - 2026-05-05
+
+### Added
+
+- **`narrowed` decision** on `respond_to_request`. The holder can close their original claim and atomically open a new claim with a tighter pattern. Inherits the original's engineer / repo / session / TTL. The server validates `narrowed_pattern` is a strict subset of the holder's current pattern via the same heuristic-overlap synthesizer used by `compute_overlap`; disjoint or broader patterns are 400'd. Cascade-resolves any open requests against the closed claim.
+- **`coexist` decision** on `respond_to_request`. The holder grants the requester a sibling claim on the same scope. Both claims live, mutually self-excluded via a new `claims.coexists_with` JSON-array column, and they remain adversarial to anyone outside the pair. Useful when two agents want to edit different functions in the same file. Cooperative not enforced -- imports and shared module-level state are still on the agents to handle.
+- **`requested_scope`** on `POST /requests` and the `request_release` MCP tool. The requester says what they actually need (often a sub-pattern of the holder's claim); the holder uses it to decide between approve / deny / narrow / coexist. Recorded in the audit trail.
+- **Schema migration v6** adds nullable `requests.requested_scope` (TEXT) and `claims.coexists_with` (TEXT, JSON-encoded array of partner claim IDs, NULL for none). Forwards-only.
+- Dashboard `release requests` panel gains a `scope` column and the `narrowed` (dashed phosphor) and `coexist` (cyan) decision pills.
+- `db._detach_coexist_partners` cleanup hook wired into `release_claims`, `release_for_session`, and `expire_stale_claims` so a coexist partner's `coexists_with` array is cleaned up when its sibling claim ends.
+
+### Fixed
+
+- coord-mcp no longer installs custom SIGTERM/SIGINT handlers. The v0.10 handlers re-raised the signal under `SIG_DFL` after cleanup, which fought with FastMCP's own signal handling and caused the MCP child to die abruptly during operations -- agents would then see "Transport closed" on their next tool call and have to fall back to the coord CLI to release claims. Marker cleanup now runs purely from `atexit`, which fires for both clean exits and signal-driven shutdowns through the interpreter's normal path. FastMCP keeps full control over the signal disposition.
+
+### Built by
+
+A 3-phase, 3-agent build: phase 1 (schema + DB methods) ran sequentially because phases 2/3 depend on its API; phase 2a (service + API + conflict-check coexist semantics) and phase 2b (MCP tools + dashboard + snippets) were dispatched in parallel against the merged phase 1. Phase 2b's agent hit a usage cap mid-task; its tests landed but the implementation had to be completed by the dispatcher.
+
 ## [0.10.0] - 2026-05-05
 
 ### Fixed

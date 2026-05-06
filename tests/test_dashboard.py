@@ -787,3 +787,99 @@ async def test_dashboard_release_requests_panel_zero_state(
 ) -> None:
     html_out = await render_dashboard()
     assert "no release requests filed yet" in html_out.lower()
+
+
+# ---------------------------------------------------------------------------
+# Release-requests panel: scope column + narrowed/coexist pill (v0.11.0)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dashboard_renders_requested_scope_column_in_requests_panel(
+    svc: CoordinationService,
+) -> None:
+    """v0.11 added a `requested_scope` column between `their pattern`
+    and `holder` so an operator can see what the requester actually
+    needed (often a sub-pattern of what the holder claimed)."""
+    cid = await _insert_claim(
+        svc, engineer="holder-eve", pattern="src/api/**"
+    )
+    await svc.file_request(
+        claim_id=cid,
+        requester="bob",
+        requester_session_id=None,
+        reason="just the auth file",
+        urgency="normal",
+        requested_scope="src/api/auth.py",
+    )
+
+    html_out = await render_dashboard()
+    start = html_out.lower().index("release requests")
+    end = html_out.lower().index("claim timeline")
+    panel = html_out[start:end]
+    assert "src/api/auth.py" in panel  # requested_scope
+    assert "src/api/**" in panel  # original requested_pattern (the holder's claim)
+
+
+@pytest.mark.asyncio
+async def test_dashboard_renders_narrowed_decision_pill(
+    svc: CoordinationService,
+) -> None:
+    """A request resolved via `decision=narrowed` shows the narrowed
+    pill (dashed phosphor) instead of the regular approved pill."""
+    cid = await _insert_claim(
+        svc, engineer="holder-narrow", pattern="src/auth/**"
+    )
+    req = await svc.file_request(
+        claim_id=cid,
+        requester="bob",
+        requester_session_id=None,
+        reason="just utils",
+        urgency="normal",
+        requested_scope="src/auth/utils.py",
+    )
+    await svc.respond_to_request(
+        request_id=req["id"],
+        decision="narrowed",
+        actor_engineer="holder-narrow",
+        actor_session_id=None,
+        narrowed_pattern="src/auth/login.py",
+    )
+
+    html_out = await render_dashboard()
+    start = html_out.lower().index("release requests")
+    end = html_out.lower().index("claim timeline")
+    panel = html_out[start:end]
+    assert 'class="pill narrowed"' in panel
+
+
+@pytest.mark.asyncio
+async def test_dashboard_renders_coexist_decision_pill(
+    svc: CoordinationService,
+) -> None:
+    """A request resolved via `decision=coexist` shows the cyan
+    coexist pill, distinct from approved/narrowed."""
+    cid = await _insert_claim(
+        svc, engineer="holder-coex", pattern="src/auth.py"
+    )
+    req = await svc.file_request(
+        claim_id=cid,
+        requester="bob",
+        requester_session_id=None,
+        reason="logout function",
+        urgency="normal",
+        requested_scope="logout function",
+    )
+    await svc.respond_to_request(
+        request_id=req["id"],
+        decision="coexist",
+        actor_engineer="holder-coex",
+        actor_session_id=None,
+        coexist_pattern="src/auth.py",
+    )
+
+    html_out = await render_dashboard()
+    start = html_out.lower().index("release requests")
+    end = html_out.lower().index("claim timeline")
+    panel = html_out[start:end]
+    assert 'class="pill coexist"' in panel
