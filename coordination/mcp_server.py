@@ -411,6 +411,119 @@ def _read_marker_lines(path: Path) -> list[str]:
     return out
 
 
+def _process_start_time_ns(pid: int) -> int:
+    """Return the start time of ``pid`` in nanoseconds since epoch, or 0
+    if it can't be determined cheaply on this platform.
+
+    Linux: read field 22 of ``/proc/<pid>/stat`` (clock ticks since boot)
+    and combine with the system boot time. macOS: skip (no /proc); we
+    fall back to "PID exists is good enough" -- PID reuse over the
+    minutes-to-hours timescale of an agent session is rare enough in
+    practice. The 0 sentinel means "unknown, don't pin reuse defense
+    on this".
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            data = fh.read()
+        # Field 2 is comm in parens (may itself contain spaces and parens),
+        # so split on the LAST ')' to isolate fields 3..N.
+        right = data.rsplit(b")", 1)[-1].split()
+        # right[0] is field 3; field 22 is right[19] (0-indexed).
+        clock_ticks = int(right[19])
+    except (OSError, ValueError, IndexError):
+        return 0
+    try:
+        # Linux only -- raises AttributeError elsewhere.
+        ticks_per_sec = os.sysconf("SC_CLK_TCK")
+    except (AttributeError, ValueError, OSError):
+        return 0
+    if ticks_per_sec <= 0:
+        return 0
+    try:
+        with open("/proc/stat", "rb") as fh:
+            for line in fh.read().splitlines():
+                if line.startswith(b"btime "):
+                    boot_time_s = int(line.split()[1])
+                    break
+            else:
+                return 0
+    except (OSError, ValueError):
+        return 0
+    process_start_s = boot_time_s + (clock_ticks / ticks_per_sec)
+    return int(process_start_s * 1_000_000_000)
+
+
+def _is_live_pid(pid: int, expected_start_time_ns: int = 0) -> bool:
+    """Return True iff process ``pid`` exists, optionally also matching
+    ``expected_start_time_ns`` to defend against PID reuse.
+
+    ``expected_start_time_ns == 0`` skips the start-time check (the
+    platform couldn't supply a value at write time, or the entry pre-
+    dates v0.12). ``os.kill(pid, 0)`` is the POSIX-portable existence
+    probe: signal 0 isn't sent, only the permission/existence checks
+    fire. PermissionError on a foreign-uid process still proves the
+    process exists, so it counts as live.
+    """
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    if expected_start_time_ns <= 0:
+        return True
+    actual = _process_start_time_ns(pid)
+    if actual <= 0:
+        # Couldn't read it now (race with process exit, or platform
+        # support disappeared). Treat as live -- the next sweep will
+        # catch it if it really is dead.
+        return True
+    # Allow a 100ms tolerance for floating-point drift from clock_ticks
+    # arithmetic.
+    return abs(actual - expected_start_time_ns) < 100_000_000
+
+
+def _format_marker_line(session_id: str, pid: int, start_time_ns: int) -> str:
+    """Compose a sessions.live entry. v0.12 format: 3 fields,
+    space-separated, terminated by newline at write time. Reader
+    splits on first/second whitespace and accepts trailing fields
+    for forward-compat."""
+    return f"{session_id} {pid} {start_time_ns}"
+
+
+def _parse_marker_entry(raw: str) -> tuple[str, int, int] | None:
+    """Parse a single sessions.live line into (session_id, pid, start_time_ns).
+
+    Pre-v0.12 entries (just a session id with no PID) parse to
+    ``(session_id, 0, 0)``. Callers should treat pid<=0 as "stale,
+    prune on next pass" -- there's no way to verify liveness without
+    a PID, and migrating away from the legacy format means dropping
+    those entries on first contact.
+
+    Returns None for blank/comment lines or unparseable garbage.
+    """
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        return None
+    parts = line.split()
+    sid = parts[0]
+    if not sid:
+        return None
+    pid_raw = parts[1] if len(parts) > 1 else "0"
+    start_raw = parts[2] if len(parts) > 2 else "0"
+    try:
+        pid = int(pid_raw)
+        start_time_ns = int(start_raw)
+    except ValueError:
+        # Garbage in pid/start fields -> treat the rest as legacy.
+        return (sid, 0, 0)
+    return (sid, pid, start_time_ns)
+
+
 def _atomic_write_lines(path: Path, lines: list[str]) -> None:
     """Write ``lines`` to ``path`` atomically.
 
@@ -440,23 +553,65 @@ def _atomic_write_lines(path: Path, lines: list[str]) -> None:
         raise
 
 
-def _register_session_marker() -> None:
-    """Idempotently add ``_SESSION_ID`` to ``sessions.live`` on startup.
+def _sweep_stale_entries(raw_lines: list[str]) -> list[tuple[str, int, int]]:
+    """Filter ``sessions.live`` lines to only those whose PID is live.
 
-    No-op when the ``.coordination/`` directory does not exist (the agent
-    is running outside a coord-managed repo). Any filesystem error is
-    swallowed so MCP startup is never blocked by a marker glitch.
+    Pre-v0.12 entries (no PID, parsed pid<=0) are stale by construction
+    -- the v0.12 format always carries a PID. Live PIDs are kept; dead
+    PIDs are dropped. This is the self-healing core of v0.12: every
+    coord-mcp startup sweeps its predecessors' graves before adding
+    its own headstone.
+    """
+    out: list[tuple[str, int, int]] = []
+    for raw in raw_lines:
+        parsed = _parse_marker_entry(raw)
+        if parsed is None:
+            continue
+        sid, pid, start = parsed
+        if pid <= 0:
+            continue
+        if not _is_live_pid(pid, start):
+            continue
+        out.append((sid, pid, start))
+    return out
+
+
+def _register_session_marker() -> None:
+    """Sweep stale entries, then idempotently add ours.
+
+    The sweep is the v0.12 cleanup mechanism: any predecessor coord-mcp
+    process that died via SIGKILL / OOM / parent-crash bypassed the
+    atexit handler and left its session_id in the file. On every fresh
+    startup we read the file, drop entries whose PID is no longer
+    alive, and write back the cleaned set plus our own line. Eventually
+    consistent across multi-mcp races (last-writer-wins; the loser's
+    next call cleans up).
+
+    No-op when ``.coordination/`` doesn't exist (agent running outside
+    a coord-managed repo). Any filesystem error is swallowed so MCP
+    startup is never blocked by a marker glitch.
     """
     try:
         coord_dir = _repo_root_for_marker()
         if coord_dir is None:
             return
         marker = coord_dir / "sessions.live"
-        existing = _read_marker_lines(marker)
-        if _SESSION_ID in existing:
-            return
-        existing.append(_SESSION_ID)
-        _atomic_write_lines(marker, existing)
+        try:
+            raw = marker.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
+            raw = []
+        live = _sweep_stale_entries(raw)
+        my_pid = os.getpid()
+        my_start = _process_start_time_ns(my_pid)
+        if any(sid == _SESSION_ID for sid, _p, _s in live):
+            # Already registered (idempotent re-call). Still write back
+            # the swept file so we get the cleanup benefit even when
+            # nothing changes about our own line.
+            new_lines = [_format_marker_line(s, p, st) for s, p, st in live]
+        else:
+            new_lines = [_format_marker_line(s, p, st) for s, p, st in live]
+            new_lines.append(_format_marker_line(_SESSION_ID, my_pid, my_start))
+        _atomic_write_lines(marker, new_lines)
     except Exception:
         # Marker is best-effort; never let it break MCP startup.
         pass
@@ -476,17 +631,33 @@ def _remove_session_marker() -> None:
         marker = coord_dir / "sessions.live"
         if not marker.exists():
             return
-        existing = _read_marker_lines(marker)
-        if _SESSION_ID not in existing:
+        try:
+            raw = marker.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
             return
-        remaining = [sid for sid in existing if sid != _SESSION_ID]
-        if not remaining:
+        # Parse, drop our line, write back. Don't sweep dead PIDs here
+        # -- shutdown is a fast path; the next mcp startup or hook
+        # invocation does the sweep. Just remove our own.
+        kept: list[tuple[str, int, int]] = []
+        had_us = False
+        for r in raw:
+            parsed = _parse_marker_entry(r)
+            if parsed is None:
+                continue
+            if parsed[0] == _SESSION_ID:
+                had_us = True
+                continue
+            kept.append(parsed)
+        if not had_us:
+            return
+        if not kept:
             try:
                 marker.unlink()
             except OSError:
                 pass
             return
-        _atomic_write_lines(marker, remaining)
+        new_lines = [_format_marker_line(s, p, st) for s, p, st in kept]
+        _atomic_write_lines(marker, new_lines)
     except Exception:
         # Marker is best-effort; never let it break MCP shutdown.
         pass

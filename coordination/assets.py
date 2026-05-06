@@ -228,10 +228,32 @@ fi
 # the existing engineer-name self-exclusion.
 SESSION_QS=""
 if [[ -f "${REPO_ROOT}/.coordination/sessions.live" ]]; then
+  # v0.12 format per line: "<session_id> <pid> <start_time_ns>". Older
+  # entries with just a session_id (no PID) are pruned by the next
+  # coord-mcp startup; we also skip them here as a defense-in-depth so
+  # legacy entries don't cause /conflicts to over-exclude. Any entry
+  # whose PID is no longer alive is also skipped -- that's the v0.12
+  # cleanup mechanism on the read side: bash's "kill -0 <pid>" is the
+  # POSIX-portable existence probe (signal 0 sends nothing, only the
+  # permission/existence checks fire).
   while IFS= read -r session_line || [[ -n "${session_line}" ]]; do
-    [[ -z "${session_line}" ]] && continue
-    [[ "${session_line}" == \\#* ]] && continue
-    enc_sid="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${session_line}")"
+    case "${session_line}" in
+      ''|'#'*) continue ;;
+    esac
+    # Split into session_id, pid, and the rest (which we don't use).
+    read -r session_field pid_field _rest <<< "${session_line}"
+    [[ -z "${session_field}" ]] && continue
+    # Legacy entry (no PID) -> stale, skip.
+    [[ -z "${pid_field}" ]] && continue
+    # Numeric guard. A non-numeric "pid" is corruption; skip.
+    if ! [[ "${pid_field}" =~ ^[0-9]+$ ]]; then
+      continue
+    fi
+    # Liveness probe. kill -0 returns 0 iff the process exists.
+    if ! kill -0 "${pid_field}" 2>/dev/null; then
+      continue
+    fi
+    enc_sid="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${session_field}")"
     SESSION_QS+="&session_id=${enc_sid}"
   done < "${REPO_ROOT}/.coordination/sessions.live"
 fi

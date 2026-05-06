@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 
@@ -229,11 +230,15 @@ def test_script_session_qs_e2e_builds_expected_string(tmp_path) -> None:
     # urllib.parse.quote (safe='/') will encode -- '#' becomes %23 -- so
     # the test verifies encoding actually fires. Keep the second id
     # plain to verify pass-through too.
+    # v0.12 format: "<session_id> <pid> <start_time_ns>". Use the current
+    # process PID (alive for the duration of the test) so the hook's
+    # kill -0 liveness probe passes and both entries make it into SESSION_QS.
+    live_pid = os.getpid()
     sessions_live.write_text(
         "# this is a comment\n"
         "\n"
-        "session-one\n"
-        "mcp#session-two\n",
+        f"session-one {live_pid} 0\n"
+        f"mcp#session-two {live_pid} 0\n",
         encoding="utf-8",
     )
 

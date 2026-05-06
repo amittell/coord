@@ -19,6 +19,24 @@ Semantic Versioning.
 
 - (none recorded yet)
 
+## [0.12.0] - 2026-05-06
+
+### Added
+
+- **PID-tracked `sessions.live` format (v0.12)**. Every `coord-mcp` instance now writes `<session_id> <pid> <start_time_ns>` per line in `.coordination/sessions.live` instead of the bare session-id from v0.10. The PID enables liveness probing without any process-supervision infrastructure.
+- **Self-healing startup sweep**. `_register_session_marker` runs `_sweep_stale_entries` before appending its own line. Any entry whose PID fails a `kill -0` probe (or whose start time mismatches on Linux, preventing PID-reuse false positives) is silently pruned. A single startup on a host that had SIGKILL-killed coord-mcp processes clears all stale entries.
+- **`_is_live_pid` / `_process_start_time_ns`** helper functions in `coordination/mcp_server.py`. `_process_start_time_ns` reads `/proc/<pid>/stat` on Linux for PID-reuse defense; returns 0 on other platforms where the probe is not available.
+- **Hook-side PID liveness pruning**. The `SESSION_QS` block in the pre-push script now parses the three-field v0.12 format and uses `kill -0 <pid>` to skip dead entries before forwarding session IDs to `/conflicts`. Legacy entries (no PID field) are also skipped so old repos migrate safely on first contact.
+- **`coord doctor` sessions.live check**. A new `_check_sessions_live` diagnostic in `coordination/cli_doctor.py` surfaces the total / live / stale entry counts. Reports `WARNING` when stale entries are present (they will be pruned on next `coord-mcp` startup), `OK` when all entries are live, and `INFO` when the file is absent.
+
+### Changed
+
+- **Backward compat**: pre-v0.12 `sessions.live` entries (bare session_id, no PID) are treated as stale on first contact and pruned automatically on the next `coord-mcp` startup. No manual migration needed.
+
+### Fixed
+
+- Stale `sessions.live` entries from SIGKILL-killed `coord-mcp` processes no longer accumulate indefinitely. Previously, `atexit` cleanup does not fire for SIGKILL or OOM kills, leaving entries forever. The PID-tracked format with startup-time sweep eliminates this buildup without requiring a supervisor.
+
 ## [0.11.0] - 2026-05-05
 
 ### Added

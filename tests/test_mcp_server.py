@@ -11,6 +11,9 @@ socket layer is mocked.
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -978,8 +981,12 @@ async def test_list_claims_passes_session_id(
 # ---------------------------------------------------------------------------
 
 
-def _read_marker_lines(path: Path) -> list[str]:
-    """Read non-blank, non-comment lines from a sessions.live file."""
+def _read_marker_session_ids(path: Path) -> list[str]:
+    """Read just the session_id column from a sessions.live file.
+
+    v0.12 format: each non-comment line is "<session_id> <pid> <start_time_ns>"
+    space-separated. Tests usually only care about the session_id list.
+    """
     if not path.exists():
         return []
     out: list[str] = []
@@ -987,8 +994,18 @@ def _read_marker_lines(path: Path) -> list[str]:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        out.append(line)
+        out.append(line.split()[0])
     return out
+
+
+def _seed_live_marker_line(session_id: str) -> str:
+    """Compose a sessions.live entry whose PID is the current process,
+    so the v0.12 sweep treats it as a 'live' peer when seeding test
+    fixtures. The current pid + its real start_time pass _is_live_pid
+    on any platform."""
+    pid = os.getpid()
+    start = mcp_server._process_start_time_ns(pid)
+    return f"{session_id} {pid} {start}"
 
 
 def test_register_session_marker_creates_file_with_session_id(
@@ -1005,7 +1022,35 @@ def test_register_session_marker_creates_file_with_session_id(
 
     marker = coord_dir / "sessions.live"
     assert marker.exists()
-    assert _read_marker_lines(marker) == ["abc123def456"]
+    assert _read_marker_session_ids(marker) == ["abc123def456"]
+
+
+def test_register_session_marker_writes_pid_and_start_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """v0.12 format records PID alongside session_id so the sweep can
+    later check liveness via os.kill(pid, 0). The line MUST have at
+    least 2 whitespace-separated fields and the second must be our
+    own running PID (so subsequent sweeps see us as live)."""
+    coord_dir = tmp_path / ".coordination"
+    coord_dir.mkdir()
+    monkeypatch.setattr(mcp_server, "_SESSION_ID", "v12-fmt-test")
+    monkeypatch.setattr(
+        mcp_server, "_repo_root_for_marker", lambda: coord_dir
+    )
+
+    mcp_server._register_session_marker()
+
+    marker = coord_dir / "sessions.live"
+    raw = marker.read_text(encoding="utf-8").splitlines()
+    body = [ln for ln in raw if ln.strip() and not ln.strip().startswith("#")]
+    assert len(body) == 1
+    parts = body[0].split()
+    assert parts[0] == "v12-fmt-test"
+    assert int(parts[1]) == os.getpid()
+    # Field 2 (start_time_ns) is platform-dependent; it's 0 when /proc
+    # isn't available. Just assert it parses as an int.
+    assert int(parts[2]) >= 0
 
 
 def test_register_session_marker_appends_when_other_sessions_present(
@@ -1014,8 +1059,10 @@ def test_register_session_marker_appends_when_other_sessions_present(
     coord_dir = tmp_path / ".coordination"
     coord_dir.mkdir()
     marker = coord_dir / "sessions.live"
-    # Pre-existing live session belonging to a different process.
-    marker.write_text("# header comment\nother-session-aaa\n\n", encoding="utf-8")
+    # Pre-existing live session belonging to a different "process":
+    # we tag it with our own PID so the v0.12 sweep keeps it as live.
+    other = _seed_live_marker_line("other-session-aaa")
+    marker.write_text(f"# header comment\n{other}\n\n", encoding="utf-8")
     monkeypatch.setattr(mcp_server, "_SESSION_ID", "my-session-bbb")
     monkeypatch.setattr(
         mcp_server, "_repo_root_for_marker", lambda: coord_dir
@@ -1023,12 +1070,10 @@ def test_register_session_marker_appends_when_other_sessions_present(
 
     mcp_server._register_session_marker()
 
-    lines = _read_marker_lines(marker)
-    assert "other-session-aaa" in lines
-    assert "my-session-bbb" in lines
-    # Existing line preserved, ours added (no order contract beyond
-    # "both present"); guard against accidental duplicates.
-    assert len(lines) == 2
+    ids = _read_marker_session_ids(marker)
+    assert "other-session-aaa" in ids
+    assert "my-session-bbb" in ids
+    assert len(ids) == 2
 
 
 def test_register_session_marker_is_idempotent(
@@ -1046,7 +1091,64 @@ def test_register_session_marker_is_idempotent(
     mcp_server._register_session_marker()
 
     marker = coord_dir / "sessions.live"
-    assert _read_marker_lines(marker) == ["dup-test-sid"]
+    assert _read_marker_session_ids(marker) == ["dup-test-sid"]
+
+
+def test_register_session_marker_sweeps_dead_pid_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """v0.12: every coord-mcp startup sweeps stale predecessor entries
+    out of sessions.live before adding its own line. An entry whose
+    PID is no longer alive is exactly the bug v0.10 left behind on
+    SIGKILL / OOM exits, and v0.12 self-heals."""
+    coord_dir = tmp_path / ".coordination"
+    coord_dir.mkdir()
+    marker = coord_dir / "sessions.live"
+
+    # Spawn a real subprocess, capture its PID, then wait for it to
+    # exit. The PID is now guaranteed-dead (POSIX guarantees no reuse
+    # before reap). On macOS we can't use the start-time defense, so
+    # we set start=0; on Linux _is_live_pid will short-circuit on
+    # ProcessLookupError before checking start_time anyway.
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    dead_pid = proc.pid
+
+    marker.write_text(f"ghost-session {dead_pid} 0\n", encoding="utf-8")
+    monkeypatch.setattr(mcp_server, "_SESSION_ID", "fresh-startup")
+    monkeypatch.setattr(
+        mcp_server, "_repo_root_for_marker", lambda: coord_dir
+    )
+
+    mcp_server._register_session_marker()
+
+    ids = _read_marker_session_ids(marker)
+    assert "ghost-session" not in ids, "stale dead-PID entry must be swept"
+    assert "fresh-startup" in ids
+
+
+def test_register_session_marker_prunes_legacy_format_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pre-v0.12 sessions.live file has lines with just a session_id
+    and no PID. The sweep can't verify liveness without a PID, so it
+    drops these entries. The next live coord-mcp will re-register
+    itself in the new format."""
+    coord_dir = tmp_path / ".coordination"
+    coord_dir.mkdir()
+    marker = coord_dir / "sessions.live"
+    marker.write_text("legacy-no-pid\n", encoding="utf-8")
+    monkeypatch.setattr(mcp_server, "_SESSION_ID", "v12-startup")
+    monkeypatch.setattr(
+        mcp_server, "_repo_root_for_marker", lambda: coord_dir
+    )
+
+    mcp_server._register_session_marker()
+
+    ids = _read_marker_session_ids(marker)
+    assert ids == ["v12-startup"], (
+        f"legacy entry must be pruned, only ours kept; got {ids!r}"
+    )
 
 
 def test_remove_session_marker_unlinks_file_when_only_line(
@@ -1055,7 +1157,7 @@ def test_remove_session_marker_unlinks_file_when_only_line(
     coord_dir = tmp_path / ".coordination"
     coord_dir.mkdir()
     marker = coord_dir / "sessions.live"
-    marker.write_text("solo-session\n", encoding="utf-8")
+    marker.write_text(_seed_live_marker_line("solo-session") + "\n", encoding="utf-8")
     monkeypatch.setattr(mcp_server, "_SESSION_ID", "solo-session")
     monkeypatch.setattr(
         mcp_server, "_repo_root_for_marker", lambda: coord_dir
@@ -1073,7 +1175,15 @@ def test_remove_session_marker_leaves_other_sessions_intact(
     coord_dir.mkdir()
     marker = coord_dir / "sessions.live"
     marker.write_text(
-        "first-session\nme-session\nthird-session\n", encoding="utf-8"
+        "\n".join(
+            [
+                _seed_live_marker_line("first-session"),
+                _seed_live_marker_line("me-session"),
+                _seed_live_marker_line("third-session"),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
     )
     monkeypatch.setattr(mcp_server, "_SESSION_ID", "me-session")
     monkeypatch.setattr(
@@ -1082,11 +1192,32 @@ def test_remove_session_marker_leaves_other_sessions_intact(
 
     mcp_server._remove_session_marker()
 
-    lines = _read_marker_lines(marker)
-    assert "me-session" not in lines
-    assert "first-session" in lines
-    assert "third-session" in lines
-    assert len(lines) == 2
+    ids = _read_marker_session_ids(marker)
+    assert "me-session" not in ids
+    assert "first-session" in ids
+    assert "third-session" in ids
+    assert len(ids) == 2
+
+
+def test_is_live_pid_true_for_current_process() -> None:
+    assert mcp_server._is_live_pid(os.getpid()) is True
+
+
+def test_is_live_pid_false_for_dead_process() -> None:
+    """Spawn a real subprocess, wait for it to exit, then verify
+    _is_live_pid returns False for its PID. POSIX guarantees no PID
+    reuse until the parent reaps, which subprocess.wait() does."""
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    assert mcp_server._is_live_pid(proc.pid) is False
+
+
+def test_is_live_pid_false_for_nonpositive_pid() -> None:
+    """Defense: pid 0 and negative pids must short-circuit to False
+    rather than fall into os.kill semantics (which would signal the
+    whole process group / every process you can signal)."""
+    assert mcp_server._is_live_pid(0) is False
+    assert mcp_server._is_live_pid(-1) is False
 
 
 def test_register_skips_silently_when_coordination_dir_missing(

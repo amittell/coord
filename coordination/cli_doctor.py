@@ -116,6 +116,93 @@ def _check_service(config: RepoConfig, token: str) -> list[CheckResult]:
     return out
 
 
+def _check_sessions_live(repo_root: Path) -> list[CheckResult]:
+    """Inspect ``.coordination/sessions.live`` for entries pointing at
+    dead PIDs (or pre-v0.12 entries with no PID at all).
+
+    Stale entries are not a hard failure -- the pre-push hook prunes
+    them on read and the next coord-mcp startup sweeps them out -- but
+    leaving them in the file means /conflicts gets dead session_ids
+    forwarded as self-exclusions on every push. Functionally a no-op
+    (they don't match any active claim), operationally noise. Surface
+    so an operator can run a quick sweep ('pkill coord-mcp' followed
+    by any agent activity) if they care.
+    """
+    import os as _os
+
+    marker = repo_root / ".coordination" / "sessions.live"
+    if not marker.exists():
+        return []
+    try:
+        raw_lines = marker.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return [
+            CheckResult(
+                "sessions.live readable",
+                False,
+                "could not read .coordination/sessions.live",
+                "Inspect file permissions; the pre-push hook needs to read it.",
+            )
+        ]
+
+    total = 0
+    stale = 0
+    legacy = 0
+    for raw in raw_lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        total += 1
+        parts = line.split()
+        if len(parts) < 2:
+            stale += 1
+            legacy += 1
+            continue
+        try:
+            pid = int(parts[1])
+        except ValueError:
+            stale += 1
+            continue
+        if pid <= 0:
+            stale += 1
+            continue
+        try:
+            _os.kill(pid, 0)
+        except ProcessLookupError:
+            stale += 1
+        except PermissionError:
+            # Process exists but is owned by another uid; treat as live.
+            pass
+        except OSError:
+            stale += 1
+
+    if total == 0:
+        return []
+    if stale == 0:
+        return [
+            CheckResult(
+                f"sessions.live entries are live ({total}/{total})",
+                True,
+            )
+        ]
+    detail_bits = [f"{stale}/{total} entries point at dead PIDs"]
+    if legacy:
+        detail_bits.append(f"{legacy} use the pre-v0.12 format with no PID")
+    return [
+        CheckResult(
+            f"sessions.live entries are live ({total - stale}/{total})",
+            False,
+            "; ".join(detail_bits),
+            (
+                "Stale entries are pruned automatically by the next coord-mcp "
+                "startup in this repo (and harmlessly skipped by the pre-push "
+                "hook). To clean up immediately: 'pkill -f coord-mcp' will "
+                "force a fresh sweep on every running agent's next coord call."
+            ),
+        )
+    ]
+
+
 def _extract_managed_block(text: str) -> str | None:
     """Return the *content* (without the marker lines and the
     AUTO-GENERATED warning line, if present) of the managed block,
@@ -434,6 +521,13 @@ def run_doctor(args) -> int:
 
     mcp_bin = shutil.which("coord-mcp") or str(local_coord_mcp_path())
     results.append(CheckResult("coord-mcp command available", Path(mcp_bin).exists()))
+
+    # v0.12: stale entries in .coordination/sessions.live aren't a
+    # functional break -- the pre-push hook prunes them on read and
+    # the next coord-mcp startup sweeps them out -- but they're
+    # operator-noise worth surfacing. Each stale entry forwards a
+    # dead session_id to /conflicts which over-excludes harmlessly.
+    results.extend(_check_sessions_live(repo_root))
 
     results.extend(_check_asset_drift(repo_root, config))
 
