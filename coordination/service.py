@@ -498,9 +498,6 @@ class CoordinationService:
         - ``KeyError`` if the claim does not exist.
         - ``ValueError`` if the claim is already released or expired.
         """
-        from datetime import UTC, datetime, timedelta
-        from uuid import uuid4
-
         # Lookup current claim state.
         rows = await self.db.list_active_claims_rows()
         claim = next((c for c in rows if str(c["id"]) == claim_id), None)
@@ -607,6 +604,11 @@ class CoordinationService:
                     f"the holder's current pattern {original_pattern!r}; "
                     "narrowing must reduce scope, not move it"
                 )
+        # Floor the new claim's TTL at the default working window so that a
+        # narrowed or coexist claim created in response to a request does not
+        # inherit the shortened deadline that request_release imposed on the
+        # holder's original claim.
+        min_expires_at = _expires_at(self.settings.default_ttl_hours)
         return await self.db.respond_to_request(
             request_id=request_id,
             decision=decision,
@@ -615,6 +617,7 @@ class CoordinationService:
             note=note,
             narrowed_pattern=narrowed_pattern,
             coexist_pattern=coexist_pattern,
+            min_expires_at=min_expires_at,
         )
 
     async def get_request(self, request_id: str) -> dict[str, Any] | None:

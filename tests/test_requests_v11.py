@@ -526,3 +526,219 @@ async def test_releasing_a_coexisting_claim_with_remaining_partners_keeps_others
     # B<->C edge must survive.
     assert c_cid in b_after, f"expected c in b's partners; got {b_after}"
     assert b_cid in c_after, f"expected b in c's partners; got {c_after}"
+
+
+# --- TTL floor: narrowed / coexist must not inherit a shortened TTL ---------
+
+
+async def _file_request_with_shortening(
+    db: Database,
+    *,
+    claim_id: str,
+    requester_engineer: str = "bob",
+    requester_session_id: str | None = "requester-sess",
+    short_ttl_seconds: int = 30,
+) -> dict:
+    """File a request that actually shortens the claim TTL (unlike the
+    standard _file_request helper which leaves TTL untouched)."""
+    rid = str(uuid4())
+    rows = await db.list_active_claims_rows()
+    claim = next(r for r in rows if r["id"] == claim_id)
+    original = str(claim["expires_at"])
+    shortened = _iso(datetime.now(UTC) + timedelta(seconds=short_ttl_seconds))
+    return await db.create_request(
+        request_id=rid,
+        claim_id=claim_id,
+        requester_engineer=requester_engineer,
+        requester_session_id=requester_session_id,
+        requested_pattern=str(claim["pattern"]),
+        reason="urgent",
+        urgency="high",
+        original_expires_at=original,
+        shortened_expires_at=shortened,
+        new_claim_expires_at=shortened,  # actually shorten the claim TTL
+    )
+
+
+@pytest.mark.asyncio
+async def test_narrowed_floors_ttl_when_claim_was_shortened(db: Database) -> None:
+    """When the holder's claim TTL was shortened by request_release, the
+    new narrowed claim must receive at least min_expires_at rather than
+    inheriting the compressed deadline."""
+    cid = await _seed_claim(db, pattern="src/api/**", ttl_hours=4)
+    req = await _file_request_with_shortening(db, claim_id=cid, short_ttl_seconds=30)
+
+    min_exp = _iso(datetime.now(UTC) + timedelta(hours=1))
+    result = await db.respond_to_request(
+        request_id=req["id"],
+        decision="narrowed",
+        actor_engineer="alice",
+        actor_session_id="holder-sess",
+        narrowed_pattern="src/api/billing/**",
+        min_expires_at=min_exp,
+    )
+    assert result is not None
+
+    active = await db.list_active_claims_rows()
+    nc = next((c for c in active if c["engineer"] == "alice"), None)
+    assert nc is not None, "new narrowed claim must exist"
+    assert nc["expires_at"] >= min_exp, (
+        f"narrowed claim TTL {nc['expires_at']!r} must be >= floor {min_exp!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_narrowed_does_not_floor_when_original_ttl_is_healthy(
+    db: Database,
+) -> None:
+    """When no shortening occurred (min_expires_at is None), the narrowed
+    claim inherits the original TTL unchanged."""
+    cid = await _seed_claim(db, pattern="src/api/**", ttl_hours=4)
+    rows = await db.list_active_claims_rows()
+    original_exp = next(r for r in rows if r["id"] == cid)["expires_at"]
+
+    req = await _file_request(db, claim_id=cid, requested_pattern="src/api/**")
+    await db.respond_to_request(
+        request_id=req["id"],
+        decision="narrowed",
+        actor_engineer="alice",
+        actor_session_id="holder-sess",
+        narrowed_pattern="src/api/billing/**",
+        min_expires_at=None,
+    )
+    active = await db.list_active_claims_rows()
+    nc = next((c for c in active if c["engineer"] == "alice"), None)
+    assert nc is not None
+    assert nc["expires_at"] == original_exp
+
+
+@pytest.mark.asyncio
+async def test_coexist_floors_ttl_when_claim_was_shortened(db: Database) -> None:
+    """The requester's sibling claim must receive at least min_expires_at
+    rather than inheriting the holder's shortened TTL."""
+    holder_cid = await _seed_claim(
+        db, engineer="alice", pattern="src/api/handlers.py", ttl_hours=4
+    )
+    req = await _file_request_with_shortening(
+        db, claim_id=holder_cid, short_ttl_seconds=30
+    )
+
+    min_exp = _iso(datetime.now(UTC) + timedelta(hours=1))
+    result = await db.respond_to_request(
+        request_id=req["id"],
+        decision="coexist",
+        actor_engineer="alice",
+        actor_session_id="holder-sess",
+        coexist_pattern="src/api/handlers.py",
+        min_expires_at=min_exp,
+    )
+    assert result is not None
+
+    active = await db.list_active_claims_rows()
+    bob_claims = [c for c in active if c["engineer"] == "bob"]
+    assert len(bob_claims) == 1
+    assert bob_claims[0]["expires_at"] >= min_exp, (
+        f"coexist claim TTL {bob_claims[0]['expires_at']!r} must be >= floor {min_exp!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_coexist_does_not_floor_when_holder_ttl_is_healthy(
+    db: Database,
+) -> None:
+    """When no shortening occurred (min_expires_at is None), the coexist
+    sibling inherits the holder's existing TTL unchanged."""
+    holder_cid = await _seed_claim(
+        db, engineer="alice", pattern="src/api/handlers.py", ttl_hours=4
+    )
+    rows = await db.list_active_claims_rows()
+    holder_exp = next(r for r in rows if r["id"] == holder_cid)["expires_at"]
+
+    req = await _file_request(db, claim_id=holder_cid)
+    await db.respond_to_request(
+        request_id=req["id"],
+        decision="coexist",
+        actor_engineer="alice",
+        actor_session_id="holder-sess",
+        coexist_pattern="src/api/handlers.py",
+        min_expires_at=None,
+    )
+    active = await db.list_active_claims_rows()
+    bob_claims = [c for c in active if c["engineer"] == "bob"]
+    assert len(bob_claims) == 1
+    assert bob_claims[0]["expires_at"] == holder_exp
+
+
+# --- ttl_shortened column ----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_request_stamps_ttl_shortened_on_claim(db: Database) -> None:
+    """create_request sets ttl_shortened=1 on the claim row when the TTL
+    is actually shortened. If the existing TTL is already shorter than
+    the requested shortened value, the column stays 0."""
+    cid = await _seed_claim(db, ttl_hours=4)
+    rows = await db.list_active_claims_rows()
+    original_exp = next(r for r in rows if r["id"] == cid)["expires_at"]
+    shortened = _iso(datetime.now(UTC) + timedelta(seconds=60))
+
+    await db.create_request(
+        request_id=str(uuid4()),
+        claim_id=cid,
+        requester_engineer="bob",
+        requester_session_id=None,
+        requested_pattern="src/foo.py",
+        reason=None,
+        urgency="normal",
+        original_expires_at=original_exp,
+        shortened_expires_at=shortened,
+        new_claim_expires_at=shortened,
+    )
+
+    async with aiosqlite.connect(db.path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute(
+            "SELECT ttl_shortened FROM claims WHERE id = ?", (cid,)
+        )
+        row = await cur.fetchone()
+    assert row is not None
+    assert row["ttl_shortened"] == 1
+
+
+@pytest.mark.asyncio
+async def test_denied_resets_ttl_shortened(db: Database) -> None:
+    """A 'denied' decision restores the original TTL and must also reset
+    ttl_shortened=0 so the claim is not mislabelled if it expires later."""
+    cid = await _seed_claim(db, ttl_hours=4)
+    rows = await db.list_active_claims_rows()
+    original_exp = next(r for r in rows if r["id"] == cid)["expires_at"]
+    shortened = _iso(datetime.now(UTC) + timedelta(seconds=60))
+
+    req = await db.create_request(
+        request_id=str(uuid4()),
+        claim_id=cid,
+        requester_engineer="bob",
+        requester_session_id=None,
+        requested_pattern="src/foo.py",
+        reason=None,
+        urgency="normal",
+        original_expires_at=original_exp,
+        shortened_expires_at=shortened,
+        new_claim_expires_at=shortened,
+    )
+    await db.respond_to_request(
+        request_id=req["id"],
+        decision="denied",
+        actor_engineer="alice",
+        actor_session_id=None,
+    )
+
+    async with aiosqlite.connect(db.path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute(
+            "SELECT expires_at, ttl_shortened FROM claims WHERE id = ?", (cid,)
+        )
+        row = await cur.fetchone()
+    assert row is not None
+    assert row["ttl_shortened"] == 0, "denied must reset ttl_shortened"
+    assert row["expires_at"] == original_exp, "denied must restore original TTL"

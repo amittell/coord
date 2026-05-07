@@ -577,15 +577,18 @@ def _sweep_stale_entries(raw_lines: list[str]) -> list[tuple[str, int, int]]:
 
 
 def _register_session_marker() -> None:
-    """Sweep stale entries, then idempotently add ours.
+    """Append our session line to sessions.live without reading first.
 
-    The sweep is the v0.12 cleanup mechanism: any predecessor coord-mcp
-    process that died via SIGKILL / OOM / parent-crash bypassed the
-    atexit handler and left its session_id in the file. On every fresh
-    startup we read the file, drop entries whose PID is no longer
-    alive, and write back the cleaned set plus our own line. Eventually
-    consistent across multi-mcp races (last-writer-wins; the loser's
-    next call cleans up).
+    Append-only writes eliminate the read-modify-write race where two
+    coord-mcp processes starting simultaneously both read the same file,
+    sweep independently, and the second writer silently drops the first
+    session's entry. With append-only each process owns exactly its own
+    line; no writer can clobber another's.
+
+    Stale entries from SIGKILL/OOM-killed predecessors are swept lazily:
+    _remove_session_marker rewrites the file with only live entries on
+    graceful shutdown, and the pre-push hook skips dead PIDs on every
+    read. The doctor check surfaces the stale count.
 
     No-op when ``.coordination/`` doesn't exist (agent running outside
     a coord-managed repo). Any filesystem error is swallowed so MCP
@@ -596,22 +599,10 @@ def _register_session_marker() -> None:
         if coord_dir is None:
             return
         marker = coord_dir / "sessions.live"
-        try:
-            raw = marker.read_text(encoding="utf-8").splitlines()
-        except (OSError, UnicodeDecodeError):
-            raw = []
-        live = _sweep_stale_entries(raw)
         my_pid = os.getpid()
         my_start = _process_start_time_ns(my_pid)
-        if any(sid == _SESSION_ID for sid, _p, _s in live):
-            # Already registered (idempotent re-call). Still write back
-            # the swept file so we get the cleanup benefit even when
-            # nothing changes about our own line.
-            new_lines = [_format_marker_line(s, p, st) for s, p, st in live]
-        else:
-            new_lines = [_format_marker_line(s, p, st) for s, p, st in live]
-            new_lines.append(_format_marker_line(_SESSION_ID, my_pid, my_start))
-        _atomic_write_lines(marker, new_lines)
+        with open(marker, "a", encoding="utf-8") as fh:
+            fh.write(_format_marker_line(_SESSION_ID, my_pid, my_start) + "\n")
     except Exception:
         # Marker is best-effort; never let it break MCP startup.
         pass
@@ -635,19 +626,22 @@ def _remove_session_marker() -> None:
             raw = marker.read_text(encoding="utf-8").splitlines()
         except (OSError, UnicodeDecodeError):
             return
-        # Parse, drop our line, write back. Don't sweep dead PIDs here
-        # -- shutdown is a fast path; the next mcp startup or hook
-        # invocation does the sweep. Just remove our own.
+        # Parse all entries: drop our own line and also sweep any dead-PID
+        # entries accumulated since this file was last rewritten. With
+        # append-only registration, removal is the natural rewrite point.
         kept: list[tuple[str, int, int]] = []
         had_us = False
         for r in raw:
             parsed = _parse_marker_entry(r)
             if parsed is None:
                 continue
-            if parsed[0] == _SESSION_ID:
+            sid, pid, start = parsed
+            if sid == _SESSION_ID:
                 had_us = True
                 continue
-            kept.append(parsed)
+            # Keep only live entries; drop stale ones from SIGKILL/OOM deaths.
+            if pid > 0 and _is_live_pid(pid, start):
+                kept.append((sid, pid, start))
         if not had_us:
             return
         if not kept:

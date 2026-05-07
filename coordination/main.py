@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import os
 import time
@@ -57,7 +58,9 @@ async def lifespan(app: FastAPI):
     async def cleanup_loop() -> None:
         while True:
             try:
-                await get_service().db.expire_stale_claims()
+                await get_service().db.expire_stale_claims(
+                    idle_timeout_sec=settings.idle_timeout_sec
+                )
             except Exception:  # pragma: no cover - background cleanup failures are logged
                 logger.exception("Failed to expire stale claims")
             await asyncio.sleep(settings.cleanup_interval_sec)
@@ -162,7 +165,7 @@ def require_auth(authorization: str | None = Header(default=None)) -> None:
         metrics.auth_failures_total.inc()
         raise HTTPException(status_code=401, detail="Missing bearer token")
     token = authorization.removeprefix("Bearer ").strip()
-    if token != settings.auth_token:
+    if not hmac.compare_digest(token, settings.auth_token):
         metrics.auth_failures_total.inc()
         raise HTTPException(status_code=401, detail="Invalid bearer token")
 

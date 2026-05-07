@@ -1076,9 +1076,14 @@ def test_register_session_marker_appends_when_other_sessions_present(
     assert len(ids) == 2
 
 
-def test_register_session_marker_is_idempotent(
+def test_register_session_marker_appends_own_line(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """_register_session_marker is append-only: each call adds one line
+    to sessions.live without reading or rewriting the file. Duplicate
+    entries from multiple calls are harmless -- the hook uses kill -0 to
+    filter, and _remove_session_marker rewrites with only live entries on
+    graceful shutdown."""
     coord_dir = tmp_path / ".coordination"
     coord_dir.mkdir()
     monkeypatch.setattr(mcp_server, "_SESSION_ID", "dup-test-sid")
@@ -1091,25 +1096,22 @@ def test_register_session_marker_is_idempotent(
     mcp_server._register_session_marker()
 
     marker = coord_dir / "sessions.live"
-    assert _read_marker_session_ids(marker) == ["dup-test-sid"]
+    ids = _read_marker_session_ids(marker)
+    assert len(ids) == 3, f"three appends should produce three lines; got {ids!r}"
+    assert all(sid == "dup-test-sid" for sid in ids)
 
 
-def test_register_session_marker_sweeps_dead_pid_entries(
+def test_register_session_marker_does_not_sweep_at_startup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """v0.12: every coord-mcp startup sweeps stale predecessor entries
-    out of sessions.live before adding its own line. An entry whose
-    PID is no longer alive is exactly the bug v0.10 left behind on
-    SIGKILL / OOM exits, and v0.12 self-heals."""
+    """Registration no longer sweeps dead entries -- that responsibility
+    moved to _remove_session_marker so the registration path is a single
+    non-blocking append (no read-modify-write race). Dead entries remain
+    until the next graceful shutdown rewrites the file."""
     coord_dir = tmp_path / ".coordination"
     coord_dir.mkdir()
     marker = coord_dir / "sessions.live"
 
-    # Spawn a real subprocess, capture its PID, then wait for it to
-    # exit. The PID is now guaranteed-dead (POSIX guarantees no reuse
-    # before reap). On macOS we can't use the start-time defense, so
-    # we set start=0; on Linux _is_live_pid will short-circuit on
-    # ProcessLookupError before checking start_time anyway.
     proc = subprocess.Popen([sys.executable, "-c", "pass"])
     proc.wait()
     dead_pid = proc.pid
@@ -1123,31 +1125,65 @@ def test_register_session_marker_sweeps_dead_pid_entries(
     mcp_server._register_session_marker()
 
     ids = _read_marker_session_ids(marker)
-    assert "ghost-session" not in ids, "stale dead-PID entry must be swept"
-    assert "fresh-startup" in ids
+    assert "fresh-startup" in ids, "our session must be registered"
+    assert "ghost-session" in ids, (
+        "dead entries are NOT swept at registration; they wait for removal"
+    )
 
 
-def test_register_session_marker_prunes_legacy_format_entries(
+def test_remove_session_marker_sweeps_dead_pid_entries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A pre-v0.12 sessions.live file has lines with just a session_id
-    and no PID. The sweep can't verify liveness without a PID, so it
-    drops these entries. The next live coord-mcp will re-register
-    itself in the new format."""
+    """_remove_session_marker sweeps dead-PID entries when it rewrites
+    the file. This is the lazy cleanup path for SIGKILL/OOM predecessors
+    whose atexit handler never fired."""
     coord_dir = tmp_path / ".coordination"
     coord_dir.mkdir()
     marker = coord_dir / "sessions.live"
-    marker.write_text("legacy-no-pid\n", encoding="utf-8")
-    monkeypatch.setattr(mcp_server, "_SESSION_ID", "v12-startup")
+
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    dead_pid = proc.pid
+
+    # Seed the file with a dead entry plus our own live entry.
+    live_line = _seed_live_marker_line("our-session")
+    marker.write_text(
+        f"ghost-session {dead_pid} 0\n{live_line}\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(mcp_server, "_SESSION_ID", "our-session")
     monkeypatch.setattr(
         mcp_server, "_repo_root_for_marker", lambda: coord_dir
     )
 
-    mcp_server._register_session_marker()
+    mcp_server._remove_session_marker()
 
-    ids = _read_marker_session_ids(marker)
-    assert ids == ["v12-startup"], (
-        f"legacy entry must be pruned, only ours kept; got {ids!r}"
+    assert not marker.exists(), (
+        "file should be unlinked when only dead entries + our own remain"
+    )
+
+
+def test_remove_session_marker_drops_legacy_format_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_remove_session_marker rewrites the file with only live v0.12
+    entries. Legacy entries (no PID) cannot be verified and are dropped."""
+    coord_dir = tmp_path / ".coordination"
+    coord_dir.mkdir()
+    marker = coord_dir / "sessions.live"
+
+    # Seed with a legacy entry plus our own live entry.
+    live_line = _seed_live_marker_line("current-session")
+    marker.write_text(f"legacy-no-pid\n{live_line}\n", encoding="utf-8")
+    monkeypatch.setattr(mcp_server, "_SESSION_ID", "current-session")
+    monkeypatch.setattr(
+        mcp_server, "_repo_root_for_marker", lambda: coord_dir
+    )
+
+    mcp_server._remove_session_marker()
+
+    # Our session is removed; legacy entry is also gone (can't verify liveness).
+    assert not marker.exists(), (
+        "file should be unlinked when only unverifiable legacy entries remain"
     )
 
 

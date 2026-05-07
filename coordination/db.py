@@ -140,7 +140,7 @@ CREATE INDEX IF NOT EXISTS idx_claims_engineer ON claims (engineer);
 """
 
 
-CURRENT_SCHEMA_VERSION = 6
+CURRENT_SCHEMA_VERSION = 7
 
 # Migration registry: list of (version, upgrade_sql) tuples applied in order.
 # Entry for version N is the SQL that upgrades a DB from version N-1 to N.
@@ -233,6 +233,19 @@ MIGRATIONS: list[tuple[int, str]] = [
         6,
         "ALTER TABLE requests ADD COLUMN requested_scope TEXT;\n"
         "ALTER TABLE claims ADD COLUMN coexists_with TEXT;",
+    ),
+    # v7: track whether a claim's TTL was shortened by a `request_release`
+    # call. Previously `expire_stale_claims` inferred this by joining the
+    # requests table for pending decisions -- which produced false positives
+    # (claim expired with a pending request that arrived just before the
+    # natural deadline) and false negatives (TTL was shortened but the
+    # requester later withdrew, leaving no pending request). Storing the
+    # fact on the claim row makes the audit label deterministic. The
+    # `denied` decision path resets this to 0 when restoring the original
+    # TTL.
+    (
+        7,
+        "ALTER TABLE claims ADD COLUMN ttl_shortened BOOLEAN DEFAULT 0;",
     ),
 ]
 
@@ -601,28 +614,33 @@ class Database:
             return 0
         now = _utcnow()
         await self.init()
-        # Capture which claims will close so we can cascade-resolve
-        # their open requests after the bulk update.
+        # SELECT and UPDATE in a single BEGIN IMMEDIATE transaction so
+        # there is no TOCTOU window where a concurrent release_claims
+        # could close some of these IDs between our SELECT and UPDATE,
+        # causing spurious cascade-resolve calls on already-closed claims.
         async with aiosqlite.connect(self.path) as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
-            cur = await conn.execute(
-                "SELECT id FROM claims WHERE session_id = ? AND released_at IS NULL",
-                (session_id,),
-            )
-            to_close = [str(r["id"]) for r in await cur.fetchall()]
-        async with aiosqlite.connect(self.path) as conn:
-            conn.row_factory = aiosqlite.Row
-            await _configure_sqlite(conn)
-            cur = await conn.execute(
-                """
-                UPDATE claims SET released_at = ?
-                WHERE session_id = ? AND released_at IS NULL
-                """,
-                (now, session_id),
-            )
-            await conn.commit()
-            n = cur.rowcount or 0
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = await conn.execute(
+                    "SELECT id FROM claims WHERE session_id = ? AND released_at IS NULL",
+                    (session_id,),
+                )
+                to_close = [str(r["id"]) for r in await cur.fetchall()]
+                if to_close:
+                    cur = await conn.execute(
+                        "UPDATE claims SET released_at = ? "
+                        "WHERE session_id = ? AND released_at IS NULL",
+                        (now, session_id),
+                    )
+                    n = cur.rowcount or 0
+                else:
+                    n = 0
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
         # Detach this session's released claims from any coexisting
         # partners BEFORE cascade-resolving requests, so a partner that
         # is about to receive a coexist-related event sees a clean
@@ -706,16 +724,27 @@ class Database:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(
-                "SELECT id, expires_at, last_activity FROM claims WHERE released_at IS NULL",
+                "SELECT id, expires_at, last_activity, ttl_shortened "
+                "FROM claims WHERE released_at IS NULL",
             )
             rows = await cur.fetchall()
             await conn.commit()
 
         to_close: list[str] = []
+        # ttl_shortened_ids: claims whose TTL was explicitly shortened by a
+        # request_release call. Read directly from the claims.ttl_shortened
+        # column (set in create_request, reset in denied respond_to_request)
+        # rather than inferring from the requests table, which produces false
+        # positives (claim expired with a pending request that arrived just
+        # before natural deadline) and false negatives (TTL shortened but
+        # requester withdrew so no pending request remains).
+        ttl_shortened_ids: set[str] = set()
         for r in rows:
             exp = datetime.fromisoformat(str(r["expires_at"]).replace("Z", "+00:00"))
             if exp <= cutoff:
                 to_close.append(str(r["id"]))
+                if r["ttl_shortened"]:
+                    ttl_shortened_ids.add(str(r["id"]))
                 continue
             la_raw = r["last_activity"]
             if idle_cutoff is not None and la_raw:
@@ -725,21 +754,10 @@ class Database:
                     continue
                 if la <= idle_cutoff:
                     to_close.append(str(r["id"]))
+                    if r["ttl_shortened"]:
+                        ttl_shortened_ids.add(str(r["id"]))
         if not to_close:
             return 0
-
-        # Track which claim IDs were closed by request-shortened TTL vs
-        # other reasons (TTL-only / idle), so cascade events get the
-        # right release_kind for the audit trail.
-        ttl_shortened: set[str] = set()
-        async with aiosqlite.connect(self.path) as conn:
-            conn.row_factory = aiosqlite.Row
-            await _configure_sqlite(conn)
-            cur = await conn.execute(
-                "SELECT DISTINCT claim_id FROM requests "
-                "WHERE decision = 'pending'"
-            )
-            ttl_shortened = {str(r["claim_id"]) for r in await cur.fetchall()}
 
         async with aiosqlite.connect(self.path) as conn:
             conn.row_factory = aiosqlite.Row
@@ -761,7 +779,7 @@ class Database:
         for cid in actually_closed:
             await self._detach_coexist_partners(cid)
         for cid in actually_closed:
-            kind = "ttl-shortened" if cid in ttl_shortened else "ttl-or-idle"
+            kind = "ttl-shortened" if cid in ttl_shortened_ids else "ttl-or-idle"
             await self.cascade_resolve_requests_for_claim(
                 cid, release_kind=kind, actor_engineer=None
             )
@@ -939,11 +957,13 @@ class Database:
             await conn.execute("BEGIN IMMEDIATE")
             try:
                 # Update the claim's TTL to the shortened value -- but
-                # never extend (clamp on the existing expires_at).
+                # never extend (clamp on the existing expires_at). Also
+                # stamp ttl_shortened=1 so expire_stale_claims can label
+                # the audit event correctly without a requests-table join.
                 await conn.execute(
                     """
                     UPDATE claims
-                    SET expires_at = ?
+                    SET expires_at = ?, ttl_shortened = 1
                     WHERE id = ?
                       AND released_at IS NULL
                       AND datetime(expires_at) > datetime(?)
@@ -1045,6 +1065,7 @@ class Database:
         note: str | None = None,
         narrowed_pattern: str | None = None,
         coexist_pattern: str | None = None,
+        min_expires_at: str | None = None,
     ) -> dict[str, Any] | None:
         """Record the holder's decision and apply its side-effect.
 
@@ -1132,8 +1153,11 @@ class Database:
                 elif decision == "denied":
                     # Restore the original TTL so the holder isn't
                     # punished for the request having shortened it.
+                    # Also reset ttl_shortened so a claim that expires
+                    # naturally after denial is not mislabelled in the
+                    # audit trail.
                     await conn.execute(
-                        "UPDATE claims SET expires_at = ? "
+                        "UPDATE claims SET expires_at = ?, ttl_shortened = 0 "
                         "WHERE id = ? AND released_at IS NULL",
                         (req["original_expires_at"], req["claim_id"]),
                     )
@@ -1143,6 +1167,7 @@ class Database:
                         request_row=req,
                         narrowed_pattern=str(narrowed_pattern),
                         now=now,
+                        min_expires_at=min_expires_at,
                     )
                 elif decision == "coexist":
                     extra_detail = await self._apply_coexist(
@@ -1150,6 +1175,7 @@ class Database:
                         request_row=req,
                         coexist_pattern=str(coexist_pattern),
                         now=now,
+                        min_expires_at=min_expires_at,
                     )
 
                 await conn.execute(
@@ -1188,6 +1214,7 @@ class Database:
         request_row: aiosqlite.Row,
         narrowed_pattern: str,
         now: str,
+        min_expires_at: str | None = None,
     ) -> dict[str, Any]:
         """Release the original claim and open a new claim under the
         narrower pattern, all inside the caller's transaction. Returns
@@ -1218,6 +1245,25 @@ class Database:
         # session_id (matches the v0.6+ idle-expiration opt-in rule
         # used by insert_claims_batch).
         new_last_activity = now if orig["session_id"] else None
+        # Floor the new claim's TTL at min_expires_at when provided.
+        # If the original claim's TTL was shortened by a request_release
+        # call, the new narrowed claim would otherwise inherit that
+        # compressed deadline, which may be only minutes away. The
+        # service layer passes min_expires_at = now + default_ttl so the
+        # holder's narrowed scope gets a fresh working window.
+        new_expires_at = str(orig["expires_at"])
+        if min_expires_at:
+            try:
+                orig_dt = datetime.fromisoformat(
+                    new_expires_at.replace("Z", "+00:00")
+                )
+                floor_dt = datetime.fromisoformat(
+                    min_expires_at.replace("Z", "+00:00")
+                )
+                if orig_dt < floor_dt:
+                    new_expires_at = min_expires_at
+            except ValueError:
+                pass
         await conn.execute(
             """
             INSERT INTO claims (
@@ -1235,7 +1281,7 @@ class Database:
                 narrowed_pattern,
                 orig["severity"],
                 now,
-                orig["expires_at"],
+                new_expires_at,
                 orig["repo"],
                 orig["session_id"],
                 new_last_activity,
@@ -1255,6 +1301,7 @@ class Database:
         request_row: aiosqlite.Row,
         coexist_pattern: str,
         now: str,
+        min_expires_at: str | None = None,
     ) -> dict[str, Any]:
         """Grant the requester a sibling claim and wire the pairwise
         coexists_with edge between holder and requester. Returns
@@ -1284,6 +1331,24 @@ class Database:
         requester_last_activity = now if requester_session_id else None
         request_id = str(request_row["id"])
 
+        # Floor the requester's new claim TTL at min_expires_at when
+        # provided. The holder's TTL may have been shortened by the
+        # request_release call; the requester's sibling should not
+        # inherit that compressed deadline.
+        requester_expires_at = str(holder["expires_at"])
+        if min_expires_at:
+            try:
+                holder_dt = datetime.fromisoformat(
+                    requester_expires_at.replace("Z", "+00:00")
+                )
+                floor_dt = datetime.fromisoformat(
+                    min_expires_at.replace("Z", "+00:00")
+                )
+                if holder_dt < floor_dt:
+                    requester_expires_at = min_expires_at
+            except ValueError:
+                pass
+
         # Insert the requester's sibling claim. Pattern matches what
         # the holder approved; severity is 'soft' because cooperative
         # coexistence is the whole point of this verb.
@@ -1304,7 +1369,7 @@ class Database:
                 coexist_pattern,
                 "soft",
                 now,
-                holder["expires_at"],
+                requester_expires_at,
                 holder["repo"],
                 requester_session_id,
                 requester_last_activity,

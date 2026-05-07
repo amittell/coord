@@ -19,6 +19,25 @@ Semantic Versioning.
 
 - (none recorded yet)
 
+## [0.13.0] - 2026-05-06
+
+### Fixed
+
+- **CRITICAL: idle expiration silently disabled in background sweep.** The background `cleanup_loop` called `expire_stale_claims()` with no arguments, so `idle_timeout_sec` defaulted to 0 and the idle path never fired between API requests. Dead-agent claims were not reaped after 30 minutes of inactivity; they sat until the full hard TTL expired. Fix: pass `settings.idle_timeout_sec` to the background call.
+- **HIGH: `narrowed` / `coexist` decisions inherited a possibly-shortened TTL.** When a holder responded to a release request with `narrowed` or `coexist`, the new claim's `expires_at` was copied from the original row, which may have already been shortened by `request_release`. The new claim could expire within minutes of creation. Fix: the service layer now passes `min_expires_at = now + default_ttl_hours` to `db.respond_to_request`, which floors the new claim's TTL at that value. The DB layer accepts a `min_expires_at: str | None` parameter on `_apply_narrowed` and `_apply_coexist`.
+- **HIGH: `_register_session_marker` non-atomic read-modify-write race.** Two `coord-mcp` processes starting simultaneously both read sessions.live before either writes; the second writer's atomic replace silently dropped the first session's entry. That session's claims were then not self-excluded at push time, causing false-positive conflict blocks on the agent's own push. Fix: registration is now append-only (one `open(marker, "a")` write, no read). Stale entries are swept lazily by `_remove_session_marker` on graceful shutdown, which rewrites the file with only live entries.
+- **MEDIUM: `release_for_session` TOCTOU.** SELECT and UPDATE ran in separate connections; a concurrent `release_claims` between them could close some IDs before the UPDATE, causing spurious cascade-resolve calls. Fix: SELECT and UPDATE now share a single `BEGIN IMMEDIATE` transaction.
+- **MEDIUM: `ttl_shortened` audit label used wrong heuristic.** `expire_stale_claims` labelled expiring claims `"ttl-shortened"` based on whether they had pending requests at expiry time, producing false positives (claim expired with a pending request that arrived just before the natural deadline) and false negatives (TTL shortened but requester withdrew). Fix: schema v7 adds `claims.ttl_shortened BOOLEAN DEFAULT 0`; `create_request` stamps it `1` when shortening; the `denied` decision resets it `0`; `expire_stale_claims` reads it directly from the claims row rather than joining the requests table.
+- **LOW: non-constant-time bearer token comparison.** `token != settings.auth_token` used Python's built-in string equality. Fix: replaced with `hmac.compare_digest`.
+- **LOW: redundant in-function imports in `service.py`.** `file_request` re-imported `datetime`/`uuid4` inside its body; both are already at module scope. Removed.
+
+### Added
+
+- `claims.ttl_shortened BOOLEAN DEFAULT 0` column (schema v7). Tracks whether a claim's TTL was explicitly shortened by a `request_release` call. Used by `expire_stale_claims` for accurate audit labelling and reset by `denied` decisions when the original TTL is restored.
+- `db.respond_to_request` accepts `min_expires_at: str | None` parameter, forwarded to `_apply_narrowed` and `_apply_coexist`. Callers can supply a floor timestamp; new claims get `max(inherited_ttl, min_expires_at)`.
+- Tests for `narrowed` and `coexist` decision paths: TTL floor behavior, `ttl_shortened` stamping and reset, and both "healthy TTL unchanged" and "shortened TTL floored" cases (7 new tests in `test_requests_v11.py`).
+- `_remove_session_marker` now sweeps dead-PID and legacy-format entries when rewriting the file, completing the lazy-cleanup contract introduced by the append-only registration change.
+
 ## [0.12.0] - 2026-05-06
 
 ### Added
