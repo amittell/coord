@@ -1486,3 +1486,254 @@ def test_atomic_write_lines_replaces_destination_atomically(
     # No leftover temp files in the same directory.
     leftovers = [p for p in _os.listdir(tmp_path) if p != "sessions.live"]
     assert leftovers == []
+
+
+# ---------------------------------------------------------------------------
+# symbol-scope claims (v0.14)
+#
+# claim_files accepts an optional ``symbols`` dict[file_path, [name, ...]]
+# and an optional ``narrowable`` bool. When a path is symbol-scoped, the
+# emitted claim entry carries a ``symbols`` array; the entry is otherwise
+# the same shape as a normal file claim. When ``narrowable`` is set, it
+# is echoed verbatim on every emitted claim entry. When neither is set,
+# the wire shape is byte-identical to pre-v0.14 so older servers see no
+# change at all.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_claim_files_with_symbols_builds_correct_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A path that appears in both ``patterns`` and ``symbols`` is sent
+    as a single symbol-scope entry (symbols win over the bare path).
+    A path that's only in ``patterns`` stays a whole-file claim. Both
+    forms coexist in the same request, in the order ``patterns`` was
+    given, with extra symbol-only paths appended afterwards."""
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    captured = _install_mock_transport(
+        monkeypatch,
+        _json_handler(
+            200,
+            {"claim_ids": ["c1", "c2"], "conflicts": [], "warnings": [], "options": []},
+        ),
+    )
+
+    await mcp_server.claim_files(
+        engineer="alice",
+        patterns=["src/auth/login.ts", "src/auth/logout.ts"],
+        symbols={
+            "src/auth/login.ts": ["handleLogin", "validateCredentials"],
+            "src/billing/charge.ts": ["chargeCard"],
+        },
+    )
+
+    import json as _json
+
+    body = _json.loads(captured[0].content.decode("utf-8"))
+    # login.ts: in both patterns and symbols -> single symbol entry.
+    # logout.ts: only in patterns -> whole-file entry.
+    # billing/charge.ts: only in symbols -> appended symbol entry.
+    assert body["claims"] == [
+        {
+            "type": "file",
+            "pattern": "src/auth/login.ts",
+            "symbols": ["handleLogin", "validateCredentials"],
+        },
+        {"type": "file", "pattern": "src/auth/logout.ts"},
+        {
+            "type": "file",
+            "pattern": "src/billing/charge.ts",
+            "symbols": ["chargeCard"],
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_claim_files_with_symbols_overrides_pattern_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """De-dup contract: a path listed in ``patterns`` AND ``symbols``
+    produces exactly one claim entry -- the symbol-scope one. The
+    whole-file entry must not also be sent (that would let the server
+    open a second, broader claim that swallows the intended narrower
+    scope)."""
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    captured = _install_mock_transport(
+        monkeypatch,
+        _json_handler(
+            200,
+            {"claim_ids": ["c1"], "conflicts": [], "warnings": [], "options": []},
+        ),
+    )
+
+    await mcp_server.claim_files(
+        engineer="alice",
+        patterns=["src/auth/login.ts"],
+        symbols={"src/auth/login.ts": ["handleLogin"]},
+    )
+
+    import json as _json
+
+    body = _json.loads(captured[0].content.decode("utf-8"))
+    assert body["claims"] == [
+        {
+            "type": "file",
+            "pattern": "src/auth/login.ts",
+            "symbols": ["handleLogin"],
+        },
+    ]
+    # Defensive: there must not be a second entry for the same pattern
+    # without symbols.
+    bare_entries = [
+        c
+        for c in body["claims"]
+        if c.get("pattern") == "src/auth/login.ts" and "symbols" not in c
+    ]
+    assert bare_entries == [], (
+        "the bare-pattern entry must be replaced, not duplicated"
+    )
+
+
+@pytest.mark.asyncio
+async def test_claim_files_narrowable_false_passes_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``narrowable=False`` must surface on every emitted claim entry
+    (both whole-file and symbol-scope rows, plus shared_file rows when
+    present) so the server knows the holder has opted out of auto-narrow.
+    The literal value ``False`` -- not omitted -- must appear on each
+    entry."""
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    captured = _install_mock_transport(
+        monkeypatch,
+        _json_handler(
+            200,
+            {"claim_ids": ["c1", "c2"], "conflicts": [], "warnings": [], "options": []},
+        ),
+    )
+
+    await mcp_server.claim_files(
+        engineer="alice",
+        patterns=["src/auth/login.ts", "src/auth/logout.ts"],
+        symbols={"src/auth/login.ts": ["handleLogin"]},
+        narrowable=False,
+    )
+
+    import json as _json
+
+    body = _json.loads(captured[0].content.decode("utf-8"))
+    assert body["claims"] == [
+        {
+            "type": "file",
+            "pattern": "src/auth/login.ts",
+            "symbols": ["handleLogin"],
+            "narrowable": False,
+        },
+        {
+            "type": "file",
+            "pattern": "src/auth/logout.ts",
+            "narrowable": False,
+        },
+    ]
+    # Spot-check: the literal False is present, not the key missing.
+    for entry in body["claims"]:
+        assert entry["narrowable"] is False
+
+
+@pytest.mark.asyncio
+async def test_claim_files_without_symbols_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Backward-compat guarantee: a call that doesn't pass ``symbols``
+    or ``narrowable`` must produce claim entries with NEITHER key set.
+    A pre-v0.14 server with a strict pydantic model that doesn't know
+    those fields must see the exact byte shape it always saw."""
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    captured = _install_mock_transport(
+        monkeypatch,
+        _json_handler(
+            200,
+            {"claim_ids": ["c1"], "conflicts": [], "warnings": [], "options": []},
+        ),
+    )
+
+    await mcp_server.claim_files(
+        engineer="alice",
+        patterns=["src/auth/login.ts"],
+        shared_files=["package-lock.json"],
+    )
+
+    import json as _json
+
+    body = _json.loads(captured[0].content.decode("utf-8"))
+    assert body["claims"] == [
+        {"type": "file", "pattern": "src/auth/login.ts"},
+        {"type": "shared_file", "pattern": "package-lock.json"},
+    ]
+    for entry in body["claims"]:
+        assert "symbols" not in entry, (
+            "symbols must be absent when caller didn't pass it"
+        )
+        assert "narrowable" not in entry, (
+            "narrowable must be absent when caller didn't pass it"
+        )
+
+
+@pytest.mark.asyncio
+async def test_claim_files_returns_symbol_overlap_in_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the server returns a 409 with a ``symbol_overlap`` payload
+    inside ``conflicts[i]``, the MCP tool must propagate the JSON body
+    verbatim so the agent can decide whether to retry with a different
+    symbol set, escalate via request_release, or back off entirely."""
+    conflict_body = {
+        "claim_ids": [],
+        "conflicts": [
+            {
+                "your_pattern": "src/auth/login.ts",
+                "your_symbols": ["handleLogin"],
+                "conflicting_claim": {
+                    "id": "x",
+                    "engineer": "bob",
+                    "pattern": "src/auth/login.ts",
+                    "severity": "hard",
+                    "description": "rewriting login flow",
+                    "expires_at": "2099-01-01T00:00:00Z",
+                    "scope_type": "symbol",
+                    "symbols": ["handleLogin", "logSignin"],
+                },
+                "overlap": ["src/auth/login.ts"],
+                "symbol_overlap": [
+                    {"file": "src/auth/login.ts", "symbols": ["handleLogin"]}
+                ],
+            }
+        ],
+        "warnings": [],
+        "options": ["wait", "narrow_claim", "escalate", "override"],
+    }
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    _install_mock_transport(monkeypatch, _json_handler(409, conflict_body))
+
+    result = await mcp_server.claim_files(
+        engineer="alice",
+        patterns=["src/auth/login.ts"],
+        symbols={"src/auth/login.ts": ["handleLogin"]},
+    )
+
+    assert result == conflict_body
+    # The new symbol-level fields must round-trip untouched -- the tool
+    # never strips or rewrites them on the way back to the agent.
+    assert result["conflicts"][0]["symbol_overlap"] == [
+        {"file": "src/auth/login.ts", "symbols": ["handleLogin"]}
+    ]
+    assert result["conflicts"][0]["your_symbols"] == ["handleLogin"]
+    assert (
+        result["conflicts"][0]["conflicting_claim"]["scope_type"] == "symbol"
+    )

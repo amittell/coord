@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sqlite3
 import sys
@@ -140,7 +141,7 @@ CREATE INDEX IF NOT EXISTS idx_claims_engineer ON claims (engineer);
 """
 
 
-CURRENT_SCHEMA_VERSION = 7
+CURRENT_SCHEMA_VERSION = 9
 
 # Migration registry: list of (version, upgrade_sql) tuples applied in order.
 # Entry for version N is the SQL that upgrades a DB from version N-1 to N.
@@ -246,6 +247,65 @@ MIGRATIONS: list[tuple[int, str]] = [
     (
         7,
         "ALTER TABLE claims ADD COLUMN ttl_shortened BOOLEAN DEFAULT 0;",
+    ),
+    # v8: sub-file (symbol-level) claims. `claims.scope_type` distinguishes
+    # whole-file claims (legacy default) from symbol-scoped claims; the
+    # latter cover only the symbols enumerated in `claim_symbols`.
+    # `claims.narrowable` controls whether an incoming symbol claim is
+    # allowed to auto-narrow this row's effective scope (default 1; v0.13
+    # behaviour preserved because pre-v0.14 clients never submit symbol
+    # claims, so no auto-narrow can fire against legacy rows in practice).
+    #
+    # `claim_symbols` is the symbol set for a `scope_type='symbol'` claim;
+    # `(file_path, symbol_name)` is the join key the overlap engine uses
+    # to detect symbol intersection across two claims on the same file.
+    # symbol_kind is informational only -- 'function' | 'class' |
+    # 'interface' | 'type' | 'const' | 'enum' | 'unknown'.
+    (
+        8,
+        "ALTER TABLE claims ADD COLUMN scope_type TEXT NOT NULL DEFAULT 'file';\n"
+        "ALTER TABLE claims ADD COLUMN narrowable BOOLEAN NOT NULL DEFAULT 1;\n"
+        "CREATE TABLE claim_symbols (\n"
+        "    id TEXT PRIMARY KEY,\n"
+        "    claim_id TEXT NOT NULL,\n"
+        "    file_path TEXT NOT NULL,\n"
+        "    symbol_name TEXT NOT NULL,\n"
+        "    symbol_kind TEXT NOT NULL,\n"
+        "    UNIQUE (claim_id, file_path, symbol_name),\n"
+        "    FOREIGN KEY (claim_id) REFERENCES claims(id)\n"
+        ");\n"
+        "CREATE INDEX idx_claim_symbols_file_symbol ON claim_symbols (file_path, symbol_name);\n"
+        "CREATE INDEX idx_claim_symbols_claim ON claim_symbols (claim_id);",
+    ),
+    # v9: relax `request_events.request_id` to nullable. v0.14 auto-coexist
+    # and auto-narrow resolutions are server-side decisions that skip the
+    # requests table entirely; the design doc (docs/design/sub-file-claims.md,
+    # "State machine deltas") specifies these events land in request_events
+    # with `request_id=NULL` so the join becomes a left join. SQLite cannot
+    # alter a column's NOT NULL or FK constraint in place, so the migration
+    # rebuilds the table: rename old -> copy rows -> drop old -> recreate
+    # indexes. All inside the v9 BEGIN IMMEDIATE so a crash mid-migration
+    # rolls back cleanly.
+    (
+        9,
+        "ALTER TABLE request_events RENAME TO request_events_v8;\n"
+        "CREATE TABLE request_events (\n"
+        "    id TEXT PRIMARY KEY,\n"
+        "    request_id TEXT,\n"
+        "    event_type TEXT NOT NULL,\n"
+        "    actor_engineer TEXT,\n"
+        "    actor_session_id TEXT,\n"
+        "    detail TEXT,\n"
+        "    created_at TEXT NOT NULL,\n"
+        "    FOREIGN KEY (request_id) REFERENCES requests(id)\n"
+        ");\n"
+        "INSERT INTO request_events (id, request_id, event_type, "
+        "actor_engineer, actor_session_id, detail, created_at) "
+        "SELECT id, request_id, event_type, actor_engineer, "
+        "actor_session_id, detail, created_at FROM request_events_v8;\n"
+        "DROP TABLE request_events_v8;\n"
+        "CREATE INDEX idx_request_events_request ON request_events (request_id);\n"
+        "CREATE INDEX idx_request_events_created ON request_events (created_at);",
     ),
 ]
 
@@ -546,6 +606,180 @@ class Database:
                 )
             await conn.commit()
         return [i[0] for i in items]
+
+    async def insert_claim_symbols(
+        self,
+        *,
+        rows: list[tuple[str, str, str, str, str]],
+    ) -> None:
+        """Insert symbol rows for ``scope_type='symbol'`` claims.
+
+        Each row is ``(id, claim_id, file_path, symbol_name, symbol_kind)``.
+        The caller (service layer) generates the row ids and groups symbols
+        per claim. Idempotent against the ``UNIQUE (claim_id, file_path,
+        symbol_name)`` index: a duplicate insert is silently ignored so
+        retries don't 500.
+        """
+        if not rows:
+            return
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            await _configure_sqlite(conn)
+            await conn.executemany(
+                """
+                INSERT OR IGNORE INTO claim_symbols
+                    (id, claim_id, file_path, symbol_name, symbol_kind)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+            await conn.commit()
+
+    async def get_claim_symbols(
+        self, claim_id: str
+    ) -> list[dict[str, str]]:
+        """Return all symbol rows for a claim. Empty list for file-scope
+        claims or unknown claim_id."""
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                """
+                SELECT file_path, symbol_name, symbol_kind
+                FROM claim_symbols
+                WHERE claim_id = ?
+                ORDER BY file_path, symbol_name
+                """,
+                (claim_id,),
+            )
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+    async def find_symbol_overlaps(
+        self,
+        *,
+        file_path: str,
+        symbol_names: list[str],
+        exclude_engineer: str | None = None,
+        exclude_session_ids: list[str] | None = None,
+        repo: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return active symbol-scope claim rows whose symbol set intersects
+        the supplied ``symbol_names`` on the supplied ``file_path``.
+
+        Excludes the caller's own engineer / session_ids the same way the
+        path-overlap check does. Used by the conflict engine when both
+        holder and requester are symbol-scoped; an empty intersection
+        means the conflict engine returns AUTO_COEXIST instead of 409.
+        """
+        if not symbol_names:
+            return []
+        await self.init()
+        placeholders = ",".join("?" for _ in symbol_names)
+        params: list[Any] = [file_path, *symbol_names]
+        sql = (
+            "SELECT c.*, cs.symbol_name AS overlapping_symbol, "
+            "cs.symbol_kind AS overlapping_symbol_kind "
+            "FROM claim_symbols cs JOIN claims c ON c.id = cs.claim_id "
+            "WHERE cs.file_path = ? AND cs.symbol_name IN (" + placeholders + ") "
+            "AND c.released_at IS NULL "
+            "AND c.scope_type = 'symbol'"
+        )
+        if exclude_engineer:
+            sql += " AND c.engineer != ?"
+            params.append(exclude_engineer)
+        if exclude_session_ids:
+            ph = ",".join("?" for _ in exclude_session_ids)
+            sql += f" AND (c.session_id IS NULL OR c.session_id NOT IN ({ph}))"
+            params.extend(exclude_session_ids)
+        if repo is not None:
+            sql += " AND c.repo IS ?"
+            params.append(repo)
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(sql, params)
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+    async def find_narrowable_file_claims_on(
+        self,
+        *,
+        file_path: str,
+        exclude_engineer: str | None = None,
+        exclude_session_ids: list[str] | None = None,
+        repo: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return active narrowable file-scope claims whose pattern matches
+        the given ``file_path``. Used by the auto-narrow path: a symbol
+        requester scans this list to find holders it can auto-narrow.
+
+        Pattern matching is left to the caller via ``compute_overlap`` --
+        we return every narrowable file claim in the same repo and the
+        caller filters by pattern intersection.
+        """
+        await self.init()
+        sql = (
+            "SELECT * FROM claims "
+            "WHERE released_at IS NULL "
+            "AND scope_type = 'file' "
+            "AND narrowable = 1 "
+            "AND claim_type != 'shared_file'"
+        )
+        params: list[Any] = []
+        if exclude_engineer:
+            sql += " AND engineer != ?"
+            params.append(exclude_engineer)
+        if exclude_session_ids:
+            ph = ",".join("?" for _ in exclude_session_ids)
+            sql += f" AND (session_id IS NULL OR session_id NOT IN ({ph}))"
+            params.extend(exclude_session_ids)
+        if repo is not None:
+            sql += " AND repo IS ?"
+            params.append(repo)
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(sql, params)
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+    async def attach_coexist_partner(
+        self, claim_id: str, partner_id: str
+    ) -> None:
+        """Add ``partner_id`` to ``claims[claim_id].coexists_with`` (JSON
+        array). Idempotent: a partner already present is not duplicated.
+
+        Used by auto-coexist / auto-narrow paths to mark two claims as
+        cooperative without going through the request flow.
+        """
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                "SELECT coexists_with FROM claims WHERE id = ? AND released_at IS NULL",
+                (claim_id,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return
+            raw = row["coexists_with"]
+            partners: list[str] = []
+            if raw:
+                try:
+                    partners = list(json.loads(raw))
+                except (ValueError, TypeError):
+                    partners = []
+            if partner_id in partners:
+                return
+            partners.append(partner_id)
+            await conn.execute(
+                "UPDATE claims SET coexists_with = ? WHERE id = ?",
+                (json.dumps(partners), claim_id),
+            )
+            await conn.commit()
 
     async def touch_session_activity(self, session_id: str) -> int:
         """Bump ``last_activity`` on every active claim that belongs to
@@ -1023,7 +1257,7 @@ class Database:
     async def _record_event_in_txn(
         conn: aiosqlite.Connection,
         *,
-        request_id: str,
+        request_id: str | None,
         event_type: str,
         actor_engineer: str | None,
         actor_session_id: str | None,
@@ -1034,6 +1268,9 @@ class Database:
         Detail is JSON-encoded so the column stays TEXT and SQLite
         can be queried via JSON1 functions if we ever need to grep
         the audit trail by detail field. The caller commits.
+
+        ``request_id`` is nullable as of schema v9: v0.14 auto-coexist /
+        auto-narrow events have no parent request row and pass None.
         """
         import json as _json
 
@@ -1556,6 +1793,37 @@ class Database:
             )
             await conn.commit()
             return True
+
+    async def record_request_event(
+        self,
+        event_type: str,
+        *,
+        request_id: str | None = None,
+        actor_engineer: str | None = None,
+        actor_session_id: str | None = None,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        """Append a single ``request_events`` row in its own transaction.
+
+        Public counterpart to ``_record_event_in_txn`` for callers that
+        aren't already inside a transaction. ``request_id`` is optional
+        (nullable as of schema v9) so v0.14 auto-resolution paths
+        (``auto-coexist``, ``auto-narrow``) can record audit rows even
+        though they bypass the ``requests`` table entirely.
+        """
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            await self._record_event_in_txn(
+                conn,
+                request_id=request_id,
+                event_type=event_type,
+                actor_engineer=actor_engineer,
+                actor_session_id=actor_session_id,
+                detail=detail,
+            )
+            await conn.commit()
 
     async def get_request(self, request_id: str) -> dict[str, Any] | None:
         await self.init()

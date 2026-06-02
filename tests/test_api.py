@@ -969,3 +969,153 @@ async def test_access_log_records_non_2xx_status(
     assert getattr(rec, "status", None) == 401
     assert getattr(rec, "method", None) == "GET"
     assert getattr(rec, "path", None) == "/claims"
+
+
+# ---------------------------------------------------------------------------
+# v0.14: symbol-scope claims end-to-end through POST /claims
+# ---------------------------------------------------------------------------
+
+
+_AUTH = {"Authorization": "Bearer test-token"}
+
+
+def _symbol_claim(pattern: str, symbols: list[str]) -> dict:
+    return {"type": "file", "pattern": pattern, "symbols": symbols}
+
+
+@pytest.mark.asyncio
+async def test_symbol_claim_creates_with_scope_type_symbol(
+    client: AsyncClient,
+) -> None:
+    r = await client.post(
+        "/claims",
+        headers=_AUTH,
+        json={
+            "engineer": "alex",
+            "repo": "amittell/coord",
+            "claims": [_symbol_claim("src/auth/login.ts", ["handleLogin"])],
+        },
+    )
+    assert r.status_code == 200, r.text
+    cid = r.json()["claim_ids"][0]
+    listing = await client.get(
+        "/claims", headers=_AUTH, params={"active_only": "true"}
+    )
+    rows = listing.json()
+    target = [c for c in rows.get("claims", []) if c["id"] == cid][0]
+    assert target["scope_type"] == "symbol"
+    assert target["narrowable"] == 0
+
+
+@pytest.mark.asyncio
+async def test_symbol_disjoint_auto_coexists_without_409(
+    client: AsyncClient,
+) -> None:
+    body_a = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [_symbol_claim("src/auth/login.ts", ["handleLogin"])],
+    }
+    body_b = {
+        "engineer": "bob",
+        "repo": "amittell/coord",
+        "claims": [_symbol_claim("src/auth/login.ts", ["handleLogout"])],
+    }
+    ra = await client.post("/claims", headers=_AUTH, json=body_a)
+    assert ra.status_code == 200, ra.text
+    rb = await client.post("/claims", headers=_AUTH, json=body_b)
+    assert rb.status_code == 200, rb.text
+    assert rb.json()["claim_ids"], "AUTO_COEXIST should grant the claim"
+    listing = await client.get(
+        "/claims", headers=_AUTH, params={"active_only": "true"}
+    )
+    active_ids = {c["id"] for c in listing.json().get("claims", [])}
+    assert ra.json()["claim_ids"][0] in active_ids
+    assert rb.json()["claim_ids"][0] in active_ids
+
+
+@pytest.mark.asyncio
+async def test_symbol_overlap_returns_409_with_symbol_detail(
+    client: AsyncClient,
+) -> None:
+    body_a = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [_symbol_claim("src/auth/login.ts", ["handleLogin"])],
+    }
+    ra = await client.post("/claims", headers=_AUTH, json=body_a)
+    assert ra.status_code == 200, ra.text
+    body_b = {
+        "engineer": "bob",
+        "repo": "amittell/coord",
+        "claims": [
+            _symbol_claim("src/auth/login.ts", ["handleLogin", "validate"])
+        ],
+    }
+    rb = await client.post("/claims", headers=_AUTH, json=body_b)
+    assert rb.status_code == 409
+    payload = rb.json()
+    assert payload["claim_ids"] == []
+    assert payload["conflicts"], "expected at least one conflict"
+    entry = payload["conflicts"][0]
+    assert entry["your_symbols"] == ["handleLogin", "validate"]
+    assert entry["conflicting_claim"]["scope_type"] == "symbol"
+    so = entry.get("symbol_overlap")
+    assert so and so[0]["symbols"] == ["handleLogin"]
+
+
+@pytest.mark.asyncio
+async def test_file_holder_narrowable_auto_narrows_for_symbol_requester(
+    client: AsyncClient,
+) -> None:
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/auth/login.ts"}],
+    }
+    rh = await client.post("/claims", headers=_AUTH, json=holder)
+    assert rh.status_code == 200, rh.text
+    requester = {
+        "engineer": "bob",
+        "repo": "amittell/coord",
+        "claims": [_symbol_claim("src/auth/login.ts", ["handleLogin"])],
+    }
+    rr = await client.post("/claims", headers=_AUTH, json=requester)
+    assert rr.status_code == 200, rr.text
+    assert rr.json()["claim_ids"], "AUTO_NARROW should grant symbol claim"
+    # Both claims should now be active and marked as coexist partners.
+    listing = await client.get(
+        "/claims", headers=_AUTH, params={"active_only": "true"}
+    )
+    rows = listing.json()["claims"]
+    holder_id = rh.json()["claim_ids"][0]
+    requester_id = rr.json()["claim_ids"][0]
+    holder_row = [c for c in rows if c["id"] == holder_id][0]
+    requester_row = [c for c in rows if c["id"] == requester_id][0]
+    import json as _json
+
+    holder_partners = _json.loads(holder_row.get("coexists_with") or "[]")
+    requester_partners = _json.loads(requester_row.get("coexists_with") or "[]")
+    assert requester_id in holder_partners
+    assert holder_id in requester_partners
+
+
+@pytest.mark.asyncio
+async def test_shared_file_holder_blocks_symbol_requester(
+    client: AsyncClient,
+) -> None:
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "shared_file", "pattern": "package-lock.json"}],
+    }
+    rh = await client.post("/claims", headers=_AUTH, json=holder)
+    assert rh.status_code == 200, rh.text
+    requester = {
+        "engineer": "bob",
+        "repo": "amittell/coord",
+        "claims": [_symbol_claim("package-lock.json", ["irrelevant"])],
+    }
+    rr = await client.post("/claims", headers=_AUTH, json=requester)
+    # shared_file is explicitly non-narrowable -> conflict path stays 409.
+    assert rr.status_code == 409

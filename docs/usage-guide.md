@@ -59,6 +59,32 @@ Avoid:
 
 Very broad claims are rejected when `COORD_REPO_ROOT` is configured and the claim exceeds the configured scope limits.
 
+## Symbol-level claims (v0.14+)
+
+When several agents need to coexist on different parts of one hot file (a multi-route handler, a shared component module, a feature-flag dispatch table), file-scope claims force them to serialise even though the actual edits don't overlap. Symbol-scope claims push the unit of coordination one level down: the claim covers only the named top-level declarations, and disjoint symbol sets on the same file resolve as `AUTO_COEXIST` without filing a request.
+
+When to reach for them:
+
+- TypeScript files where two or more agents predictably want different functions, classes, or types within the same file.
+- A file claim that keeps getting `409`'d on hotspots where the work is actually disjoint.
+
+When file-scope is still the right call:
+
+- Small files where the whole content effectively moves together.
+- Files in languages without a v0.14 parser (Python, Go land in v0.15; everything else stays file-scope).
+- Edits that touch imports, top-level statements outside any declared symbol, or anything that changes module shape. Symbol claims do NOT cover module-level code -- you need a file claim for that, even if you also hold a symbol claim on the same file.
+
+Passing `symbols` on `claim_files` (a `dict[str, list[str]]` keyed by file path, values are symbol names within that file) flips the claim to `scope_type='symbol'`. Without `symbols`, behaviour is identical to pre-v0.14.
+
+The `narrowable` flag controls whether a file claim can be auto-narrowed by an incoming symbol claim. Defaults:
+
+- `file` claims: `narrowable=true`. A symbol-scope requester arriving against your file claim triggers `AUTO_NARROW`: both claims live, your effective scope shrinks to "file minus the partner's symbols", and you get a `pending_requests` notice on your next poll.
+- `shared_file` claims: `narrowable=false`. The whole point is to make overlap visible.
+- `module` claims: `narrowable=false`. Coarse scope was deliberate.
+- `symbol` claims: `narrowable=false`. Already at the leaf level.
+
+Pass `narrowable=false` on a file claim to opt out: an incoming symbol claim then has to file an explicit `request_release`. See [./design/sub-file-claims.md](./design/sub-file-claims.md) for the overlap algorithm, parser strategy, and migration notes.
+
 ## Monorepo wiring: `coord init --root`
 
 In a monorepo, `coord init` defaults to the enclosing git work tree root, which is usually the whole repo. If several services share one repo and each service wants its own `.coordination/` directory (per-service ownership rules, per-service MCP wiring, per-service pre-push hook), pass `--root` to tell `init` where to place the generated files:

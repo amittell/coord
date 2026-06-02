@@ -80,6 +80,19 @@ From Claude Code, confirm the `coord` toolset can:
 
 If those work, the integration is live.
 
+For symbol-level claims (v0.14+), pass `symbols` to `claim_files` to coexist with other agents on different declarations in the same file:
+
+```python
+claim_files(
+    engineer="alex/claude/main",
+    patterns=["src/auth/login.ts"],
+    symbols={"src/auth/login.ts": ["handleLogin", "validateCredentials"]},
+    description="auth refactor",
+)
+```
+
+A peer claiming a disjoint symbol set on the same file is granted automatically (`AUTO_COEXIST`) instead of hitting a `409`. See [../usage-guide.md](../usage-guide.md) for when symbol claims help and when file scope is still the right call.
+
 ## Auth resolution order
 
 `coord-mcp` resolves `COORD_*` env vars in this order, with the first non-placeholder value winning:

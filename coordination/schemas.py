@@ -6,6 +6,33 @@ from pydantic import BaseModel, Field
 class ClaimItem(BaseModel):
     type: str = Field(..., description="module | file | shared_file")
     pattern: str
+    symbols: list[str] | None = Field(
+        default=None,
+        description=(
+            "Optional symbol-level scope (v0.14+). When non-empty, the "
+            "claim covers only the listed top-level symbols (functions, "
+            "classes, types, etc.) within every file the pattern matches "
+            "rather than the whole file. Two symbol claims on the same "
+            "file with disjoint symbol sets auto-coexist (no 409). When "
+            "absent or empty, the claim retains the legacy whole-file "
+            "scope. See docs/design/sub-file-claims.md."
+        ),
+    )
+    narrowable: bool | None = Field(
+        default=None,
+        description=(
+            "Optional flag (v0.14+) controlling whether an incoming "
+            "symbol-scope claim is allowed to auto-narrow this row. "
+            "Defaults: file claims True, shared_file False, module False, "
+            "symbol-scope claims always non-narrowable. Explicit False on "
+            "a normal file claim forces the legacy 409+request flow."
+        ),
+    )
+
+
+class ConflictingSymbol(BaseModel):
+    file: str
+    symbols: list[str]
 
 
 class CreateClaimsRequest(BaseModel):
@@ -41,12 +68,31 @@ class ConflictingClaim(BaseModel):
     severity: str
     description: str | None = None
     expires_at: str
+    scope_type: str | None = Field(
+        default=None,
+        description="'file' | 'symbol' (v0.14+). Absent for legacy responses.",
+    )
+    symbols: list[str] | None = Field(
+        default=None,
+        description="Symbol set the conflicting claim covers, when scope_type='symbol'.",
+    )
 
 
 class ConflictEntry(BaseModel):
     your_pattern: str
     conflicting_claim: ConflictingClaim
     overlap: list[str]
+    your_symbols: list[str] | None = Field(
+        default=None,
+        description="Symbols you tried to claim on the overlapping file (v0.14+).",
+    )
+    symbol_overlap: list[ConflictingSymbol] | None = Field(
+        default=None,
+        description=(
+            "Set when both sides are symbol-scope on the overlapping file. "
+            "Empty list means symbol-disjoint (would have auto-coexisted)."
+        ),
+    )
 
 
 class CreateClaimsResponse(BaseModel):

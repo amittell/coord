@@ -161,11 +161,65 @@ async def claim_files(
     branch: str | None = None,
     shared_files: list[str] | None = None,
     ttl_hours: int | None = None,
+    symbols: dict[str, list[str]] | None = None,
+    narrowable: bool | None = None,
 ) -> dict[str, Any]:
-    """Claim files or glob patterns before editing; returns claim_ids or conflicts."""
-    claims = [{"type": "file", "pattern": p} for p in patterns]
+    """Claim files or glob patterns before editing; returns claim_ids or conflicts.
+
+    ``symbols`` (v0.14+) maps file paths to lists of top-level symbol
+    names within those files (functions, classes, types, etc.). When a
+    file appears as a key, that claim becomes symbol-scoped: only the
+    listed symbols are covered, not the whole file. Two symbol claims
+    on the same file with disjoint symbol sets auto-coexist server-side
+    (no 409). If a path appears in both ``patterns`` and ``symbols`` the
+    symbol form wins -- a single symbol-scope claim is sent instead of
+    a whole-file claim. Paths in ``symbols`` that are not in ``patterns``
+    are still claimed (as symbol-scope rows).
+
+    ``narrowable`` (v0.14+) controls whether the server may auto-narrow
+    this claim when a later symbol-scope claim arrives on an overlapping
+    file. Defaults are decided server-side (file=True, shared_file=False,
+    symbol=False); pass ``False`` here to force the legacy 409+request
+    flow instead of auto-narrow on a normal file claim.
+
+    For backward compatibility the wrapper omits the ``symbols`` and
+    ``narrowable`` keys from each ``claims[i]`` payload entry when they
+    would be ``None`` or empty, so a pre-v0.14 server sees the exact
+    same shape it always did.
+    """
+    # Decide which paths are symbol-scoped. A non-empty list in `symbols`
+    # for a given path turns that path into a symbol-scope claim; empty
+    # lists are treated as "no symbols specified" (same as omitted), so
+    # the legacy whole-file shape goes out.
+    symbol_map: dict[str, list[str]] = {
+        path: list(syms)
+        for path, syms in (symbols or {}).items()
+        if syms
+    }
+    claims: list[dict[str, Any]] = []
+    seen_symbol_paths: set[str] = set()
+    for p in patterns:
+        entry: dict[str, Any] = {"type": "file", "pattern": p}
+        if p in symbol_map:
+            entry["symbols"] = list(symbol_map[p])
+            seen_symbol_paths.add(p)
+        if narrowable is not None:
+            entry["narrowable"] = narrowable
+        claims.append(entry)
+    # Symbol-scope paths not already represented by an entry in `patterns`
+    # still need a claim: emit them as additional symbol-scope claim rows.
+    for path, syms in symbol_map.items():
+        if path in seen_symbol_paths:
+            continue
+        entry = {"type": "file", "pattern": path, "symbols": list(syms)}
+        if narrowable is not None:
+            entry["narrowable"] = narrowable
+        claims.append(entry)
     for sf in shared_files or []:
-        claims.append({"type": "shared_file", "pattern": sf})
+        sf_entry: dict[str, Any] = {"type": "shared_file", "pattern": sf}
+        if narrowable is not None:
+            sf_entry["narrowable"] = narrowable
+        claims.append(sf_entry)
     body: dict[str, Any] = {
         "engineer": engineer,
         "branch": branch,

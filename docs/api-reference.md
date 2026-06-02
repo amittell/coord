@@ -60,6 +60,28 @@ Request body:
 }
 ```
 
+Each `ClaimItem` accepts two optional fields added in v0.14:
+
+- `symbols` (`list[str]`): top-level symbol names within `pattern`. When present and non-empty, the claim becomes `scope_type='symbol'` and covers only the listed declarations; imports and module-level statements are explicitly not covered. When `pattern` is a glob, the symbol list applies to every matched file -- pass separate claim items if you want per-file granularity. Empty or absent: `scope_type='file'` (legacy behaviour).
+- `narrowable` (`bool`): whether a later symbol-scope requester can auto-narrow this claim. Defaults: `file` -> `true`, `shared_file` / `module` / `symbol` -> `false`.
+
+Symbol-scope example:
+
+```json
+{
+  "engineer": "alex/claude/main",
+  "branch": "alex/auth-refactor",
+  "claims": [
+    {
+      "type": "file",
+      "pattern": "src/auth/login.ts",
+      "symbols": ["handleLogin", "validateCredentials"]
+    }
+  ],
+  "ttl_hours": 2
+}
+```
+
 Responses:
 
 - `200`: claims created
@@ -74,21 +96,29 @@ Conflict response shape:
   "conflicts": [
     {
       "your_pattern": "src/auth/**",
+      "your_symbols": ["handleLogin"],
       "conflicting_claim": {
         "id": "claim-id",
         "engineer": "bob/claude/main",
         "pattern": "src/auth/login.ts",
+        "scope_type": "symbol",
+        "symbols": ["handleLogin", "logSignin"],
         "severity": "hard",
         "description": "working on login",
         "expires_at": "2026-04-10T15:00:00Z"
       },
-      "overlap": ["src/auth/login.ts"]
+      "overlap": ["src/auth/login.ts"],
+      "symbol_overlap": [
+        {"file": "src/auth/login.ts", "symbols": ["handleLogin"]}
+      ]
     }
   ],
   "warnings": [],
   "options": ["wait", "narrow_claim", "escalate", "override"]
 }
 ```
+
+`your_symbols` echoes the requester's symbol list for the conflicting pattern. `conflicting_claim.scope_type` is `'file'` or `'symbol'`; `conflicting_claim.symbols` is present only when `scope_type='symbol'`. `symbol_overlap` lists the per-file symbol-name intersection; it is present only when both sides are symbol-scoped and their symbol sets actually overlap. Disjoint symbol sets do not produce a `409` -- the server resolves them as `AUTO_COEXIST` and returns `200` with both claims granted, cross-referenced via `coexists_with`. Pre-v0.14 clients that don't send `symbols` see the same `200` / `409` behaviour as before; the new fields are absent from their responses unless the conflict involves a v0.14 holder. See [./design/sub-file-claims.md](./design/sub-file-claims.md) for the full overlap algorithm.
 
 ## `GET /claims`
 

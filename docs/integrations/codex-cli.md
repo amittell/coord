@@ -69,6 +69,19 @@ Within Codex, confirm the `coord` MCP server exposes:
 
 If the tools show up but fail at runtime, double-check `COORD_API_URL` and `COORD_AUTH_TOKEN` in the shell environment that starts Codex.
 
+For symbol-level claims (v0.14+), pass `symbols` to `claim_files` so two Codex sessions can edit different declarations in the same TypeScript file without serialising:
+
+```python
+claim_files(
+    engineer="alex/codex/main",
+    patterns=["src/auth/login.ts"],
+    symbols={"src/auth/login.ts": ["handleLogin", "validateCredentials"]},
+    description="auth refactor",
+)
+```
+
+A peer claiming a disjoint symbol set on the same file is granted automatically (`AUTO_COEXIST`) instead of hitting a `409`. See [../usage-guide.md](../usage-guide.md) for when symbol claims help and when file scope is still the right call.
+
 ## Auth resolution order
 
 `coord-mcp` resolves `COORD_*` env vars in this order, with the first non-placeholder value winning:

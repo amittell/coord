@@ -10,11 +10,18 @@ from coordination import metrics
 from coordination.config import Settings, get_settings
 from coordination.db import Database
 from coordination.engine import compute_overlap, files_matching_pattern, git_ls_files
+from coordination.overlap_symbols import (
+    OverlapKind,
+    check_overlap as check_symbol_overlap,
+    record_auto_resolution,
+)
 from coordination.ownership import PathRule, parse_ownership_yaml, severity_for_pattern
 from coordination.schemas import (
+    ClaimItem,
     ConflictCheckResponse,
     ConflictEntry,
     ConflictingClaim,
+    ConflictingSymbol,
     CreateClaimsRequest,
     CreateClaimsResponse,
 )
@@ -317,6 +324,13 @@ class CoordinationService:
         zero_match_warnings = await self._zero_match_warnings(patterns)
 
         conflicts: list[ConflictEntry] = []
+        # Queued auto-resolutions (v0.14): pairs of (item, holder_row, result)
+        # discovered during the overlap pass that should bypass 409 and be
+        # recorded as auto-coexist / auto-narrow events after the
+        # requester's claim row is inserted. We hold the requester's
+        # claim id back until insert_claims_batch returns.
+        auto_resolutions: list[tuple[ClaimItem, dict[str, Any], Any]] = []
+
         active = await self.db.list_active_claims_rows(exclude_engineer=body.engineer)
         # Repo-scoped check (v0.4.0): see check_conflicts for rationale.
         active = [r for r in active if r.get("repo") == body.repo]
@@ -339,18 +353,47 @@ class CoordinationService:
             if partner_ids:
                 active = [r for r in active if str(r.get("id")) not in partner_ids]
         for item in body.claims:
+            requester_scope = "symbol" if item.symbols else "file"
+            requester_symbols_by_file: dict[str, list[str]] = (
+                {item.pattern: list(item.symbols)} if item.symbols else {}
+            )
             for row in active:
-                overlap = await compute_overlap(
-                    item.pattern,
-                    row["pattern"],
-                    repo_root=self.settings.repo_root,
-                    scope=self.settings.repo_scope,
+                result = await check_symbol_overlap(
+                    db=self.db,
+                    holder=row,
+                    requester_pattern=item.pattern,
+                    requester_scope_type=requester_scope,
+                    requester_symbols_by_file=requester_symbols_by_file,
                 )
-                if not overlap:
+                if result.kind is OverlapKind.NO_OVERLAP:
                     continue
+                if result.kind in (
+                    OverlapKind.AUTO_COEXIST,
+                    OverlapKind.AUTO_NARROW,
+                ):
+                    auto_resolutions.append((item, row, result))
+                    continue
+                # FILE_OVERLAP, SYMBOL_OVERLAP, PARTIAL_GRANT all 409.
+                holder_symbols: list[str] | None = None
+                if row.get("scope_type") == "symbol":
+                    holder_symbol_rows = await self.db.get_claim_symbols(
+                        str(row["id"])
+                    )
+                    holder_symbols = sorted(
+                        {s["symbol_name"] for s in holder_symbol_rows}
+                    )
+                symbol_overlap_payload: list[ConflictingSymbol] | None = None
+                if result.kind is OverlapKind.SYMBOL_OVERLAP:
+                    symbol_overlap_payload = [
+                        ConflictingSymbol(file=f, symbols=list(syms))
+                        for f, syms in result.overlapping_symbols
+                    ]
                 conflicts.append(
                     ConflictEntry(
                         your_pattern=item.pattern,
+                        your_symbols=(
+                            list(item.symbols) if item.symbols else None
+                        ),
                         conflicting_claim=ConflictingClaim(
                             id=row["id"],
                             engineer=row["engineer"],
@@ -358,8 +401,11 @@ class CoordinationService:
                             severity=row["severity"],
                             description=row.get("description"),
                             expires_at=row["expires_at"],
+                            scope_type=row.get("scope_type"),
+                            symbols=holder_symbols,
                         ),
-                        overlap=overlap,
+                        overlap=list(result.overlapping_paths),
+                        symbol_overlap=symbol_overlap_payload,
                     )
                 )
                 await self.db.log_conflict(
@@ -381,6 +427,9 @@ class CoordinationService:
 
         ttl = body.ttl_hours or self.settings.default_ttl_hours
         ids: list[tuple[str, str, str, str, str]] = []
+        # Parallel to ids: per-item (cid, item) so post-insert wiring can
+        # find the right ClaimItem for each created row without re-zipping.
+        item_for_cid: dict[str, ClaimItem] = {}
         for item in body.claims:
             cid = str(uuid4())
             sev = severity_for_pattern(item.pattern, rules) if rules else "soft"
@@ -389,6 +438,7 @@ class CoordinationService:
             else:
                 exp = _expires_at(ttl)
             ids.append((cid, item.type, item.pattern, sev, exp))
+            item_for_cid[cid] = item
 
         created = await self.db.insert_claims_batch(
             engineer=body.engineer,
@@ -398,6 +448,35 @@ class CoordinationService:
             repo=body.repo,
             session_id=body.session_id,
         )
+        # v0.14: post-insert scope_type / narrowable / symbol rows. We
+        # defer this from insert_claims_batch to keep its signature stable
+        # and the migration footprint minimal -- the create_claims handler
+        # owns the symbol contract.
+        await self._finalise_v14_scope(
+            created=created, item_for_cid=item_for_cid
+        )
+
+        # v0.14: persist any auto-resolutions queued during overlap pass.
+        # We look up the requester's claim id by (item.pattern) match
+        # against the just-inserted batch. Each ClaimItem produces exactly
+        # one row in ``ids`` so the pattern is unique within this batch.
+        if auto_resolutions:
+            cid_by_pattern: dict[str, str] = {
+                pat: cid for cid, _ctype, pat, _sev, _exp in ids if cid in created
+            }
+            for item, holder_row, result in auto_resolutions:
+                requester_cid = cid_by_pattern.get(item.pattern)
+                if not requester_cid:
+                    continue
+                await record_auto_resolution(
+                    db=self.db,
+                    kind=result.kind,
+                    holder_claim_id=str(holder_row["id"]),
+                    requester_claim_id=requester_cid,
+                    overlapping_paths=result.overlapping_paths,
+                    overlapping_symbols=result.overlapping_symbols,
+                )
+
         # Count one tick per successfully inserted claim. We look back at
         # the computed severity for each item so the label distribution
         # mirrors the ownership configuration.
@@ -410,6 +489,67 @@ class CoordinationService:
             warnings=zero_match_warnings,
             options=[],
         )
+
+    async def _finalise_v14_scope(
+        self,
+        *,
+        created: list[str],
+        item_for_cid: dict[str, ClaimItem],
+    ) -> None:
+        """Apply v0.14 ``scope_type`` / ``narrowable`` / ``claim_symbols``
+        to each just-inserted claim row.
+
+        v0.14 fields default to ``scope_type='file'`` and ``narrowable=1``
+        at the schema level. The conflict pipeline then promotes rows
+        per ClaimItem: symbol claims get ``scope_type='symbol'`` plus
+        ``claim_symbols`` rows; ``shared_file`` / ``module`` / explicit
+        opt-out claims get ``narrowable=0``. Splitting this out of
+        ``insert_claims_batch`` keeps the legacy contract intact and
+        makes the v0.14 surface self-contained.
+        """
+        if not created:
+            return
+        import aiosqlite  # local import: keep service.py import surface stable
+
+        from coordination.db import _configure_sqlite
+
+        symbol_rows: list[tuple[str, str, str, str, str]] = []
+        async with aiosqlite.connect(self.db.path) as conn:
+            await _configure_sqlite(conn)
+            for cid in created:
+                item = item_for_cid.get(cid)
+                if item is None:
+                    continue
+                want_scope = "symbol" if item.symbols else "file"
+                # Narrowable resolution: explicit value wins; shared_file
+                # / module / symbol scope all default to non-narrowable;
+                # plain file claims default narrowable=1.
+                if item.narrowable is not None:
+                    narrowable = 1 if item.narrowable else 0
+                elif item.type in ("shared_file", "module") or want_scope == "symbol":
+                    narrowable = 0
+                else:
+                    narrowable = 1
+                if want_scope != "file" or narrowable != 1:
+                    await conn.execute(
+                        "UPDATE claims SET scope_type = ?, narrowable = ? "
+                        "WHERE id = ?",
+                        (want_scope, narrowable, cid),
+                    )
+                if item.symbols:
+                    for name in item.symbols:
+                        symbol_rows.append(
+                            (
+                                str(uuid4()),
+                                cid,
+                                item.pattern,
+                                name,
+                                "unknown",
+                            )
+                        )
+            await conn.commit()
+        if symbol_rows:
+            await self.db.insert_claim_symbols(rows=symbol_rows)
 
     async def list_claims(
         self,

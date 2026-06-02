@@ -129,6 +129,38 @@ curl -X POST http://127.0.0.1:8080/claims \
 
 `_headers()` also drops the `Authorization` header when the token is a documented placeholder, so a misconfigured client fails loud with a clean `401` instead of silently leaking a `Bearer set-me` request. The net effect: a tracked `.mcp.json` template can ship placeholder values to a public repo without breaking any working setup, and rotating credentials means editing one file (`.coordination/local.env`) rather than every per-tool MCP registration. See `docs/integrations/claude-code.md` and `docs/integrations/codex-cli.md` for the resolution order in tool-specific terms.
 
+## Sub-file (symbol-level) claims
+
+File-level locking scales poorly once 10+ agents work the same repo: hot files (`router.ts`, the schema index, the app shell) are touched by every active branch, so the conflict engine forces agents to serialise even when their actual edits don't overlap. The v0.11 `narrowed` / `coexist` decisions help, but they're reactive -- the requester still hits a `409` first. Coord v0.14 adds symbol-scope claims so two agents editing different functions in the same file coexist by default, with no human-in-the-loop request.
+
+Claim `handleLogin` in `auth.ts` from MCP:
+
+```python
+claim_files(
+    engineer="alex/claude/main",
+    patterns=["src/auth/login.ts"],
+    symbols={"src/auth/login.ts": ["handleLogin"]},
+)
+```
+
+Or over HTTP:
+
+```json
+{
+  "engineer": "alex/claude/main",
+  "claims": [
+    {"type": "file", "pattern": "src/auth/login.ts", "symbols": ["handleLogin"]}
+  ]
+}
+```
+
+Two automatic decisions kick in when symbols are involved:
+
+- **AUTO_COEXIST**: a second symbol claim on the same file with a disjoint symbol set is granted immediately. Both claims live as cooperative partners (`coexists_with` cross-referenced). No `409`, no request filed, audit row `event_type='auto-coexist'`.
+- **AUTO_NARROW**: a symbol claim arriving against an existing narrowable file claim is granted alongside the file claim. The holder's effective scope becomes "the file minus the new partner's symbols"; they get a `pending_requests` notice on their next poll but don't have to act. File claims are `narrowable=true` by default; `shared_file` and `module` claims are not.
+
+Symbols only cover the named declarations. Imports and module-level statements still need a file claim. TypeScript is supported in v0.14; Python and Go follow in v0.15. See [./docs/design/sub-file-claims.md](./docs/design/sub-file-claims.md) for the full spec.
+
 ## Local Assets
 
 - `.env.example`: environment variable template
