@@ -39,6 +39,25 @@ Known false-negatives (documented so callers know the trade-off):
 brace matching without becoming a full parser. Conflict detection only uses
 the ``(file_path, name)`` pair, so this approximation does not affect the
 coordination contract.
+
+Nesting posture (v0.19):
+
+Go's nesting model differs from TypeScript and Python: there are no nested
+classes. Types are file-scoped, or function-local when declared inside a
+function body. Methods always live at the top level of the file with the
+receiver named in the signature (``func (r *T) M() {}``), not lexically
+inside the type's body. The v0.16 receiver-as-parent capture is the only
+parent edge Go expresses; v0.19 does not recurse further because there is
+no second nesting level to descend into the way a TypeScript class can
+contain another class, or a Python class can contain a nested class with
+its own methods.
+
+Function-local type declarations (``func f() { type Local struct{}; ... }``)
+are intentionally skipped at top-level extraction. They are not callable
+from outside the enclosing function, so they have no role in cross-file
+coordination. The column-zero anchoring documented above is what enforces
+this for the regex backend in practice: conventional ``gofmt`` indents
+declarations inside function bodies, keeping them out of the result.
 """
 
 from __future__ import annotations

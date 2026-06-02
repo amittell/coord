@@ -181,7 +181,7 @@ Two agents on `Router::handleAuth` and `Router::handleLogout` auto-coexist; a cl
 
 ### Recursive nesting (v0.17)
 
-The notation is recursive: `"Outer::Inner::method"` works to any depth. A claim on `"Outer"` covers every descendant; a claim on `"Outer::Inner"` covers `"Outer::Inner::*"` but not `"Outer::Other::*"`. Storage is unchanged -- `parent_symbol` carries the ancestor chain joined by `::`, and the conflict engine prefix-matches on the full canonical path.
+The notation is recursive: `"Outer::Inner::method"` works to any depth. A claim on `"Outer"` covers every descendant; a claim on `"Outer::Inner"` covers `"Outer::Inner::*"` but not `"Outer::Other::*"`. Storage is unchanged -- `parent_symbol` carries the ancestor chain joined by `::`, and the conflict engine prefix-matches on the full canonical path. As of v0.19 the TypeScript parser also walks recursively into nested class declarations, so symbol claims on `"Outer::Inner::method"` validate end-to-end for TS files in addition to Python.
 
 ### Validation (v0.17)
 
@@ -190,6 +190,8 @@ When `COORD_REPO_ROOT` is set the service parses each claimed file and rejects u
 ### Observability (v0.18)
 
 The dashboard surfaces a 30-day auto-resolution heatmap per repo so you can see whether sub-file claims are actually saving conflicts. The same series is exposed at `GET /metrics/auto-resolutions?days=30` for external monitoring.
+
+- **Hotspot files (v0.20):** the dashboard adds a "Hotspot files (30d)" panel listing the files agents keep `409`'ing on, with a suggested-action chip (split into modules, promote to `shared_file`, or just monitor) based on attempt thresholds. The same series is exposed at `GET /metrics/hotspots?days=30` for external monitoring. Read-only signal for v0.20; auto-promote is queued for v0.21.
 
 ## Local Assets
 

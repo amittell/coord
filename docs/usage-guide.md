@@ -110,6 +110,16 @@ When to reach for method scope:
 
 Limitations in v0.16: two-level only. Nested classes (`Outer::Inner`) and nested namespaces are NOT yet supported and will be parsed as a single two-level pair. Top-level symbols whose name happens to contain `::` should be avoided as claim targets until v0.17.
 
+### Hotspot file suggestions (v0.20+)
+
+The dashboard surfaces a "Hotspot files (30d)" panel that ranks files by how often agents have `409`'d on them in the last 30 days, grouped per repo. Each row carries the attempt count, the number of distinct attempting engineers, and a suggested-action chip:
+
+- **split into modules** -- attempts well above the threshold; the file is doing too much and the underlying conflict will keep recurring until it's broken up.
+- **promote to `shared_file`** -- attempts above the threshold but the file is genuinely shared (lockfiles, routing tables, schema index); switching the claim type to `shared_file` makes the overlap explicit.
+- **monitor** -- just above `min_attempts`; not actionable yet, but worth watching.
+
+The signal is read-only in v0.20 -- nothing happens automatically. Auto-promote is queued for v0.21. The same series is exposed at `GET /metrics/hotspots?days=30` for external monitoring (Prometheus scrapes, weekly digest emails, etc.); see [./api-reference.md](./api-reference.md) for query params and response shape.
+
 ## Monorepo wiring: `coord init --root`
 
 In a monorepo, `coord init` defaults to the enclosing git work tree root, which is usually the whole repo. If several services share one repo and each service wants its own `.coordination/` directory (per-service ownership rules, per-service MCP wiring, per-service pre-push hook), pass `--root` to tell `init` where to place the generated files:

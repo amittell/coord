@@ -1401,3 +1401,49 @@ async def test_validation_skipped_for_missing_files(
     # Missing file -> skip validation, no warning, claim succeeds.
     assert r.status_code == 200, r.text
     assert r.json()["claim_ids"]
+
+
+# ---------------------------------------------------------------------------
+# v0.20: hotspot detection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_hotspots_endpoint_returns_series(
+    client: AsyncClient,
+) -> None:
+    """End-to-end: create a holder, force several 409s on the same path,
+    then /metrics/hotspots reports the pattern with the right counts."""
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/router.ts"}],
+    }
+    rh = await client.post("/claims", headers=_AUTH, json=holder)
+    assert rh.status_code == 200, rh.text
+    # Five different attempters each bounce off the same path.
+    for i in range(5):
+        r = await client.post(
+            "/claims",
+            headers=_AUTH,
+            json={
+                "engineer": f"bouncer-{i}",
+                "repo": "amittell/coord",
+                "claims": [{"type": "file", "pattern": "src/router.ts"}],
+            },
+        )
+        assert r.status_code == 409
+    # Hotspots endpoint surfaces the pattern.
+    r = await client.get(
+        "/metrics/hotspots",
+        headers=_AUTH,
+        params={"days": 30, "min_attempts": 5},
+    )
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["count"] >= 1
+    by_pattern = {row["pattern"]: row for row in payload["hotspots"]}
+    assert "src/router.ts" in by_pattern
+    target = by_pattern["src/router.ts"]
+    assert target["attempts"] >= 5
+    assert target["distinct_attempters"] >= 5

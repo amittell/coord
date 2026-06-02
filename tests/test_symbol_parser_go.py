@@ -415,3 +415,124 @@ def test_methods_on_different_receivers_distinct(backend: str) -> None:
     send = _by_name(result, "Send")
     assert handle.parent == "Server"
     assert send.parent == "Client"
+
+
+# ---------------------------------------------------------------------------
+# v0.19: nesting boundary cases
+# ---------------------------------------------------------------------------
+
+
+def test_method_on_embedded_type_keeps_outer_parent(backend: str) -> None:
+    """A method on a struct that embeds another type still parents to the outer.
+
+    Embedding in Go is a composition mechanism, not inheritance: methods promoted
+    from the embedded type stay attached to the embedded type at extraction time.
+    The method defined directly on ``Outer`` must carry ``parent='Outer'`` and
+    must not be re-parented to ``Inner`` just because ``Outer`` embeds it.
+    """
+
+    src = (
+        "package main\n"
+        "\n"
+        "type Inner struct{}\n"
+        "\n"
+        "func (i *Inner) Hidden() {}\n"
+        "\n"
+        "type Outer struct {\n"
+        "    Inner\n"
+        "    Name string\n"
+        "}\n"
+        "\n"
+        "func (o *Outer) Visible() {}\n"
+    )
+    result = extract_symbols("sample.go", src)
+    names = _names(result)
+    assert "Visible" in names
+    assert "Hidden" in names
+    assert "Inner" in names
+    assert "Outer" in names
+    visible = _by_name(result, "Visible")
+    assert visible.kind == "function"
+    assert visible.parent == "Outer"
+    hidden = _by_name(result, "Hidden")
+    assert hidden.parent == "Inner"
+
+
+def test_function_local_type_excluded(backend: str) -> None:
+    """A type declared inside a function body must not appear as a top-level symbol.
+
+    ``func main() { type Local struct{}; ... }`` is the canonical case the v0.19
+    docstrings call out. ``Local`` is not callable from outside ``main`` so it
+    has no place in the cross-file coordination grain. ``main`` itself remains.
+    """
+
+    src = (
+        "package main\n"
+        "\n"
+        "func main() {\n"
+        "    type Local struct{}\n"
+        "    _ = Local{}\n"
+        "}\n"
+    )
+    result = extract_symbols("sample.go", src)
+    names = _names(result)
+    assert "main" in names
+    assert "Local" not in names
+
+
+def test_methods_on_types_in_different_files_independent(backend: str) -> None:
+    """Two types and methods on each in one file must not cross-contaminate.
+
+    The receiver-type capture must scope to each method's own receiver and not
+    bleed from one method into the next. Verifies that the extractor does not
+    accidentally cache or carry receiver state between sibling declarations.
+    """
+
+    src = (
+        "package main\n"
+        "\n"
+        "type Alpha struct{}\n"
+        "type Beta struct{}\n"
+        "\n"
+        "func (a *Alpha) One() {}\n"
+        "func (a *Alpha) Two() {}\n"
+        "func (b *Beta) Three() {}\n"
+        "func (b *Beta) Four() {}\n"
+    )
+    result = extract_symbols("sample.go", src)
+    one = _by_name(result, "One")
+    two = _by_name(result, "Two")
+    three = _by_name(result, "Three")
+    four = _by_name(result, "Four")
+    assert one.parent == "Alpha"
+    assert two.parent == "Alpha"
+    assert three.parent == "Beta"
+    assert four.parent == "Beta"
+    # All four are functions; receiver type does not affect kind.
+    assert {one.kind, two.kind, three.kind, four.kind} == {"function"}
+
+
+def test_generic_method_on_generic_receiver(backend: str) -> None:
+    """``func (c *Container[T]) Add(item T)`` -> parent='Container'.
+
+    v0.16 already strips the type-parameter list from generic receivers. This
+    test repeats the assertion to pin the v0.19 docstring posture: a generic
+    receiver collapses to the bare type name, which is the only parent edge
+    the Go extractor records.
+    """
+
+    src = (
+        "package main\n"
+        "\n"
+        "type Container[T any] struct{}\n"
+        "\n"
+        "func (c *Container[T]) Add(item T) {}\n"
+        "func (c *Container[T]) Get(i int) T { var z T; return z }\n"
+    )
+    result = extract_symbols("sample.go", src)
+    add = _by_name(result, "Add")
+    get = _by_name(result, "Get")
+    assert add.parent == "Container"
+    assert get.parent == "Container"
+    assert add.kind == "function"
+    assert get.kind == "function"

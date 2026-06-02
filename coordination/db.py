@@ -1169,6 +1169,70 @@ class Database:
             await conn.commit()
             return [dict(r) for r in rows]
 
+    async def hotspot_files(
+        self,
+        *,
+        days: int = 30,
+        min_attempts: int = 5,
+        limit: int = 20,
+        repo: str | None = None,
+        now: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Files with the most blocked claim attempts in the window (v0.20).
+
+        Joins ``conflict_log`` (which records every ``claim_files`` 409)
+        to ``claims`` so we can pick up the holder's repo. Groups by
+        ``(claims.repo, conflict_log.attempted_pattern)`` and returns
+        rows where the attempt count is at least ``min_attempts``,
+        ordered by attempts DESC then last_attempt DESC, capped at
+        ``limit``.
+
+        Operators read this list to decide which files belong in a
+        ``shared_file`` rule (declared hotspots that don't 409 by
+        design), or which paths need to be split into smaller modules
+        (the boundary itself is wrong). v0.20 is read-only signal;
+        auto-promote is queued for v0.21.
+        """
+        await self.init()
+        now = now or datetime.now(UTC)
+        cutoff = (now - timedelta(days=days)).replace(microsecond=0)
+        cutoff_iso = cutoff.isoformat().replace("+00:00", "Z")
+        params: list[Any] = [cutoff_iso]
+        repo_filter = ""
+        if repo is not None:
+            repo_filter = " AND c.repo IS ?"
+            params.append(repo)
+        params.extend([min_attempts, limit])
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                "SELECT c.repo AS repo, "
+                "cl.attempted_pattern AS pattern, "
+                "COUNT(*) AS attempts, "
+                "COUNT(DISTINCT cl.attempted_by) AS distinct_attempters, "
+                "MAX(cl.created_at) AS last_attempt "
+                "FROM conflict_log cl JOIN claims c ON c.id = cl.claim_id "
+                "WHERE datetime(cl.created_at) >= datetime(?)"
+                + repo_filter
+                + " GROUP BY c.repo, cl.attempted_pattern "
+                "HAVING attempts >= ? "
+                "ORDER BY attempts DESC, last_attempt DESC "
+                "LIMIT ?",
+                params,
+            )
+            rows = await cur.fetchall()
+        return [
+            {
+                "repo": r["repo"],
+                "pattern": r["pattern"],
+                "attempts": int(r["attempts"] or 0),
+                "distinct_attempters": int(r["distinct_attempters"] or 0),
+                "last_attempt": r["last_attempt"],
+            }
+            for r in rows
+        ]
+
     async def daily_auto_resolutions(
         self,
         *,

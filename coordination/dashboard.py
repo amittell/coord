@@ -622,6 +622,46 @@ tbody tr td.empty {
   color: var(--text);
   font-variant-numeric: tabular-nums;
 }
+
+/* v0.20 hotspot files panel */
+.hotspots .hsrow {
+  display: grid;
+  grid-template-columns: 18ch minmax(0, 1fr) 14ch 16ch;
+  gap: calc(var(--grid) * 2);
+  align-items: center;
+  padding: calc(var(--grid)) 0;
+  border-bottom: 1px dashed var(--hairline);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.hotspots .hsrow:last-child { border-bottom: none; }
+.hotspots .hsrepo {
+  color: var(--phosphor);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hotspots .hspattern {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hotspots .hscount {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.hotspots .hssuggest {
+  text-align: center;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  padding: 2px 6px;
+  border-radius: 3px;
+  border: 1px solid var(--hairline);
+}
+.hotspots .hssuggest.sg-split { color: #ff8a7f; border-color: #6b3a36; }
+.hotspots .hssuggest.sg-shared { color: var(--cyan); border-color: #2f5466; }
+.hotspots .hssuggest.sg-monitor { color: var(--muted-2); }
 """
 
 
@@ -650,6 +690,7 @@ async def render_dashboard() -> str:
     requests = await svc.list_requests(limit=200)
     auto_resolutions = await svc.db.count_auto_resolutions_since(window_hours=24)
     auto_resolution_series = await svc.db.daily_auto_resolutions(days=30)
+    hotspot_rows = await svc.db.hotspot_files(days=30, min_attempts=5, limit=10)
 
     claims_by_id: dict[str, dict[str, Any]] = {
         str(c["id"]): c for c in recent if c.get("id")
@@ -1008,6 +1049,50 @@ async def render_dashboard() -> str:
         '</section>'
     )
 
+    # v0.20: hotspot panel. Files agents repeatedly 409 on are
+    # candidates for shared_file rules (declared hotspots) or module
+    # splits (the boundary is wrong). Suggested-action chip is purely
+    # advisory; v0.20 ships read-only signal, v0.21 plans auto-promote.
+    def _hotspot_suggestion(attempts: int) -> tuple[str, str]:
+        if attempts >= 50:
+            return ("split", "split into modules")
+        if attempts >= 20:
+            return ("shared", "promote to shared_file")
+        return ("monitor", "monitor")
+
+    if hotspot_rows:
+        hotspot_lines: list[str] = []
+        for row in hotspot_rows:
+            attempts = int(row.get("attempts") or 0)
+            distinct = int(row.get("distinct_attempters") or 0)
+            tag, label = _hotspot_suggestion(attempts)
+            repo_label = _esc(str(row.get("repo") or "(unattributed)"))
+            pattern_label = _esc(str(row.get("pattern") or ""))
+            hotspot_lines.append(
+                '<div class="hsrow">'
+                f'<div class="hsrepo">{repo_label}</div>'
+                f'<div class="hspattern">{pattern_label}</div>'
+                f'<div class="hscount">{attempts} '
+                f'<span class="muted">({distinct} engineers)</span></div>'
+                f'<div class="hssuggest sg-{tag}">{label}</div>'
+                '</div>'
+            )
+        hotspot_body = "".join(hotspot_lines)
+    else:
+        hotspot_body = (
+            '<div class="empty" style="padding:calc(var(--grid) * 2)">'
+            'no hotspot files in the last 30 days (good!)</div>'
+        )
+    hotspots_html = (
+        '<section class="panel">'
+        '<header><h2>hotspot files (30d)</h2>'
+        f'<span class="meta">{len(hotspot_rows)} files · min 5 attempts</span></header>'
+        '<div class="hotspots" style="padding:calc(var(--grid) * 2)">'
+        + hotspot_body +
+        '</div>'
+        '</section>'
+    )
+
     auto_resolutions_html = (
         '<section class="panel">'
         '<header><h2>auto-resolutions (24h)</h2>'
@@ -1071,6 +1156,8 @@ async def render_dashboard() -> str:
     {auto_resolutions_html}
 
     {heatmap_html}
+
+    {hotspots_html}
 
     <div class="row split-7-5">
       <section class="panel">

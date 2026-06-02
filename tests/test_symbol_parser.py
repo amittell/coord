@@ -467,3 +467,186 @@ def test_methods_disabled_outside_class(backend: str) -> None:
     assert bar.parent is None
     assert foo.kind == "function"
     assert bar.kind == "function"
+
+
+# ---------------------------------------------------------------------------
+# v0.19: nested classes
+# ---------------------------------------------------------------------------
+#
+# Tree-sitter and the regex backend each have their own natural shape for
+# nested TS classes:
+#
+# - Tree-sitter sees ``static Inner = class Inner { ... }`` as a real
+#   ``public_field_definition`` whose value is a ``class`` expression. The
+#   v0.19 walk recurses through that field into the class expression,
+#   addressing it by its binding name. The bare ``class Inner {}`` syntax
+#   used in some example pseudocode is not valid TS, so tree-sitter cannot
+#   parse it; the regex backend, which only tracks braces, handles it.
+#
+# - The regex backend brace-tracks an inner ``class Inner {`` directly
+#   inside a class body. This works regardless of TS validity because the
+#   backend never validates the parse.
+#
+# Each test therefore picks a source shape compatible with both backends
+# (static-field class expressions) and asserts the v0.19 behaviour. The
+# regex backend assertions are relaxed to "expected symbols present"
+# because the brace tracker emits false positives in some edge cases.
+
+
+def test_nested_class_emitted_with_ancestor_parent(backend: str) -> None:
+    """A class declared inside another class emits with parent=<outer name>.
+
+    Source: ``class Outer { static Inner = class Inner {}; }``.
+    Expected: ``Outer`` (parent=None), ``Inner`` (parent='Outer').
+    """
+
+    src = (
+        "class Outer {\n"
+        "  static Inner = class Inner {};\n"
+        "}\n"
+    )
+    result = extract_symbols("nested_basic.ts", src)
+
+    outer = _by_name(result, "Outer")
+    assert outer.kind == "class"
+    assert outer.parent is None
+
+    inner = _by_name(result, "Inner")
+    assert inner.kind == "class"
+    assert inner.parent == "Outer"
+
+    if backend == "treesitter":
+        # Exactly two class symbols, in source order, no stray entries.
+        classes = [s for s in result if s.kind == "class"]
+        assert [s.name for s in classes] == ["Outer", "Inner"]
+
+
+def test_method_on_nested_class(backend: str) -> None:
+    """A method on an inner class carries the full ancestor path in parent.
+
+    Source: ``class Outer { static Inner = class Inner { handle() {} }; }``.
+    Expected: ``Outer``, ``Inner`` (parent='Outer'), ``handle``
+    (parent='Outer::Inner').
+    """
+
+    src = (
+        "class Outer {\n"
+        "  static Inner = class Inner {\n"
+        "    handle() {}\n"
+        "  };\n"
+        "}\n"
+    )
+    result = extract_symbols("nested_method.ts", src)
+
+    outer = _by_name(result, "Outer")
+    assert outer.kind == "class"
+    assert outer.parent is None
+
+    inner = _by_name(result, "Inner")
+    assert inner.kind == "class"
+    assert inner.parent == "Outer"
+
+    handle = _by_name(result, "handle")
+    assert handle.kind == "function"
+    assert handle.parent == "Outer::Inner"
+
+    if backend == "treesitter":
+        # Exactly the three expected symbols.
+        assert sorted(_names(result)) == sorted(["Outer", "Inner", "handle"])
+
+
+def test_three_levels_deep(backend: str) -> None:
+    """Three-deep nesting walks correctly and emits joined parent paths.
+
+    Source: ``class A { static B = class B { static C = class C { m() {} };
+    }; }``. Expected: ``A``, ``B`` (parent='A'), ``C`` (parent='A::B'),
+    ``m`` (parent='A::B::C').
+    """
+
+    src = (
+        "class A {\n"
+        "  static B = class B {\n"
+        "    static C = class C {\n"
+        "      m() {}\n"
+        "    };\n"
+        "  };\n"
+        "}\n"
+    )
+    result = extract_symbols("three_deep.ts", src)
+
+    a = _by_name(result, "A")
+    assert a.parent is None
+    assert a.kind == "class"
+
+    b = _by_name(result, "B")
+    assert b.parent == "A"
+    assert b.kind == "class"
+
+    c = _by_name(result, "C")
+    assert c.parent == "A::B"
+    assert c.kind == "class"
+
+    m = _by_name(result, "m")
+    assert m.parent == "A::B::C"
+    assert m.kind == "function"
+
+    if backend == "treesitter":
+        assert sorted(_names(result)) == sorted(["A", "B", "C", "m"])
+
+
+def test_sibling_inner_classes(backend: str) -> None:
+    """Two sibling inner classes both attribute to the same outer parent.
+
+    Source: ``class Outer { static A = class A {}; static B = class B {}; }``.
+    Expected: ``Outer``, ``A`` (parent='Outer'), ``B`` (parent='Outer').
+    """
+
+    src = (
+        "class Outer {\n"
+        "  static A = class A {};\n"
+        "  static B = class B {};\n"
+        "}\n"
+    )
+    result = extract_symbols("siblings.ts", src)
+
+    outer = _by_name(result, "Outer")
+    assert outer.parent is None
+
+    a = _by_name(result, "A")
+    assert a.parent == "Outer"
+    assert a.kind == "class"
+
+    b = _by_name(result, "B")
+    assert b.parent == "Outer"
+    assert b.kind == "class"
+
+    if backend == "treesitter":
+        classes = [s for s in result if s.kind == "class"]
+        assert [s.name for s in classes] == ["Outer", "A", "B"]
+
+
+def test_top_level_unaffected(backend: str) -> None:
+    """A free-standing top-level class with a method still emits correctly.
+
+    Regression guard: the recursive walk must not change the parent of a
+    direct member of a top-level class. ``Foo`` is top-level (parent=None)
+    and ``method`` is its direct member (parent='Foo').
+    """
+
+    src = (
+        "class Foo {\n"
+        "  method() {}\n"
+        "}\n"
+    )
+    result = extract_symbols("toplevel.ts", src)
+
+    foo = _by_name(result, "Foo")
+    assert foo.kind == "class"
+    assert foo.parent is None
+
+    method = _by_name(result, "method")
+    assert method.kind == "function"
+    assert method.parent == "Foo"
+
+    if backend == "treesitter":
+        assert sorted(_names(result)) == sorted(["Foo", "method"])

@@ -92,6 +92,8 @@ await claim_files(
 
 A peer claiming a disjoint symbol set on the same file is granted automatically (`AUTO_COEXIST`) instead of hitting a `409`. See [../usage-guide.md](../usage-guide.md) for when symbol claims help and when file scope is still the right call.
 
+As of v0.19 the TypeScript parser also walks recursively into nested class declarations, so symbol claims on `"Outer::Inner::method"` extract correctly end-to-end (the API has always accepted the notation; v0.19 makes parser-side validation match).
+
 ## Auth resolution order
 
 `coord-mcp` resolves `COORD_*` env vars in this order, with the first non-placeholder value winning:

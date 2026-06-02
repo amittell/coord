@@ -32,6 +32,25 @@ sits before the ``type_parameter_list`` child.
 Nested declarations (closures inside functions, types declared inside method
 bodies) are excluded by design -- we walk only the direct children of
 ``source_file``.
+
+Nesting posture (v0.19):
+
+Go's nesting model differs from TypeScript and Python: there are no nested
+classes. Types are file-scoped, or function-local when declared inside a
+function body. Methods always live at the top level of the file with the
+receiver named in the signature (``func (r *T) M() {}``), not lexically
+inside the type's body. The v0.16 extractor already records the receiver
+type as ``parent`` for every ``method_declaration``, which is the only
+parent edge Go expresses. v0.19 does not recurse further because there is
+nothing to recurse into: there is no second nesting level the way a
+TypeScript class can contain another class, or a Python class can contain
+a nested class with its own methods.
+
+Function-local type declarations (``func f() { type Local struct{}; ... }``)
+are intentionally skipped at top-level extraction. They are not callable
+from outside the enclosing function, so they have no role in cross-file
+coordination. Any method on such a local type would itself be unreachable
+from outside the function body and is likewise out of scope.
 """
 
 from __future__ import annotations

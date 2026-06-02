@@ -255,6 +255,30 @@ async def list_repos(_: None = Depends(require_auth)) -> dict:
     return {"repos": rows, "count": len(rows)}
 
 
+@app.get("/metrics/hotspots")
+async def hotspots_metric(
+    days: int = Query(default=30, ge=1, le=90),
+    min_attempts: int = Query(default=5, ge=1),
+    limit: int = Query(default=20, ge=1, le=200),
+    repo: str | None = Query(default=None),
+    _: None = Depends(require_auth),
+) -> dict:
+    """Top files by blocked claim attempts (v0.20).
+
+    Operators look at this list to decide which files belong in a
+    ``shared_file`` rule or which areas need to be split into modules.
+    """
+    rows = await get_service().db.hotspot_files(
+        days=days, min_attempts=min_attempts, limit=limit, repo=repo,
+    )
+    return {
+        "hotspots": rows,
+        "days": days,
+        "min_attempts": min_attempts,
+        "count": len(rows),
+    }
+
+
 @app.get("/metrics/auto-resolutions")
 async def auto_resolutions_metric(
     days: int = Query(default=30, ge=1, le=90),

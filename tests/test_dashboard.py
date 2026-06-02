@@ -967,3 +967,64 @@ async def test_dashboard_renders_auto_resolutions_panel_with_counts(
     # Legend / link to the design doc is present so operators know what
     # the two decisions mean.
     assert "sub-file-claims.md" in panel
+
+
+@pytest.mark.asyncio
+async def test_dashboard_renders_hotspots_panel(
+    svc: CoordinationService,
+) -> None:
+    """v0.20: dashboard "hotspot files (30d)" panel renders rows with
+    suggested-action tags driven by attempt-count thresholds."""
+    from uuid import uuid4
+    import aiosqlite
+    from coordination.db import _configure_sqlite
+
+    # Holder claim so the conflict_log JOIN finds a repo.
+    await svc.db.insert_claims_batch(
+        engineer="alice",
+        branch="main",
+        description="seed",
+        items=[
+            ("holder-h", "file", "src/router.ts", "soft",
+             "2099-01-01T00:00:00Z"),
+            ("holder-w", "file", "src/middleware.ts", "soft",
+             "2099-01-01T00:00:00Z"),
+        ],
+        session_id="sess",
+        repo="amittell/coord",
+    )
+
+    # 25 attempts on router.ts (-> "promote to shared_file"), 7 on
+    # middleware.ts (-> "monitor"). cold.ts has 3 attempts (-> filtered).
+    async with aiosqlite.connect(svc.db.path) as conn:
+        await _configure_sqlite(conn)
+        for i in range(25):
+            await conn.execute(
+                "INSERT INTO conflict_log (id, claim_id, attempted_by, "
+                "attempted_pattern, resolution, created_at) "
+                "VALUES (?, ?, ?, ?, NULL, ?)",
+                (str(uuid4()), "holder-h", f"eng-{i % 6}",
+                 "src/router.ts", "2026-06-01T10:00:00Z"),
+            )
+        for i in range(7):
+            await conn.execute(
+                "INSERT INTO conflict_log (id, claim_id, attempted_by, "
+                "attempted_pattern, resolution, created_at) "
+                "VALUES (?, ?, ?, ?, NULL, ?)",
+                (str(uuid4()), "holder-w", f"eng-{i}",
+                 "src/middleware.ts", "2026-06-01T11:00:00Z"),
+            )
+        await conn.commit()
+
+    html_out = await render_dashboard()
+
+    # Panel header present and both qualifying patterns surfaced.
+    assert "hotspot files (30d)" in html_out
+    assert "src/router.ts" in html_out
+    assert "src/middleware.ts" in html_out
+    # router.ts at 25 attempts -> "promote to shared_file" chip.
+    assert "promote to shared_file" in html_out
+    # middleware.ts at 7 attempts -> "monitor" chip.
+    assert "monitor" in html_out
+    # Cold patterns under min_attempts should not appear.
+    assert "src/cold.ts" not in html_out

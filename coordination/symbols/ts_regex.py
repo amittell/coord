@@ -29,21 +29,27 @@ Known false-negatives (documented so callers know the trade-off):
   TypeScript formatting where only top-level declarations sit at the left
   margin; nested declarations are always indented.
 
-v0.16: a second pass extracts method-level symbols from inside top-level
-class bodies. The class body is bounded by counting ``{`` / ``}`` characters
-from the opening brace on the ``class Foo {`` line. The brace counter
-ignores strings, regex literals, template literals, and comments -- it is a
-pure character count. This is brittle by design; the goal is a useful
-fallback when tree-sitter is unavailable, not a parser. Known false-positives
-and false-negatives for the method pass:
+v0.16 added a second pass that extracts method-level symbols from inside
+top-level class bodies. The class body is bounded by counting ``{`` / ``}``
+characters from the opening brace on the ``class Foo {`` line. v0.19
+extends this with a stack: when an inner ``class Inner {`` is encountered
+inside an active class body, the inner class itself emits with
+``parent=<outer path>`` and gets pushed onto the stack. Subsequent
+method-shaped lines are attributed to the top-of-stack class. The stack is
+popped when the brace depth dips below the depth at which the class was
+pushed.
+
+The brace counter ignores strings, regex literals, template literals, and
+comments -- it is a pure character count. This is brittle by design; the
+goal is a useful fallback when tree-sitter is unavailable, not a parser.
+Known false-positives and false-negatives for the method pass:
 
 - Braces inside string/template/regex literals are counted, so a method body
   containing the literal text ``"}"`` will end the class early.
 - ``//`` and ``/* */`` comments containing ``{`` or ``}`` shift the counter.
-- Nested classes inside a method body have their methods attributed to the
-  outer class (the brace counter cannot distinguish member scopes). This is
-  acceptable given the tree-sitter backend correctly excludes them and is
-  preferred whenever available.
+- Comments containing class-header-shaped text (``// class Foo {``) are
+  matched as if they were real headers and may push a phantom entry onto
+  the nested-class stack.
 - Static initialisation blocks (``static { ... }``) confuse the brace
   counter only insofar as their contents are scanned for method-shaped
   lines; the design doc rules these out as not-claimable anyway.
@@ -143,15 +149,40 @@ _METHOD_NAME_BLACKLIST = frozenset(
 # Top-level class headers: matches ``class Foo {`` and ``export class Foo<T> {``
 # at column zero. The opening brace must appear on the same line; tracking
 # the body across "class Foo\n{" would require multi-line state we do not
-# carry. The captured ``name`` is the class identifier; the captured
-# ``brace_offset`` is the position of the opening brace within the matched
-# region so the body scan knows where to begin counting.
+# carry. The captured ``name`` is the class identifier.
 _CLASS_HEADER_RE = re.compile(
     r"^(?:export\s+(?:default\s+)?)?(?:abstract\s+)?class\s+"
     r"(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)"
     r"[^\n{]*"
     r"\{",
     re.MULTILINE,
+)
+
+# Inner class header anchored to a body line (any leading whitespace allowed,
+# no ``export`` prefix because nested classes cannot be exported in TS). The
+# opening brace must appear on the same line so we can locate it relative to
+# the matched span. Covers the (invalid-but-conceivable) bare
+# ``class Inner {`` form.
+_INNER_CLASS_HEADER_RE = re.compile(
+    r"^[ \t]*(?:abstract\s+)?class\s+"
+    r"(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)"
+    r"[^\n{]*"
+    r"\{"
+)
+
+# Static / instance class-valued field: ``static Inner = class Inner { ... }``
+# or ``static Inner = class { ... }``. The binding name on the LHS is the
+# addressable identifier; the RHS class expression's own name (if present)
+# is ignored. The opening brace of the class expression must live on the
+# same line for the brace counter to bound the body correctly.
+_FIELD_CLASS_VALUE_RE = re.compile(
+    r"^[ \t]*"
+    r"(?:(?:public|private|protected|static|readonly|override)\s+)*"
+    r"(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)"
+    r"\s*(?::\s*[^=]+)?"
+    r"\s*=\s*(?:abstract\s+)?class(?:\s+[A-Za-z_$][A-Za-z0-9_$]*)?"
+    r"[^\n{]*"
+    r"\{"
 )
 
 # A method-shaped line inside a class body. Must be indented (anything other
@@ -208,12 +239,20 @@ def _line_of(content: str, index: int) -> int:
 
 
 def _extract_methods(content: str) -> list[Symbol]:
-    """Find method-shaped declarations inside top-level class bodies.
+    """Find class-body members inside top-level class bodies.
 
     For each ``class Foo {`` header at column zero, locate the matching
     closing brace by simple depth counting and scan the lines between them
-    for method/arrow-property patterns. Each hit is attributed to the
-    enclosing class via ``parent``.
+    for method/arrow-property/inner-class patterns. A stack tracks the
+    enclosing-class chain so nested class declarations attribute their
+    members to the full ``Outer::Inner`` path.
+
+    Each line is walked character by character to keep the brace counter
+    accurate (so an inner class's opening ``{`` and closing ``}`` register
+    even when they sit on a method-shaped line). The stack carries
+    ``(class_path, push_depth)`` entries; an entry is popped when the
+    running brace depth dips back to or below the depth at which the class
+    body was entered.
     """
 
     out: list[Symbol] = []
@@ -228,10 +267,93 @@ def _extract_methods(content: str) -> list[Symbol]:
         body = content[open_brace + 1 : end_index]
         base_line = _line_of(content, open_brace + 1)
 
-        seen_on_line: set[int] = set()
+        # Stack of (class_path, depth_at_which_body_opened). The outer
+        # class's body opens at depth 1 (we are inside the first ``{``).
+        # An inner class body opens at the current depth + 1 when its
+        # header is consumed.
+        stack: list[tuple[str, int]] = [(class_name, 1)]
+        depth = 1
+
         for body_line_offset, line in enumerate(body.split("\n")):
             line_number = base_line + body_line_offset
 
+            # Pop any classes whose body has already closed at the current
+            # depth before evaluating this line.
+            while len(stack) > 1 and depth < stack[-1][1]:
+                stack.pop()
+
+            if not stack:
+                # Defensive: never lose the outer entry; if depth went
+                # negative we bail out of this header's scan.
+                break
+
+            current_path = stack[-1][0]
+
+            # Field with class-expression value:
+            #   ``static Inner = class Inner { ... }``.
+            # The binding name on the LHS is the addressable identifier;
+            # the class expression on the RHS holds the body that needs
+            # walking with the binding name as the path component.
+            field_class_match = _FIELD_CLASS_VALUE_RE.match(line)
+            if field_class_match is not None:
+                inner_name = field_class_match.group("name")
+                inner_path = f"{current_path}::{inner_name}"
+                out.append(
+                    Symbol(
+                        name=inner_name,
+                        kind="class",
+                        start_line=line_number,
+                        end_line=line_number,
+                        parent=current_path,
+                    )
+                )
+                line_open = line.count("{")
+                line_close = line.count("}")
+                depth += 1  # entering the class expression body
+                stack.append((inner_path, depth))
+                depth += line_open - 1
+                depth -= line_close
+                while len(stack) > 1 and depth < stack[-1][1]:
+                    stack.pop()
+                continue
+
+            # Inner class header on this line: emit the inner class, push
+            # onto the stack with the post-brace depth.
+            inner_match = _INNER_CLASS_HEADER_RE.match(line)
+            if inner_match is not None:
+                inner_name = inner_match.group("name")
+                inner_path = f"{current_path}::{inner_name}"
+                out.append(
+                    Symbol(
+                        name=inner_name,
+                        kind="class",
+                        start_line=line_number,
+                        end_line=line_number,
+                        parent=current_path,
+                    )
+                )
+                # Walk the line's braces to update depth and push the
+                # inner class at the depth its body sits in. The header
+                # ends with a ``{`` per the regex, so depth bumps by 1.
+                line_open = line.count("{")
+                line_close = line.count("}")
+                # The opening ``{`` of the inner class is one of the
+                # ``{`` characters; pushing at depth+1 (after that brace)
+                # matches the outer-class convention (body opens at
+                # depth 1).
+                depth += 1  # entering the inner class body
+                stack.append((inner_path, depth))
+                # Account for any additional braces on the same line
+                # (rare: ``class Inner { m() {} }``). The remaining open
+                # count is line_open - 1; closes also count.
+                depth += line_open - 1
+                depth -= line_close
+                # Pop any classes that closed on this same line.
+                while len(stack) > 1 and depth < stack[-1][1]:
+                    stack.pop()
+                continue
+
+            # Method-shaped line: attribute to the current top-of-stack.
             method_match = _METHOD_LINE_RE.match(line)
             if method_match is not None:
                 name = method_match.group("name")
@@ -242,14 +364,16 @@ def _extract_methods(content: str) -> list[Symbol]:
                             kind="function",
                             start_line=line_number,
                             end_line=line_number,
-                            parent=class_name,
+                            parent=current_path,
                         )
                     )
-                    seen_on_line.add(line_number)
+                    depth += line.count("{") - line.count("}")
+                    while len(stack) > 1 and depth < stack[-1][1]:
+                        stack.pop()
                     continue
 
             arrow_match = _ARROW_PROP_RE.match(line)
-            if arrow_match is not None and line_number not in seen_on_line:
+            if arrow_match is not None:
                 name = arrow_match.group("name")
                 if name not in _METHOD_NAME_BLACKLIST:
                     out.append(
@@ -258,9 +382,14 @@ def _extract_methods(content: str) -> list[Symbol]:
                             kind="const",
                             start_line=line_number,
                             end_line=line_number,
-                            parent=class_name,
+                            parent=current_path,
                         )
                     )
+
+            # Always update depth based on braces seen on this line.
+            depth += line.count("{") - line.count("}")
+            while len(stack) > 1 and depth < stack[-1][1]:
+                stack.pop()
 
     return out
 
@@ -308,6 +437,7 @@ def extract(content: str) -> list[Symbol]:
         seen_anon_default = True
 
     # v0.16: append method-level symbols (parent=class) for top-level classes.
+    # v0.19: walk extends into nested classes with full ancestor paths.
     out.extend(_extract_methods(content))
 
     return out

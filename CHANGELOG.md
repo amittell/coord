@@ -9,6 +9,34 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.20.0] - 2026-06-02
+
+### Added
+
+- Hotspot file detection. New `db.hotspot_files(days=30, min_attempts=5)`
+  helper groups conflict_log entries by (repo, attempted_pattern) and
+  returns the files agents keep bouncing off of.
+- `GET /metrics/hotspots?days=&min_attempts=&limit=&repo=` exposes the
+  same series for external monitoring.
+- Dashboard "Hotspot files (30d)" panel showing the top-N files per
+  repo with attempt counts, distinct attempters, and a suggested
+  action chip ("split into modules" / "promote to shared_file" /
+  "monitor") based on count thresholds. Read-only signal for v0.20;
+  auto-promote is queued for v0.21.
+
+## [0.19.0] - 2026-06-02
+
+### Added
+
+- TypeScript parser walks RECURSIVELY into nested class_declaration
+  nodes (deferred from v0.17). Both tree-sitter and regex backends
+  emit inner classes plus their methods with the full ancestor path
+  in `parent`. Closes the v0.17 carry-over flagged in [0.18.0].
+- Go parser documents the nesting boundary explicitly: Go has no
+  nested class model so the v0.16 receiver-as-parent extraction is
+  the deepest nesting that applies. New tests pin the behavior for
+  embedded types, function-local types, and generic receivers.
+
 ## [0.18.0] - 2026-06-02
 
 ### Added

@@ -363,3 +363,78 @@ async def test_daily_auto_resolutions_buckets_correctly(tmp_path: Path) -> None:
     # Repo filter
     rows_b_only = await db.daily_auto_resolutions(days=30, repo="repo-b", now=fake_now)
     assert {r["repo"] for r in rows_b_only} == {"repo-b"}
+
+
+@pytest.mark.asyncio
+async def test_hotspot_files_groups_and_threshold(tmp_path: Path) -> None:
+    """v0.20: hotspot_files groups by (repo, pattern), enforces
+    min_attempts threshold, orders by attempts DESC, and caps at limit.
+    """
+    import aiosqlite
+    from coordination.db import _configure_sqlite
+
+    db = Database(tmp_path / "db.sqlite")
+    await db.init()
+
+    # Two holders in repo-a, one in repo-b.
+    await db.insert_claims_batch(
+        engineer="alice",
+        branch="main",
+        description="t",
+        items=[
+            ("cA", "file", "src/hot.ts", "soft", "2099-01-01T00:00:00Z"),
+            ("cB", "file", "src/warm.ts", "soft", "2099-01-01T00:00:00Z"),
+            ("cC", "file", "src/cold.ts", "soft", "2099-01-01T00:00:00Z"),
+        ],
+        session_id="sess",
+        repo="repo-a",
+    )
+
+    # Seed conflict_log: 12 attempts on hot.ts (8 distinct), 7 on warm.ts, 3 on cold.ts.
+    from uuid import uuid4
+
+    async with aiosqlite.connect(db.path) as conn:
+        await _configure_sqlite(conn)
+        for i in range(12):
+            await conn.execute(
+                "INSERT INTO conflict_log (id, claim_id, attempted_by, "
+                "attempted_pattern, resolution, created_at) "
+                "VALUES (?, ?, ?, ?, NULL, ?)",
+                (str(uuid4()), "cA", f"eng-{i % 8}", "src/hot.ts",
+                 "2026-06-01T10:00:00Z"),
+            )
+        for i in range(7):
+            await conn.execute(
+                "INSERT INTO conflict_log (id, claim_id, attempted_by, "
+                "attempted_pattern, resolution, created_at) "
+                "VALUES (?, ?, ?, ?, NULL, ?)",
+                (str(uuid4()), "cB", f"eng-{i}", "src/warm.ts",
+                 "2026-06-01T11:00:00Z"),
+            )
+        for i in range(3):
+            await conn.execute(
+                "INSERT INTO conflict_log (id, claim_id, attempted_by, "
+                "attempted_pattern, resolution, created_at) "
+                "VALUES (?, ?, ?, ?, NULL, ?)",
+                (str(uuid4()), "cC", f"eng-{i}", "src/cold.ts",
+                 "2026-06-01T12:00:00Z"),
+            )
+        await conn.commit()
+
+    from datetime import datetime, UTC
+    fake_now = datetime(2026, 6, 2, 12, 0, 0, tzinfo=UTC)
+
+    # min_attempts=5: cold.ts (3) is filtered out.
+    rows = await db.hotspot_files(days=30, min_attempts=5, now=fake_now)
+    patterns = [r["pattern"] for r in rows]
+    assert patterns == ["src/hot.ts", "src/warm.ts"]
+    assert rows[0]["attempts"] == 12
+    assert rows[0]["distinct_attempters"] == 8
+    assert rows[1]["attempts"] == 7
+
+    # limit=1: only the top entry survives.
+    rows_capped = await db.hotspot_files(
+        days=30, min_attempts=5, limit=1, now=fake_now
+    )
+    assert len(rows_capped) == 1
+    assert rows_capped[0]["pattern"] == "src/hot.ts"

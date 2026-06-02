@@ -203,6 +203,72 @@ Returns:
 
 The `repo` value is automatically attached to claims by `coord-mcp` from `COORD_REPO_ID` (set by `coord init` from `git remote get-url origin`).
 
+## `GET /metrics/hotspots` (v0.20.0+)
+
+Files that agents keep `409`'ing on, grouped per repo. The same series powers the dashboard's "Hotspot files (30d)" panel and is exposed standalone so external monitoring (Prometheus, digest emails, etc.) can consume it.
+
+Query params:
+
+- `days` (int, default `30`, range `1..90`) -- look-back window for `conflict_log` rows.
+- `min_attempts` (int, default `5`) -- floor below which a file is not considered a hotspot. Rows with fewer attempts than this in the window are excluded.
+- `limit` (int, default `20`, max `100`) -- top-N rows per repo, sorted by attempt count descending.
+- `repo` (str, optional) -- restrict the result to a single repo identifier. When omitted every repo with at least one qualifying row appears.
+
+Example:
+
+```bash
+curl "http://127.0.0.1:8080/metrics/hotspots?days=30&min_attempts=5&limit=10" \
+  -H "Authorization: Bearer $COORD_AUTH_TOKEN"
+```
+
+Example response:
+
+```json
+{
+  "series": [
+    {
+      "repo": "amittell/coord",
+      "attempted_pattern": "src/router.ts",
+      "attempts": 24,
+      "distinct_attempters": 6,
+      "first_seen": "2026-05-04T09:11:00Z",
+      "last_seen": "2026-06-01T22:47:00Z",
+      "suggested_action": "split into modules"
+    },
+    {
+      "repo": "amittell/coord",
+      "attempted_pattern": "package-lock.json",
+      "attempts": 18,
+      "distinct_attempters": 9,
+      "first_seen": "2026-05-05T11:02:00Z",
+      "last_seen": "2026-06-02T03:18:00Z",
+      "suggested_action": "promote to shared_file"
+    },
+    {
+      "repo": "amittell/coord",
+      "attempted_pattern": "src/auth/session.ts",
+      "attempts": 7,
+      "distinct_attempters": 2,
+      "first_seen": "2026-05-29T14:20:00Z",
+      "last_seen": "2026-06-02T08:05:00Z",
+      "suggested_action": "monitor"
+    }
+  ],
+  "days": 30,
+  "min_attempts": 5,
+  "limit": 10,
+  "count": 3
+}
+```
+
+`suggested_action` mirrors the dashboard's threshold logic:
+
+- `attempts >= 20` -> `"split into modules"` (the file is doing too much, repeated conflict is structural).
+- `attempts >= 10` -> `"promote to shared_file"` (genuinely shared scope, make the overlap explicit).
+- `attempts >= min_attempts` -> `"monitor"` (not actionable yet, but worth watching).
+
+Empty result (no qualifying rows in the window) returns `{"series": [], "days": ..., "min_attempts": ..., "limit": ..., "count": 0}`. The signal is read-only in v0.20 -- nothing is promoted automatically; auto-promote is queued for v0.21.
+
 ## `GET /sessions/{session_id}/pending_requests` (v0.6.0+, extended in v0.9.0)
 
 The merged inbox a holder polls. Returns two kinds of rows distinguished by `kind`:

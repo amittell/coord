@@ -36,9 +36,20 @@ Each direct child of the class's ``class_body`` is examined and emitted with
 - ``public_field_definition`` whose value is an ``arrow_function`` or
   ``function_expression`` -> ``kind='const'``.
 
-Nested classes inside a method body are NOT recursed into; only direct
-members of the outermost top-level class are emitted. This matches the
-coarseness contract from the design doc (one level of nesting only).
+v0.19 extends the class walk to RECURSE into nested ``class_declaration``
+nodes encountered as direct members of a class body. The inner class itself
+emits as a symbol with ``parent=<outer class name>`` (or the full ancestor
+path for deeper nesting), and its members emit with the full path joined by
+``"::"``. So ``class Outer { class Inner { handle() {} } }`` produces:
+
+- ``Outer`` -- ``parent=None``
+- ``Inner`` -- ``parent='Outer'``
+- ``handle`` -- ``parent='Outer::Inner'``
+
+The overlap engine's recursive prefix matching (see
+``coordination/overlap_symbols.py``) handles arbitrary depths without schema
+changes. Nested classes inside a method body (closures) are still excluded;
+only direct members of a class body block are walked.
 """
 
 from __future__ import annotations
@@ -195,25 +206,79 @@ def _method_name(node) -> str | None:
     return name_node.text.decode("utf-8")
 
 
-def _symbols_from_class_body(class_node) -> list[Symbol]:
-    """Emit method-level symbols for a single ``class_declaration``.
+def _walk_class(
+    class_node,
+    ancestor_path: str | None,
+    name_override: str | None = None,
+    span_node=None,
+) -> list[Symbol]:
+    """Emit the class itself plus every direct member of its body.
 
-    Only direct children of the class's ``class_body`` are inspected. Nested
-    classes inside method bodies are NOT recursed into; the design doc keeps
-    coordination to one level of nesting.
+    ``ancestor_path`` is the chain leading UP TO (but not including) this
+    class, joined by ``"::"``. ``None`` for a top-level class; ``"Outer"``
+    for a class declared directly inside ``Outer``; ``"Outer::Inner"`` for
+    a class declared inside ``Outer.Inner``; and so on.
+
+    ``name_override`` lets callers force the emitted class name when the
+    syntactic site provides a binding name distinct from the class
+    expression's own (or in place of) name. The realistic TS pattern for a
+    nested class is ``static Inner = class Inner { ... }``; the binding
+    identifier ``Inner`` is the addressable name. When ``name_override`` is
+    set, it wins over the class expression's optional name.
+
+    ``span_node`` lets the emitted Symbol span the enclosing site (so the
+    ``static Inner = class { ... };`` field definition's line range is
+    used) instead of just the class body. ``None`` falls back to
+    ``class_node``.
+
+    The returned list always starts with this class's own symbol, followed
+    by its members in source order. Nested ``class_declaration`` nodes and
+    class expressions inside field values both recurse depth-first.
+
+    ``method_definition`` (regular methods, ``constructor``, static, async,
+    getters, setters) emit with ``kind='function'`` and ``parent=full_path``.
+    ``public_field_definition`` whose value is an arrow/function expression
+    emit with ``kind='const'`` and ``parent=full_path``; whose value is a
+    class expression recurse into :func:`_walk_class` with the field's
+    binding name as the addressable identifier. Other class members
+    (index signatures, plain property declarations, abstract method
+    signatures) are not callable scopes and are skipped.
     """
 
-    class_name_node = class_node.child_by_field_name("name")
-    if class_name_node is None:
-        return []
-    class_name = class_name_node.text.decode("utf-8")
+    if name_override is not None:
+        class_name = name_override
+    else:
+        class_name_node = class_node.child_by_field_name("name")
+        if class_name_node is None:
+            return []
+        class_name = class_name_node.text.decode("utf-8")
+    full_path = f"{ancestor_path}::{class_name}" if ancestor_path else class_name
+
+    span = span_node if span_node is not None else class_node
+    out: list[Symbol] = [
+        Symbol(
+            name=class_name,
+            kind="class",
+            start_line=span.start_point[0] + 1,
+            end_line=span.end_point[0] + 1,
+            parent=ancestor_path,
+        )
+    ]
 
     body = class_node.child_by_field_name("body")
     if body is None or body.type != "class_body":
-        return []
+        return out
 
-    out: list[Symbol] = []
     for member in body.children:
+        # A nested class_declaration is not currently producible by the
+        # tree-sitter-typescript grammar (the grammar treats `class X {}`
+        # inside a class body as a syntax error), but the branch is kept
+        # for forward compatibility with grammar evolutions or alternative
+        # backends that might surface one.
+        if member.type == "class_declaration":
+            out.extend(_walk_class(member, full_path))
+            continue
+
         if member.type == "method_definition":
             name = _method_name(member)
             if name is None:
@@ -224,17 +289,32 @@ def _symbols_from_class_body(class_node) -> list[Symbol]:
                     kind="function",
                     start_line=member.start_point[0] + 1,
                     end_line=member.end_point[0] + 1,
-                    parent=class_name,
+                    parent=full_path,
                 )
             )
             continue
 
         if member.type == "public_field_definition":
             value_node = member.child_by_field_name("value")
-            if value_node is None or not _function_like(value_node):
+            if value_node is None:
                 continue
             name = _method_name(member)
             if name is None:
+                continue
+            # Class expression on the right-hand side: recurse so the
+            # nested class is addressable via its binding name. This is
+            # the realistic TS shape for nested classes.
+            if value_node.type == "class":
+                out.extend(
+                    _walk_class(
+                        value_node,
+                        full_path,
+                        name_override=name,
+                        span_node=member,
+                    )
+                )
+                continue
+            if not _function_like(value_node):
                 continue
             out.append(
                 Symbol(
@@ -242,7 +322,7 @@ def _symbols_from_class_body(class_node) -> list[Symbol]:
                     kind="const",
                     start_line=member.start_point[0] + 1,
                     end_line=member.end_point[0] + 1,
-                    parent=class_name,
+                    parent=full_path,
                 )
             )
             continue
@@ -259,11 +339,12 @@ def extract(content: str) -> list[Symbol]:
 
     Top-level declarations (functions, classes, interfaces, types, enums,
     function-valued ``const``/``let``/``var``) are walked from the direct
-    children of the ``program`` node. v0.16 additionally descends one level
-    into every top-level ``class_declaration`` to emit its methods and
-    arrow-valued fields with ``parent=<class name>``. Deeper nesting
-    (functions inside functions, classes inside methods) is intentionally
-    excluded.
+    children of the ``program`` node. Top-level ``class_declaration`` nodes
+    are handed to :func:`_walk_class` which recursively emits the class
+    itself, its direct members, and any nested classes (with their members
+    and so on, depth-first). Functions inside functions and classes nested
+    inside method bodies remain excluded -- only direct members of a class
+    body block are walked.
     """
 
     parser = _tsx_parser()
@@ -290,12 +371,16 @@ def extract(content: str) -> list[Symbol]:
             continue
 
         if decl.type in _DECLARATION_KINDS:
-            sym = _symbol_from_named_declaration(decl, is_default)
-            if sym is not None:
-                out.append(sym)
-            # v0.16: also emit method-level symbols for top-level classes.
+            # v0.19: top-level classes go through _walk_class so the class
+            # itself and its full nested-member tree are emitted in source
+            # order. Other named declarations (function/interface/type/enum)
+            # emit a single symbol.
             if decl.type == "class_declaration":
-                out.extend(_symbols_from_class_body(decl))
+                out.extend(_walk_class(decl, None))
+            else:
+                sym = _symbol_from_named_declaration(decl, is_default)
+                if sym is not None:
+                    out.append(sym)
             continue
 
         if decl.type in {"lexical_declaration", "variable_declaration"}:
