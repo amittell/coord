@@ -1,51 +1,44 @@
-# coord prod overlay (kebabrack k3s)
+# coord prod overlay example
 
-Argocd target manifests for running `coord` on the kebabrack k3s cluster.
-Deployed via the `coord-prod` Application in the `argocd` namespace, which
-syncs this directory from the `amittell/coord` repo (`main` branch).
+Example manifests for running `coord` on a private Kubernetes cluster.
+Copy these into your own deployment repo or GitOps path and replace the
+placeholder hostnames, image reference, Vault references, and storage class.
 
 ## Cluster assumptions
 
-These manifests are specific to kebabrack and will not apply cleanly to
-other clusters without edits. They assume:
+These manifests are intentionally concrete enough to show the moving parts,
+but they are not intended to apply unchanged. They assume:
 
 - Ingress controller: Traefik (`kubernetes.io/ingress.class: traefik`)
 - Default StorageClass: `local-path`
 - Vault Secrets Operator installed with a cluster-shared
-  `VaultAuth` at `vault/vault-auth`, wired to an authenticated Vault
-  that carries `secret/apps/k8s/coord` (kv-v2)
-- GHCR image is private; pull creds are sourced from the same Vault path
+  `VaultAuth` at `vault/vault-auth`, wired to a kv-v2 path that you own
+- GHCR image is private; pull creds are sourced from the same secret path
 
 The portable reference manifests (no namespace, no ingress, no VSO) live
 one directory up in `deploy/k8s/`.
 
 ## Auth posture
 
-`COORD_ALLOW_INSECURE_NO_AUTH=true` is set on the Deployment. The service
-sits behind a LAN-only Traefik ingress (`coord.kebabrack.lan`) and is
-not reachable from outside the network. This trades token-based access
-control for a browser-accessible dashboard. To flip to bearer-required
-mode instead, remove the env var and let the container read
-`COORD_AUTH_TOKEN` from the `coord-auth` Secret (populated by the
-VaultStaticSecret).
+The example Deployment reads `COORD_AUTH_TOKEN` from the `coord-auth`
+Secret populated by the VaultStaticSecret. Keep the service behind
+private ingress, VPN, or another access-control layer unless you have
+reviewed the dashboard and API exposure model for your environment.
 
 ## Files
 
 - `namespace.yaml` - `coord` namespace
 - `vaultstaticsecret-auth.yaml` - syncs `COORD_AUTH_TOKEN` from Vault
-  into the `coord-auth` Secret (unused while insecure mode is on, but
-  kept ready for the flip)
+  into the `coord-auth` Secret
 - `vaultstaticsecret-ghcr.yaml` - renders a `kubernetes.io/dockerconfigjson`
   Secret `ghcr-pull` from the `ghcr_username` / `ghcr_pat` fields
 - `pvc.yaml` - 1Gi `local-path` PVC for the SQLite DB
 - `deployment.yaml` - single replica, non-root, pinned image digest,
-  insecure-no-auth mode
+  bearer-token auth
 - `service.yaml` - ClusterIP :8080
-- `ingress.yaml` - Traefik ingress for `coord.kebabrack.lan`
+- `ingress.yaml` - Traefik ingress for `coord.internal.example`
 
 ## DNS
 
-`coord.kebabrack.lan` must resolve to a Traefik LB IP (any of the
-`192.168.210.126/139/177/197/53/75` addresses). This cluster's
-`*.kebabrack.lan` DNS is served by the Firewalla at `192.168.210.1`
-and is not managed from the cluster.
+`coord.internal.example` is a placeholder. Replace it with a private
+hostname that resolves to your ingress controller.

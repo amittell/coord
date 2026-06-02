@@ -36,8 +36,8 @@ def test_detect_repo_id_from_https_origin(tmp_path: Path) -> None:
 
 def test_detect_repo_id_from_ssh_origin(tmp_path: Path) -> None:
     _setup_repo(tmp_path)
-    _git("remote", "add", "origin", "git@github.com:amittell/bastionx.git", cwd=tmp_path)
-    assert _detect_repo_id(tmp_path) == "amittell/bastionx"
+    _git("remote", "add", "origin", "git@github.com:example-org/bastionx.git", cwd=tmp_path)
+    assert _detect_repo_id(tmp_path) == "example-org/bastionx"
 
 
 def test_detect_repo_id_strips_dot_git_suffix(tmp_path: Path) -> None:
