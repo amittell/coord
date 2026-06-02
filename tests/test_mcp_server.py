@@ -572,6 +572,142 @@ def test_headers_omit_bearer_when_token_unset(monkeypatch: pytest.MonkeyPatch) -
     assert "Authorization" not in mcp_server._headers()
 
 
+def test_headers_omit_bearer_when_token_is_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tracked .mcp.json ships ``COORD_AUTH_TOKEN=set-me`` so OSS users
+    see the shape; sending ``Bearer set-me`` to a real server would 401
+    and leave the user wondering whether the wrapper or the server is at
+    fault. Treating the documented placeholder as "no token" yields a
+    cleaner failure mode (no Authorization header at all)."""
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "set-me")
+    assert "Authorization" not in mcp_server._headers()
+
+
+# ---------------------------------------------------------------------------
+# .coordination/local.env auto-load
+# ---------------------------------------------------------------------------
+
+
+def _seed_local_env(repo_root: Path, body: str) -> Path:
+    coord_dir = repo_root / ".coordination"
+    coord_dir.mkdir(parents=True, exist_ok=True)
+    env_file = coord_dir / "local.env"
+    env_file.write_text(body, encoding="utf-8")
+    return env_file
+
+
+def test_load_local_env_populates_unset_vars(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_local_env(
+        tmp_path,
+        "COORD_API_URL=http://svc.example\nCOORD_AUTH_TOKEN=real-token\n",
+    )
+    for key in ("COORD_API_URL", "COORD_AUTH_TOKEN"):
+        monkeypatch.delenv(key, raising=False)
+
+    loaded = mcp_server._load_local_env(start=tmp_path)
+
+    assert loaded == tmp_path / ".coordination" / "local.env"
+    assert os.environ["COORD_API_URL"] == "http://svc.example"
+    assert os.environ["COORD_AUTH_TOKEN"] == "real-token"
+
+
+def test_load_local_env_overrides_placeholder_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole point of the placeholder override: a tracked .mcp.json
+    can keep ``COORD_AUTH_TOKEN=set-me`` and the wrapper still picks up
+    the real token from local.env on startup. Without this, the
+    placeholder in .mcp.json would shadow the real value and the
+    sanitisation-vs-prod-config tension would force secrets into git."""
+    _seed_local_env(tmp_path, "COORD_AUTH_TOKEN=real-token\n")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "set-me")
+
+    mcp_server._load_local_env(start=tmp_path)
+
+    assert os.environ["COORD_AUTH_TOKEN"] == "real-token"
+
+
+def test_load_local_env_preserves_real_existing_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Shell exports or a real .mcp.json env block must win over
+    local.env, so an operator's explicit override stays in effect."""
+    _seed_local_env(tmp_path, "COORD_AUTH_TOKEN=from-file\n")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "from-shell")
+
+    mcp_server._load_local_env(start=tmp_path)
+
+    assert os.environ["COORD_AUTH_TOKEN"] == "from-shell"
+
+
+def test_load_local_env_walks_up_to_repo_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """coord-mcp may be spawned with cwd set anywhere under the repo
+    (subdir of a monorepo, or a subagent's working dir). The loader has
+    to walk up like git does."""
+    _seed_local_env(tmp_path, "COORD_AUTH_TOKEN=root-token\n")
+    nested = tmp_path / "a" / "b" / "c"
+    nested.mkdir(parents=True)
+    monkeypatch.delenv("COORD_AUTH_TOKEN", raising=False)
+
+    loaded = mcp_server._load_local_env(start=nested)
+
+    assert loaded == tmp_path / ".coordination" / "local.env"
+    assert os.environ["COORD_AUTH_TOKEN"] == "root-token"
+
+
+def test_load_local_env_noop_when_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "existing")
+    assert mcp_server._load_local_env(start=tmp_path) is None
+    assert os.environ["COORD_AUTH_TOKEN"] == "existing"
+
+
+def test_load_local_env_ignores_comments_and_quotes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_local_env(
+        tmp_path,
+        "# comment line\n"
+        '\nCOORD_API_URL="http://svc.example"\n'
+        "COORD_AUTH_TOKEN='quoted'\n"
+        "INVALID LINE WITHOUT EQUALS\n",
+    )
+    for key in ("COORD_API_URL", "COORD_AUTH_TOKEN"):
+        monkeypatch.delenv(key, raising=False)
+
+    mcp_server._load_local_env(start=tmp_path)
+
+    assert os.environ["COORD_API_URL"] == "http://svc.example"
+    assert os.environ["COORD_AUTH_TOKEN"] == "quoted"
+
+
+def test_load_local_env_ignores_unknown_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Limiting the loader to a known COORD_* allowlist keeps a stray
+    line in local.env (an unrelated tool's config, a debugging dump,
+    etc.) from silently mutating the MCP wrapper's env."""
+    _seed_local_env(
+        tmp_path,
+        "COORD_AUTH_TOKEN=ok\nPATH=/should/not/leak\nMALICIOUS=value\n",
+    )
+    monkeypatch.delenv("COORD_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("MALICIOUS", "preserved")
+    before_path = os.environ.get("PATH", "")
+
+    mcp_server._load_local_env(start=tmp_path)
+
+    assert os.environ["COORD_AUTH_TOKEN"] == "ok"
+    assert os.environ.get("PATH", "") == before_path
+    assert os.environ["MALICIOUS"] == "preserved"
+
+
 # ---------------------------------------------------------------------------
 # session_id (v0.5.0)
 # ---------------------------------------------------------------------------

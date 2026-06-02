@@ -79,3 +79,12 @@ From Claude Code, confirm the `coord` toolset can:
 4. `release_claims`
 
 If those work, the integration is live.
+
+## Auth resolution order
+
+`coord-mcp` resolves `COORD_*` env vars in this order, with the first non-placeholder value winning:
+
+1. The MCP child process environment (shell exports, `env` block in `.mcp.json`).
+2. `<repo-root>/.coordination/local.env`, auto-loaded at startup by walking up from cwd.
+
+The placeholder values `set-me`, `example-org/example-repo`, and `http://127.0.0.1:8080` are treated as "unset" for this purpose, so a committed `.mcp.json` template can ship them harmlessly and the wrapper still finds the real values in the gitignored `local.env`. This is why `coord init` is safe to run in a public repo: it writes credentials to `local.env` only and leaves `.mcp.json` as a template.

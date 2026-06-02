@@ -14,6 +14,68 @@ from mcp.server.fastmcp import FastMCP
 mcp = FastMCP("coordination")
 
 
+_LOCAL_ENV_KEYS = (
+    "COORD_API_URL",
+    "COORD_SERVICE_URL",
+    "COORD_AUTH_TOKEN",
+    "COORD_REPO_ID",
+    "COORD_REPO_ROOT",
+    "COORD_USER",
+    "COORD_REQUESTER",
+)
+_PLACEHOLDER_VALUES = frozenset(
+    {
+        "set-me",
+        "example-org/example-repo",
+        "http://127.0.0.1:8080",
+    }
+)
+
+
+def _load_local_env(start: Path | None = None) -> Path | None:
+    """Bootstrap COORD_* env vars from ``.coordination/local.env``.
+
+    Walks ``start`` (default: cwd) up to filesystem root looking for a
+    ``.coordination/local.env`` file. For each ``KEY=VALUE`` line, sets
+    ``os.environ[KEY]`` only if the variable is currently unset or holds
+    a known placeholder (e.g. ``set-me``). Explicit env (shell exports,
+    .mcp.json env blocks with real values) wins; placeholders lose.
+
+    The placeholder override is the load-bearing part: ``.mcp.json``
+    ships as a checked-in template with ``COORD_AUTH_TOKEN="set-me"`` so
+    OSS users see the shape, and ``coord init`` writes the real token
+    to ``.coordination/local.env`` (gitignored). Without the override
+    the template's placeholder would win because "set" beats "unset".
+
+    Returns the path of the file actually loaded, or None.
+    """
+    base = (start or Path.cwd()).resolve()
+    for d in [base, *base.parents]:
+        env_file = d / ".coordination" / "local.env"
+        if not env_file.is_file():
+            continue
+        try:
+            text = env_file.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            if key not in _LOCAL_ENV_KEYS:
+                continue
+            val = val.strip().strip('"').strip("'")
+            existing = os.environ.get(key, "")
+            if existing and existing not in _PLACEHOLDER_VALUES:
+                continue
+            if val:
+                os.environ[key] = val
+        return env_file
+    return None
+
+
 def _base_url() -> str:
     return os.environ.get("COORD_API_URL", "http://127.0.0.1:8080").rstrip("/")
 
@@ -21,7 +83,7 @@ def _base_url() -> str:
 def _headers() -> dict[str, str]:
     token = os.environ.get("COORD_AUTH_TOKEN", "")
     h: dict[str, str] = {"Accept": "application/json"}
-    if token:
+    if token and token not in _PLACEHOLDER_VALUES:
         h["Authorization"] = f"Bearer {token}"
     return h
 
@@ -707,6 +769,7 @@ def _install_marker_handlers() -> None:
 
 
 def main() -> None:
+    _load_local_env()
     _register_session_marker()
     _install_marker_handlers()
     mcp.run(transport="stdio")

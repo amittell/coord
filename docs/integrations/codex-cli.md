@@ -68,3 +68,12 @@ Within Codex, confirm the `coord` MCP server exposes:
 - `release_claims`
 
 If the tools show up but fail at runtime, double-check `COORD_API_URL` and `COORD_AUTH_TOKEN` in the shell environment that starts Codex.
+
+## Auth resolution order
+
+`coord-mcp` resolves `COORD_*` env vars in this order, with the first non-placeholder value winning:
+
+1. The MCP child process environment (shell exports, `[mcp_servers.coord.env]` block in Codex config, `env` block in `.mcp.json`).
+2. `<repo-root>/.coordination/local.env`, auto-loaded at startup by walking up from cwd.
+
+The placeholder values `set-me`, `example-org/example-repo`, and `http://127.0.0.1:8080` are treated as "unset" for this purpose, so a committed `.mcp.json` template can ship them harmlessly and the wrapper still finds the real values in the gitignored `local.env`. This is why you can leave your Codex config minimal (just `command = "coord-mcp"`) and have `coord init` manage credentials via `local.env`.
