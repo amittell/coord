@@ -36,9 +36,10 @@ reviewed the dashboard and API exposure model for your environment.
 - `deployment.yaml` - single replica, non-root, pinned image digest,
   bearer-token auth
 - `service.yaml` - ClusterIP :8080
-- `ingress.yaml` - Traefik ingress for `coord.internal.example`
+- `ingress.yaml` - Traefik ingress for `coord.kebabrack.lan`
 
 ## DNS
 
-`coord.internal.example` is a placeholder. Replace it with a private
-hostname that resolves to your ingress controller.
+`coord.kebabrack.lan` must resolve to a Traefik LB IP for the kebabrack
+cluster. If you reuse this overlay outside kebabrack, replace it with a
+private hostname that resolves to your ingress controller.
