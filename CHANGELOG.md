@@ -245,7 +245,7 @@ The hook redesign was prompted by an agent in astrowars rewriting the hook on it
 
 ### Changed
 
-- Conflict detection is now repo-scoped. A claim with `repo=X` is only checked against other claims with `repo=X`; a claim with `repo=NULL` (legacy / un-tagged client) is only checked against other `repo=NULL` claims. Closes the cross-repo false-positive where, for example, a `client/js/**` claim from `amittell/astrowars` would block any push touching `client/js/**` in unrelated services on the same coord instance. Both `POST /claims` and `GET /conflicts` apply the partition.
+- Conflict detection is now repo-scoped. A claim with `repo=X` is only checked against other claims with `repo=X`; a claim with `repo=NULL` (legacy / un-tagged client) is only checked against other `repo=NULL` claims. Closes the cross-repo false-positive where, for example, a `client/js/**` claim from `example-org/astrowars` would block any push touching `client/js/**` in unrelated services on the same coord instance. Both `POST /claims` and `GET /conflicts` apply the partition.
 - `GET /conflicts` accepts a new `repo=` query parameter so the pre-push hook can scope its check.
 - Pre-push hook reads `COORD_REPO_ID` from `.coordination/local.env` and forwards it as `&repo=` on every `/conflicts` call. Existing repos pick up the behaviour on their next `coord upgrade`.
 
@@ -276,7 +276,7 @@ The hook redesign was prompted by an agent in astrowars rewriting the hook on it
 - `coord doctor` now flags managed asset drift (in-repo hook or managed block content does not match the packaged snippet) and points at `coord upgrade`.
 - `coord doctor` now compares the locally installed CLI version against the running service's `/meta` and reports skew in either direction with an actionable hint (update local install, or bump the cluster image).
 - Proactive once-per-24h update notice on every CLI command. When the configured service reports a newer version than the local install, `coord` prints a single stderr line pointing at `coord upgrade`. Throttled via a timestamp file, silent on failure, opt-out with `COORD_NO_UPDATE_CHECK=1`, skipped for `init` / `start` / `_serve` / `doctor` and outside coord-initialised repos.
-- `deploy/k8s/prod/` overlay for kebabrack k3s: namespace, Traefik ingress, local-path PVC, two `VaultStaticSecret` resources (auth token + GHCR pull credentials rendered as `kubernetes.io/dockerconfigjson`), and a pinned image digest. Argocd-managed.
+- `deploy/k8s/prod/` overlay: namespace, Traefik ingress, local-path PVC, two `VaultStaticSecret` resources (auth token + GHCR pull credentials rendered as `kubernetes.io/dockerconfigjson`), and a pinned image digest.
 
 ### Fixed
 

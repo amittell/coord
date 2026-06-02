@@ -342,7 +342,7 @@ async def test_list_claims_filters_by_repo(client: AsyncClient) -> None:
     for repo, pat in [
         ("amittell/coord", "src/a.py"),
         ("amittell/coord", "src/b.py"),
-        ("amittell/bastionx", "services/x.py"),
+        ("example-org/bastionx", "services/x.py"),
     ]:
         r = await client.post(
             "/claims",
@@ -370,7 +370,7 @@ async def test_repos_endpoint_aggregates_per_repo_stats(client: AsyncClient) -> 
     for repo, eng, pat in [
         ("amittell/coord", "alice", "src/a.py"),
         ("amittell/coord", "bob", "src/b.py"),
-        ("amittell/bastionx", "alice", "services/x.py"),
+        ("example-org/bastionx", "alice", "services/x.py"),
     ]:
         r = await client.post(
             "/claims",
@@ -390,7 +390,7 @@ async def test_repos_endpoint_aggregates_per_repo_stats(client: AsyncClient) -> 
     assert by_name["amittell/coord"]["claims_24h"] == 2
     assert by_name["amittell/coord"]["engineers_24h"] == 2
     assert by_name["amittell/coord"]["active_claims"] == 2
-    assert by_name["amittell/bastionx"]["claims_24h"] == 1
+    assert by_name["example-org/bastionx"]["claims_24h"] == 1
 
 
 @pytest.mark.asyncio
@@ -420,7 +420,7 @@ async def test_create_claims_no_cross_repo_conflict(client: AsyncClient) -> None
         headers=h,
         json={
             "engineer": "alice",
-            "repo": "amittell/astrowars",
+            "repo": "example-org/astrowars",
             "claims": [{"type": "module", "pattern": "client/js/**"}],
         },
     )
@@ -445,7 +445,7 @@ async def test_conflicts_endpoint_filters_by_repo(client: AsyncClient) -> None:
 
     # Cross-repo: clean.
     r = await client.get(
-        "/conflicts?pattern=client/js/foo.ts&engineer=alice&repo=amittell/astrowars",
+        "/conflicts?pattern=client/js/foo.ts&engineer=alice&repo=example-org/astrowars",
         headers=h,
     )
     assert r.status_code == 200, r.text
@@ -471,7 +471,7 @@ async def test_create_claims_self_excludes_within_session(client: AsyncClient) -
         headers=h,
         json={
             "engineer": "codex-server",
-            "repo": "amittell/astrowars",
+            "repo": "example-org/astrowars",
             "session_id": "sess-xyz",
             "claims": [{"type": "module", "pattern": "server/**"}],
         },
@@ -483,7 +483,7 @@ async def test_create_claims_self_excludes_within_session(client: AsyncClient) -
         headers=h,
         json={
             "engineer": "codex-shared",
-            "repo": "amittell/astrowars",
+            "repo": "example-org/astrowars",
             "session_id": "sess-xyz",
             "claims": [{"type": "module", "pattern": "server/**"}],
         },
@@ -500,7 +500,7 @@ async def test_conflicts_endpoint_honors_session_id(client: AsyncClient) -> None
         headers=h,
         json={
             "engineer": "codex-foo",
-            "repo": "amittell/astrowars",
+            "repo": "example-org/astrowars",
             "session_id": "sess-1",
             "claims": [{"type": "module", "pattern": "server/**"}],
         },
@@ -510,7 +510,7 @@ async def test_conflicts_endpoint_honors_session_id(client: AsyncClient) -> None
     # Same session, different engineer name: clean.
     r = await client.get(
         "/conflicts?pattern=server/x.js&engineer=codex-bar"
-        "&repo=amittell/astrowars&session_id=sess-1",
+        "&repo=example-org/astrowars&session_id=sess-1",
         headers=h,
     )
     assert r.status_code == 200
@@ -519,7 +519,7 @@ async def test_conflicts_endpoint_honors_session_id(client: AsyncClient) -> None
     # Different session: adversarial.
     r = await client.get(
         "/conflicts?pattern=server/x.js&engineer=codex-bar"
-        "&repo=amittell/astrowars&session_id=sess-2",
+        "&repo=example-org/astrowars&session_id=sess-2",
         headers=h,
     )
     assert r.json()["has_conflicts"] is True
@@ -547,7 +547,7 @@ async def test_conflicts_endpoint_honors_repeated_session_id_params(
             headers=h,
             json={
                 "engineer": engineer,
-                "repo": "amittell/astrowars",
+                "repo": "example-org/astrowars",
                 "session_id": sess,
                 "claims": [
                     {"type": "module", "pattern": f"server/{engineer}/**"}
@@ -562,7 +562,7 @@ async def test_conflicts_endpoint_honors_repeated_session_id_params(
             ("pattern", "server/codex-a/x.js"),
             ("pattern", "server/codex-b/y.js"),
             ("engineer", "outsider"),
-            ("repo", "amittell/astrowars"),
+            ("repo", "example-org/astrowars"),
             ("session_id", "sess-A"),
             ("session_id", "sess-B"),
         ],
@@ -581,7 +581,7 @@ async def test_conflicts_endpoint_honors_repeated_session_id_params(
             ("pattern", "server/codex-a/x.js"),
             ("pattern", "server/codex-b/y.js"),
             ("engineer", "outsider"),
-            ("repo", "amittell/astrowars"),
+            ("repo", "example-org/astrowars"),
             ("session_id", "sess-A"),
         ],
         headers=h,
@@ -608,7 +608,7 @@ async def test_conflicts_endpoint_single_session_id_unchanged(
         headers=h,
         json={
             "engineer": "codex-foo",
-            "repo": "amittell/astrowars",
+            "repo": "example-org/astrowars",
             "session_id": "sess-only",
             "claims": [{"type": "module", "pattern": "server/**"}],
         },
@@ -617,7 +617,7 @@ async def test_conflicts_endpoint_single_session_id_unchanged(
 
     r = await client.get(
         "/conflicts?pattern=server/x.js&engineer=codex-bar"
-        "&repo=amittell/astrowars&session_id=sess-only",
+        "&repo=example-org/astrowars&session_id=sess-only",
         headers=h,
     )
     assert r.status_code == 200
@@ -625,7 +625,7 @@ async def test_conflicts_endpoint_single_session_id_unchanged(
 
     r = await client.get(
         "/conflicts?pattern=server/x.js&engineer=codex-bar"
-        "&repo=amittell/astrowars&session_id=sess-other",
+        "&repo=example-org/astrowars&session_id=sess-other",
         headers=h,
     )
     assert r.status_code == 200
@@ -646,7 +646,7 @@ async def test_conflicts_endpoint_no_session_id_unchanged(
         headers=h,
         json={
             "engineer": "codex-foo",
-            "repo": "amittell/astrowars",
+            "repo": "example-org/astrowars",
             "session_id": "sess-legacy",
             "claims": [{"type": "module", "pattern": "server/**"}],
         },
@@ -655,7 +655,7 @@ async def test_conflicts_endpoint_no_session_id_unchanged(
 
     r = await client.get(
         "/conflicts?pattern=server/x.js&engineer=codex-bar"
-        "&repo=amittell/astrowars",
+        "&repo=example-org/astrowars",
         headers=h,
     )
     assert r.status_code == 200
