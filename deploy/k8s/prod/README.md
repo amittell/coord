@@ -1,22 +1,31 @@
-# coord prod overlay example
+# coord prod overlay (kebabrack)
 
-Example manifests for running `coord` on a private Kubernetes cluster.
-Copy these into your own deployment repo or GitOps path and replace the
-placeholder hostnames, image reference, Vault references, and storage class.
+Live GitOps overlay for the `kebabrack` cluster, synced by Argo CD
+(`coord-prod` Application). Concrete hostnames and Vault paths are
+intentionally checked in -- they are not sensitive and Argo needs them
+to reconcile. If you fork this repo, point Argo at your own overlay
+rather than editing these files, otherwise an Argo sync will replace
+your values with kebabrack's.
+
+The portable, environment-neutral reference manifests (no namespace,
+no ingress, no VSO) live one directory up in `deploy/k8s/`. Use those
+as the starting point for a new overlay.
+
+`tests/test_deploy_overlay.py` guards this directory against
+placeholder regressions (`YOUR_CLUSTER`, `coord.internal.example`,
+`set-me`) so a future "public readiness" pass cannot silently break
+production by sanitising live values back to examples.
 
 ## Cluster assumptions
 
-These manifests are intentionally concrete enough to show the moving parts,
-but they are not intended to apply unchanged. They assume:
+The overlay assumes:
 
 - Ingress controller: Traefik (`kubernetes.io/ingress.class: traefik`)
 - Default StorageClass: `local-path`
-- Vault Secrets Operator installed with a cluster-shared
-  `VaultAuth` at `vault/vault-auth`, wired to a kv-v2 path that you own
+- Vault Secrets Operator installed with a cluster-shared `VaultAuth`
+  at `vault/vault-auth` and a kv-v2 entry at `secret/apps/k8s/coord`
+  with keys `auth_token`, `ghcr_username`, `ghcr_pat`
 - GHCR image is private; pull creds are sourced from the same secret path
-
-The portable reference manifests (no namespace, no ingress, no VSO) live
-one directory up in `deploy/k8s/`.
 
 ## Auth posture
 
