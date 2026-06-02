@@ -12,6 +12,10 @@ data/
 dist/
 build/
 *.egg-info/
+*.bak
+*.bak[0-9]*
+*.orig
+*.rej
 .env
 .coord/
 .remember/

@@ -153,7 +153,7 @@ Start with `docs/integrations/claude-code.md` if your team is primarily on Claud
 | `COORD_API_URL` | Base URL for the MCP stdio bridge and pre-push hook. Default: `http://127.0.0.1:8080` |
 | `COORD_SERVICE_URL` | Legacy alias for `COORD_API_URL`. Pre-push hook accepts both. |
 | `COORD_TOKEN` | Legacy alias for `COORD_AUTH_TOKEN` accepted by the pre-push hook. |
-| `COORD_REPO_ID` | Repo identifier (e.g. `amittell/bastionx`) attached to every claim from this repo (added in v0.3.0). Set automatically by `coord init` from `git remote get-url origin`. |
+| `COORD_REPO_ID` | Repo identifier (e.g. `example-org/example-app`) attached to every claim from this repo (added in v0.3.0). Set automatically by `coord init` from `git remote get-url origin`. |
 | `COORD_SESSION_ID` | Pin a stable session id across coord-mcp restarts (added in v0.5.0). Otherwise coord-mcp generates a fresh 16-char hex id at startup. |
 | `COORD_NO_UPDATE_CHECK` | Set truthy to silence the once-per-24h "update available" stderr line emitted by every `coord` CLI command. Default: unset |
 

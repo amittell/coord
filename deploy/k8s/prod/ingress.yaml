@@ -11,7 +11,7 @@ metadata:
 spec:
   ingressClassName: traefik
   rules:
-    - host: coord.kebabrack.lan
+    - host: coord.internal.example
       http:
         paths:
           - path: /

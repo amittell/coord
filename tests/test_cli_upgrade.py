@@ -303,12 +303,12 @@ def test_upgrade_codex_embeds_repo_id_when_known(tmp_path: Path) -> None:
     _seed_initialised_repo(tmp_path, tool="codex")
     # Add a fake origin so _detect_repo_id resolves.
     subprocess.run(
-        ["git", "remote", "add", "origin", "git@github.com:amittell/widgets.git"],
+        ["git", "remote", "add", "origin", "git@github.com:example-org/widgets.git"],
         cwd=tmp_path, check=True,
     )
     cli_upgrade.run_upgrade(_make_args(tmp_path))
     codex_cfg = (tmp_path / ".codex" / "config.toml").read_text(encoding="utf-8")
-    assert 'COORD_REPO_ID = "amittell/widgets"' in codex_cfg
+    assert 'COORD_REPO_ID = "example-org/widgets"' in codex_cfg
 
 
 def test_upgrade_skips_owners_yaml_even_if_force_flag_unused(tmp_path: Path) -> None:
