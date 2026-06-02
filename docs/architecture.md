@@ -52,6 +52,15 @@ The MCP server runs as a stdio process with `coord-mcp`. It proxies tool calls t
 
 This is the intended integration path for Claude Code, Codex CLI, and Cursor. You usually do not expose a separate remote MCP endpoint.
 
+#### Env resolution
+
+The wrapper reconciles two configuration sources at startup so committed MCP registrations can ship placeholder env values without breaking working setups:
+
+1. **Explicit env** from the MCP child process: shell exports, the `env` block inside `.mcp.json`, or the `[mcp_servers.coord.env]` block in Codex's config.
+2. **`<repo-root>/.coordination/local.env`**, auto-loaded by walking up from cwd until a match is found, restricted to a `COORD_*` allowlist.
+
+For each allowlisted variable: if the current value is unset or matches a documented placeholder (`set-me`, `example-org/example-repo`, `http://127.0.0.1:8080`), the wrapper overrides from `local.env`; otherwise the explicit value wins. The `Authorization` header is suppressed entirely when the resolved token is a placeholder, so the failure mode is a clean `401 Authorization required` rather than the server logging a forged-looking `Bearer set-me` line. The committed `.mcp.json` template can therefore live in a public repo carrying only the placeholders, with the real bearer token kept in the gitignored `.coordination/local.env`.
+
 ### Templates
 
 The `templates/` directory is the rollout kit for the application repo:

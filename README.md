@@ -99,6 +99,36 @@ curl -X POST http://127.0.0.1:8080/claims \
 - Local unauthenticated mode is possible, but only if you opt in with `COORD_ALLOW_INSECURE_NO_AUTH=true`.
 - `COORD_REPO_ROOT` is optional but strongly recommended when the service can access a checkout of the application repo, because overlap detection is more accurate with `git ls-files`.
 
+## Configuration & secrets
+
+`coord init` lays down two kinds of files in the application repo:
+
+1. **Tracked templates** committed to VCS with placeholder values. These tell every MCP client (Claude Code, Codex CLI, Cursor) how to spawn `coord-mcp` and tell agents the coordination protocol. They are safe to share publicly.
+2. **Gitignored runtime config** under `.coordination/` carrying the real bearer token and repo identifier. Never committed.
+
+| Path | Tracked? | What it carries |
+|------|----------|-----------------|
+| `.mcp.json` (Claude Code) | yes (template) | `command = "coord-mcp"` + an `env` block with placeholder `COORD_*` values |
+| `.codex/config.toml` (Codex CLI) | yes (template) | Codex equivalent of the above |
+| `.cursor/mcp.json` (Cursor) | yes (template) | Cursor equivalent of the above |
+| `CLAUDE.md` / `AGENTS.md` | yes | Protocol snippet inside a `coord:begin … coord:end` managed block |
+| `.gitignore` | yes | Managed block adds `/.coordination/` so step 2 stays untracked |
+| `.coordination/config.toml` | **no** (gitignored) | Per-repo coord settings: mode, service URL, ownership file path |
+| `.coordination/local.env` | **no** (gitignored) | Real `COORD_AUTH_TOKEN`, `COORD_API_URL`, `COORD_REPO_ID` |
+| `.coordination/owners.yaml` | **no** (gitignored) | Per-repo ownership rules; upload to the service via `POST /config/ownership` |
+| `.git/hooks/pre-push` | not in repo | Installed by `coord init`; sources `.coordination/local.env` before calling the API |
+
+`coord init` patches `.gitignore` with `/.coordination/` automatically, so the whole `.coordination/` directory is excluded from the moment it is created. No additional setup is required to keep secrets out of git history.
+
+### How the template + secret split works at runtime
+
+`coord-mcp` is spawned by the editor/CLI with whatever env the tracked MCP registration provides — usually the placeholder values `set-me`, `example-org/example-repo`, and `http://127.0.0.1:8080`. At startup the wrapper walks up from its working directory (like git looking for `.git/`) until it finds `.coordination/local.env`, then for each `COORD_*` allowlisted key:
+
+- if the variable is currently unset, **or** holds one of the documented placeholders, the wrapper overrides it from `local.env`;
+- if the variable already holds a real value (a shell export, or an inline env block in `.mcp.json` with a real token), the explicit value wins.
+
+`_headers()` also drops the `Authorization` header when the token is a documented placeholder, so a misconfigured client fails loud with a clean `401` instead of silently leaking a `Bearer set-me` request. The net effect: a tracked `.mcp.json` template can ship placeholder values to a public repo without breaking any working setup, and rotating credentials means editing one file (`.coordination/local.env`) rather than every per-tool MCP registration. See `docs/integrations/claude-code.md` and `docs/integrations/codex-cli.md` for the resolution order in tool-specific terms.
+
 ## Local Assets
 
 - `.env.example`: environment variable template

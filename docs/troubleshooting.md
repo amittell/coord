@@ -27,6 +27,44 @@ Fix:
 curl -H "Authorization: Bearer $COORD_AUTH_TOKEN" http://127.0.0.1:8080/claims
 ```
 
+## MCP tools return `401` from a known-good service
+
+Symptom: `coord` MCP tools (e.g. `list_claims`) return `401` even though `curl -H "Authorization: Bearer $COORD_AUTH_TOKEN" $COORD_API_URL/claims` from the same shell returns `200`.
+
+Cause: the MCP child process (`coord-mcp`) was spawned with placeholder env values from a sanitised `.mcp.json` (`COORD_AUTH_TOKEN=set-me`, `COORD_API_URL=http://127.0.0.1:8080`) and `.coordination/local.env` either does not exist or also carries the placeholder. The wrapper treats `set-me`, `example-org/example-repo`, and `http://127.0.0.1:8080` as "unset" for the purpose of overriding from `local.env` and for the `Authorization` header, so a setup with placeholders everywhere reaches the service with no `Authorization` at all.
+
+Confirm by simulating the loader against the affected repo:
+
+```bash
+cd /path/to/your-app
+COORD_AUTH_TOKEN=set-me python -c "
+import os
+from coordination.mcp_server import _load_local_env, _headers, _base_url
+print('loaded:', _load_local_env())
+print('url:   ', _base_url())
+print('auth:  ', _headers().get('Authorization', '<absent>')[:18])
+"
+```
+
+If `loaded:` is `None`, there is no `.coordination/local.env` for the wrapper to find. Run `coord init` to generate one, then drop the real token in:
+
+```bash
+coord init --tool claude --mode local --yes
+$EDITOR .coordination/local.env       # replace COORD_AUTH_TOKEN=set-me
+```
+
+If `loaded:` points at a real file but `auth:` is `<absent>`, the file carries the placeholder. Edit the same file and replace `COORD_AUTH_TOKEN=set-me` with the real token (`coord start` prints it; for a remote service ask the operator).
+
+Restart the editor/CLI so the next `coord-mcp` child picks up the change. The committed `.mcp.json` does not need to be edited; placeholders are the right value for that file.
+
+## MCP wrapper picks up the wrong service URL
+
+Symptom: MCP tools connect to `http://127.0.0.1:8080` even though the team's `COORD_API_URL` is the cluster URL.
+
+Cause: same as above. `.mcp.json` carries the placeholder `http://127.0.0.1:8080`, no `.coordination/local.env` exists, and no shell export overrides. The wrapper falls through to the built-in default.
+
+Fix: run `coord init --mode remote --service-url <real-url>` or hand-edit `.coordination/local.env` to set `COORD_API_URL` and restart the editor.
+
 ## Ownership upload fails
 
 Cause: the YAML shape is invalid.

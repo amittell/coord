@@ -73,14 +73,29 @@ coord doctor
 
 That command sequence will:
 
-1. create `.coordination/config.toml`
-2. create `.coordination/local.env`
-3. create `.coordination/owners.yaml`
-4. patch `.mcp.json` or the selected tool config
-5. patch `CLAUDE.md` or `AGENTS.md`
-6. install a pre-push hook
+1. create `.coordination/config.toml` (gitignored)
+2. create `.coordination/local.env` (gitignored, holds the bearer token)
+3. create `.coordination/owners.yaml` (gitignored)
+4. patch `.mcp.json` or the selected tool config (tracked template, ships with placeholder env values)
+5. patch `CLAUDE.md` or `AGENTS.md` (tracked, protocol snippet inside a managed block)
+6. install a pre-push hook at `.git/hooks/pre-push`
+7. patch `.gitignore` with `/.coordination/` (tracked)
 
 If you prefer manual rollout, the template inventory still lives in `../templates/README.md`.
+
+### Configuration & secrets
+
+The split between tracked templates and the gitignored `.coordination/` directory is deliberate: the MCP registration files (`.mcp.json`, `.codex/config.toml`, `.cursor/mcp.json`) are committed with placeholder env values (`COORD_AUTH_TOKEN=set-me`, `COORD_REPO_ID=example-org/example-repo`, `COORD_API_URL=http://127.0.0.1:8080`) so the shape is visible to every contributor and so a public-facing repo can ship the template without leaking credentials. The real values live only in `.coordination/local.env`.
+
+`coord-mcp` reconciles the two at startup: it walks up from its working directory looking for `.coordination/local.env`, and for each `COORD_*` allowlisted variable overrides any unset or placeholder value with what the file carries. Real values supplied via shell exports or via a non-placeholder env block in `.mcp.json` are preserved (explicit > file > built-in defaults). The `Authorization` header is also dropped when the token is a documented placeholder, so a misconfigured setup yields a clean `401` rather than `Bearer set-me`.
+
+Operational implications:
+
+- rotating the bearer token = edit `.coordination/local.env` in every coordinated repo; the committed MCP configs do not need to change.
+- a stale tracked `.mcp.json` (e.g. one regenerated against a sanitised template) does not require a `coord init --force` to recover; `coord-mcp` will fall through to `local.env`.
+- the pre-push hook sources `.coordination/local.env` directly via shell, independent of the MCP wrapper, so it is unaffected by editor/CLI restarts.
+
+See `docs/integrations/claude-code.md` and `docs/integrations/codex-cli.md` for the resolution order in tool-specific terms.
 
 ## Step 5: Use session-scoped engineer names
 

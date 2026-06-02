@@ -64,9 +64,14 @@ Expected result: `has_conflicts: true` while the first claim is active.
 In a second shell:
 
 ```bash
+coord-mcp
+```
+
+`coord-mcp` walks up from cwd to find `<repo-root>/.coordination/local.env` (written by `coord init`) and loads `COORD_API_URL` and `COORD_AUTH_TOKEN` from it. Explicit env beats the file, so the manual exports below are only needed when running `coord-mcp` outside an initialised repo or when overriding for a one-off test:
+
+```bash
 export COORD_API_URL=http://127.0.0.1:8080
-# COORD_AUTH_TOKEN should already be set from step 1; otherwise:
-#   export COORD_AUTH_TOKEN="$(cut -d= -f2 /path/to/your-app/.coordination/local.env)"
+export COORD_AUTH_TOKEN="$(cut -d= -f2 /path/to/your-app/.coordination/local.env)"
 coord-mcp
 ```
 

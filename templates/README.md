@@ -18,7 +18,16 @@ For step-by-step rollout guidance, see `../docs/getting-started.md` plus the too
 | `github-coordination-semantic.yml` | Copy to `.github/workflows/coordination-semantic.yml` (PR + merge-group CI template) |
 | `MERGE_QUEUE.md` | Notes for merge queue + stacked PR workflow |
 
-Set environment variables:
+## Set environment variables
+
+The `.example` MCP wirings (`.mcp.json.example`, `.codex/config.toml.example`, `.cursor/mcp.json.example`) are tracked templates with placeholder values (`COORD_AUTH_TOKEN=set-me`, `COORD_API_URL=http://127.0.0.1:8080`, `COORD_REPO_ID=example-org/example-repo`). They are designed to be committed to a public application repo without leaking secrets.
+
+`coord-mcp` auto-loads `.coordination/local.env` at startup and treats those three strings as "unset", so the real credentials live only in `.coordination/local.env` (which `coord init` writes and `/.coordination/` is added to `.gitignore`):
 
 - `COORD_TOKEN` / `COORD_AUTH_TOKEN` (depending on tool): bearer token for the coordination API
 - `COORD_SERVICE_URL` / `COORD_API_URL`: base URL of the deployed coordination service
+- `COORD_REPO_ID`: repo identifier (e.g. `your-org/your-app`) attached to every claim from this repo
+
+If you want a one-off shell override (e.g. while pointing at a staging service from a tracked checkout), `export`ing the variable in the same shell that launches the editor/CLI still wins; the wrapper only fills in unset or placeholder values.
+
+See the root `README.md` "Configuration & secrets" section for the full tracked-vs-gitignored model and `docs/architecture.md` for the resolution order.

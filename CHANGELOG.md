@@ -9,7 +9,10 @@ Semantic Versioning.
 
 ### Added
 
-- (none recorded yet)
+- `coord-mcp` auto-loads `<repo-root>/.coordination/local.env` at startup, walking up from cwd like git looking for `.git/`. Restricted to a `COORD_*` allowlist so an unrelated env line in the file can't mutate the wrapper. Explicit env (shell exports, `.mcp.json` env block, codex `[mcp_servers.coord.env]`) still wins -- the file only fills in unset variables and overrides documented placeholders (`set-me`, `example-org/example-repo`, `http://127.0.0.1:8080`). This makes the committed-template + gitignored-secret pattern work hands-off: a tracked `.mcp.json` can ship placeholder values to a public repo and the wrapper recovers the real values from `.coordination/local.env` (which `coord init` already gitignores).
+- `_headers()` skips the `Authorization` header entirely when the resolved token is a documented placeholder, so a misconfigured setup yields a clean `401 Authorization required` instead of a `Bearer set-me` request that looks malicious in server logs.
+- `tests/test_deploy_overlay.py` guards against two sanitisation hazards: `deploy/k8s/prod/` (the live Argo overlay) must NOT carry `YOUR_CLUSTER` / `coord.internal.example` / `set-me` placeholders, and the tracked `.mcp.json` must NOT carry a real-looking 40+ char hex token. Parametrised over every yaml in the overlay; 10 cases total.
+- Documentation sweep: README has a new `Configuration & secrets` section with a tracked-vs-gitignored table and the runtime resolution model; `docs/getting-started.md` annotates Step 4 file list and adds a `Configuration & secrets` subsection; `docs/architecture.md` has a new `Env resolution` subsection under MCP bridge; `docs/troubleshooting.md` has new `MCP tools return 401 from a known-good service` and `MCP wrapper picks up the wrong service URL` entries with a copy-pasteable diagnostic command; `docs/integrations/{claude-code,codex-cli}.md` document the resolution order in tool-specific terms; `templates/README.md` calls out that the `.example` MCP wirings are placeholder templates and points at `local.env` for real credentials.
 
 ### Changed
 
@@ -17,7 +20,7 @@ Semantic Versioning.
 
 ### Fixed
 
-- (none recorded yet)
+- **Deploy overlay placeholder regression.** A prior "public readiness" sanitisation sweep had replaced `secret/apps/k8s/coord` with `apps/YOUR_CLUSTER/coord` in `deploy/k8s/prod/vaultstaticsecret-{auth,ghcr}.yaml`, leaving the live `coord-auth` and `ghcr-pull` Secrets unable to refresh against Vault (`VaultStaticSecret` status: `empty response from Vault, path="secret/data/apps/YOUR_CLUSTER/coord"`). The kebabrack `coord` pod kept serving on stale cached Secret data, but the placeholder also propagated into `.mcp.json` env blocks across repos, leading to `401`s from MCP clients once their wrappers were spawned with the sanitised values. Restored the real Vault path in both manifests; the new `tests/test_deploy_overlay.py` guard prevents the same sweep from breaking prod again. The companion ingress-host restore landed earlier in `f7851d1`.
 
 ## [0.13.0] - 2026-05-06
 
