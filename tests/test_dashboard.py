@@ -545,7 +545,7 @@ async def test_dashboard_renders_repos_panel(svc: CoordinationService) -> None:
     async with aiosqlite.connect(svc.db.path) as conn:
         await conn.execute(
             "UPDATE claims SET repo = ? WHERE engineer = 'alice'",
-            ("amittell/bastionx",),
+            ("example-org/bastionx",),
         )
         await conn.commit()
 
@@ -570,7 +570,7 @@ async def test_dashboard_renders_repos_panel(svc: CoordinationService) -> None:
     # The next panel is "top modules · 24h"; use that as the slice end.
     repos_end = html_out.lower().index("top modules", repos_start)
     section = html_out[repos_start:repos_end]
-    assert "amittell/bastionx" in section
+    assert "example-org/bastionx" in section
     assert "amittell/coord" in section
 
 

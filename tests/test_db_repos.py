@@ -109,7 +109,7 @@ async def test_list_repos_aggregates_per_repo_stats(tmp_path: Path) -> None:
             db,
             engineer=eng,
             pattern=pat,
-            repo="amittell/bastionx",
+            repo="example-org/bastionx",
             created_at=fresh,
             expires_at=expired,
         )
@@ -137,10 +137,10 @@ async def test_list_repos_aggregates_per_repo_stats(tmp_path: Path) -> None:
     repos = await db.list_repos(window_hours=24, now=now)
 
     by_name = {r["repo"]: r for r in repos}
-    assert "amittell/bastionx" in by_name
+    assert "example-org/bastionx" in by_name
     assert "amittell/coord" in by_name
 
-    bx = by_name["amittell/bastionx"]
+    bx = by_name["example-org/bastionx"]
     assert bx["claims_24h"] == 3
     assert bx["engineers_24h"] == 2
 
@@ -160,7 +160,7 @@ async def test_list_repos_excludes_old_activity_from_window(tmp_path: Path) -> N
         db,
         engineer="alice",
         pattern="src/old.py",
-        repo="amittell/ancient",
+        repo="example-org/ancient",
         created_at=very_old,
         expires_at=very_old,
     )
@@ -169,8 +169,8 @@ async def test_list_repos_excludes_old_activity_from_window(tmp_path: Path) -> N
     by_name = {r["repo"]: r for r in repos}
     # Old repo must still be listed (the user wants visibility) but with
     # zero counts inside the window.
-    assert "amittell/ancient" in by_name
-    assert by_name["amittell/ancient"]["claims_24h"] == 0
+    assert "example-org/ancient" in by_name
+    assert by_name["example-org/ancient"]["claims_24h"] == 0
 
 
 async def test_list_repos_reports_last_activity_timestamp(tmp_path: Path) -> None:
@@ -186,7 +186,7 @@ async def test_list_repos_reports_last_activity_timestamp(tmp_path: Path) -> Non
         db,
         engineer="alice",
         pattern="src/a.py",
-        repo="amittell/x",
+        repo="example-org/x",
         created_at=older,
         expires_at=expired,
     )
@@ -194,14 +194,14 @@ async def test_list_repos_reports_last_activity_timestamp(tmp_path: Path) -> Non
         db,
         engineer="alice",
         pattern="src/b.py",
-        repo="amittell/x",
+        repo="example-org/x",
         created_at=newer,
         expires_at=expired,
     )
 
     repos = await db.list_repos(window_hours=24, now=now)
     by_name = {r["repo"]: r for r in repos}
-    assert by_name["amittell/x"]["last_activity"] == newer
+    assert by_name["example-org/x"]["last_activity"] == newer
 
 
 async def test_list_repos_active_claim_count_excludes_released(tmp_path: Path) -> None:
@@ -218,7 +218,7 @@ async def test_list_repos_active_claim_count_excludes_released(tmp_path: Path) -
         db,
         engineer="alice",
         pattern="src/active.py",
-        repo="amittell/y",
+        repo="example-org/y",
         created_at=fresh,
         expires_at=expires,
     )
@@ -226,7 +226,7 @@ async def test_list_repos_active_claim_count_excludes_released(tmp_path: Path) -
         db,
         engineer="bob",
         pattern="src/released.py",
-        repo="amittell/y",
+        repo="example-org/y",
         created_at=fresh,
         expires_at=expires,
         released_at=released,
@@ -235,11 +235,11 @@ async def test_list_repos_active_claim_count_excludes_released(tmp_path: Path) -
         db,
         engineer="bob",
         pattern="src/expired.py",
-        repo="amittell/y",
+        repo="example-org/y",
         created_at=_iso(now - timedelta(hours=10)),
         expires_at=_iso(now - timedelta(hours=5)),
     )
 
     repos = await db.list_repos(window_hours=24, now=now)
     by_name = {r["repo"]: r for r in repos}
-    assert by_name["amittell/y"]["active_claims"] == 1
+    assert by_name["example-org/y"]["active_claims"] == 1

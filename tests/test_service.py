@@ -359,7 +359,7 @@ async def test_create_claims_does_not_conflict_across_repos(
     result = await repo_service.create_claims(
         CreateClaimsRequest(
             engineer="alice",
-            repo="amittell/astrowars",
+            repo="example-org/astrowars",
             claims=[ClaimItem(type="module", pattern="client/js/**")],
         )
     )
@@ -414,7 +414,7 @@ async def test_create_claims_null_repo_isolated_from_repo_tagged(
     result = await repo_service.create_claims(
         CreateClaimsRequest(
             engineer="alice",
-            repo="amittell/astrowars",
+            repo="example-org/astrowars",
             claims=[ClaimItem(type="module", pattern="client/js/**")],
         )
     )
@@ -467,7 +467,7 @@ async def test_check_conflicts_filters_by_repo(
     resp = await repo_service.check_conflicts(
         patterns=["client/js/**"],
         engineer="alice",
-        repo="amittell/astrowars",
+        repo="example-org/astrowars",
     )
     assert resp.has_conflicts is False
     assert resp.conflicts == []
@@ -546,14 +546,14 @@ async def test_create_claims_self_excludes_same_session_different_engineer(
         branch=None,
         description=None,
         items=[("cid_sess1", "module", "server/**", "soft", "2099-01-01T00:00:00Z")],
-        repo="amittell/astrowars",
+        repo="example-org/astrowars",
         session_id="sess-a-1234",
     )
 
     result = await repo_service.create_claims(
         CreateClaimsRequest(
             engineer="codex-shared-review",
-            repo="amittell/astrowars",
+            repo="example-org/astrowars",
             session_id="sess-a-1234",
             claims=[ClaimItem(type="module", pattern="server/**")],
         )
@@ -579,14 +579,14 @@ async def test_create_claims_still_conflicts_across_different_sessions(
         branch=None,
         description=None,
         items=[("cid_sess2a", "module", "server/**", "soft", "2099-01-01T00:00:00Z")],
-        repo="amittell/astrowars",
+        repo="example-org/astrowars",
         session_id="sess-a",
     )
 
     result = await repo_service.create_claims(
         CreateClaimsRequest(
             engineer="codex-render",
-            repo="amittell/astrowars",
+            repo="example-org/astrowars",
             session_id="sess-b",
             claims=[ClaimItem(type="module", pattern="server/**")],
         )

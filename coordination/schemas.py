@@ -18,7 +18,7 @@ class CreateClaimsRequest(BaseModel):
         default=None,
         description=(
             "Identifier for the repo this claim came from "
-            "(e.g. 'amittell/bastionx'). Optional for backward compat; "
+            "(e.g. 'example-org/example-app'). Optional for backward compat; "
             "supplied automatically by coord-mcp when set in the repo's config."
         ),
     )
