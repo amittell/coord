@@ -607,6 +607,7 @@ async def render_dashboard() -> str:
     repos = await svc.db.list_repos()
     idle_timeout_sec = svc.settings.idle_timeout_sec
     requests = await svc.list_requests(limit=200)
+    auto_resolutions = await svc.db.count_auto_resolutions_since(window_hours=24)
 
     claims_by_id: dict[str, dict[str, Any]] = {
         str(c["id"]): c for c in recent if c.get("id")
@@ -670,6 +671,12 @@ async def render_dashboard() -> str:
         top_modules_html = "<li class='empty'>no activity in the last 24h</li>"
 
     # ---- active claims ---------------------------------------------------
+    # Note: v0.14.1 added a per-row Database.get_claim_symbols call so
+    # symbol-scope claims can render their symbol list inline. This is
+    # an N+1 query against claim_symbols; acceptable on the dashboard
+    # because the active-claims set is small (typically << 100 rows) and
+    # the page is an operator surface, not a hot path. If the row count
+    # ever explodes we'll batch this into a single IN-clause fetch.
     if rows:
         rows_html = ""
         for r in rows:
@@ -686,11 +693,36 @@ async def render_dashboard() -> str:
             )
             rem = _remaining(r.get("expires_at"))
             rem_class = "muted" if rem == "expired" else ""
+
+            scope_type = (r.get("scope_type") or "file").lower()
+            if scope_type == "symbol":
+                claim_id = r.get("id")
+                symbol_names: list[str] = []
+                if claim_id:
+                    sym_rows = await svc.db.get_claim_symbols(str(claim_id))
+                    symbol_names = [
+                        str(s.get("symbol_name") or "")
+                        for s in sym_rows
+                        if s.get("symbol_name")
+                    ]
+                if symbol_names:
+                    symbols_inline = ", ".join(_esc(n) for n in symbol_names)
+                    scope_cell = (
+                        "<td>symbol"
+                        f"<br><em class='symbols' style='font-size:11px;color:var(--muted)'>"
+                        f"{symbols_inline}</em></td>"
+                    )
+                else:
+                    scope_cell = "<td>symbol</td>"
+            else:
+                scope_cell = "<td class='muted'>file</td>"
+
             rows_html += (
                 "<tr>"
                 f"<td>{_esc(r.get('engineer'))}</td>"
                 f"<td>{_esc(r.get('repo')) or '<span class=muted>—</span>'}</td>"
                 f"<td><span class='pattern'>{_esc(r.get('pattern'))}</span></td>"
+                f"{scope_cell}"
                 f"<td class='muted'>{_esc(r.get('description'))}</td>"
                 f"<td class='{rem_class}'>{_esc(rem)}</td>"
                 f"<td>{sev_html}</td>"
@@ -699,7 +731,7 @@ async def render_dashboard() -> str:
             )
     else:
         rows_html = (
-            "<tr><td class='empty' colspan='7'>no active claims</td></tr>"
+            "<tr><td class='empty' colspan='8'>no active claims</td></tr>"
         )
 
     # ---- module heatmap (full unicode block bar) -------------------------
@@ -849,6 +881,44 @@ async def render_dashboard() -> str:
             "<tr><td class='empty' colspan='6'>no claim history yet</td></tr>"
         )
 
+    # ---- auto-resolutions panel (v0.14.1) -------------------------------
+    # Surface the count of server-side auto-resolutions (auto-coexist and
+    # auto-narrow) over the last 24 hours. These are decisions the
+    # conflict engine took on its own when symbol sets were disjoint or
+    # when a symbol requester landed on a narrowable file claim -- the
+    # holder doesn't get blocked and no request is filed. Operators want
+    # visibility into the volume so they can spot churn or
+    # mis-configurations. See docs/design/sub-file-claims.md, "State
+    # machine deltas".
+    ac = int(auto_resolutions.get("auto_coexist", 0))
+    an = int(auto_resolutions.get("auto_narrow", 0))
+    auto_total = ac + an
+    auto_resolutions_html = (
+        '<section class="panel">'
+        '<header><h2>auto-resolutions (24h)</h2>'
+        f'<span class="meta">{auto_total} total</span></header>'
+        '<div style="padding:calc(var(--grid) * 2);'
+        'display:flex;gap:calc(var(--grid) * 4);align-items:baseline;flex-wrap:wrap">'
+        f'<span style="font-size:32px;color:var(--phosphor);'
+        f'font-variant-numeric:tabular-nums">{auto_total}</span>'
+        f'<span class="muted" style="font-size:12px">'
+        f'<strong style="color:var(--cyan)">{ac}</strong> coexist · '
+        f'<strong style="color:var(--phosphor)">{an}</strong> narrow'
+        '</span>'
+        '<span class="muted" style="font-size:11px;letter-spacing:0.04em;'
+        'margin-left:auto;max-width:60ch;line-height:1.5">'
+        '<strong>auto-coexist</strong>: server granted both symbol claims '
+        'because their symbol sets did not intersect. '
+        '<strong>auto-narrow</strong>: symbol requester was granted alongside '
+        'an existing narrowable file claim. '
+        '<a href="https://github.com/amittell/coord/blob/main/docs/design/'
+        'sub-file-claims.md#state-machine-deltas" '
+        'style="color:var(--cyan)">design notes</a>.'
+        '</span>'
+        '</div>'
+        '</section>'
+    )
+
     # ---- compose page ----------------------------------------------------
     from coordination import __version__
 
@@ -883,6 +953,8 @@ async def render_dashboard() -> str:
       {stats_html}
     </div>
 
+    {auto_resolutions_html}
+
     <div class="row split-7-5">
       <section class="panel">
         <header><h2>repositories</h2><span class="meta">{len(repos)} total</span></header>
@@ -914,6 +986,7 @@ async def render_dashboard() -> str:
             <th>engineer</th>
             <th>repo</th>
             <th>pattern</th>
+            <th>scope</th>
             <th>description</th>
             <th>time left</th>
             <th>severity</th>

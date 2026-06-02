@@ -883,3 +883,87 @@ async def test_dashboard_renders_coexist_decision_pill(
     end = html_out.lower().index("claim timeline")
     panel = html_out[start:end]
     assert 'class="pill coexist"' in panel
+
+
+# ---------------------------------------------------------------------------
+# v0.14.1: scope column + auto-resolutions panel
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dashboard_active_claims_show_symbol_names_for_symbol_scope(
+    svc: CoordinationService,
+) -> None:
+    """v0.14.1: the active-claims table gained a `scope` column. For
+    symbol-scope claims, the symbol names render inline so an operator
+    can tell which parts of a file are locked without a round trip to
+    the API."""
+    import aiosqlite
+    from uuid import uuid4
+
+    cid = await _insert_claim(
+        svc, engineer="alice", pattern="src/auth/login.ts"
+    )
+    # Flip the claim to symbol scope and seed two symbols. The DB layer
+    # tolerates this composition: scope_type lives on claims, the symbol
+    # list lives on claim_symbols.
+    async with aiosqlite.connect(svc.db.path) as conn:
+        await conn.execute(
+            "UPDATE claims SET scope_type = 'symbol' WHERE id = ?", (cid,)
+        )
+        await conn.commit()
+    await svc.db.insert_claim_symbols(
+        rows=[
+            (str(uuid4()), cid, "src/auth/login.ts", "handleLogin", "function"),
+            (str(uuid4()), cid, "src/auth/login.ts", "validateCredentials", "function"),
+        ]
+    )
+
+    html_out = await render_dashboard()
+    # Slice to the active-claims panel so a symbol-named token in
+    # another section can't accidentally satisfy the assertion.
+    start = html_out.lower().index("active claims")
+    end = html_out.lower().index("module heatmap")
+    panel = html_out[start:end]
+    assert "handleLogin" in panel
+    assert "validateCredentials" in panel
+    # The scope cell labels the row as a symbol claim.
+    assert "symbol" in panel
+
+
+@pytest.mark.asyncio
+async def test_dashboard_renders_auto_resolutions_panel_with_counts(
+    svc: CoordinationService,
+) -> None:
+    """v0.14.1: a top-of-page panel surfaces the rolling 24h count of
+    server-side auto-resolutions, broken out by `auto-coexist` and
+    `auto-narrow`. Numbers come from
+    Database.count_auto_resolutions_since(window_hours=24)."""
+    # Two auto-coexist events and one auto-narrow event, all inside the
+    # 24h window since record_request_event stamps created_at = now.
+    await svc.db.record_request_event(
+        "auto-coexist", actor_engineer="bob", detail={"holder_claim_id": "x"}
+    )
+    await svc.db.record_request_event(
+        "auto-coexist", actor_engineer="bob", detail={"holder_claim_id": "y"}
+    )
+    await svc.db.record_request_event(
+        "auto-narrow", actor_engineer="bob", detail={"holder_claim_id": "z"}
+    )
+
+    html_out = await render_dashboard()
+    # Panel header is lowercase per the dashboard aesthetic.
+    assert "auto-resolutions (24h)" in html_out.lower()
+
+    start = html_out.lower().index("auto-resolutions (24h)")
+    # The panel ends before the repos panel header.
+    end = html_out.lower().index("repositories", start)
+    panel = html_out[start:end]
+    # Breakdown text shows 2 coexist + 1 narrow.
+    assert ">2</strong> coexist" in panel
+    assert ">1</strong> narrow" in panel
+    # Sum (3) is shown as a headline number.
+    assert ">3<" in panel
+    # Legend / link to the design doc is present so operators know what
+    # the two decisions mean.
+    assert "sub-file-claims.md" in panel

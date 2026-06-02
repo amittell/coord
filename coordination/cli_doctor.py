@@ -31,6 +31,11 @@ class CheckResult:
     ok: bool
     detail: str = ""
     hint: str = ""
+    # ``level`` distinguishes a soft warning (regex fallback because the
+    # native tree-sitter wheel is not installed) from a hard failure. Only
+    # checks that explicitly set ``level='warn'`` participate; everything
+    # else continues to use the boolean ok / fail contract unchanged.
+    level: str = "fail"
 
 
 def _load_token(repo_root: Path, config: RepoConfig) -> str:
@@ -448,9 +453,89 @@ def _check_server_version(config: RepoConfig, client_version: str) -> CheckResul
     )
 
 
+def _check_symbol_parser_backend() -> CheckResult:
+    """Verify which backend ``coord-mcp`` would resolve for each registered
+    sub-file-claim file extension.
+
+    Three outcomes:
+
+    - **OK** -- every supported extension resolves to a tree-sitter backend.
+    - **WARN** -- one or more extensions fall back to regex. The parser still
+      works (regex is the documented fallback) but operators may want to
+      install the native wheels via the ``symbols`` extra for stricter
+      parsing.
+    - **FAIL** -- ``COORD_SYMBOL_PARSER=treesitter`` is set in the
+      environment and at least one extension has no native backend
+      installed. In treesitter-only mode this would crash
+      :func:`coordination.symbols.extract_symbols` at call time, so we
+      surface it as a hard failure.
+    """
+    import os as _os
+
+    from coordination.symbols import probe_backend, supported_extensions
+
+    pref = _os.environ.get("COORD_SYMBOL_PARSER", "auto").strip().lower() or "auto"
+    if pref not in {"treesitter", "regex", "auto"}:
+        pref = "auto"
+
+    fallbacks: list[str] = []
+    missing: list[str] = []
+    for ext in sorted(supported_extensions()):
+        status, _detail = probe_backend(ext)
+        if status == "treesitter":
+            continue
+        if status == "regex":
+            fallbacks.append(ext)
+        else:
+            missing.append(ext)
+
+    label = "symbol parser backend"
+
+    if missing:
+        return CheckResult(
+            label,
+            ok=False,
+            detail=(
+                f"COORD_SYMBOL_PARSER={pref} but no native backend for: "
+                f"{', '.join(missing)}"
+            ),
+            hint=(
+                "Install the 'symbols' extra (pip install "
+                "'multi-agent-coordination[symbols]') or unset "
+                "COORD_SYMBOL_PARSER to fall back to regex."
+            ),
+        )
+
+    if fallbacks:
+        return CheckResult(
+            label,
+            ok=False,
+            level="warn",
+            detail=(
+                f"COORD_SYMBOL_PARSER={pref}; regex fallback for: "
+                f"{', '.join(fallbacks)}"
+            ),
+            hint=(
+                "Install the 'symbols' extra (pip install "
+                "'multi-agent-coordination[symbols]') for stricter parsing."
+            ),
+        )
+
+    return CheckResult(
+        label,
+        ok=True,
+        detail=f"COORD_SYMBOL_PARSER={pref}; tree-sitter for all extensions",
+    )
+
+
 def _print_results(results: list[CheckResult]) -> None:
     for result in results:
-        status = "OK" if result.ok else "FAIL"
+        if result.ok:
+            status = "OK"
+        elif result.level == "warn":
+            status = "WARN"
+        else:
+            status = "FAIL"
         detail = f" ({result.detail})" if result.detail else ""
         print(f"{status}  {result.label}{detail}")
         if not result.ok and result.hint:
@@ -539,6 +624,15 @@ def run_doctor(args) -> int:
     if version_result is not None:
         results.append(version_result)
 
+    # v0.15: sub-file claims are now stable, so doctor surfaces which
+    # parser backend will handle each registered extension. Regex fallback
+    # is a warning (parser still works); treesitter-only mode with a
+    # missing grammar is a hard fail.
+    results.append(_check_symbol_parser_backend())
+
     _print_results(results)
-    return 0 if all(r.ok for r in results) else 1
+    # warn-level results don't sink the overall exit code -- they're
+    # informational (e.g. tree-sitter not installed so the parser falls
+    # back to regex). Only hard failures flip the exit code.
+    return 0 if all(r.ok or r.level == "warn" for r in results) else 1
 

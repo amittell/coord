@@ -30,7 +30,7 @@ import os
 from dataclasses import dataclass
 from typing import Callable
 
-__all__ = ["Symbol", "extract_symbols"]
+__all__ = ["Symbol", "extract_symbols", "probe_backend", "supported_extensions"]
 
 
 @dataclass(frozen=True)
@@ -48,8 +48,23 @@ class Symbol:
     end_line: int
 
 
-# Backend = Callable[[str], list[Symbol]]
-_TS_EXTENSIONS = {".ts", ".tsx"}
+Backend = Callable[[str], list[Symbol]]
+
+
+# Registry: extension (with leading dot, lowercase) -> (language_label,
+# treesitter_module_name, regex_module_name). Each backend module exposes
+# a module-level ``extract(content: str) -> list[Symbol]`` function. The
+# dispatcher imports lazily so a missing optional grammar (e.g.
+# tree_sitter_python) only affects callers that target that language.
+#
+# v0.14: TypeScript only.
+# v0.15: Python (.py) and Go (.go) added.
+_BACKENDS: dict[str, tuple[str, str, str]] = {
+    ".ts": ("typescript", "ts_treesitter", "ts_regex"),
+    ".tsx": ("typescript", "ts_treesitter", "ts_regex"),
+    ".py": ("python", "py_treesitter", "py_regex"),
+    ".go": ("go", "go_treesitter", "go_regex"),
+}
 
 # Per-process memoisation. Key: (file_path, sha256 hex of content).
 _CACHE: dict[tuple[str, str], list[Symbol]] = {}
@@ -59,39 +74,118 @@ def _content_digest(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-def _select_ts_backend() -> Callable[[str], list[Symbol]]:
-    """Return the TypeScript backend honouring ``COORD_SYMBOL_PARSER``."""
+def supported_extensions() -> frozenset[str]:
+    """Return the set of file extensions (with leading dot) the dispatcher
+    knows how to parse. Useful for doctor checks and for callers that want
+    to short-circuit before stat'ing a file."""
+
+    return frozenset(_BACKENDS.keys())
+
+
+def _import_backend(module_name: str) -> Backend | None:
+    """Import a backend module from this package; return its ``extract``
+    callable or ``None`` if the module / its native dependency is missing.
+    The caller decides how to react to ``None`` (auto mode falls back,
+    treesitter mode raises)."""
+
+    try:
+        module = __import__(
+            f"coordination.symbols.{module_name}",
+            fromlist=["extract"],
+        )
+    except ImportError:
+        return None
+    extract = getattr(module, "extract", None)
+    if not callable(extract):
+        return None
+    return extract
+
+
+def _select_backend(extension: str) -> Backend | None:
+    """Resolve a backend for ``extension`` honouring ``COORD_SYMBOL_PARSER``.
+
+    Returns ``None`` when the extension has no registered backend.
+    Raises :class:`RuntimeError` only in ``treesitter`` mode when the
+    native grammar is missing (consistent with the v0.14 contract).
+    """
+
+    if extension not in _BACKENDS:
+        return None
+    _, treesitter_mod, regex_mod = _BACKENDS[extension]
 
     preference = os.environ.get("COORD_SYMBOL_PARSER", "auto").strip().lower()
     if preference not in {"treesitter", "regex", "auto"}:
-        # Unknown value -- fall back to auto rather than crash. The doctor
-        # surface is the right place to enforce strict validation.
         preference = "auto"
 
     if preference == "regex":
-        from . import ts_regex
-
-        return ts_regex.extract
+        return _import_backend(regex_mod)
 
     if preference == "treesitter":
-        # Hard failure surfaces as RuntimeError so misconfiguration is loud.
-        try:
-            from . import ts_treesitter
-        except ImportError as exc:  # pragma: no cover - exercised via env var
+        backend = _import_backend(treesitter_mod)
+        if backend is None:
             raise RuntimeError(
-                "COORD_SYMBOL_PARSER=treesitter but tree_sitter is not "
-                "installed; install the 'symbols' extra or unset the var."
-            ) from exc
-        return ts_treesitter.extract
+                f"COORD_SYMBOL_PARSER=treesitter but {treesitter_mod} is "
+                "not importable; install the 'symbols' extra or unset the var."
+            )
+        return backend
 
-    # auto: prefer tree-sitter, silently fall back to regex.
-    try:
-        from . import ts_treesitter
-    except ImportError:
-        from . import ts_regex
+    # auto: prefer tree-sitter, fall back to regex silently.
+    backend = _import_backend(treesitter_mod)
+    if backend is not None:
+        return backend
+    return _import_backend(regex_mod)
 
-        return ts_regex.extract
-    return ts_treesitter.extract
+
+def probe_backend(extension: str) -> tuple[str, str]:
+    """Resolve which backend would handle ``extension`` right now and why.
+
+    Returns a ``(status, detail)`` tuple where ``status`` is one of:
+
+    - ``"treesitter"`` -- the native tree-sitter backend imports cleanly and
+      will be used (in ``auto`` or ``treesitter`` mode).
+    - ``"regex"`` -- the regex fallback is what callers would get, either
+      because ``COORD_SYMBOL_PARSER=regex`` is set or because the tree-sitter
+      grammar is not importable on this machine.
+    - ``"none"`` -- the extension is not registered, or no backend resolved
+      (e.g. ``COORD_SYMBOL_PARSER=treesitter`` is set and the grammar is
+      missing -- in that case ``detail`` carries the import error message).
+
+    ``detail`` is a short human-readable explanation suitable for surfacing
+    in ``coord doctor`` output. The function never raises; the
+    ``treesitter``-mode RuntimeError that :func:`extract_symbols` would
+    propagate is caught here and reported as ``status='none'`` so doctor can
+    classify it as a hard failure instead of crashing.
+    """
+
+    if extension not in _BACKENDS:
+        return ("none", f"no backend registered for {extension}")
+    _, treesitter_mod, regex_mod = _BACKENDS[extension]
+
+    preference = os.environ.get("COORD_SYMBOL_PARSER", "auto").strip().lower()
+    if preference not in {"treesitter", "regex", "auto"}:
+        preference = "auto"
+
+    if preference == "regex":
+        backend = _import_backend(regex_mod)
+        if backend is not None:
+            return ("regex", "forced via COORD_SYMBOL_PARSER=regex")
+        return ("none", f"regex backend {regex_mod} not importable")
+
+    if preference == "treesitter":
+        backend = _import_backend(treesitter_mod)
+        if backend is not None:
+            return ("treesitter", "ok")
+        return (
+            "none",
+            f"COORD_SYMBOL_PARSER=treesitter but {treesitter_mod} not installed",
+        )
+
+    # auto
+    if _import_backend(treesitter_mod) is not None:
+        return ("treesitter", "ok")
+    if _import_backend(regex_mod) is not None:
+        return ("regex", f"fallback: {treesitter_mod} not installed")
+    return ("none", f"neither {treesitter_mod} nor {regex_mod} importable")
 
 
 def extract_symbols(file_path: str, content: str) -> list[Symbol]:
@@ -107,16 +201,10 @@ def extract_symbols(file_path: str, content: str) -> list[Symbol]:
         return cached
 
     _, dot, ext = file_path.rpartition(".")
-    if dot:
-        suffix = "." + ext.lower()
-    else:
-        suffix = ""
+    suffix = "." + ext.lower() if dot else ""
 
-    if suffix in _TS_EXTENSIONS:
-        backend = _select_ts_backend()
-        result = backend(content)
-    else:
-        result = []
+    backend = _select_backend(suffix)
+    result = backend(content) if backend is not None else []
 
     _CACHE[cache_key] = result
     return result

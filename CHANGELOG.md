@@ -7,17 +7,39 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+(none recorded yet)
+
+## [0.15.0] - 2026-06-02
+
 ### Added
 
-- **Sub-file (symbol-level) claims (v0.14, experimental).** `POST /claims` and the `claim_files` MCP tool accept an optional `symbols` field that flips a claim from whole-file to symbol-scope: the claim covers only the named top-level declarations, not imports or other module-level code. Two automatic decisions resolve overlaps without filing a request: `AUTO_COEXIST` grants two symbol claims on the same file when their symbol sets are disjoint, and `AUTO_NARROW` grants a symbol claim against an existing narrowable file claim, marking the two as cooperative partners. Both are logged to `request_events` as new event types but skip the `requests` table. A new `narrowable` flag controls auto-narrow eligibility (`file` defaults `true`; `shared_file` / `module` / `symbol` default `false`). Schema v8 adds `claims.scope_type`, `claims.narrowable`, and a `claim_symbols` join table; pre-v0.14 rows backfill as `scope_type='file'` so existing behaviour is unchanged. TypeScript is the only parser backend in v0.14 (tree-sitter with a regex fallback, selected via `COORD_SYMBOL_PARSER`); Python and Go follow in v0.15. Opt-in: any caller that doesn't pass `symbols` sees identical behaviour to v0.13. Full spec in `docs/design/sub-file-claims.md`.
+- **Python symbol parser.** `.py` files now participate in sub-file claims. Tree-sitter backend via `tree-sitter-python` with a regex fallback for environments where the native wheel is unavailable; selection follows the existing `COORD_SYMBOL_PARSER` contract introduced in v0.14.
+- **Go symbol parser.** `.go` files now participate in sub-file claims. Tree-sitter backend via `tree-sitter-go` with a regex fallback; same selection rules as the other backends.
+- **`coord doctor` symbol-parser-backend check.** A new `symbol parser backend` diagnostic probes every registered extension (`.ts`, `.tsx`, `.py`, `.go`) and reports which backend would resolve. OK when every extension lands on tree-sitter; WARN when one or more fall back to regex (the parser still works, but native wheels give stricter parsing); FAIL only when `COORD_SYMBOL_PARSER=treesitter` is forced and a native grammar is missing -- which would otherwise crash `extract_symbols` at call time. The check uses a new `coordination.symbols.probe_backend(extension)` helper that classifies the resolved backend without raising. WARN-level results do not flip the doctor exit code.
+- **Sub-file (symbol-level) claims promoted to stable.** The opt-in `symbols` field on `POST /claims` / `claim_files`, the `AUTO_COEXIST` / `AUTO_NARROW` decisions, the `narrowable` flag, and the `claim_symbols` join table (schema v8) are all considered stable as of v0.15. Schema v8 and v9 are unchanged; the only behavioural difference is documentation posture and the addition of Python and Go to the parser dispatcher.
+
+### Changed
+
+- Sub-file claims promoted from experimental to stable. Schema v8 + v9 unchanged; the only behavioural difference is documentation posture and the doctor surfacing parser-backend status.
+- `CheckResult` in `coordination/cli_doctor.py` gains an optional `level: str` field (default `"fail"`) so a check can opt into WARN semantics without breaking the existing boolean `ok` contract. WARN results are surfaced in the doctor output but do not fail the overall exit code. Only the new symbol-parser-backend check uses this today.
+
+## [0.14.1] - 2026-06-02
+
+### Added
+
+- **Dashboard surfaces symbol claims.** Active claims table gains a `Scope` column (`file` / `symbol` / `shared_file` / `module`) and a `Symbols` column that lists the bound symbol names from the `claim_symbols` join table. Symbol-scope rows are visually distinct so an operator can see at a glance which claims are sub-file.
+- **`Auto-resolutions (24h)` stat panel** showing rolling counts of `AUTO_COEXIST` and `AUTO_NARROW` events. Computed from `request_events`; no schema change.
+- **`/repos` response includes `auto_resolutions_24h` per repo**, so the dashboard's repos panel can show the same headline figure broken down by repository without an additional round trip.
+
+## [0.14.0] - 2026-06-02
+
+### Added
+
+- **Sub-file (symbol-level) claims (experimental).** `POST /claims` and the `claim_files` MCP tool accept an optional `symbols` field that flips a claim from whole-file to symbol-scope: the claim covers only the named top-level declarations, not imports or other module-level code. Two automatic decisions resolve overlaps without filing a request: `AUTO_COEXIST` grants two symbol claims on the same file when their symbol sets are disjoint, and `AUTO_NARROW` grants a symbol claim against an existing narrowable file claim, marking the two as cooperative partners. Both are logged to `request_events` as new event types but skip the `requests` table. A new `narrowable` flag controls auto-narrow eligibility (`file` defaults `true`; `shared_file` / `module` / `symbol` default `false`). Schema v8 adds `claims.scope_type`, `claims.narrowable`, and a `claim_symbols` join table; pre-v0.14 rows backfill as `scope_type='file'` so existing behaviour is unchanged. TypeScript is the only parser backend in v0.14 (tree-sitter with a regex fallback, selected via `COORD_SYMBOL_PARSER`); Python and Go follow in v0.15. Opt-in: any caller that doesn't pass `symbols` sees identical behaviour to v0.13. Full spec in `docs/design/sub-file-claims.md`.
 - `coord-mcp` auto-loads `<repo-root>/.coordination/local.env` at startup, walking up from cwd like git looking for `.git/`. Restricted to a `COORD_*` allowlist so an unrelated env line in the file can't mutate the wrapper. Explicit env (shell exports, `.mcp.json` env block, codex `[mcp_servers.coord.env]`) still wins -- the file only fills in unset variables and overrides documented placeholders (`set-me`, `example-org/example-repo`, `http://127.0.0.1:8080`). This makes the committed-template + gitignored-secret pattern work hands-off: a tracked `.mcp.json` can ship placeholder values to a public repo and the wrapper recovers the real values from `.coordination/local.env` (which `coord init` already gitignores).
 - `_headers()` skips the `Authorization` header entirely when the resolved token is a documented placeholder, so a misconfigured setup yields a clean `401 Authorization required` instead of a `Bearer set-me` request that looks malicious in server logs.
 - `tests/test_deploy_overlay.py` guards against two sanitisation hazards: `deploy/k8s/prod/` (the live Argo overlay) must NOT carry `YOUR_CLUSTER` / `coord.internal.example` / `set-me` placeholders, and the tracked `.mcp.json` must NOT carry a real-looking 40+ char hex token. Parametrised over every yaml in the overlay; 10 cases total.
 - Documentation sweep: README has a new `Configuration & secrets` section with a tracked-vs-gitignored table and the runtime resolution model; `docs/getting-started.md` annotates Step 4 file list and adds a `Configuration & secrets` subsection; `docs/architecture.md` has a new `Env resolution` subsection under MCP bridge; `docs/troubleshooting.md` has new `MCP tools return 401 from a known-good service` and `MCP wrapper picks up the wrong service URL` entries with a copy-pasteable diagnostic command; `docs/integrations/{claude-code,codex-cli}.md` document the resolution order in tool-specific terms; `templates/README.md` calls out that the `.example` MCP wirings are placeholder templates and points at `local.env` for real credentials.
-
-### Changed
-
-- (none recorded yet)
 
 ### Fixed
 

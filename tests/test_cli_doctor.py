@@ -365,3 +365,78 @@ def test_drift_check_uses_agents_md_for_codex(tmp_path):
     by_label = {r.label: r for r in results}
     assert by_label["AGENTS.md managed block is up to date"].ok is True
     assert "CLAUDE.md managed block is up to date" not in by_label
+
+
+# --- symbol-parser-backend check (v0.15) ---------------------------------
+
+
+def test_symbol_parser_check_ok_when_treesitter_available(monkeypatch):
+    """The dev extra ships tree-sitter for every registered extension, so
+    the default install path should resolve to tree-sitter end-to-end and
+    report OK with no fallback list."""
+    # Ensure auto mode (no forced backend) so probe sees the real install state.
+    monkeypatch.delenv("COORD_SYMBOL_PARSER", raising=False)
+    # Force every probe call to look like tree-sitter is present, so the
+    # test is independent of the host machine's wheel install state.
+    from coordination import symbols
+
+    monkeypatch.setattr(
+        symbols,
+        "probe_backend",
+        lambda ext: ("treesitter", "ok"),
+    )
+
+    result = cli_doctor._check_symbol_parser_backend()
+    assert result.label == "symbol parser backend"
+    assert result.ok is True
+    assert result.level == "fail"  # default; ok=True so level is irrelevant
+    assert "tree-sitter" in result.detail
+
+
+def test_symbol_parser_check_warns_when_forced_to_regex(monkeypatch):
+    """`COORD_SYMBOL_PARSER=regex` flips every supported extension to the
+    regex backend. That's a documented degraded mode, not a failure, so
+    the check must report WARN and list every fallback extension."""
+    monkeypatch.setenv("COORD_SYMBOL_PARSER", "regex")
+    from coordination import symbols
+
+    monkeypatch.setattr(
+        symbols,
+        "probe_backend",
+        lambda ext: ("regex", "forced via COORD_SYMBOL_PARSER=regex"),
+    )
+
+    result = cli_doctor._check_symbol_parser_backend()
+    assert result.label == "symbol parser backend"
+    assert result.ok is False
+    assert result.level == "warn"
+    # Every registered extension should appear in the fallback list.
+    for ext in symbols.supported_extensions():
+        assert ext in result.detail
+    assert "regex" in result.detail.lower()
+    assert "symbols" in result.hint  # nudges toward the install extra
+
+
+def test_symbol_parser_check_fails_when_treesitter_forced_and_missing(monkeypatch):
+    """`COORD_SYMBOL_PARSER=treesitter` with a missing native grammar would
+    crash `extract_symbols` at call time, so doctor must surface it as a
+    hard fail (not a warn) with a hint pointing at the `symbols` extra."""
+    monkeypatch.setenv("COORD_SYMBOL_PARSER", "treesitter")
+    from coordination import symbols
+
+    monkeypatch.setattr(
+        symbols,
+        "probe_backend",
+        lambda ext: (
+            "none",
+            f"COORD_SYMBOL_PARSER=treesitter but grammar for {ext} not installed",
+        ),
+    )
+
+    result = cli_doctor._check_symbol_parser_backend()
+    assert result.label == "symbol parser backend"
+    assert result.ok is False
+    assert result.level == "fail"
+    assert "COORD_SYMBOL_PARSER=treesitter" in result.detail
+    # The hint must mention how to fix it.
+    assert "symbols" in result.hint

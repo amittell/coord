@@ -243,3 +243,54 @@ async def test_list_repos_active_claim_count_excludes_released(tmp_path: Path) -
     repos = await db.list_repos(window_hours=24, now=now)
     by_name = {r["repo"]: r for r in repos}
     assert by_name["example-org/y"]["active_claims"] == 1
+
+
+async def test_list_repos_includes_auto_resolution_counts(tmp_path: Path) -> None:
+    """v0.14.1: list_repos rows include ``auto_resolutions_24h`` with a
+    breakdown of ``auto_coexist`` / ``auto_narrow`` audit events
+    attributed to the repo. The attribution joins the audit event
+    through ``detail.holder_claim_id`` -> ``claims.repo``.
+    """
+    db = Database(tmp_path / "db.sqlite")
+    await db.init()
+
+    now = datetime.now(UTC)
+    fresh = _iso(now - timedelta(hours=2))
+    expires = _iso(now + timedelta(hours=4))
+
+    holder_id = await _insert(
+        db,
+        engineer="alice",
+        pattern="src/auth.py",
+        repo="example-org/coexist",
+        created_at=fresh,
+        expires_at=expires,
+    )
+    partner_id = await _insert(
+        db,
+        engineer="bob",
+        pattern="src/auth.py",
+        repo="example-org/coexist",
+        created_at=fresh,
+        expires_at=expires,
+    )
+
+    # Record an auto-coexist event between the two claims. The holder
+    # claim id lives under detail.holder_claim_id; that's the field
+    # count_auto_resolutions_since joins on to attribute the event to
+    # the repo.
+    await db.record_request_event(
+        "auto-coexist",
+        actor_engineer="bob",
+        detail={
+            "holder_claim_id": holder_id,
+            "partner_claim_id": partner_id,
+        },
+    )
+
+    repos = await db.list_repos(window_hours=24, now=now)
+    by_name = {r["repo"]: r for r in repos}
+    assert "example-org/coexist" in by_name
+    counts = by_name["example-org/coexist"]["auto_resolutions_24h"]
+    assert counts["auto_coexist"] == 1
+    assert counts["auto_narrow"] == 0

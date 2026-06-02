@@ -1091,6 +1091,67 @@ class Database:
             await conn.commit()
             return [dict(r) for r in rows]
 
+    async def count_auto_resolutions_since(
+        self,
+        *,
+        window_hours: int = 24,
+        now: datetime | None = None,
+        repo: str | None = None,
+    ) -> dict[str, int]:
+        """Count v0.14 ``auto-coexist`` / ``auto-narrow`` audit events in
+        the rolling window. ``repo`` is matched via the holder claim's
+        repo field (joining ``request_events`` -> ``claims`` through the
+        ``detail`` JSON's ``holder_claim_id``). Returns a dict with keys
+        ``auto_coexist`` and ``auto_narrow``; callers can sum for a single
+        "auto-resolutions" stat.
+
+        v0.14.1 dashboard surface and ``/repos`` extension both consume
+        this helper. Repo filter is optional because the dashboard's
+        global panel ignores it.
+        """
+        await self.init()
+        now = now or datetime.now(UTC)
+        cutoff = (now - timedelta(hours=window_hours)).replace(microsecond=0)
+        cutoff_iso = cutoff.isoformat().replace("+00:00", "Z")
+
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            if repo is None:
+                cur = await conn.execute(
+                    "SELECT event_type, COUNT(*) AS n "
+                    "FROM request_events "
+                    "WHERE event_type IN ('auto-coexist','auto-narrow') "
+                    "AND datetime(created_at) >= datetime(?) "
+                    "GROUP BY event_type",
+                    (cutoff_iso,),
+                )
+            else:
+                # JSON1 extension is on by default in the aiosqlite build
+                # we ship; json_extract drops the holder_claim_id out of
+                # the detail blob so we can join against claims.repo.
+                cur = await conn.execute(
+                    "SELECT re.event_type, COUNT(*) AS n "
+                    "FROM request_events re "
+                    "JOIN claims c ON c.id = "
+                    "  json_extract(re.detail, '$.holder_claim_id') "
+                    "WHERE re.event_type IN ('auto-coexist','auto-narrow') "
+                    "AND datetime(re.created_at) >= datetime(?) "
+                    "AND c.repo IS ? "
+                    "GROUP BY re.event_type",
+                    (cutoff_iso, repo),
+                )
+            rows = await cur.fetchall()
+        counts = {"auto_coexist": 0, "auto_narrow": 0}
+        for r in rows:
+            key = (
+                "auto_coexist"
+                if r["event_type"] == "auto-coexist"
+                else "auto_narrow"
+            )
+            counts[key] = int(r["n"] or 0)
+        return counts
+
     async def list_repos(
         self,
         *,
@@ -1107,6 +1168,15 @@ class Database:
         ``active_claims`` is window-independent: it counts claims that
         are unreleased and not yet expired right now, regardless of
         when they were created.
+
+        ``auto_resolutions_24h`` (v0.14.1) breaks down the count of
+        server-side auto-resolved overlaps -- ``auto_coexist`` and
+        ``auto_narrow`` -- attributed to the repo by joining the audit
+        event through ``detail.holder_claim_id`` -> ``claims.repo``.
+        Implemented as a per-repo query after the aggregate fetch:
+        N+1, but the row count is small (one per repo this service has
+        ever seen) and the dashboard / ``/repos`` endpoint are operator
+        surfaces, not high-traffic.
         """
         await self.init()
         now = now or datetime.now(UTC)
@@ -1139,16 +1209,23 @@ class Database:
             rows = await cur.fetchall()
             await conn.commit()
 
-        return [
-            {
-                "repo": r["repo"],
-                "last_activity": r["last_activity"],
-                "claims_24h": int(r["claims_in_window"] or 0),
-                "engineers_24h": int(r["engineers_in_window"] or 0),
-                "active_claims": int(r["active_claims"] or 0),
-            }
-            for r in rows
-        ]
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            repo_name = r["repo"]
+            auto_counts = await self.count_auto_resolutions_since(
+                window_hours=window_hours, now=now, repo=repo_name
+            )
+            out.append(
+                {
+                    "repo": repo_name,
+                    "last_activity": r["last_activity"],
+                    "claims_24h": int(r["claims_in_window"] or 0),
+                    "engineers_24h": int(r["engineers_in_window"] or 0),
+                    "active_claims": int(r["active_claims"] or 0),
+                    "auto_resolutions_24h": auto_counts,
+                }
+            )
+        return out
 
     # --- Release requests (v5) ----------------------------------------
 
