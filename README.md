@@ -215,3 +215,7 @@ docker run \
   -p 8080:8080 \
   coordination
 ```
+
+## License
+
+Apache License 2.0. See [`LICENSE`](./LICENSE).
