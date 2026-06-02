@@ -228,6 +228,41 @@ fi
 # the existing engineer-name self-exclusion.
 SESSION_QS=""
 if [[ -f "${REPO_ROOT}/.coordination/sessions.live" ]]; then
+  coord_pid_is_live() {
+    local pid="$1"
+    if kill -0 "${pid}" 2>/dev/null; then
+      return 0
+    fi
+    python3 - "${pid}" <<'PY'
+import os
+import sys
+
+pid = int(sys.argv[1])
+if pid <= 0 or os.name != "nt":
+    sys.exit(1)
+
+try:
+    import ctypes
+    import ctypes.wintypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        sys.exit(1)
+    exit_code = ctypes.wintypes.DWORD()
+    try:
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            sys.exit(1)
+        sys.exit(0 if exit_code.value == STILL_ACTIVE else 1)
+    finally:
+        kernel32.CloseHandle(handle)
+except Exception:
+    sys.exit(1)
+PY
+  }
+
   # v0.12 format per line: "<session_id> <pid> <start_time_ns>". Older
   # entries with just a session_id (no PID) are pruned by the next
   # coord-mcp startup; we also skip them here as a defense-in-depth so
@@ -249,8 +284,10 @@ if [[ -f "${REPO_ROOT}/.coordination/sessions.live" ]]; then
     if ! [[ "${pid_field}" =~ ^[0-9]+$ ]]; then
       continue
     fi
-    # Liveness probe. kill -0 returns 0 iff the process exists.
-    if ! kill -0 "${pid_field}" 2>/dev/null; then
+    # Liveness probe. POSIX shells can use kill -0 directly; Git Bash on
+    # Windows cannot reliably resolve native Python PIDs, so fall back to
+    # a tiny Win32 process-exit-code check there.
+    if ! coord_pid_is_live "${pid_field}"; then
       continue
     fi
     enc_sid="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${session_field}")"

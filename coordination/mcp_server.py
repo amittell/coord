@@ -466,6 +466,33 @@ def _is_live_pid(pid: int, expected_start_time_ns: int = 0) -> bool:
     """
     if pid <= 0:
         return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            import ctypes.wintypes
+
+            process_query_limited_information = 0x1000
+            still_active = 259
+            windll = getattr(ctypes, "WinDLL", None)
+            if windll is None:
+                return False
+            kernel32 = windll("kernel32", use_last_error=True)
+            handle = kernel32.OpenProcess(
+                process_query_limited_information, False, pid
+            )
+            if not handle:
+                return False
+            exit_code = ctypes.wintypes.DWORD()
+            try:
+                if not kernel32.GetExitCodeProcess(
+                    handle, ctypes.byref(exit_code)
+                ):
+                    return False
+                return exit_code.value == still_active
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return False
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
