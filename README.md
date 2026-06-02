@@ -177,7 +177,19 @@ POST /claims
 }
 ```
 
-Two agents on `Router::handleAuth` and `Router::handleLogout` auto-coexist; a claim on the bare `Router` blocks both (and vice versa). Two-level only in v0.16 -- nested classes / nested namespaces are not yet supported.
+Two agents on `Router::handleAuth` and `Router::handleLogout` auto-coexist; a claim on the bare `Router` blocks both (and vice versa).
+
+### Recursive nesting (v0.17)
+
+The notation is recursive: `"Outer::Inner::method"` works to any depth. A claim on `"Outer"` covers every descendant; a claim on `"Outer::Inner"` covers `"Outer::Inner::*"` but not `"Outer::Other::*"`. Storage is unchanged -- `parent_symbol` carries the ancestor chain joined by `::`, and the conflict engine prefix-matches on the full canonical path.
+
+### Validation (v0.17)
+
+When `COORD_REPO_ROOT` is set the service parses each claimed file and rejects unknown symbols with a hint listing the file's actual symbol set. The MCP wrapper also pre-validates locally before POSTing so typos fail fast without a round-trip; disable with `COORD_DISABLE_CLIENT_VALIDATION=1`.
+
+### Observability (v0.18)
+
+The dashboard surfaces a 30-day auto-resolution heatmap per repo so you can see whether sub-file claims are actually saving conflicts. The same series is exposed at `GET /metrics/auto-resolutions?days=30` for external monitoring.
 
 ## Local Assets
 

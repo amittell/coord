@@ -255,6 +255,22 @@ async def list_repos(_: None = Depends(require_auth)) -> dict:
     return {"repos": rows, "count": len(rows)}
 
 
+@app.get("/metrics/auto-resolutions")
+async def auto_resolutions_metric(
+    days: int = Query(default=30, ge=1, le=90),
+    repo: str | None = Query(default=None),
+    _: None = Depends(require_auth),
+) -> dict:
+    """Daily auto-coexist / auto-narrow counts per repo (v0.18).
+
+    The series is consumed by the dashboard heatmap and is also
+    available standalone for external monitoring. Empty days are
+    omitted -- callers that want a dense grid fill the gaps.
+    """
+    rows = await get_service().db.daily_auto_resolutions(days=days, repo=repo)
+    return {"series": rows, "days": days, "count": len(rows)}
+
+
 @app.get("/conflicts")
 async def conflicts(
     pattern: list[str] | None = Query(default=None),

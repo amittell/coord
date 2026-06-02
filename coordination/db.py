@@ -1169,6 +1169,65 @@ class Database:
             await conn.commit()
             return [dict(r) for r in rows]
 
+    async def daily_auto_resolutions(
+        self,
+        *,
+        days: int = 30,
+        repo: str | None = None,
+        now: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Daily ``auto-coexist`` / ``auto-narrow`` buckets for the last
+        ``days`` days (v0.18).
+
+        Returns one row per (repo, date) bucket ordered by ``(repo,
+        date ASC)``. Empty buckets are omitted -- the dashboard fills
+        the gaps to render the heatmap cells. When ``repo`` is None
+        every repo with at least one event in the window appears.
+
+        The query joins ``request_events`` to ``claims`` through the
+        ``detail`` JSON's ``holder_claim_id`` so the bucket is tagged
+        with the holder's repo (the requester's repo is the same in
+        practice; we pick one to keep the query single-join).
+        """
+        await self.init()
+        now = now or datetime.now(UTC)
+        cutoff = (now - timedelta(days=days)).replace(microsecond=0)
+        cutoff_iso = cutoff.isoformat().replace("+00:00", "Z")
+        params: list[Any] = [cutoff_iso]
+        repo_filter = ""
+        if repo is not None:
+            repo_filter = " AND c.repo IS ?"
+            params.append(repo)
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                "SELECT c.repo AS repo, "
+                "strftime('%Y-%m-%d', re.created_at) AS date, "
+                "SUM(CASE WHEN re.event_type='auto-coexist' "
+                "        THEN 1 ELSE 0 END) AS auto_coexist, "
+                "SUM(CASE WHEN re.event_type='auto-narrow' "
+                "        THEN 1 ELSE 0 END) AS auto_narrow "
+                "FROM request_events re "
+                "JOIN claims c ON c.id = "
+                "  json_extract(re.detail, '$.holder_claim_id') "
+                "WHERE re.event_type IN ('auto-coexist','auto-narrow') "
+                "AND datetime(re.created_at) >= datetime(?)"
+                + repo_filter
+                + " GROUP BY c.repo, date ORDER BY c.repo, date",
+                params,
+            )
+            rows = await cur.fetchall()
+        return [
+            {
+                "repo": r["repo"],
+                "date": r["date"],
+                "auto_coexist": int(r["auto_coexist"] or 0),
+                "auto_narrow": int(r["auto_narrow"] or 0),
+            }
+            for r in rows
+        ]
+
     async def count_auto_resolutions_since(
         self,
         *,

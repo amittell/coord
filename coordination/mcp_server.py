@@ -11,6 +11,9 @@ from typing import Any
 import httpx
 from mcp.server.fastmcp import FastMCP
 
+from coordination.overlap_symbols import format_symbol_path
+from coordination.symbols import extract_symbols
+
 mcp = FastMCP("coordination")
 
 
@@ -153,6 +156,102 @@ async def check_conflicts(files: list[str], engineer: str) -> dict[str, Any]:
         return r.json()
 
 
+def _validate_symbols_locally(
+    symbols: dict[str, list[str]],
+) -> str | None:
+    """Pre-validate symbol claims against the local working tree (v0.17).
+
+    For each ``(file_path, [symbol_name, ...])`` pair, open the file from
+    disk (resolved against ``Path.cwd()`` -- the MCP wrapper runs in the
+    agent's checkout) and parse it with the same ``extract_symbols``
+    dispatcher the server uses. Any claimed symbol that isn't found is
+    collected and reported as a single combined error string so the
+    caller can short-circuit the POST and surface the typo without a
+    network round-trip.
+
+    Files that don't exist on disk are SKIPPED, not flagged: the agent
+    may be claiming a path that's about to be created on the same
+    branch, and refusing the claim would block a legitimate workflow.
+    The server-side validator (the source of truth) makes the final
+    call against whatever it can see in the repo root.
+
+    Valid-symbol set construction mirrors the server: every
+    ``format_symbol_path(s.parent, s.name)`` plus every distinct parent
+    path. The parent expansion is what makes ``"Outer"`` valid even
+    when only ``"Outer::Inner::method"`` was emitted by the parser --
+    a bare-class claim must always be acceptable when any of its
+    methods are visible.
+
+    Set ``COORD_DISABLE_CLIENT_VALIDATION=1`` to bypass this helper
+    entirely. Useful when the wrapper runs outside a checkout (server-
+    only deployments, CI shells) or filesystem access is unreliable.
+    The server-side check still runs in those cases; this knob only
+    affects the local fast path.
+
+    Returns ``None`` when every claimed symbol resolves (or every file
+    is skipped); returns a human-readable error string otherwise. The
+    error string truncates to the first 5 problem files and the first
+    20 missing symbols per file so a single typo doesn't produce an
+    unreadable wall of text.
+    """
+    if os.environ.get("COORD_DISABLE_CLIENT_VALIDATION", "").strip() == "1":
+        return None
+    cwd = Path.cwd()
+    missing_by_file: dict[str, list[str]] = {}
+    for raw_path, syms in symbols.items():
+        if not syms:
+            continue
+        file_path = cwd / raw_path
+        if not file_path.is_file():
+            # Path may be about to be created; let the server adjudicate.
+            continue
+        try:
+            content = file_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            # Unreadable file (permissions, race with delete, etc.) --
+            # skip rather than block the claim on a local I/O glitch.
+            continue
+        parsed = extract_symbols(raw_path, content)
+        if not parsed:
+            # Extension unsupported by any backend -- nothing to validate.
+            # The server-side check will handle this the same way.
+            continue
+        valid: set[str] = set()
+        for sym in parsed:
+            valid.add(format_symbol_path(sym.parent, sym.name))
+            if sym.parent:
+                # Expand every ancestor path so a bare-class claim
+                # ("Outer") matches even when only descendants were
+                # emitted ("Outer::Inner::method"). Walks the ``::``
+                # chain so each intermediate namespace ("Outer",
+                # "Outer::Inner") is also accepted.
+                parts = sym.parent.split("::")
+                for i in range(1, len(parts) + 1):
+                    valid.add("::".join(parts[:i]))
+        missing = [s for s in syms if s not in valid]
+        if missing:
+            missing_by_file[raw_path] = missing
+    if not missing_by_file:
+        return None
+    file_items = list(missing_by_file.items())
+    truncated_files = file_items[:5]
+    rendered: list[str] = []
+    for fpath, syms in truncated_files:
+        shown = syms[:20]
+        more = len(syms) - len(shown)
+        joined = ", ".join(shown)
+        if more > 0:
+            joined += f" (+{more} more)"
+        rendered.append(f"{fpath}: {joined}")
+    extra_files = len(file_items) - len(truncated_files)
+    suffix = f" (+{extra_files} more files)" if extra_files > 0 else ""
+    return (
+        "client-side validation: symbols not found in local source: "
+        + "; ".join(rendered)
+        + suffix
+    )
+
+
 @mcp.tool()
 async def claim_files(
     engineer: str,
@@ -196,6 +295,21 @@ async def claim_files(
         for path, syms in (symbols or {}).items()
         if syms
     }
+    # v0.17: client-side pre-validation. When the caller actually asked
+    # for symbol-scope claims, parse the local files first so an obvious
+    # typo ("missingFn") fails fast without a network round-trip. The
+    # server-side check (added in parallel) is still the source of
+    # truth; this is purely a UX fast-path. Skipped under the
+    # COORD_DISABLE_CLIENT_VALIDATION=1 escape hatch.
+    if symbol_map:
+        err = _validate_symbols_locally(symbol_map)
+        if err:
+            return {
+                "claim_ids": [],
+                "warnings": [err],
+                "options": ["narrow_claim"],
+                "client_validated": True,
+            }
     claims: list[dict[str, Any]] = []
     seen_symbol_paths: set[str] = set()
     for p in patterns:

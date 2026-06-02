@@ -1205,3 +1205,199 @@ async def test_method_on_different_classes_coexists(client: AsyncClient) -> None
     rb = await client.post("/claims", headers=_AUTH, json=body_b)
     assert rb.status_code == 200, rb.text
     assert rb.json()["claim_ids"], "same method name on different parents must coexist"
+
+
+# ---------------------------------------------------------------------------
+# v0.17: recursive nested-namespace claims
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_nested_methods_coexist(client: AsyncClient) -> None:
+    """Sibling methods of the same nested class auto-coexist."""
+    body_a = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [_symbol_claim("src/api.ts", ["Outer::Inner::handle"])],
+    }
+    body_b = {
+        "engineer": "bob",
+        "repo": "amittell/coord",
+        "claims": [_symbol_claim("src/api.ts", ["Outer::Inner::reset"])],
+    }
+    ra = await client.post("/claims", headers=_AUTH, json=body_a)
+    assert ra.status_code == 200, ra.text
+    rb = await client.post("/claims", headers=_AUTH, json=body_b)
+    assert rb.status_code == 200, rb.text
+
+
+@pytest.mark.asyncio
+async def test_outer_class_blocks_nested_method(client: AsyncClient) -> None:
+    """Claiming the outer class blocks any descendant method claim."""
+    body_outer = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [_symbol_claim("src/api.ts", ["Outer"])],
+    }
+    body_method = {
+        "engineer": "bob",
+        "repo": "amittell/coord",
+        "claims": [_symbol_claim("src/api.ts", ["Outer::Inner::handle"])],
+    }
+    await client.post("/claims", headers=_AUTH, json=body_outer)
+    rb = await client.post("/claims", headers=_AUTH, json=body_method)
+    assert rb.status_code == 409
+    so = rb.json()["conflicts"][0].get("symbol_overlap")
+    assert so and "Outer::Inner::handle" in so[0]["symbols"]
+
+
+@pytest.mark.asyncio
+async def test_inner_class_blocks_method_but_not_sibling(
+    client: AsyncClient,
+) -> None:
+    """Claiming Outer::Inner blocks Outer::Inner::handle but not
+    Outer::Other::handle (different inner class)."""
+    body_inner = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [_symbol_claim("src/api.ts", ["Outer::Inner"])],
+    }
+    body_method_same = {
+        "engineer": "bob",
+        "repo": "amittell/coord",
+        "claims": [_symbol_claim("src/api.ts", ["Outer::Inner::handle"])],
+    }
+    body_method_diff = {
+        "engineer": "carol",
+        "repo": "amittell/coord",
+        "claims": [_symbol_claim("src/api.ts", ["Outer::Other::handle"])],
+    }
+    await client.post("/claims", headers=_AUTH, json=body_inner)
+    r_same = await client.post("/claims", headers=_AUTH, json=body_method_same)
+    r_diff = await client.post("/claims", headers=_AUTH, json=body_method_diff)
+    assert r_same.status_code == 409, "Outer::Inner must block Outer::Inner::handle"
+    assert r_diff.status_code == 200, "Outer::Inner must NOT block Outer::Other::handle"
+
+
+# ---------------------------------------------------------------------------
+# v0.17: server-side symbol-claim validation
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+async def client_with_repo_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncClient:
+    """Variant of ``client`` that points COORD_REPO_ROOT at a tmp repo.
+    Tests seed source files under tmp_path/repo/ and claim paths
+    relative to that root."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    db_path = tmp_path / "db.sqlite"
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "test-token")
+    monkeypatch.setenv("COORD_DATABASE_PATH", str(db_path))
+    monkeypatch.setenv("COORD_DISABLE_BACKGROUND_CLEANUP", "1")
+    monkeypatch.setenv("COORD_DISABLE_INSTANCE_LOCK", "1")
+    monkeypatch.setenv("COORD_REPO_ROOT", str(repo_root))
+    # Disable max-ratio scope check; this fixture's repos are tiny so a
+    # single-file claim would otherwise trip the 20% cap.
+    monkeypatch.setenv("COORD_MAX_CLAIM_RATIO", "1.0")
+
+    from coordination import deps
+
+    deps.get_service.cache_clear()
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        ac.repo_root = repo_root  # type: ignore[attr-defined]
+        yield ac
+
+    deps.get_service.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_validation_skipped_when_repo_root_unset(
+    client: AsyncClient,
+) -> None:
+    body = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [_symbol_claim("src/never.ts", ["doesNotExist"])],
+    }
+    r = await client.post("/claims", headers=_AUTH, json=body)
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.asyncio
+async def test_validation_passes_when_symbol_exists(
+    client_with_repo_root: AsyncClient,
+) -> None:
+    repo_root = client_with_repo_root.repo_root  # type: ignore[attr-defined]
+    (repo_root / "auth.ts").write_text(
+        "export function handleAuth() { return null; }\n", encoding="utf-8"
+    )
+    body = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [_symbol_claim("auth.ts", ["handleAuth"])],
+    }
+    r = await client_with_repo_root.post("/claims", headers=_AUTH, json=body)
+    assert r.status_code == 200, r.text
+    assert r.json()["claim_ids"]
+
+
+@pytest.mark.asyncio
+async def test_validation_rejects_unknown_symbol(
+    client_with_repo_root: AsyncClient,
+) -> None:
+    repo_root = client_with_repo_root.repo_root  # type: ignore[attr-defined]
+    (repo_root / "auth.ts").write_text(
+        "export function handleAuth() { return null; }\n", encoding="utf-8"
+    )
+    body = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [_symbol_claim("auth.ts", ["nonexistentFn"])],
+    }
+    r = await client_with_repo_root.post("/claims", headers=_AUTH, json=body)
+    # Mirrors syntax/scope error path: 200 with warnings + empty claim_ids
+    payload = r.json()
+    assert payload["claim_ids"] == []
+    assert payload["warnings"], "expected validation warning"
+    msg = payload["warnings"][0]
+    assert "nonexistentFn" in msg
+    assert "handleAuth" in msg, "expected hint to list available symbol"
+
+
+@pytest.mark.asyncio
+async def test_validation_accepts_method_notation(
+    client_with_repo_root: AsyncClient,
+) -> None:
+    repo_root = client_with_repo_root.repo_root  # type: ignore[attr-defined]
+    (repo_root / "router.ts").write_text(
+        "class Router {\n  handleAuth() { return null; }\n}\n",
+        encoding="utf-8",
+    )
+    body = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [_symbol_claim("router.ts", ["Router::handleAuth"])],
+    }
+    r = await client_with_repo_root.post("/claims", headers=_AUTH, json=body)
+    assert r.status_code == 200, r.text
+    assert r.json()["claim_ids"]
+
+
+@pytest.mark.asyncio
+async def test_validation_skipped_for_missing_files(
+    client_with_repo_root: AsyncClient,
+) -> None:
+    body = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [_symbol_claim("does/not/exist.ts", ["whatever"])],
+    }
+    r = await client_with_repo_root.post("/claims", headers=_AUTH, json=body)
+    # Missing file -> skip validation, no warning, claim succeeds.
+    assert r.status_code == 200, r.text
+    assert r.json()["claim_ids"]

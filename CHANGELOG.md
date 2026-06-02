@@ -9,6 +9,66 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.18.0] - 2026-06-02
+
+### Added
+
+- Dashboard "auto-resolution heatmap (30d)" panel: per-repo strip of
+  30 day cells, intensity scaled by combined auto-coexist + auto-narrow
+  count. Renders a "no auto-resolutions in the last 30 days"
+  placeholder when the series is empty.
+- `GET /metrics/auto-resolutions` endpoint returning the daily per-repo
+  series. Accepts `?days=1..90` and `?repo=` filters; authenticated.
+- `db.daily_auto_resolutions(days=30, repo=None)` helper. Groups
+  `request_events.auto-coexist` / `auto-narrow` by `(repo, date)` so
+  the dashboard, the new endpoint, and external monitoring share one
+  query.
+
+## [0.17.0] - 2026-06-02
+
+### Added
+
+- Recursive nested-namespace symbol claims. `"Outer::Inner::method"`
+  notation works to any depth. `parse_symbol_path` uses `rpartition`
+  so `parent_symbol` carries the full ancestor chain joined by `"::"`;
+  `symbol_paths_overlap` prefix-matches on the canonical full path.
+  A claim on `"Outer"` covers every `"Outer::*"` descendant, a claim
+  on `"Outer::Inner"` covers `"Outer::Inner::*"` but not
+  `"Outer::Other::*"`, sibling methods of the same class continue to
+  auto-coexist.
+- Python parser walks RECURSIVELY into nested class definitions and
+  emits inner classes plus their methods with the full ancestor path
+  in `parent`. Both tree-sitter and regex backends updated; regex
+  backend uses an indentation stack to track ancestor chains in
+  source order. TypeScript and Go nesting follow in a subsequent
+  release; `Outer::Inner::method` claims work today via the API
+  notation regardless of parser support because the conflict engine
+  is the source of truth.
+- Server-side symbol-claim validation in `POST /claims`. When
+  `COORD_REPO_ROOT` is set, the service reads each claimed file and
+  rejects unknown symbols with a hint listing the file's actual
+  symbol set (up to 20 hints). Missing files skip validation rather
+  than blocking the claim. When `COORD_REPO_ROOT` is unset the call
+  is a silent no-op so legacy deployments keep working.
+- Client-side pre-validation in `coord-mcp`. `claim_files` reads
+  files locally and short-circuits with a warning + `client_validated`
+  flag before round-tripping when symbols don't exist. Disable with
+  `COORD_DISABLE_CLIENT_VALIDATION=1`. The server-side check remains
+  the source of truth.
+- 8 new e2e tests: 3 recursive-nesting overlap (`Outer::Inner::method`
+  auto-coexist with siblings, outer-class blocks nested method, inner
+  class blocks its descendants but not siblings), 5 server-side
+  validation (skipped without repo root, accepts known symbol,
+  rejects unknown with hint, accepts method notation, skips missing
+  file), 5 client-side validation (analogous, plus disable-flag and
+  namespace path resolution).
+
+### Changed
+
+- `Database.insert_claim_symbols` 6-tuple shape from v0.16 unchanged;
+  the new `parent_symbol` column simply gains nesting depth at the
+  string level.
+
 ## [0.16.0] - 2026-06-02
 
 ### Added

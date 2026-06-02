@@ -581,6 +581,47 @@ tbody tr td.empty {
   display: flex;
   justify-content: space-between;
 }
+
+/* v0.18 auto-resolution heatmap */
+.heatmap .hrow {
+  display: grid;
+  grid-template-columns: 24ch 1fr 10ch;
+  gap: calc(var(--grid) * 2);
+  align-items: center;
+  padding: calc(var(--grid)) 0;
+  border-bottom: 1px dashed var(--hairline);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.heatmap .hrow:last-child { border-bottom: none; }
+.heatmap .hrepo {
+  color: var(--phosphor);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.heatmap .hcells {
+  display: grid;
+  grid-template-columns: repeat(30, 1fr);
+  gap: 2px;
+}
+.heatmap .hcell {
+  display: block;
+  width: 100%;
+  height: 12px;
+  border-radius: 2px;
+  background: #1a1a1a;
+}
+.heatmap .hcell.h0 { background: #1a1a1a; }
+.heatmap .hcell.h1 { background: #1f3a2a; }
+.heatmap .hcell.h2 { background: #2f6440; }
+.heatmap .hcell.h3 { background: #4ea870; }
+.heatmap .hcell.h4 { background: #7fffa1; }
+.heatmap .htotal {
+  text-align: right;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
 """
 
 
@@ -608,6 +649,7 @@ async def render_dashboard() -> str:
     idle_timeout_sec = svc.settings.idle_timeout_sec
     requests = await svc.list_requests(limit=200)
     auto_resolutions = await svc.db.count_auto_resolutions_since(window_hours=24)
+    auto_resolution_series = await svc.db.daily_auto_resolutions(days=30)
 
     claims_by_id: dict[str, dict[str, Any]] = {
         str(c["id"]): c for c in recent if c.get("id")
@@ -893,6 +935,79 @@ async def render_dashboard() -> str:
     ac = int(auto_resolutions.get("auto_coexist", 0))
     an = int(auto_resolutions.get("auto_narrow", 0))
     auto_total = ac + an
+    # v0.18: build the 30-day per-repo heatmap. Group the series by
+    # repo, fill the 30 day-slots from (today - 29) .. today, and
+    # render each cell as a coloured span keyed on total count.
+
+    today = now.date()
+    day_keys = [
+        (today - timedelta(days=29 - i)).strftime("%Y-%m-%d")
+        for i in range(30)
+    ]
+    series_by_repo: dict[str, dict[str, dict[str, int]]] = {}
+    for row in auto_resolution_series:
+        repo_key = str(row.get("repo") or "(unattributed)")
+        series_by_repo.setdefault(repo_key, {})[row["date"]] = {
+            "auto_coexist": int(row.get("auto_coexist") or 0),
+            "auto_narrow": int(row.get("auto_narrow") or 0),
+        }
+
+    def _cell_class(count: int) -> str:
+        if count <= 0:
+            return "h0"
+        if count <= 2:
+            return "h1"
+        if count <= 9:
+            return "h2"
+        if count <= 49:
+            return "h3"
+        return "h4"
+
+    heatmap_rows: list[str] = []
+    for repo_key in sorted(series_by_repo):
+        days_data = series_by_repo[repo_key]
+        total_coexist = sum(d.get("auto_coexist", 0) for d in days_data.values())
+        total_narrow = sum(d.get("auto_narrow", 0) for d in days_data.values())
+        cells = []
+        for k in day_keys:
+            d = days_data.get(k, {"auto_coexist": 0, "auto_narrow": 0})
+            count = int(d.get("auto_coexist", 0)) + int(d.get("auto_narrow", 0))
+            cls = _cell_class(count)
+            title = (
+                f"{k}: {count} "
+                f"({d.get('auto_coexist', 0)} coexist, "
+                f"{d.get('auto_narrow', 0)} narrow)"
+            )
+            cells.append(
+                f'<span class="hcell {cls}" title="{_esc(title)}"></span>'
+            )
+        cells_html = "".join(cells)
+        repo_label = _esc(repo_key)
+        heatmap_rows.append(
+            '<div class="hrow">'
+            f'<div class="hrepo">{repo_label}</div>'
+            f'<div class="hcells">{cells_html}</div>'
+            f'<div class="htotal">{total_coexist + total_narrow} '
+            f'<span class="muted">({total_coexist}c·{total_narrow}n)</span></div>'
+            '</div>'
+        )
+    if heatmap_rows:
+        heatmap_body = "".join(heatmap_rows)
+    else:
+        heatmap_body = (
+            '<div class="empty" style="padding:calc(var(--grid) * 2)">'
+            'no auto-resolutions in the last 30 days</div>'
+        )
+    heatmap_html = (
+        '<section class="panel">'
+        '<header><h2>auto-resolution heatmap (30d)</h2>'
+        f'<span class="meta">last 30 days · {len(series_by_repo)} repos</span></header>'
+        '<div class="heatmap" style="padding:calc(var(--grid) * 2)">'
+        + heatmap_body +
+        '</div>'
+        '</section>'
+    )
+
     auto_resolutions_html = (
         '<section class="panel">'
         '<header><h2>auto-resolutions (24h)</h2>'
@@ -954,6 +1069,8 @@ async def render_dashboard() -> str:
     </div>
 
     {auto_resolutions_html}
+
+    {heatmap_html}
 
     <div class="row split-7-5">
       <section class="panel">

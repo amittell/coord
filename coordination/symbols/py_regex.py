@@ -130,60 +130,126 @@ def _infer_body_indent(slice_text: str) -> int:
     return smallest
 
 
+_NESTED_CLASS_RE = re.compile(
+    r"^(?P<indent>[ \t]+)class\s+(?P<name>\w+)",
+    re.MULTILINE,
+)
+
+
 def _method_matches_in_slice(
     content: str,
     slice_start: int,
     slice_end: int,
     class_name: str,
 ) -> list[Symbol]:
-    """Scan ``content[slice_start:slice_end]`` for class-body methods.
+    """Scan ``content[slice_start:slice_end]`` for class-body members.
 
-    The slice should run from the class header offset to the next top-level
-    declaration (or end of file). Indented defs and lambda assignments whose
-    indent length matches the inferred body indent are emitted as method
-    symbols tagged with ``parent=class_name``. Anything deeper-indented is
-    treated as nested (closure / nested-class member / conditional body)
-    and skipped.
+    v0.17: walks an indentation stack so nested classes (and their
+    nested methods) surface with the full ``Outer::Inner::method``
+    ancestor path. The slice runs from the class header offset to the
+    next column-zero declaration (or end of file). Lines whose indent
+    is the current top-of-stack class's body indent emit as members
+    of that class. Deeper-indented lines (closures inside a method,
+    bodies of conditional blocks) stay excluded.
+
+    Tracks classes as a stack of ``(indent, full_path)`` -- the indent
+    is the class header's indent (which equals the parent's body
+    indent). When we see a line whose indent is <= some stack entry's
+    indent, we pop that entry (it has gone out of scope). A line
+    whose indent equals ``current_top.indent + body_indent_step``
+    counts as a direct member; ``body_indent_step`` is inferred from
+    the slice as the smallest non-zero indent.
     """
 
     slice_text = content[slice_start:slice_end]
-    body_indent = _infer_body_indent(slice_text)
-    if body_indent == 0:
+    body_indent_step = _infer_body_indent(slice_text)
+    if body_indent_step == 0:
         return []
 
     out: list[Symbol] = []
+    # Stack of (class_header_indent, full_path) tracking the active
+    # ancestor chain. The outer class lives at indent 0 (its header
+    # was at column zero) so its body indent is body_indent_step.
+    stack: list[tuple[int, str]] = [(0, class_name)]
 
-    for match in _INDENTED_DEF_RE.finditer(slice_text):
-        if len(match.group("indent")) != body_indent:
-            continue
-        name = match.group("name")
-        absolute_offset = slice_start + match.start()
-        line = content.count("\n", 0, absolute_offset) + 1
-        out.append(
-            Symbol(
-                name=name,
-                kind="function",
-                start_line=line,
-                end_line=line,
-                parent=class_name,
-            )
-        )
+    def member_path_for(line_indent: int) -> str | None:
+        """Return the class path whose body matches ``line_indent``.
 
-    for match in _INDENTED_LAMBDA_RE.finditer(slice_text):
-        if len(match.group("indent")) != body_indent:
+        Pops any stack entries that have gone out of scope (their body
+        indent is greater than line_indent), then returns the top
+        entry's path iff its body indent equals line_indent.
+        """
+        while stack and stack[-1][0] + body_indent_step > line_indent:
+            stack.pop()
+        if stack and stack[-1][0] + body_indent_step == line_indent:
+            return stack[-1][1]
+        return None
+
+    # Single pass over lines in source order so the stack stays valid.
+    line_offset = 0
+    for raw_line in slice_text.split("\n"):
+        if raw_line.strip() == "" or raw_line.lstrip().startswith("#"):
+            line_offset += len(raw_line) + 1
             continue
-        name = match.group("name")
-        absolute_offset = slice_start + match.start()
+        indent_len = len(raw_line) - len(raw_line.lstrip())
+        if indent_len == 0:
+            line_offset += len(raw_line) + 1
+            continue
+        path = member_path_for(indent_len)
+        if path is None:
+            line_offset += len(raw_line) + 1
+            continue
+        absolute_offset = slice_start + line_offset
         line = content.count("\n", 0, absolute_offset) + 1
-        out.append(
-            Symbol(
-                name=name,
-                kind="const",
-                start_line=line,
-                end_line=line,
-                parent=class_name,
+
+        nested_class_match = _NESTED_CLASS_RE.match(raw_line)
+        if nested_class_match:
+            inner_name = nested_class_match.group("name")
+            full = f"{path}::{inner_name}"
+            out.append(
+                Symbol(
+                    name=inner_name,
+                    kind="class",
+                    start_line=line,
+                    end_line=line,
+                    parent=path,
+                )
             )
+            stack.append((indent_len, full))
+            line_offset += len(raw_line) + 1
+            continue
+
+        # Method def: indented def / async def
+        def_match = re.match(
+            r"^[ \t]+(?:async\s+)?def\s+(\w+)", raw_line
         )
+        if def_match:
+            out.append(
+                Symbol(
+                    name=def_match.group(1),
+                    kind="function",
+                    start_line=line,
+                    end_line=line,
+                    parent=path,
+                )
+            )
+            line_offset += len(raw_line) + 1
+            continue
+
+        lambda_match = re.match(
+            r"^[ \t]+(\w+)\s*=\s*lambda\b", raw_line
+        )
+        if lambda_match:
+            out.append(
+                Symbol(
+                    name=lambda_match.group(1),
+                    kind="const",
+                    start_line=line,
+                    end_line=line,
+                    parent=path,
+                )
+            )
+        line_offset += len(raw_line) + 1
 
     return out
 

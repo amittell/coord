@@ -1737,3 +1737,124 @@ async def test_claim_files_returns_symbol_overlap_in_conflict(
     assert (
         result["conflicts"][0]["conflicting_claim"]["scope_type"] == "symbol"
     )
+
+
+# ---------------------------------------------------------------------------
+# v0.17: client-side symbol validation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_client_validation_passes_when_symbol_exists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "foo.ts").write_text(
+        "export function bar() { return null; }\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    captured = _install_mock_transport(
+        monkeypatch, _json_handler(200, {"claim_ids": ["c1"]})
+    )
+    result = await mcp_server.claim_files(
+        engineer="alice",
+        patterns=["foo.ts"],
+        symbols={"foo.ts": ["bar"]},
+    )
+    assert result == {"claim_ids": ["c1"]}
+    assert captured, "expected POST to reach the server"
+
+
+@pytest.mark.asyncio
+async def test_client_validation_rejects_missing_symbol(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "foo.ts").write_text(
+        "export function bar() { return null; }\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    captured = _install_mock_transport(
+        monkeypatch, _json_handler(200, {"claim_ids": ["unexpected"]})
+    )
+    result = await mcp_server.claim_files(
+        engineer="alice",
+        patterns=["foo.ts"],
+        symbols={"foo.ts": ["missingFn"]},
+    )
+    # Fast path: no POST, error returned with client_validated flag.
+    assert not captured, "validation should short-circuit before POST"
+    assert result.get("client_validated") is True
+    assert result.get("claim_ids") == []
+    assert any("missingFn" in w for w in result.get("warnings", []))
+
+
+@pytest.mark.asyncio
+async def test_client_validation_skips_missing_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    captured = _install_mock_transport(
+        monkeypatch, _json_handler(200, {"claim_ids": ["c2"]})
+    )
+    result = await mcp_server.claim_files(
+        engineer="alice",
+        patterns=["never.ts"],
+        symbols={"never.ts": ["whatever"]},
+    )
+    assert captured, "missing-file claims must still POST"
+    assert result == {"claim_ids": ["c2"]}
+
+
+@pytest.mark.asyncio
+async def test_client_validation_disabled_via_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "foo.ts").write_text(
+        "export function bar() {}\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.setenv("COORD_DISABLE_CLIENT_VALIDATION", "1")
+    captured = _install_mock_transport(
+        monkeypatch, _json_handler(200, {"claim_ids": ["c3"]})
+    )
+    result = await mcp_server.claim_files(
+        engineer="alice",
+        patterns=["foo.ts"],
+        symbols={"foo.ts": ["doesNotExist"]},
+    )
+    assert captured, "disabled validation must allow POST"
+    assert result == {"claim_ids": ["c3"]}
+
+
+@pytest.mark.asyncio
+async def test_client_validation_namespace_path_resolved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "router.ts").write_text(
+        "class Foo {\n  handleA() {}\n}\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    captured = _install_mock_transport(
+        monkeypatch, _json_handler(200, {"claim_ids": ["c4"]})
+    )
+    result = await mcp_server.claim_files(
+        engineer="alice",
+        patterns=["router.ts"],
+        symbols={"router.ts": ["Foo::handleA"]},
+    )
+    assert captured, "valid namespace claim must POST"
+    assert result == {"claim_ids": ["c4"]}

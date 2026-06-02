@@ -397,12 +397,13 @@ def test_decorated_method_emitted(backend: str) -> None:
 
 
 def test_method_inside_nested_class(backend: str) -> None:
-    """A nested class inside another class is skipped entirely.
+    """v0.17: a nested class and its methods are emitted with the full
+    ``Outer::Inner`` ancestor path in ``parent``.
 
-    v0.16's ``parent`` model is two levels deep (top-level vs class member).
-    ``Outer::Inner::method`` would require a third level the dataclass does
-    not yet model, so both ``Inner`` itself and its methods are dropped.
-    Only ``Outer`` survives.
+    Pre-v0.17 the two-level model dropped nested classes entirely. v0.17
+    extends ``parent_symbol`` to store the ancestor chain joined by
+    ``"::"`` so arbitrary nesting works without a schema change. This
+    test pins the new behaviour for both backends.
     """
 
     src = (
@@ -412,9 +413,14 @@ def test_method_inside_nested_class(backend: str) -> None:
         "            return 1\n"
     )
     result = extract_symbols("sample.py", src)
-    assert _names(result) == ["Outer"]
-    assert "Inner" not in _names(result)
-    assert "m" not in _names(result)
+    names = _names(result)
+    assert "Outer" in names
+    assert "Inner" in names
+    assert "m" in names
+    by_name = {s.name: s for s in result}
+    assert by_name["Outer"].parent is None
+    assert by_name["Inner"].parent == "Outer"
+    assert by_name["m"].parent == "Outer::Inner"
 
 
 def test_function_in_class_method_excluded(backend: str) -> None:

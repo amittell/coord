@@ -7,6 +7,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import aiosqlite
+import pytest
 
 from coordination.db import Database
 
@@ -294,3 +295,71 @@ async def test_list_repos_includes_auto_resolution_counts(tmp_path: Path) -> Non
     counts = by_name["example-org/coexist"]["auto_resolutions_24h"]
     assert counts["auto_coexist"] == 1
     assert counts["auto_narrow"] == 0
+
+
+@pytest.mark.asyncio
+async def test_daily_auto_resolutions_buckets_correctly(tmp_path: Path) -> None:
+    """v0.18: daily_auto_resolutions groups events by (repo, date) and
+    separates auto-coexist from auto-narrow counts."""
+    import json
+    import aiosqlite
+    from coordination.db import _configure_sqlite
+
+    db = Database(tmp_path / "db.sqlite")
+    await db.init()
+
+    # Two claims in repo-a (for the FK + repo tag), one in repo-b.
+    await db.insert_claims_batch(
+        engineer="alice",
+        branch="main",
+        description="t",
+        items=[
+            ("c-a1", "file", "src/a.ts", "soft", "2099-01-01T00:00:00Z"),
+            ("c-a2", "file", "src/b.ts", "soft", "2099-01-01T00:00:00Z"),
+            ("c-b1", "file", "src/c.ts", "soft", "2099-01-01T00:00:00Z"),
+        ],
+        session_id="sess",
+        repo="repo-a",
+    )
+    # Override repo for c-b1 to repo-b (insert_claims_batch sets one repo per call).
+    async with aiosqlite.connect(db.path) as conn:
+        await _configure_sqlite(conn)
+        await conn.execute("UPDATE claims SET repo = 'repo-b' WHERE id = 'c-b1'")
+        await conn.commit()
+
+    # Seed events across three dates for repo-a, one for repo-b.
+    events = [
+        ("e1", "auto-coexist", "c-a1", "2026-05-30T12:00:00Z"),
+        ("e2", "auto-coexist", "c-a1", "2026-05-30T13:00:00Z"),
+        ("e3", "auto-narrow",  "c-a2", "2026-05-31T09:00:00Z"),
+        ("e4", "auto-coexist", "c-a2", "2026-06-01T10:00:00Z"),
+        ("e5", "auto-narrow",  "c-b1", "2026-06-01T11:00:00Z"),
+    ]
+    async with aiosqlite.connect(db.path) as conn:
+        await _configure_sqlite(conn)
+        for eid, etype, holder_id, ts in events:
+            detail = json.dumps({"holder_claim_id": holder_id})
+            await conn.execute(
+                "INSERT INTO request_events "
+                "(id, request_id, event_type, actor_engineer, "
+                " actor_session_id, detail, created_at) "
+                "VALUES (?, NULL, ?, NULL, NULL, ?, ?)",
+                (eid, etype, detail, ts),
+            )
+        await conn.commit()
+
+    from datetime import datetime, UTC
+    fake_now = datetime(2026, 6, 2, 12, 0, 0, tzinfo=UTC)
+    rows = await db.daily_auto_resolutions(days=30, now=fake_now)
+
+    # Build a quick (repo, date) -> counts map for the assertions.
+    by_key = {(r["repo"], r["date"]): r for r in rows}
+    assert by_key[("repo-a", "2026-05-30")]["auto_coexist"] == 2
+    assert by_key[("repo-a", "2026-05-30")]["auto_narrow"] == 0
+    assert by_key[("repo-a", "2026-05-31")]["auto_narrow"] == 1
+    assert by_key[("repo-a", "2026-06-01")]["auto_coexist"] == 1
+    assert by_key[("repo-b", "2026-06-01")]["auto_narrow"] == 1
+
+    # Repo filter
+    rows_b_only = await db.daily_auto_resolutions(days=30, repo="repo-b", now=fake_now)
+    assert {r["repo"] for r in rows_b_only} == {"repo-b"}

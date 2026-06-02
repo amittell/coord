@@ -213,46 +213,61 @@ def parse_symbol_path(symbol: str) -> SymbolPath:
     """Split a claim notation string into ``(parent, name)``.
 
     ``"Foo"`` -> ``(None, "Foo")`` (top-level, v0.14 semantics).
-    ``"Foo::handleA"`` -> ``("Foo", "handleA")`` (method, v0.16+).
-    Recursive notation (``"A::B::C"``) is rejected as a programming
-    error in v0.16 -- the API contract is two levels only -- but the
-    parser tolerates it by treating everything after the first ``::``
-    as the leaf name so a future v0.17 nested model is a strict
-    extension, not a breaking change.
+    ``"Foo::handleA"`` -> ``("Foo", "handleA")`` (method, v0.16).
+    ``"Outer::Inner::method"`` -> ``("Outer::Inner", "method")`` (v0.17).
+
+    The split uses ``rpartition`` so the LAST ``::`` separates the leaf
+    name from the ancestor path. ``parent_symbol`` therefore holds the
+    full ancestor chain joined by ``::``; the overlap engine treats it
+    as a pre-joined string and prefix-matches on the full canonical
+    path. This keeps the schema unchanged (still one ``parent_symbol``
+    column) while supporting arbitrarily deep nesting.
     """
     if "::" not in symbol:
         return (None, symbol)
-    parent, _, name = symbol.partition("::")
+    parent, _, name = symbol.rpartition("::")
     return (parent, name)
 
 
 def format_symbol_path(parent: str | None, name: str) -> str:
     """Inverse of :func:`parse_symbol_path`. Used to canonicalise
     overlap-result strings the conflict response surfaces back to the
-    requester."""
+    requester. Parents already contain ``::`` separators when the
+    symbol is nested more than one level."""
+    return f"{parent}::{name}" if parent else name
+
+
+def _full_path(p: SymbolPath) -> str:
+    """Join ``(parent, name)`` into the canonical ``"a::b::c"`` form."""
+    parent, name = p
     return f"{parent}::{name}" if parent else name
 
 
 def symbol_paths_overlap(a: SymbolPath, b: SymbolPath) -> bool:
-    """Return True iff ``a`` and ``b`` overlap under the two-level
+    """Return True iff ``a`` and ``b`` overlap under the v0.17 recursive
     prefix-match rule.
 
-    - top-level vs top-level: same name.
-    - top-level vs method: the top-level name equals the method's
-      parent (claim on ``Foo`` covers every ``Foo::*`` method and vice
-      versa, mirroring the v0.14 rule that a file claim covers every
-      symbol in the file once the holder is narrowable).
-    - method vs method: same parent AND same name.
+    Two paths overlap iff one equals the other or one (followed by the
+    separator) is a strict prefix of the other. Concretely:
+
+    - ``"Foo"`` overlaps ``"Foo"`` (identity).
+    - ``"Foo"`` overlaps ``"Foo::handleA"`` (class covers method).
+    - ``"Foo"`` overlaps ``"Foo::Inner::method"`` (class covers any
+      descendant, v0.17 recursive extension of the v0.16 rule).
+    - ``"Foo::Inner"`` overlaps ``"Foo::Inner::method"`` (inner class
+      covers its method) but NOT ``"Foo::Other::method"``.
+    - ``"Foo::a"`` and ``"Foo::b"`` do not overlap (sibling methods).
+    - ``"Foo::a"`` and ``"Bar::a"`` do not overlap (different parents).
     """
-    pa, na = a
-    pb, nb = b
-    if pa is None and pb is None:
-        return na == nb
-    if pa is None:
-        return na == pb
-    if pb is None:
-        return pa == nb
-    return pa == pb and na == nb
+    pa = _full_path(a)
+    pb = _full_path(b)
+    if pa == pb:
+        return True
+    if pb.startswith(pa + "::"):
+        return True
+    if pa.startswith(pb + "::"):
+        return True
+    return False
 
 
 async def _classify_symbol_symbol(

@@ -13,6 +13,7 @@ from coordination.engine import compute_overlap, files_matching_pattern, git_ls_
 from coordination.overlap_symbols import (
     OverlapKind,
     check_overlap as check_symbol_overlap,
+    format_symbol_path,
     record_auto_resolution,
 )
 from coordination.ownership import PathRule, parse_ownership_yaml, severity_for_pattern
@@ -25,6 +26,7 @@ from coordination.schemas import (
     CreateClaimsRequest,
     CreateClaimsResponse,
 )
+from coordination.symbols import extract_symbols
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +199,100 @@ class CoordinationService:
             return "Combined claim scope exceeds max fraction of repository"
         return None
 
+    async def _validate_claim_symbols(
+        self, body: CreateClaimsRequest
+    ) -> str | None:
+        """Validate that every symbol in every symbol-scope claim exists
+        in the corresponding file.
+
+        v0.17: runs only when ``COORD_REPO_ROOT`` is configured (the
+        server needs filesystem access to the application repo to
+        parse). When the repo root is unset the call is a silent no-op,
+        preserving the v0.14-v0.16 trust-the-client posture so legacy
+        deployments keep working unchanged.
+
+        Per-claim behaviour:
+
+        - Items without a ``symbols`` payload are skipped (whole-file
+          scope has no symbols to validate).
+        - Resolve the claim's pattern against ``settings.repo_root``;
+          if the resolved path is missing on disk, skip silently. The
+          claim may legitimately reference a file landing in the same
+          commit, and refusing such claims would create a chicken-and-
+          egg failure mode at file-creation time.
+        - Otherwise parse the file with
+          :func:`coordination.symbols.extract_symbols` and build the
+          set of known canonical paths via
+          :func:`coordination.overlap_symbols.format_symbol_path`. The
+          set also includes every ancestor path so a claim like
+          ``"Outer"`` is accepted when the parser only emits leaves
+          (``Outer::Inner::method``).
+
+        Returns a single combined error string listing the missing
+        symbols per file plus up to 20 of the file's actual symbols as
+        a hint, or ``None`` when every claimed symbol checks out.
+        """
+
+        root = self.settings.repo_root
+        if not root or not root.is_dir():
+            return None
+
+        per_file_errors: list[str] = []
+        for item in body.claims:
+            if not item.symbols:
+                continue
+            resolved = (root / item.pattern).resolve()
+            try:
+                root_resolved = root.resolve()
+                resolved.relative_to(root_resolved)
+            except (OSError, ValueError):
+                # Path escapes the repo root or cannot be resolved;
+                # leave validation to the scope-check layer.
+                continue
+            if not resolved.is_file():
+                # File may be arriving in the same commit; skip rather
+                # than block. Mirrors the zero-match warning policy.
+                continue
+            try:
+                content = resolved.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                logger.warning(
+                    "symbol validation: failed to read %s: %s", resolved, exc
+                )
+                continue
+            symbols = extract_symbols(str(resolved), content)
+            if not symbols:
+                # Unsupported extension or empty file: no ground truth
+                # to validate against. Skip silently so non-TS/Py/Go
+                # claims aren't blocked by the absence of a parser.
+                continue
+            valid_paths: set[str] = set()
+            for sym in symbols:
+                valid_paths.add(format_symbol_path(sym.parent, sym.name))
+                # Also accept intermediate ancestor paths so a claim
+                # on "Outer" is valid when the parser only emits
+                # "Outer::Inner::method" (leaves-only backends).
+                parent = sym.parent
+                while parent:
+                    valid_paths.add(parent)
+                    if "::" in parent:
+                        parent = parent.rsplit("::", 1)[0]
+                    else:
+                        parent = None
+            missing = [s for s in item.symbols if s not in valid_paths]
+            if not missing:
+                continue
+            hint_symbols = sorted(valid_paths)[:20]
+            per_file_errors.append(
+                f"Unknown symbols in {item.pattern!r}: "
+                f"{sorted(missing)!r}. "
+                f"Known symbols (up to 20): {hint_symbols!r}"
+            )
+
+        if not per_file_errors:
+            return None
+        return "; ".join(per_file_errors)
+
     async def check_conflicts(
         self,
         *,
@@ -319,6 +415,18 @@ class CoordinationService:
                 conflicts=[],
                 warnings=[scope_err],
                 options=["narrow_claim", "escalate"],
+            )
+
+        # v0.17: when COORD_REPO_ROOT is set, validate that every claimed
+        # symbol exists in its file. The helper short-circuits when the
+        # repo root is unset so legacy deployments keep working.
+        symbol_err = await self._validate_claim_symbols(body)
+        if symbol_err:
+            return CreateClaimsResponse(
+                claim_ids=[],
+                conflicts=[],
+                warnings=[symbol_err],
+                options=["narrow_claim"],
             )
 
         zero_match_warnings = await self._zero_match_warnings(patterns)
@@ -541,7 +649,13 @@ class CoordinationService:
                         # v0.16: split "Parent::child" notation at insert
                         # time. parent_symbol=NULL for legacy top-level
                         # entries; non-NULL for method-scope.
-                        parent, _, leaf = raw.partition("::") if "::" in raw else (None, "", raw)
+                        # v0.17: rpartition so the LAST "::" separates leaf
+                        # from ancestor path; supports "A::B::method" as
+                        # parent="A::B", leaf="method".
+                        if "::" in raw:
+                            parent, _, leaf = raw.rpartition("::")
+                        else:
+                            parent, leaf = None, raw
                         symbol_rows.append(
                             (
                                 str(uuid4()),
