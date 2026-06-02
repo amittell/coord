@@ -1858,3 +1858,103 @@ async def test_client_validation_namespace_path_resolved(
     )
     assert captured, "valid namespace claim must POST"
     assert result == {"claim_ids": ["c4"]}
+
+
+# ---------------------------------------------------------------------------
+# v0.21: wait_seconds passthrough
+#
+# wait_seconds opts the request into the FIFO queue. A positive int is
+# forwarded as-is on the POST body so the service can long-poll for up
+# to that many seconds when the request would otherwise 409. None and
+# 0 both mean "immediate-409" (the v0.13-v0.20 default); the key must
+# be omitted in those cases so pre-v0.21 servers see a byte-identical
+# request shape.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_claim_files_with_wait_seconds_forwards_to_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A positive ``wait_seconds`` must land on the POST body verbatim so
+    the v0.21 service knows to enqueue + long-poll instead of returning
+    an immediate 409."""
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    captured = _install_mock_transport(
+        monkeypatch,
+        _json_handler(
+            200,
+            {"claim_ids": ["c1"], "conflicts": [], "warnings": [], "options": []},
+        ),
+    )
+
+    await mcp_server.claim_files(
+        engineer="alice",
+        patterns=["src/auth/login.ts"],
+        wait_seconds=30,
+    )
+
+    import json as _json
+
+    body = _json.loads(captured[0].content.decode("utf-8"))
+    assert body["wait_seconds"] == 30
+
+
+@pytest.mark.asyncio
+async def test_claim_files_without_wait_seconds_omits_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Backward-compat guarantee: when the caller omits ``wait_seconds``
+    the POST body must NOT carry the key at all. A pre-v0.21 server with
+    a strict pydantic model that doesn't know the field must see the
+    exact byte shape it always saw."""
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    captured = _install_mock_transport(
+        monkeypatch,
+        _json_handler(
+            200,
+            {"claim_ids": ["c1"], "conflicts": [], "warnings": [], "options": []},
+        ),
+    )
+
+    await mcp_server.claim_files(
+        engineer="alice",
+        patterns=["src/auth/login.ts"],
+    )
+
+    import json as _json
+
+    body = _json.loads(captured[0].content.decode("utf-8"))
+    assert "wait_seconds" not in body
+
+
+@pytest.mark.asyncio
+async def test_claim_files_zero_wait_seconds_omits_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``wait_seconds=0`` is semantically identical to the v0.13-v0.20
+    immediate-409 behaviour, so the wrapper must still omit the key
+    rather than echo a literal 0. Sending 0 would force pre-v0.21
+    servers down a validation path they don't have a field for."""
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    captured = _install_mock_transport(
+        monkeypatch,
+        _json_handler(
+            200,
+            {"claim_ids": ["c1"], "conflicts": [], "warnings": [], "options": []},
+        ),
+    )
+
+    await mcp_server.claim_files(
+        engineer="alice",
+        patterns=["src/auth/login.ts"],
+        wait_seconds=0,
+    )
+
+    import json as _json
+
+    body = _json.loads(captured[0].content.decode("utf-8"))
+    assert "wait_seconds" not in body

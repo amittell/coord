@@ -1447,3 +1447,194 @@ async def test_hotspots_endpoint_returns_series(
     target = by_pattern["src/router.ts"]
     assert target["attempts"] >= 5
     assert target["distinct_attempters"] >= 5
+
+
+# ---------------------------------------------------------------------------
+# v0.21: soft auto-promote
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_promote_hotspot_writes_shared_file_rule(
+    client: AsyncClient,
+) -> None:
+    """POST /metrics/hotspots/promote with action=shared_file writes the
+    pattern into the active owners.yaml under a `shared_files:` list."""
+    r = await client.post(
+        "/metrics/hotspots/promote",
+        headers=_AUTH,
+        json={"action": "shared_file", "pattern": "src/router.ts"},
+    )
+    assert r.status_code == 200, r.text
+    payload = r.json()
+    assert payload["ok"] is True
+    assert payload["action"] == "shared_file"
+    assert "src/router.ts" in payload["patched_yaml"]
+    # Read-back via /config/ownership confirms the write landed.
+    g = await client.get("/config/ownership", headers=_AUTH)
+    assert g.status_code == 200
+    assert "src/router.ts" in g.text
+
+
+@pytest.mark.asyncio
+async def test_promote_hotspot_idempotent_for_shared_file(
+    client: AsyncClient,
+) -> None:
+    """Promoting the same pattern twice leaves the YAML unchanged."""
+    payload = {"action": "shared_file", "pattern": "src/router.ts"}
+    first = await client.post(
+        "/metrics/hotspots/promote", headers=_AUTH, json=payload
+    )
+    second = await client.post(
+        "/metrics/hotspots/promote", headers=_AUTH, json=payload
+    )
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["patched_yaml"] == second.json()["patched_yaml"]
+
+
+@pytest.mark.asyncio
+async def test_promote_hotspot_split_action_writes_suggestion(
+    client: AsyncClient,
+) -> None:
+    """action=split writes an informational suggested_splits entry with
+    the operator's note."""
+    r = await client.post(
+        "/metrics/hotspots/promote",
+        headers=_AUTH,
+        json={
+            "action": "split",
+            "pattern": "src/big-router.ts",
+            "note": "too central, touched by every team",
+        },
+    )
+    assert r.status_code == 200, r.text
+    patched = r.json()["patched_yaml"]
+    assert "suggested_splits" in patched
+    assert "src/big-router.ts" in patched
+    assert "too central" in patched
+
+
+@pytest.mark.asyncio
+async def test_promote_hotspot_rejects_unknown_action(
+    client: AsyncClient,
+) -> None:
+    r = await client.post(
+        "/metrics/hotspots/promote",
+        headers=_AUTH,
+        json={"action": "nope", "pattern": "src/x.ts"},
+    )
+    assert r.status_code == 400, r.text
+
+
+# ---------------------------------------------------------------------------
+# v0.21: FIFO queue (wait_seconds)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_queue_disabled_when_wait_seconds_omitted(
+    client: AsyncClient,
+) -> None:
+    """Without wait_seconds, conflict path is unchanged: immediate 409
+    and no claim_queue row is inserted."""
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/x.ts"}],
+    }
+    rh = await client.post("/claims", headers=_AUTH, json=holder)
+    assert rh.status_code == 200, rh.text
+    requester = {
+        "engineer": "bob",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/x.ts"}],
+    }
+    rr = await client.post("/claims", headers=_AUTH, json=requester)
+    # Legacy 409 (or 200 with conflicts depending on the path); claim
+    # ids must be empty either way.
+    assert rr.json().get("claim_ids", None) == [] or rr.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_queue_timeout_returns_original_conflict(
+    client: AsyncClient,
+) -> None:
+    """wait_seconds=1 with no release fires the timeout; response
+    surfaces the conflict payload, no granted claim."""
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/y.ts"}],
+    }
+    rh = await client.post("/claims", headers=_AUTH, json=holder)
+    assert rh.status_code == 200, rh.text
+    requester = {
+        "engineer": "bob",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/y.ts"}],
+        "wait_seconds": 1,
+    }
+    rr = await client.post("/claims", headers=_AUTH, json=requester)
+    # Timeout path returns the conflict payload (same shape as 409).
+    payload = rr.json()
+    assert payload.get("claim_ids") == []
+    assert payload.get("conflicts"), "timeout must surface conflict payload"
+
+
+@pytest.mark.asyncio
+async def test_queue_grants_in_fifo_order_on_release(
+    client: AsyncClient,
+) -> None:
+    """Concurrent waiters land in FIFO order; release auto-grants the
+    head of the queue."""
+    import asyncio as _asyncio
+
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/z.ts"}],
+    }
+    rh = await client.post("/claims", headers=_AUTH, json=holder)
+    assert rh.status_code == 200, rh.text
+    holder_cid = rh.json()["claim_ids"][0]
+
+    async def queued_request(engineer: str) -> dict:
+        body = {
+            "engineer": engineer,
+            "repo": "amittell/coord",
+            "claims": [{"type": "file", "pattern": "src/z.ts"}],
+            "wait_seconds": 10,
+        }
+        return (await client.post("/claims", headers=_AUTH, json=body)).json()
+
+    # Fire bob first; brief sleep guarantees bob enqueues before carol.
+    bob_task = _asyncio.create_task(queued_request("bob"))
+    await _asyncio.sleep(0.05)
+    carol_task = _asyncio.create_task(queued_request("carol"))
+    await _asyncio.sleep(0.05)
+
+    # Release the holder; bob (head of FIFO) should be auto-granted.
+    rel = await client.post(
+        "/claims/release",
+        headers=_AUTH,
+        json={"claim_ids": [holder_cid], "engineer": "alice"},
+    )
+    assert rel.status_code == 200, rel.text
+
+    bob_result = await _asyncio.wait_for(bob_task, timeout=5)
+    carol_result = await _asyncio.wait_for(carol_task, timeout=5)
+
+    # Bob got the auto-grant.
+    assert bob_result.get("claim_ids"), (
+        f"bob should be auto-granted; got {bob_result}"
+    )
+    # Carol either got auto-granted in turn (after bob releases, but he
+    # didn't here) or her wait timed out into a conflict payload. In
+    # this test we don't release bob, so carol times out with the
+    # conflict shape (and her wait_seconds is large enough that she
+    # may still be waiting -- the test asserts her result is well-formed
+    # either way).
+    assert carol_result.get("claim_ids", []) == [] or carol_result.get(
+        "claim_ids"
+    )

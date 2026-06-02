@@ -1028,3 +1028,70 @@ async def test_dashboard_renders_hotspots_panel(
     assert "monitor" in html_out
     # Cold patterns under min_attempts should not appear.
     assert "src/cold.ts" not in html_out
+
+
+@pytest.mark.asyncio
+async def test_dashboard_hotspot_action_link_present(
+    svc: CoordinationService,
+) -> None:
+    """v0.21: hotspot rows that pass the actionable thresholds render
+    an "apply" link; pure-monitor rows do not."""
+    from uuid import uuid4
+    import aiosqlite
+    from coordination.db import _configure_sqlite
+
+    await svc.db.insert_claims_batch(
+        engineer="alice",
+        branch="main",
+        description="seed",
+        items=[
+            ("h-promote", "file", "src/promote.ts", "soft",
+             "2099-01-01T00:00:00Z"),
+            ("h-monitor", "file", "src/monitor.ts", "soft",
+             "2099-01-01T00:00:00Z"),
+        ],
+        session_id="sess",
+        repo="amittell/coord",
+    )
+
+    # 25 attempts on promote.ts (-> "promote to shared_file"),
+    # 7 on monitor.ts (-> "monitor").
+    async with aiosqlite.connect(svc.db.path) as conn:
+        await _configure_sqlite(conn)
+        for i in range(25):
+            await conn.execute(
+                "INSERT INTO conflict_log (id, claim_id, attempted_by, "
+                "attempted_pattern, resolution, created_at) "
+                "VALUES (?, ?, ?, ?, NULL, ?)",
+                (str(uuid4()), "h-promote", f"eng-{i % 6}",
+                 "src/promote.ts", "2026-06-01T10:00:00Z"),
+            )
+        for i in range(7):
+            await conn.execute(
+                "INSERT INTO conflict_log (id, claim_id, attempted_by, "
+                "attempted_pattern, resolution, created_at) "
+                "VALUES (?, ?, ?, ?, NULL, ?)",
+                (str(uuid4()), "h-monitor", f"eng-{i}",
+                 "src/monitor.ts", "2026-06-01T11:00:00Z"),
+            )
+        await conn.commit()
+
+    html_out = await render_dashboard()
+
+    # Promote.ts row carries an apply link with the right action.
+    assert "src/promote.ts" in html_out
+    promote_idx = html_out.index("src/promote.ts")
+    promote_row = html_out[promote_idx:promote_idx + 800]
+    assert 'class="hsapply"' in promote_row
+    assert 'data-action="shared_file"' in promote_row
+
+    # Monitor.ts row exists but has NO apply link in its row slice.
+    assert "src/monitor.ts" in html_out
+    monitor_idx = html_out.index("src/monitor.ts")
+    monitor_row = html_out[monitor_idx:monitor_idx + 800]
+    # The row must end before the next .hsrow div opens; scope the
+    # apply-check to the cell containing this row's pattern.
+    next_row_start = monitor_row.find('<div class="hsrow"', 1)
+    if next_row_start > 0:
+        monitor_row = monitor_row[:next_row_start]
+    assert 'class="hsapply"' not in monitor_row

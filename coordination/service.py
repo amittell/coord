@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import logging
@@ -102,6 +104,45 @@ def _coexist_partner_ids_from_rows(rows: list[dict[str, Any]]) -> set[str]:
         if isinstance(ids, list):
             partners.update(str(x) for x in ids)
     return partners
+
+
+# v0.21: FIFO queue waiters. Keyed on claim_queue.id. The release-path
+# drain sets the event and the granted_claim_id (or None for "give up
+# and surface the original 409"); the create_claims long-poll awaits the
+# event. Per-process state: a restart causes outstanding long-polls to
+# time out and the client to retry, which is the safe failure mode.
+_QUEUE_WAITERS: dict[str, tuple[asyncio.Event, dict[str, Any]]] = {}
+
+
+def _register_waiter(queue_id: str) -> tuple[asyncio.Event, dict[str, Any]]:
+    """Register an in-process waiter for ``queue_id`` and return the
+    (event, payload-dict) tuple. The payload dict is mutated by
+    :func:`_notify_waiter` so the long-poll caller can read the
+    grant decision off it after ``event.wait()`` returns."""
+
+    event = asyncio.Event()
+    payload: dict[str, Any] = {}
+    _QUEUE_WAITERS[queue_id] = (event, payload)
+    return event, payload
+
+
+def _notify_waiter(queue_id: str, payload: dict[str, Any]) -> None:
+    """Wake the long-poll waiter for ``queue_id``, if any, and hand it
+    the payload (granted_claim_id, or None for expiry)."""
+
+    entry = _QUEUE_WAITERS.get(queue_id)
+    if entry is None:
+        return
+    event, slot = entry
+    slot.update(payload)
+    event.set()
+
+
+def _drop_waiter(queue_id: str) -> None:
+    """Remove a queue-waiter entry after the long-poll concluded.
+    Idempotent."""
+
+    _QUEUE_WAITERS.pop(queue_id, None)
 
 
 @dataclass
@@ -526,6 +567,20 @@ class CoordinationService:
                 metrics.claims_conflicts_total.inc()
 
         if conflicts:
+            # v0.21: if the caller passed wait_seconds > 0, enqueue the
+            # FIRST conflicting requester item behind its blocking
+            # holder and long-poll for an auto-grant from a release.
+            # On timeout we fall through to the legacy 409 path so
+            # legacy clients see the same shape.
+            wait_seconds = getattr(body, "wait_seconds", None) or 0
+            if wait_seconds and wait_seconds > 0:
+                granted = await self._enqueue_and_wait(
+                    body=body,
+                    conflicts=conflicts,
+                    wait_seconds=int(wait_seconds),
+                )
+                if granted is not None:
+                    return granted
             return CreateClaimsResponse(
                 claim_ids=[],
                 conflicts=conflicts,
@@ -940,7 +995,168 @@ class CoordinationService:
         n = await self.db.release_claims(claim_ids, engineer)
         for _ in range(n):
             metrics.claims_released_total.inc()
+        # v0.21: drain the FIFO queue against every input id.
+        # _drain_queue_for is idempotent -- if the id wasn't really
+        # released (wrong engineer, already gone), pop_next_waiting
+        # returns None and the call is a no-op.
+        for cid in claim_ids:
+            await self._drain_queue_for(cid)
         return n
+
+    # ------------------------------------------------------------------
+    # v0.21 FIFO queue
+    # ------------------------------------------------------------------
+
+    async def _enqueue_and_wait(
+        self,
+        *,
+        body: CreateClaimsRequest,
+        conflicts: list[ConflictEntry],
+        wait_seconds: int,
+    ) -> CreateClaimsResponse | None:
+        """Enqueue the first conflicting requester item behind its
+        blocking holder and long-poll for up to ``wait_seconds`` seconds.
+
+        Returns a CreateClaimsResponse with the granted claim_ids when
+        the release path drains the queue in our favour. Returns None
+        when the timeout fires or the drain marks the entry expired so
+        the caller falls through to the legacy 409 response shape.
+        """
+
+        first_conflict = conflicts[0]
+        blocking_claim_id = first_conflict.conflicting_claim.id
+        # Find the requester ClaimItem that produced this conflict by
+        # matching the your_pattern field; falling back to the first
+        # claim item if matching fails. Either way one item is enqueued.
+        target_item = body.claims[0]
+        for item in body.claims:
+            if item.pattern == first_conflict.your_pattern:
+                target_item = item
+                break
+
+        entry = await self.db.enqueue_claim_request(
+            blocking_claim_id=blocking_claim_id,
+            requester_engineer=body.engineer,
+            requester_session_id=body.session_id,
+            requester_branch=body.branch,
+            requester_description=body.description,
+            repo=body.repo,
+            claim_type=target_item.type,
+            pattern=target_item.pattern,
+            symbols=list(target_item.symbols) if target_item.symbols else None,
+            narrowable=target_item.narrowable,
+            ttl_hours=body.ttl_hours,
+            wait_seconds=wait_seconds,
+        )
+
+        event, payload = _register_waiter(entry["id"])
+        try:
+            await asyncio.wait_for(event.wait(), timeout=wait_seconds)
+        except (asyncio.TimeoutError, TimeoutError):
+            await self.db.mark_queue_expired(entry["id"])
+            _drop_waiter(entry["id"])
+            return None
+        _drop_waiter(entry["id"])
+        granted_cid = payload.get("granted_claim_id")
+        if not granted_cid:
+            # Drain ran but the grant attempt re-conflicted; mark
+            # expired so the queue row reflects reality and surface the
+            # original 409 to the caller.
+            return None
+        return CreateClaimsResponse(
+            claim_ids=[granted_cid],
+            conflicts=[],
+            warnings=[],
+            options=[],
+        )
+
+    async def _drain_queue_for(self, released_claim_id: str) -> None:
+        """Pop FIFO queue entries waiting on ``released_claim_id`` and
+        try to grant them by re-issuing the equivalent of a fresh
+        ``create_claims`` for that requester. Loops while grants succeed
+        -- a single release can satisfy multiple queued requesters if
+        their scopes turn out to be symbol-disjoint after the new
+        landscape is computed.
+
+        Each grant attempt re-runs the conflict check against the
+        post-release world. If the requester would still 409 (a
+        different new holder slipped in, or the requester's scope
+        overlaps something else), the queue entry is marked expired
+        and its long-poll is notified with no granted_claim_id so the
+        client surfaces the original 409.
+        """
+
+        while True:
+            entry = await self.db.pop_next_waiting_queue_entry(
+                released_claim_id
+            )
+            if entry is None:
+                return
+            grant_body = self._queue_entry_to_create_request(entry)
+            try:
+                resp = await self.create_claims(grant_body)
+            except Exception:  # noqa: BLE001 - the grant is best-effort
+                logger.exception(
+                    "FIFO drain: grant attempt for queue %s raised",
+                    entry["id"],
+                )
+                await self.db.mark_queue_expired(entry["id"])
+                _notify_waiter(entry["id"], {"granted_claim_id": None})
+                continue
+            if resp.claim_ids:
+                granted_cid = resp.claim_ids[0]
+                await self.db.mark_queue_granted(entry["id"], granted_cid)
+                _notify_waiter(
+                    entry["id"], {"granted_claim_id": granted_cid}
+                )
+            else:
+                await self.db.mark_queue_expired(entry["id"])
+                _notify_waiter(entry["id"], {"granted_claim_id": None})
+
+    @staticmethod
+    def _queue_entry_to_create_request(
+        entry: dict[str, Any],
+    ) -> CreateClaimsRequest:
+        """Hydrate a CreateClaimsRequest from a queued claim_queue row.
+
+        The grant attempt re-uses the full create_claims pipeline so
+        validation, scope checks, severity inference, symbol writes and
+        auto-resolution audit all stay consistent with a normal POST.
+        wait_seconds is deliberately set to 0 on the rehydrated request
+        so a drain-time re-conflict doesn't enqueue itself recursively.
+        """
+
+        symbols_field: list[str] | None = None
+        raw_symbols = entry.get("symbols")
+        if raw_symbols:
+            try:
+                parsed = json.loads(raw_symbols)
+                if isinstance(parsed, list):
+                    symbols_field = [str(s) for s in parsed]
+            except (TypeError, ValueError):
+                symbols_field = None
+        narrowable_field: bool | None
+        nv = entry.get("narrowable")
+        if nv is None:
+            narrowable_field = None
+        else:
+            narrowable_field = bool(int(nv))
+        item = ClaimItem(
+            type=str(entry["claim_type"]),
+            pattern=str(entry["pattern"]),
+            symbols=symbols_field,
+            narrowable=narrowable_field,
+        )
+        return CreateClaimsRequest(
+            engineer=str(entry["requester_engineer"]),
+            branch=entry.get("requester_branch"),
+            description=entry.get("requester_description"),
+            claims=[item],
+            ttl_hours=entry.get("ttl_hours"),
+            repo=entry.get("repo"),
+            session_id=entry.get("requester_session_id"),
+            wait_seconds=0,
+        )
 
     async def extend_claim(self, claim_id: str, body_engineer: str, ttl_hours: int) -> bool:
         new_exp = _expires_at(ttl_hours)
@@ -951,6 +1167,46 @@ class CoordinationService:
 
     async def get_ownership_yaml(self) -> str | None:
         return await self.db.get_ownership_yaml()
+
+    async def promote_hotspot(
+        self,
+        *,
+        action: str,
+        pattern: str,
+        note: str | None,
+    ) -> str:
+        """v0.21 soft auto-promote: write ``pattern`` into the active
+        owners.yaml as either a shared_file rule (action='shared_file')
+        or a split-suggestion entry (action='split'). Idempotent.
+
+        Returns the patched YAML so the operator can verify the result.
+        """
+        from coordination.ownership import (
+            patch_owners_yaml_with_shared_file,
+            patch_owners_yaml_with_split_suggestion,
+        )
+
+        current = await self.db.get_ownership_yaml() or ""
+        if action == "shared_file":
+            patched = patch_owners_yaml_with_shared_file(current, pattern)
+        elif action == "split":
+            patched = patch_owners_yaml_with_split_suggestion(
+                current,
+                pattern=pattern,
+                note=note,
+                suggested_at=datetime.now(UTC)
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z"),
+            )
+        else:
+            raise ValueError(
+                f"unknown promote action {action!r}; "
+                "expected 'shared_file' or 'split'"
+            )
+        if patched != current:
+            await self.db.set_ownership_yaml(patched)
+        return patched
 
 
 def build_service() -> CoordinationService:

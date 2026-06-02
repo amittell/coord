@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import json
 from collections import Counter, defaultdict
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -662,6 +663,18 @@ tbody tr td.empty {
 .hotspots .hssuggest.sg-split { color: #ff8a7f; border-color: #6b3a36; }
 .hotspots .hssuggest.sg-shared { color: var(--cyan); border-color: #2f5466; }
 .hotspots .hssuggest.sg-monitor { color: var(--muted-2); }
+.hotspots .hsapply {
+  margin-left: calc(var(--grid));
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  padding: 1px 4px;
+  border-radius: 2px;
+  border: 1px solid currentColor;
+  text-decoration: none;
+  color: inherit;
+  opacity: 0.7;
+}
+.hotspots .hsapply:hover { opacity: 1; }
 """
 
 
@@ -1068,13 +1081,39 @@ async def render_dashboard() -> str:
             tag, label = _hotspot_suggestion(attempts)
             repo_label = _esc(str(row.get("repo") or "(unattributed)"))
             pattern_label = _esc(str(row.get("pattern") or ""))
+            # v0.21: render an "apply" link for actionable suggestions.
+            # The link is documentary (no client-side JS); the operator
+            # actuates via POST /metrics/hotspots/promote with the
+            # data-payload shown in the title attribute.
+            apply_link = ""
+            if tag in ("split", "shared"):
+                action_name = (
+                    "shared_file" if tag == "shared" else "split"
+                )
+                payload_json = json.dumps(
+                    {
+                        "action": action_name,
+                        "pattern": str(row.get("pattern") or ""),
+                        "repo": row.get("repo"),
+                    },
+                    separators=(",", ":"),
+                )
+                title_attr = (
+                    f"POST /metrics/hotspots/promote -d {payload_json}"
+                )
+                apply_link = (
+                    f'<a class="hsapply" title="{_esc(title_attr)}" '
+                    'href="#" data-pattern="'
+                    f'{_esc(str(row.get("pattern") or ""))}" '
+                    f'data-action="{action_name}">apply</a>'
+                )
             hotspot_lines.append(
                 '<div class="hsrow">'
                 f'<div class="hsrepo">{repo_label}</div>'
                 f'<div class="hspattern">{pattern_label}</div>'
                 f'<div class="hscount">{attempts} '
                 f'<span class="muted">({distinct} engineers)</span></div>'
-                f'<div class="hssuggest sg-{tag}">{label}</div>'
+                f'<div class="hssuggest sg-{tag}">{label}{apply_link}</div>'
                 '</div>'
             )
         hotspot_body = "".join(hotspot_lines)

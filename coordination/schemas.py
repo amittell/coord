@@ -59,6 +59,21 @@ class CreateClaimsRequest(BaseModel):
             "Codex/Claude process don't block each other."
         ),
     )
+    wait_seconds: int | None = Field(
+        default=None,
+        ge=0,
+        le=600,
+        description=(
+            "v0.21 FIFO queue knob. When set to a positive int and the "
+            "request would 409, the service enqueues the requester behind "
+            "the blocking holder and long-polls for up to ``wait_seconds`` "
+            "seconds. If the holder releases within that window the "
+            "service grants the next FIFO entry and returns the new claim "
+            "ids; otherwise the original conflict payload is returned. "
+            "wait_seconds=0 or None preserves the v0.13-v0.20 immediate-409 "
+            "behaviour."
+        ),
+    )
 
 
 class ConflictingClaim(BaseModel):
@@ -186,5 +201,34 @@ class RespondToRequestRequest(BaseModel):
             "via claims.coexists_with, but still adversarial to anyone "
             "outside the pair. Useful when both agents want to edit "
             "different functions in the same file."
+        ),
+    )
+
+
+class PromoteHotspotRequest(BaseModel):
+    """v0.21: write a hotspot pattern into the active owners.yaml.
+
+    The dashboard surfaces hotspot files (v0.20) with a suggested
+    action chip; v0.21 makes the suggestion actionable via POST
+    /metrics/hotspots/promote. Idempotent: promoting an already-
+    present pattern is a no-op.
+    """
+
+    action: str = Field(..., description="'shared_file' or 'split'")
+    pattern: str = Field(..., min_length=1)
+    repo: str | None = Field(
+        default=None,
+        description=(
+            "Informational only -- ownership rules are global per coord "
+            "instance today. Recorded in the response so the operator "
+            "can correlate with the dashboard row that triggered the "
+            "promote."
+        ),
+    )
+    note: str | None = Field(
+        default=None,
+        description=(
+            "Free-text note attached to a 'split' suggestion so future "
+            "reviewers can see why the operator flagged this pattern."
         ),
     )

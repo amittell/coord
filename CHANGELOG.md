@@ -9,6 +9,27 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.21.0] - 2026-06-02
+
+### Added
+
+- Soft auto-promote: POST /metrics/hotspots/promote accepts
+  {action: "shared_file" | "split", pattern, repo?, note?} and writes
+  the corresponding rule into the active owners.yaml. Idempotent.
+  Dashboard hotspot rows render an apply link for actionable suggestions.
+  Operator still in the loop -- v0.21 stays read-only by default and
+  only writes when actively poked.
+- FIFO queue for blocked claim_files requests. Schema v11 adds the
+  claim_queue table. When the caller passes wait_seconds > 0 and the
+  request would 409, the service enqueues the requester behind the
+  blocking holder and long-polls for up to wait_seconds seconds. On
+  release (manual release_claims, TTL expiry, request approval,
+  narrowed/coexist decisions) the service drains the FIFO and
+  auto-grants the next entry. wait_seconds=0 or omitted preserves the
+  v0.13-v0.20 immediate-409 behaviour.
+- CreateClaimsRequest.wait_seconds field (0..600).
+- coord-mcp claim_files exposes wait_seconds as an optional kwarg.
+
 ## [0.20.0] - 2026-06-02
 
 ### Added

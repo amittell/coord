@@ -118,7 +118,40 @@ The dashboard surfaces a "Hotspot files (30d)" panel that ranks files by how oft
 - **promote to `shared_file`** -- attempts above the threshold but the file is genuinely shared (lockfiles, routing tables, schema index); switching the claim type to `shared_file` makes the overlap explicit.
 - **monitor** -- just above `min_attempts`; not actionable yet, but worth watching.
 
-The signal is read-only in v0.20 -- nothing happens automatically. Auto-promote is queued for v0.21. The same series is exposed at `GET /metrics/hotspots?days=30` for external monitoring (Prometheus scrapes, weekly digest emails, etc.); see [./api-reference.md](./api-reference.md) for query params and response shape.
+The signal is read-only in v0.20 -- nothing happens automatically. Auto-promote ships in v0.21 (see below). The same series is exposed at `GET /metrics/hotspots?days=30` for external monitoring (Prometheus scrapes, weekly digest emails, etc.); see [./api-reference.md](./api-reference.md) for query params and response shape.
+
+#### Applying the suggestion (v0.21+)
+
+The "promote to `shared_file`" and "split into modules" chips on the dashboard hotspot rows now have actionable counterparts. POST to `/metrics/hotspots/promote` with the chosen action and pattern to write the corresponding rule into the active `owners.yaml`:
+
+```bash
+curl -X POST http://127.0.0.1:8080/metrics/hotspots/promote \
+  -H "Authorization: Bearer $COORD_AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "action": "shared_file",
+    "pattern": "package-lock.json",
+    "repo": "amittell/coord",
+    "note": "weekly digest 2026-06-02"
+  }'
+```
+
+`action` is `"shared_file"` (promote the pattern to a `shared_file` rule) or `"split"` (annotate the pattern for a follow-up modularisation pass). Idempotent: applying the same action+pattern twice is a no-op. Operator still in the loop -- v0.21 only writes when actively poked, never on its own.
+
+## Queueing claims (v0.21+)
+
+When `claim_files` would `409` against an active holder, the requester historically had to retry on a timer or file an explicit `request_release`. v0.21 adds a third option: pass `wait_seconds` and the service FIFO-queues the requester behind the blocking claim, long-polling for the holder to release.
+
+```python
+claim_files(
+    engineer="alex/claude/main",
+    patterns=["src/auth/login.ts"],
+    description="auth refactor",
+    wait_seconds=30,
+)
+```
+
+When the holder releases (manual `release_claims`, TTL expiry, request approval, or a `narrowed` / `coexist` decision), the service drains the FIFO and auto-grants the next entry. Multiple queued requesters are served in arrival order. The server caps `wait_seconds` at 600s; pass `0` (or omit) to preserve the immediate-409 behaviour from v0.13-v0.20. The MCP wrapper accepts `wait_seconds` directly on `claim_files`; the same field exists on `POST /claims` (see [./api-reference.md](./api-reference.md)).
 
 ## Monorepo wiring: `coord init --root`
 

@@ -193,6 +193,14 @@ The dashboard surfaces a 30-day auto-resolution heatmap per repo so you can see 
 
 - **Hotspot files (v0.20):** the dashboard adds a "Hotspot files (30d)" panel listing the files agents keep `409`'ing on, with a suggested-action chip (split into modules, promote to `shared_file`, or just monitor) based on attempt thresholds. The same series is exposed at `GET /metrics/hotspots?days=30` for external monitoring. Read-only signal for v0.20; auto-promote is queued for v0.21.
 
+### Apply hotspot suggestions (v0.21)
+
+The dashboard's "promote to shared_file" / "split into modules" chips now have actionable counterparts. POST to `/metrics/hotspots/promote` with `{action: "shared_file" | "split", pattern}` to write the rule into `owners.yaml`. Idempotent.
+
+### Queue claims instead of bouncing (v0.21)
+
+`claim_files` now accepts `wait_seconds`. When the request would `409`, the requester is FIFO-queued behind the holder; on release the next queued requester is auto-granted. Eliminates the retry storm on hot files.
+
 ## Local Assets
 
 - `.env.example`: environment variable template

@@ -24,6 +24,7 @@ from coordination.schemas import (
     CreateClaimsRequest,
     ExtendClaimRequest,
     FileRequestRequest,
+    PromoteHotspotRequest,
     ReleaseClaimsRequest,
     RespondToRequestRequest,
 )
@@ -276,6 +277,39 @@ async def hotspots_metric(
         "days": days,
         "min_attempts": min_attempts,
         "count": len(rows),
+    }
+
+
+@app.post("/metrics/hotspots/promote")
+async def promote_hotspot(
+    body: PromoteHotspotRequest,
+    _: None = Depends(require_auth),
+) -> dict:
+    """v0.21 soft auto-promote.
+
+    Write ``body.pattern`` into the active ownership YAML, either as a
+    top-level ``shared_files`` rule (action='shared_file') or as an
+    informational ``suggested_splits`` entry (action='split').
+    Idempotent: re-promoting a pattern that's already present is a
+    no-op and returns the unchanged YAML.
+
+    The dashboard renders an "apply" link per qualifying hotspot row
+    pointing at this endpoint; the operator is in the loop.
+    """
+    try:
+        patched = await get_service().promote_hotspot(
+            action=body.action,
+            pattern=body.pattern,
+            note=body.note,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "action": body.action,
+        "pattern": body.pattern,
+        "repo": body.repo,
+        "patched_yaml": patched,
     }
 
 

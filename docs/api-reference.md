@@ -60,6 +60,10 @@ Request body:
 }
 ```
 
+The top-level body accepts an optional `wait_seconds` field added in v0.21:
+
+- `wait_seconds` (int, default `0`, range `0..600`): when the request would `409`, FIFO-queue the caller behind the blocking holder and long-poll for up to this many seconds for the holder to release. On release (manual `release_claims`, TTL expiry, request approval, or a `narrowed` / `coexist` decision) the service drains the queue and auto-grants the next entry in arrival order. `0` (or omitted) preserves the v0.13-v0.20 immediate-409 behaviour. The server caps the value at 600.
+
 Each `ClaimItem` accepts two optional fields added in v0.14:
 
 - `symbols` (`list[str]`): top-level symbol names within `pattern`. When present and non-empty, the claim becomes `scope_type='symbol'` and covers only the listed declarations; imports and module-level statements are explicitly not covered. When `pattern` is a glob, the symbol list applies to every matched file -- pass separate claim items if you want per-file granularity. Empty or absent: `scope_type='file'` (legacy behaviour). Entries containing `::` are interpreted as method-scope (v0.16+): `"Router::handleAuth"` claims the `handleAuth` method on the `Router` class. The server splits at insert time and stores `Router` as the parent and `handleAuth` as the leaf. Two-level only -- nested classes / nested namespaces are not yet supported.
@@ -267,7 +271,55 @@ Example response:
 - `attempts >= 10` -> `"promote to shared_file"` (genuinely shared scope, make the overlap explicit).
 - `attempts >= min_attempts` -> `"monitor"` (not actionable yet, but worth watching).
 
-Empty result (no qualifying rows in the window) returns `{"series": [], "days": ..., "min_attempts": ..., "limit": ..., "count": 0}`. The signal is read-only in v0.20 -- nothing is promoted automatically; auto-promote is queued for v0.21.
+Empty result (no qualifying rows in the window) returns `{"series": [], "days": ..., "min_attempts": ..., "limit": ..., "count": 0}`. The signal is read-only in v0.20; the v0.21 `POST /metrics/hotspots/promote` endpoint (below) provides an operator-driven apply path.
+
+## `POST /metrics/hotspots/promote` (v0.21.0+)
+
+Apply a suggested action from the hotspot panel to the active `owners.yaml`. The dashboard's "promote to `shared_file`" and "split into modules" chips POST to this endpoint; operators can also call it directly from `curl` or a digest-email automation. Idempotent: applying the same action+pattern twice is a no-op and the second response simply echoes the existing rule.
+
+Request body:
+
+```json
+{
+  "action": "shared_file",
+  "pattern": "package-lock.json",
+  "repo": "amittell/coord",
+  "note": "weekly digest 2026-06-02"
+}
+```
+
+Fields:
+
+- `action` (str, required): `"shared_file"` writes the pattern as a `shared_file` rule into `owners.yaml`. `"split"` annotates the pattern with a `split` marker for a follow-up modularisation pass; the rule survives in `owners.yaml` so the dashboard surfaces the pending split until an operator removes it.
+- `pattern` (str, required): the file glob to promote. Usually copied from the hotspot row's `attempted_pattern`.
+- `repo` (str, optional): repo identifier to scope the rule. When omitted, the rule applies repo-wide.
+- `note` (str, optional): free-form audit note recorded alongside the rule. Surfaces in the dashboard and the audit trail.
+
+Example:
+
+```bash
+curl -X POST http://127.0.0.1:8080/metrics/hotspots/promote \
+  -H "Authorization: Bearer $COORD_AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"action": "shared_file", "pattern": "package-lock.json"}'
+```
+
+Response shape:
+
+```json
+{
+  "action": "shared_file",
+  "pattern": "package-lock.json",
+  "repo": "amittell/coord",
+  "applied": true,
+  "owners_yaml_path": ".coordination/owners.yaml",
+  "rule": {"type": "shared_file", "pattern": "package-lock.json"}
+}
+```
+
+`applied` is `true` when the rule was newly written and `false` when the same rule already existed (idempotent path). `400` when `action` is not one of the two supported values, or when `pattern` is empty.
+
+The operator stays in the loop -- v0.21 never auto-promotes on its own; the endpoint only writes when actively poked.
 
 ## `GET /sessions/{session_id}/pending_requests` (v0.6.0+, extended in v0.9.0)
 

@@ -141,7 +141,7 @@ CREATE INDEX IF NOT EXISTS idx_claims_engineer ON claims (engineer);
 """
 
 
-CURRENT_SCHEMA_VERSION = 10
+CURRENT_SCHEMA_VERSION = 11
 
 # Migration registry: list of (version, upgrade_sql) tuples applied in order.
 # Entry for version N is the SQL that upgrades a DB from version N-1 to N.
@@ -327,6 +327,47 @@ MIGRATIONS: list[tuple[int, str]] = [
         "ALTER TABLE claim_symbols ADD COLUMN parent_symbol TEXT;\n"
         "CREATE INDEX idx_claim_symbols_file_parent "
         "ON claim_symbols (file_path, parent_symbol);",
+    ),
+    # v11: FIFO queue for blocked claim_files requests. When the caller
+    # passes ``wait_seconds > 0`` and the requested claim overlaps an
+    # active holder, the request is enqueued instead of returning 409.
+    # The release path (manual release_claims, TTL expiry,
+    # release_session, request_release approval, narrowed/coexist
+    # decisions) drains the head of the queue: try to grant the next
+    # waiting row against the now-released scope and notify any
+    # in-process long-poll via an asyncio.Event keyed on the queue id.
+    #
+    # ``state`` is the canonical lifecycle field: waiting -> granted /
+    # expired / cancelled. ``position`` is the per-blocking-claim
+    # ordering used for FIFO. ``symbols`` is a JSON-serialised list of
+    # ``"Parent::child"`` notation strings so the requester's symbol
+    # payload survives the round-trip across the release boundary.
+    (
+        11,
+        "CREATE TABLE claim_queue (\n"
+        "    id TEXT PRIMARY KEY,\n"
+        "    blocking_claim_id TEXT NOT NULL,\n"
+        "    requester_engineer TEXT NOT NULL,\n"
+        "    requester_session_id TEXT,\n"
+        "    requester_branch TEXT,\n"
+        "    requester_description TEXT,\n"
+        "    repo TEXT,\n"
+        "    claim_type TEXT NOT NULL,\n"
+        "    pattern TEXT NOT NULL,\n"
+        "    symbols TEXT,\n"
+        "    narrowable INTEGER,\n"
+        "    ttl_hours INTEGER,\n"
+        "    position INTEGER NOT NULL,\n"
+        "    state TEXT NOT NULL DEFAULT 'waiting',\n"
+        "    granted_claim_id TEXT,\n"
+        "    enqueued_at TEXT NOT NULL,\n"
+        "    expires_at TEXT NOT NULL,\n"
+        "    FOREIGN KEY (blocking_claim_id) REFERENCES claims(id)\n"
+        ");\n"
+        "CREATE INDEX idx_claim_queue_blocking "
+        "ON claim_queue (blocking_claim_id, state, position);\n"
+        "CREATE INDEX idx_claim_queue_requester "
+        "ON claim_queue (requester_engineer, state);",
     ),
 ]
 
@@ -858,6 +899,191 @@ class Database:
                 (json.dumps(partners), claim_id),
             )
             await conn.commit()
+
+    async def enqueue_claim_request(
+        self,
+        *,
+        blocking_claim_id: str,
+        requester_engineer: str,
+        requester_session_id: str | None,
+        requester_branch: str | None,
+        requester_description: str | None,
+        repo: str | None,
+        claim_type: str,
+        pattern: str,
+        symbols: list[str] | None,
+        narrowable: bool | None,
+        ttl_hours: int | None,
+        wait_seconds: int,
+    ) -> dict[str, Any]:
+        """Enqueue a v0.21 FIFO claim request behind a blocking holder.
+
+        Returns the inserted queue row (with ``id``, ``position``,
+        ``expires_at``). The service layer's long-poll uses the ``id``
+        as the key into the in-memory asyncio.Event dispatch so a
+        release-time grant wakes the right waiter.
+
+        Position is computed inside a BEGIN IMMEDIATE so concurrent
+        enqueues on the same blocking_claim_id never collide on the
+        ordering field.
+        """
+        await self.init()
+        now = datetime.now(UTC)
+        now_iso = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        expires = now + timedelta(seconds=max(1, int(wait_seconds)))
+        expires_iso = (
+            expires.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        )
+        symbols_json = json.dumps(symbols) if symbols else None
+        narrowable_int: int | None
+        if narrowable is None:
+            narrowable_int = None
+        else:
+            narrowable_int = 1 if narrowable else 0
+        new_id = str(uuid4())
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            await conn.execute("BEGIN IMMEDIATE")
+            cur = await conn.execute(
+                "SELECT COALESCE(MAX(position), 0) AS p FROM claim_queue "
+                "WHERE blocking_claim_id = ?",
+                (blocking_claim_id,),
+            )
+            row = await cur.fetchone()
+            next_position = int((row["p"] if row else 0) or 0) + 1
+            await conn.execute(
+                "INSERT INTO claim_queue ("
+                "id, blocking_claim_id, requester_engineer, "
+                "requester_session_id, requester_branch, "
+                "requester_description, repo, claim_type, pattern, "
+                "symbols, narrowable, ttl_hours, position, state, "
+                "enqueued_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "'waiting', ?, ?)",
+                (
+                    new_id,
+                    blocking_claim_id,
+                    requester_engineer,
+                    requester_session_id,
+                    requester_branch,
+                    requester_description,
+                    repo,
+                    claim_type,
+                    pattern,
+                    symbols_json,
+                    narrowable_int,
+                    ttl_hours,
+                    next_position,
+                    now_iso,
+                    expires_iso,
+                ),
+            )
+            await conn.commit()
+        return {
+            "id": new_id,
+            "blocking_claim_id": blocking_claim_id,
+            "position": next_position,
+            "state": "waiting",
+            "enqueued_at": now_iso,
+            "expires_at": expires_iso,
+        }
+
+    async def pop_next_waiting_queue_entry(
+        self, blocking_claim_id: str
+    ) -> dict[str, Any] | None:
+        """Return the head-of-queue waiting entry for ``blocking_claim_id``,
+        marking it as ``in_progress`` so a concurrent release-drain on the
+        same claim doesn't double-grant. The service layer either calls
+        :meth:`mark_queue_granted` (success) or :meth:`mark_queue_expired`
+        / re-enqueue (failure) before returning.
+        """
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            await conn.execute("BEGIN IMMEDIATE")
+            cur = await conn.execute(
+                "SELECT * FROM claim_queue "
+                "WHERE blocking_claim_id = ? AND state = 'waiting' "
+                "ORDER BY position ASC LIMIT 1",
+                (blocking_claim_id,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                await conn.commit()
+                return None
+            await conn.execute(
+                "UPDATE claim_queue SET state = 'in_progress' WHERE id = ?",
+                (row["id"],),
+            )
+            await conn.commit()
+            return dict(row)
+
+    async def mark_queue_granted(
+        self, queue_id: str, granted_claim_id: str
+    ) -> None:
+        """Finalise a queue entry whose drain attempt produced a real
+        claim. The in-memory long-poll signal is fired by the service
+        layer; this method just persists the state transition."""
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            await _configure_sqlite(conn)
+            await conn.execute(
+                "UPDATE claim_queue SET state = 'granted', "
+                "granted_claim_id = ? WHERE id = ?",
+                (granted_claim_id, queue_id),
+            )
+            await conn.commit()
+
+    async def mark_queue_expired(self, queue_id: str) -> None:
+        """Mark a queue entry as expired (wait_seconds elapsed without
+        a grant, or the drain attempt re-conflicted). The long-poll on
+        the requester side surfaces the original 409 to the caller."""
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            await _configure_sqlite(conn)
+            await conn.execute(
+                "UPDATE claim_queue SET state = 'expired' WHERE id = ?",
+                (queue_id,),
+            )
+            await conn.commit()
+
+    async def expire_stale_queue_entries(self, now_iso: str | None = None) -> int:
+        """Mark every waiting queue entry whose ``expires_at`` has
+        passed as ``expired``. Called from the background cleanup
+        loop so a long-poll timeout always converges even if the
+        in-memory event was missed (process restart, server crash)."""
+        await self.init()
+        ts = now_iso or _utcnow()
+        async with aiosqlite.connect(self.path) as conn:
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                "UPDATE claim_queue SET state = 'expired' "
+                "WHERE state IN ('waiting', 'in_progress') "
+                "AND datetime(expires_at) <= datetime(?)",
+                (ts,),
+            )
+            await conn.commit()
+            return cur.rowcount or 0
+
+    async def list_queue_for_requester(
+        self, engineer: str
+    ) -> list[dict[str, Any]]:
+        """Return every queue row this engineer currently has, ordered
+        by enqueued_at. Powers a v0.21 ``GET /requests`` extension and
+        the dashboard's per-engineer queue panel (follow-up release)."""
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                "SELECT * FROM claim_queue WHERE requester_engineer = ? "
+                "ORDER BY enqueued_at DESC",
+                (engineer,),
+            )
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
 
     async def touch_session_activity(self, session_id: str) -> int:
         """Bump ``last_activity`` on every active claim that belongs to

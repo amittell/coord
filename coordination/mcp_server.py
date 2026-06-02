@@ -262,6 +262,7 @@ async def claim_files(
     ttl_hours: int | None = None,
     symbols: dict[str, list[str]] | None = None,
     narrowable: bool | None = None,
+    wait_seconds: int | None = None,
 ) -> dict[str, Any]:
     """Claim files or glob patterns before editing; returns claim_ids or conflicts.
 
@@ -280,6 +281,16 @@ async def claim_files(
     file. Defaults are decided server-side (file=True, shared_file=False,
     symbol=False); pass ``False`` here to force the legacy 409+request
     flow instead of auto-narrow on a normal file claim.
+
+    ``wait_seconds`` (v0.21+) opts the request into the FIFO queue. When
+    set to a positive int and the request would 409, the service
+    enqueues this caller behind the blocking holder and long-polls for
+    up to ``wait_seconds`` seconds. If the holder releases within that
+    window the service grants the next FIFO entry and returns the new
+    claim ids; otherwise the original conflict payload is returned.
+    ``wait_seconds=0`` or ``None`` preserves the v0.13-v0.20
+    immediate-409 behaviour and the key is omitted from the POST body
+    so pre-v0.21 servers see a byte-identical request shape.
 
     For backward compatibility the wrapper omits the ``symbols`` and
     ``narrowable`` keys from each ``claims[i]`` payload entry when they
@@ -346,6 +357,12 @@ async def claim_files(
     if repo_id:
         body["repo"] = repo_id
     body["session_id"] = _SESSION_ID
+    # v0.21: only forward wait_seconds when it asks for FIFO waiting.
+    # None and 0 both mean "immediate-409", and omitting the key keeps
+    # the POST body byte-identical to the v0.13-v0.20 shape so pre-v0.21
+    # servers see no difference.
+    if wait_seconds is not None and wait_seconds > 0:
+        body["wait_seconds"] = wait_seconds
     async with httpx.AsyncClient(timeout=30.0) as client:
         r = await client.post(f"{_base_url()}/claims", json=body, headers={**_headers(), "Content-Type": "application/json"})
         if r.status_code in (400, 409):
