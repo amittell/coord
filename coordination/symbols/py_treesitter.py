@@ -20,10 +20,28 @@ Recognised top-level declarations:
   targets, comprehensions, and other callable-producing expressions are
   intentionally skipped to keep the heuristic predictable.
 
-Methods nested inside a class do NOT appear in the top-level symbol list --
-this backend walks only the direct children of the ``module`` node. The same
-applies to functions defined inside ``if __name__ == '__main__':`` guards or
-any other compound statement.
+v0.16 additions -- methods inside a class are now emitted as separate symbols.
+For each top-level ``class_definition`` (including decorated ones) the
+backend walks the direct children of the class's body ``block`` and emits:
+
+- ``function_definition`` -> ``Symbol(kind='function', parent=<class name>)``.
+  Covers regular methods, dunder methods (``__init__``, ``__repr__`` etc.),
+  and async methods. Async / non-async collapse to ``'function'`` because
+  the dataclass has no ``async_function`` kind.
+- ``decorated_definition`` whose inner is a ``function_definition`` -> same
+  treatment as above. Decorators such as ``@property``, ``@staticmethod``,
+  and ``@classmethod`` do not change the emitted kind or the parent.
+- ``assignment`` (inside an ``expression_statement``) whose right hand side
+  is a ``lambda`` -> ``Symbol(kind='const', parent=<class name>)``. This
+  mirrors the top-level lambda rule for class-body bindings such as
+  ``handler = lambda x: x``.
+
+Methods nested inside other functions (closures) stay excluded -- only
+direct children of the class body block are emitted. Nested ``class``
+definitions inside a class body are skipped entirely (the two-level
+``parent`` model has no slot for ``Outer::Inner::method``). Functions
+defined inside ``if __name__ == '__main__':`` guards or other compound
+statements at module scope also stay excluded.
 """
 
 from __future__ import annotations
@@ -76,13 +94,18 @@ def _symbol_from_definition(node: Any) -> Symbol | None:
     )
 
 
-def _symbol_from_decorated(node: Any) -> Symbol | None:
+def _symbol_from_decorated(node: Any) -> tuple[Symbol, Any] | None:
     """Unwrap a decorated_definition and emit the underlying symbol.
 
     The decorator stack is preserved in the start/end span so the claim
     covers the decorators as well as the definition body. The kind comes
     from the inner ``function_definition`` / ``class_definition`` -- decorators
     such as ``@property`` or ``@staticmethod`` do not change the kind.
+
+    Returns a tuple of ``(symbol, inner_definition_node)`` so the caller can
+    walk into the inner node's body for v0.16 method extraction when the
+    inner is a ``class_definition``. Returns ``None`` if the decorated node
+    does not wrap a recognised definition.
     """
 
     inner: Any = None
@@ -97,13 +120,14 @@ def _symbol_from_decorated(node: Any) -> Symbol | None:
     if name_node is None:
         return None
 
-    return Symbol(
+    sym = Symbol(
         name=name_node.text.decode("utf-8"),
         kind=_DEFINITION_KINDS[inner.type],
         # Span covers the decorators too -- start at the outer node.
         start_line=node.start_point[0] + 1,
         end_line=node.end_point[0] + 1,
     )
+    return sym, inner
 
 
 def _symbol_from_lambda_assignment(node: Any) -> Symbol | None:
@@ -140,13 +164,125 @@ def _symbol_from_lambda_assignment(node: Any) -> Symbol | None:
     )
 
 
-def extract(content: str) -> list[Symbol]:
-    """Return top-level declarations as :class:`Symbol` instances.
+def _method_symbol_from_function(
+    func_node: Any,
+    class_name: str,
+    span_node: Any | None = None,
+) -> Symbol | None:
+    """Build a method Symbol from a function_definition inside a class body.
 
-    Only direct children of the ``module`` node are inspected -- nested
-    definitions (methods, functions inside ``if`` blocks, classes inside
-    functions) are intentionally skipped because they are not addressable as
-    top-level claims.
+    ``span_node`` lets a decorated method include its decorator stack in the
+    line span (caller passes the outer ``decorated_definition``); plain
+    methods pass ``span_node=None`` so the span comes from ``func_node``.
+    """
+
+    name_node = func_node.child_by_field_name("name")
+    if name_node is None:
+        return None
+
+    span = span_node if span_node is not None else func_node
+    return Symbol(
+        name=name_node.text.decode("utf-8"),
+        kind="function",
+        start_line=span.start_point[0] + 1,
+        end_line=span.end_point[0] + 1,
+        parent=class_name,
+    )
+
+
+def _method_symbol_from_lambda(node: Any, class_name: str) -> Symbol | None:
+    """Match ``NAME = lambda ...`` at class-body scope.
+
+    Mirrors :func:`_symbol_from_lambda_assignment` but tags the result with
+    ``parent=class_name`` so it surfaces as a method-shaped const.
+    """
+
+    assignment: Any = None
+    for child in node.children:
+        if child.type == "assignment":
+            assignment = child
+            break
+    if assignment is None:
+        return None
+
+    left = assignment.child_by_field_name("left")
+    right = assignment.child_by_field_name("right")
+    if left is None or right is None:
+        return None
+    if left.type != "identifier":
+        return None
+    if right.type != "lambda":
+        return None
+
+    return Symbol(
+        name=left.text.decode("utf-8"),
+        kind="const",
+        start_line=node.start_point[0] + 1,
+        end_line=node.end_point[0] + 1,
+        parent=class_name,
+    )
+
+
+def _methods_from_class(class_node: Any, class_name: str) -> list[Symbol]:
+    """Walk the direct children of a class body and emit method symbols.
+
+    Only direct children of the ``block`` node count; closures inside a
+    method body and nested class bodies are not traversed. Nested
+    ``class_definition`` nodes are skipped entirely because the two-level
+    ``parent`` model in v0.16 cannot represent ``Outer::Inner::method``.
+    """
+
+    body = class_node.child_by_field_name("body")
+    if body is None:
+        return []
+
+    out: list[Symbol] = []
+    for child in body.children:
+        if child.type == "function_definition":
+            sym = _method_symbol_from_function(child, class_name)
+            if sym is not None:
+                out.append(sym)
+            continue
+
+        if child.type == "decorated_definition":
+            inner: Any = None
+            for c in child.children:
+                if c.type == "function_definition":
+                    inner = c
+                    break
+            if inner is None:
+                # Decorated nested class inside a class body -- skip, same
+                # reasoning as bare nested classes below.
+                continue
+            sym = _method_symbol_from_function(inner, class_name, span_node=child)
+            if sym is not None:
+                out.append(sym)
+            continue
+
+        if child.type == "expression_statement":
+            sym = _method_symbol_from_lambda(child, class_name)
+            if sym is not None:
+                out.append(sym)
+            continue
+
+        # Anything else (nested class_definition, docstrings, bare
+        # assignments, pass statements, conditional blocks, etc.) does not
+        # produce a method symbol in v0.16. Nested classes are intentionally
+        # skipped because Outer::Inner::method would need three-level parent
+        # tracking that the dataclass and schema do not yet support.
+
+    return out
+
+
+def extract(content: str) -> list[Symbol]:
+    """Return top-level declarations and class methods as :class:`Symbol`s.
+
+    Top-level scan covers direct children of the ``module`` node. For every
+    top-level class (including decorated classes) the backend additionally
+    walks the class's body block and emits its direct-child methods with
+    ``parent`` set to the class name. Output order follows source order:
+    each class is immediately followed by its methods, before the next
+    top-level declaration.
     """
 
     parser = _python_parser()
@@ -159,12 +295,17 @@ def extract(content: str) -> list[Symbol]:
             sym = _symbol_from_definition(child)
             if sym is not None:
                 out.append(sym)
+                if child.type == "class_definition":
+                    out.extend(_methods_from_class(child, sym.name))
             continue
 
         if child.type == "decorated_definition":
-            sym = _symbol_from_decorated(child)
-            if sym is not None:
+            result = _symbol_from_decorated(child)
+            if result is not None:
+                sym, inner = result
                 out.append(sym)
+                if inner.type == "class_definition":
+                    out.extend(_methods_from_class(inner, sym.name))
             continue
 
         if child.type == "expression_statement":

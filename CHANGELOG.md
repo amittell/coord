@@ -9,6 +9,29 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.16.0] - 2026-06-02
+
+### Added
+
+- Method-level (namespaced) symbol claims. Schema v10 adds
+  `claim_symbols.parent_symbol`. Clients send `"Parent::child"`
+  notation in the `symbols` list; the service splits at insert time.
+  Two-level prefix-matching overlap: a method claim and its parent
+  class auto-block; two sibling methods auto-coexist.
+- TS/Python/Go parsers extract methods with the enclosing class /
+  receiver type recorded as `parent`. The Symbol dataclass gained a
+  `parent: str | None` field.
+- 4 new e2e API tests for the namespace overlap matrix
+  (auto-coexist between methods, class blocks method, different
+  classes coexist, same method conflicts).
+
+### Changed
+
+- `Database.insert_claim_symbols` signature is now 6-tuples
+  `(id, claim_id, file_path, symbol_name, symbol_kind, parent_symbol)`
+  instead of 5-tuples. Callers that built the tuple manually must add
+  the `parent_symbol` slot (pass `None` for top-level symbols).
+
 ## [0.15.0] - 2026-06-02
 
 ### Added

@@ -914,8 +914,8 @@ async def test_dashboard_active_claims_show_symbol_names_for_symbol_scope(
         await conn.commit()
     await svc.db.insert_claim_symbols(
         rows=[
-            (str(uuid4()), cid, "src/auth/login.ts", "handleLogin", "function"),
-            (str(uuid4()), cid, "src/auth/login.ts", "validateCredentials", "function"),
+            (str(uuid4()), cid, "src/auth/login.ts", "handleLogin", "function", None),
+            (str(uuid4()), cid, "src/auth/login.ts", "validateCredentials", "function", None),
         ]
     )
 

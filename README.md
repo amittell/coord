@@ -161,6 +161,24 @@ Two automatic decisions kick in when symbols are involved:
 
 Symbols only cover the named declarations. Imports and module-level statements still need a file claim. TypeScript is supported in v0.14; Python and Go follow in v0.15. See [./docs/design/sub-file-claims.md](./docs/design/sub-file-claims.md) for the full spec.
 
+### Method-level scope (v0.16)
+
+Claim a specific method on a class with the `Parent::child` notation:
+
+```http
+POST /claims
+{
+  "engineer": "alex/claude/main",
+  "claims": [{
+    "type": "file",
+    "pattern": "src/auth/router.ts",
+    "symbols": ["Router::handleAuth"]
+  }]
+}
+```
+
+Two agents on `Router::handleAuth` and `Router::handleLogout` auto-coexist; a claim on the bare `Router` blocks both (and vice versa). Two-level only in v0.16 -- nested classes / nested namespaces are not yet supported.
+
 ## Local Assets
 
 - `.env.example`: environment variable template

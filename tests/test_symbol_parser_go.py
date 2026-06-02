@@ -88,6 +88,8 @@ def test_simple_function(backend: str) -> None:
 
 
 def test_method_on_receiver(backend: str) -> None:
+    """v0.16: method receivers populate ``parent``."""
+
     src = (
         "package main\n"
         "\n"
@@ -96,9 +98,10 @@ def test_method_on_receiver(backend: str) -> None:
         "func (f *Foo) DoIt() error { return nil }\n"
     )
     result = extract_symbols("sample.go", src)
-    # Method name is bare ``DoIt`` -- receiver is intentionally not encoded.
     assert "DoIt" in _names(result)
-    assert _by_name(result, "DoIt").kind == "function"
+    do_it = _by_name(result, "DoIt")
+    assert do_it.kind == "function"
+    assert do_it.parent == "Foo"
 
 
 def test_generic_function(backend: str) -> None:
@@ -297,7 +300,9 @@ def test_method_on_embedded_type_still_top_level(backend: str) -> None:
     )
     result = extract_symbols("sample.go", src)
     assert "Surfaces" in _names(result)
-    assert _by_name(result, "Surfaces").kind == "function"
+    surfaces = _by_name(result, "Surfaces")
+    assert surfaces.kind == "function"
+    assert surfaces.parent == "Outer"
 
 
 # ---------------------------------------------------------------------------
@@ -312,3 +317,101 @@ def test_dispatcher_routes_go_extension(backend: str) -> None:
     result = extract_symbols("foo.go", src)
     assert result, "expected non-empty result for a simple Go func"
     assert "dispatched" in _names(result)
+
+
+# ---------------------------------------------------------------------------
+# v0.16: methods on receiver types
+# ---------------------------------------------------------------------------
+
+
+def test_pointer_receiver_extracts_parent(backend: str) -> None:
+    """``func (s *Server) Start()`` carries ``parent='Server'``."""
+
+    src = (
+        "package main\n"
+        "\n"
+        "type Server struct{}\n"
+        "\n"
+        "func (s *Server) Start() error { return nil }\n"
+    )
+    result = extract_symbols("sample.go", src)
+    start = _by_name(result, "Start")
+    assert start.kind == "function"
+    assert start.parent == "Server"
+
+
+def test_value_receiver_extracts_parent(backend: str) -> None:
+    """A value receiver (no ``*``) reduces to the same parent name."""
+
+    src = (
+        "package main\n"
+        "\n"
+        "type Server struct{}\n"
+        "\n"
+        "func (s Server) Stop() error { return nil }\n"
+    )
+    result = extract_symbols("sample.go", src)
+    stop = _by_name(result, "Stop")
+    assert stop.kind == "function"
+    assert stop.parent == "Server"
+
+
+def test_unnamed_receiver_still_extracts_type(backend: str) -> None:
+    """Receiver binding name is optional: ``func (*Server) Reset()``."""
+
+    src = (
+        "package main\n"
+        "\n"
+        "type Server struct{}\n"
+        "\n"
+        "func (*Server) Reset() {}\n"
+    )
+    result = extract_symbols("sample.go", src)
+    reset = _by_name(result, "Reset")
+    assert reset.kind == "function"
+    assert reset.parent == "Server"
+
+
+def test_top_level_func_has_no_parent(backend: str) -> None:
+    """Plain top-level functions keep ``parent=None``."""
+
+    src = "package main\n\nfunc Init() {}\n"
+    result = extract_symbols("sample.go", src)
+    init = _by_name(result, "Init")
+    assert init.kind == "function"
+    assert init.parent is None
+
+
+def test_methods_with_generic_receiver(backend: str) -> None:
+    """Generic receivers drop the type-parameter list: ``Container[T]`` -> ``Container``."""
+
+    src = (
+        "package main\n"
+        "\n"
+        "type Container[T any] struct{}\n"
+        "\n"
+        "func (c *Container[T]) Add(item T) {}\n"
+    )
+    result = extract_symbols("sample.go", src)
+    add = _by_name(result, "Add")
+    assert add.kind == "function"
+    assert add.parent == "Container"
+
+
+def test_methods_on_different_receivers_distinct(backend: str) -> None:
+    """Two methods on different receivers carry different ``parent`` values."""
+
+    src = (
+        "package main\n"
+        "\n"
+        "type Server struct{}\n"
+        "type Client struct{}\n"
+        "\n"
+        "func (s *Server) Handle() {}\n"
+        "func (c *Client) Send() {}\n"
+    )
+    result = extract_symbols("sample.go", src)
+    handle = _by_name(result, "Handle")
+    send = _by_name(result, "Send")
+    assert handle.parent == "Server"
+    assert send.parent == "Client"

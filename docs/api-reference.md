@@ -62,10 +62,10 @@ Request body:
 
 Each `ClaimItem` accepts two optional fields added in v0.14:
 
-- `symbols` (`list[str]`): top-level symbol names within `pattern`. When present and non-empty, the claim becomes `scope_type='symbol'` and covers only the listed declarations; imports and module-level statements are explicitly not covered. When `pattern` is a glob, the symbol list applies to every matched file -- pass separate claim items if you want per-file granularity. Empty or absent: `scope_type='file'` (legacy behaviour).
+- `symbols` (`list[str]`): top-level symbol names within `pattern`. When present and non-empty, the claim becomes `scope_type='symbol'` and covers only the listed declarations; imports and module-level statements are explicitly not covered. When `pattern` is a glob, the symbol list applies to every matched file -- pass separate claim items if you want per-file granularity. Empty or absent: `scope_type='file'` (legacy behaviour). Entries containing `::` are interpreted as method-scope (v0.16+): `"Router::handleAuth"` claims the `handleAuth` method on the `Router` class. The server splits at insert time and stores `Router` as the parent and `handleAuth` as the leaf. Two-level only -- nested classes / nested namespaces are not yet supported.
 - `narrowable` (`bool`): whether a later symbol-scope requester can auto-narrow this claim. Defaults: `file` -> `true`, `shared_file` / `module` / `symbol` -> `false`.
 
-Symbol-scope example:
+Symbol-scope example (mixing top-level and method-scope symbols):
 
 ```json
 {
@@ -76,6 +76,11 @@ Symbol-scope example:
       "type": "file",
       "pattern": "src/auth/login.ts",
       "symbols": ["handleLogin", "validateCredentials"]
+    },
+    {
+      "type": "file",
+      "pattern": "src/auth/router.ts",
+      "symbols": ["Router::handleAuth", "Router::handleLogout"]
     }
   ],
   "ttl_hours": 2
@@ -119,6 +124,33 @@ Conflict response shape:
 ```
 
 `your_symbols` echoes the requester's symbol list for the conflicting pattern. `conflicting_claim.scope_type` is `'file'` or `'symbol'`; `conflicting_claim.symbols` is present only when `scope_type='symbol'`. `symbol_overlap` lists the per-file symbol-name intersection; it is present only when both sides are symbol-scoped and their symbol sets actually overlap. Disjoint symbol sets do not produce a `409` -- the server resolves them as `AUTO_COEXIST` and returns `200` with both claims granted, cross-referenced via `coexists_with`. Pre-v0.14 clients that don't send `symbols` see the same `200` / `409` behaviour as before; the new fields are absent from their responses unless the conflict involves a v0.14 holder. See [./design/sub-file-claims.md](./design/sub-file-claims.md) for the full overlap algorithm.
+
+Method-scope conflict (v0.16+): when one side holds a bare-class symbol and the other claims a method on the same class, `symbol_overlap.symbols` echoes the canonical `Parent::child` form for the method side. Example -- requester asks for `Router::handleAuth` against a holder of bare `Router`:
+
+```json
+{
+  "claim_ids": [],
+  "conflicts": [
+    {
+      "your_pattern": "src/auth/router.ts",
+      "your_symbols": ["Router::handleAuth"],
+      "conflicting_claim": {
+        "id": "claim-id",
+        "engineer": "bob/claude/main",
+        "pattern": "src/auth/router.ts",
+        "scope_type": "symbol",
+        "symbols": ["Router"]
+      },
+      "overlap": ["src/auth/router.ts"],
+      "symbol_overlap": [
+        {"file": "src/auth/router.ts", "symbols": ["Router::handleAuth"]}
+      ]
+    }
+  ]
+}
+```
+
+Two agents on sibling methods (`Router::handleAuth` vs `Router::handleLogout`) do NOT hit this path -- the server grants both via `AUTO_COEXIST` and returns `200`.
 
 ## `GET /claims`
 

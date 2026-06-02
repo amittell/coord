@@ -40,12 +40,20 @@ class Symbol:
     ``start_line`` and ``end_line`` are 1-indexed and inclusive. ``kind`` is one
     of ``'function' | 'class' | 'interface' | 'type' | 'const' | 'enum'`` plus
     the catch-all ``'unknown'`` reserved for future backends.
+
+    ``parent`` is ``None`` for top-level declarations. v0.16 introduced
+    method-level symbols inside classes; for those, ``parent`` carries the
+    enclosing class name so callers can address ``Foo.handle`` distinctly from
+    a free-standing ``handle``. Older backends and free-standing declarations
+    continue to emit ``parent=None``; positional construction still works
+    because the new field has a default and is appended after ``end_line``.
     """
 
     name: str
     kind: str
     start_line: int
     end_line: int
+    parent: str | None = None
 
 
 Backend = Callable[[str], list[Symbol]]

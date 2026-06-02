@@ -1,6 +1,6 @@
 [project]
 name = "multi-agent-coordination"
-version = "0.15.0"
+version = "0.16.0"
 description = "Coordination service for multi-engineer agent teams (HTTP API + MCP + dashboard)"
 readme = "README.md"
 license = "Apache-2.0"

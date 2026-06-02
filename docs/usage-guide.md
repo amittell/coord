@@ -85,6 +85,31 @@ The `narrowable` flag controls whether a file claim can be auto-narrowed by an i
 
 Pass `narrowable=false` on a file claim to opt out: an incoming symbol claim then has to file an explicit `request_release`. See [./design/sub-file-claims.md](./design/sub-file-claims.md) for the overlap algorithm, parser strategy, and migration notes.
 
+### Method-level claims (v0.16+)
+
+For large classes, structs, or Go receiver types where multiple agents predictably touch different methods (a `Router` with 30 routes, a `Database` with a dozen query helpers), v0.16 pushes the unit of coordination one more level down: methods become individually claimable using a `Parent::child` notation in the `symbols` list.
+
+```python
+claim_files(
+    engineer="alex/claude/main",
+    patterns=["src/auth/router.ts"],
+    symbols={"src/auth/router.ts": ["Router::handleAuth"]},
+)
+```
+
+The service splits at insert time and stores `Router` as the parent and `handleAuth` as the leaf. Two-level prefix-matching overlap rules:
+
+- **Sibling methods auto-coexist.** Two agents on `Router::handleAuth` and `Router::handleLogout` are granted simultaneously via `AUTO_COEXIST` -- same posture as two disjoint top-level symbol claims on the same file.
+- **Class blocks all its methods (and vice versa).** A claim on the bare `Router` (no `::`) covers every `Router::*` method; an incoming method claim against an existing bare-class claim hits `SYMBOL_OVERLAP` and `409`s. Symmetrically: holding `Router::handleAuth` blocks an incoming claim on bare `Router`.
+- **Different parents are disjoint.** `Router::handle` and `Logger::handle` share a leaf name but no parent; they coexist freely.
+
+When to reach for method scope:
+
+- A file with one big class / struct that several agents predictably need different methods of.
+- A symbol-scope claim on the parent that keeps getting `409`'d because the actual edits are on disjoint methods.
+
+Limitations in v0.16: two-level only. Nested classes (`Outer::Inner`) and nested namespaces are NOT yet supported and will be parsed as a single two-level pair. Top-level symbols whose name happens to contain `::` should be avoided as claim targets until v0.17.
+
 ## Monorepo wiring: `coord init --root`
 
 In a monorepo, `coord init` defaults to the enclosing git work tree root, which is usually the whole repo. If several services share one repo and each service wants its own `.coordination/` directory (per-service ownership rules, per-service MCP wiring, per-service pre-push hook), pass `--root` to tell `init` where to place the generated files:

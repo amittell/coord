@@ -5,13 +5,15 @@ and emits one :class:`Symbol` per claimable declaration.
 
 Recognised top-level declarations:
 
-- ``function_declaration`` -- ``kind='function'``
+- ``function_declaration`` -- ``kind='function'``, ``parent=None``
 - ``method_declaration`` -- ``kind='function'``. Go's method declarations are
   top-level (the receiver lives outside the type), so they coordinate at the
-  same grain as plain functions. The Symbol carries just the method name --
-  receivers are intentionally dropped for v1 (sub-file claims are name-keyed
-  and adding the receiver would require a second lookup table in the conflict
-  engine).
+  same grain as plain functions. v0.16 attaches the receiver type name as
+  ``parent`` so a claim on a method can be disambiguated from a free function
+  with the same name. Pointer (``func (s *Server) ...``), value
+  (``func (s Server) ...``), unnamed (``func (*Server) ...``) and generic
+  (``func (c *Container[T]) ...``) receivers all reduce to the bare type name
+  (``Server``, ``Container``).
 - ``type_declaration`` containing one or more specs:
     - ``type_spec`` whose ``type`` child is an ``interface_type`` -> ``kind='interface'``
     - any other ``type_spec`` (struct, named primitive, type definition) -> ``kind='type'``
@@ -63,17 +65,90 @@ def _name_text(node) -> str | None:
     return name_node.text.decode("utf-8")
 
 
+def _receiver_type_name(node) -> str | None:
+    """Return the receiver type for a ``method_declaration``, or ``None``.
+
+    The receiver is the parenthesised parameter list before the method name,
+    e.g. ``(s *Server)`` or ``(c *Container[T])``. We unwrap one level of
+    pointer (``pointer_type``) and one level of generic instantiation
+    (``generic_type``) so all four supported shapes -- pointer, value,
+    unnamed receiver, generic -- collapse to the bare type identifier.
+    """
+
+    receiver = node.child_by_field_name("receiver")
+    if receiver is None:
+        return None
+
+    # The receiver is a parameter_list with exactly one parameter_declaration.
+    param_decl = None
+    for child in receiver.children:
+        if child.type == "parameter_declaration":
+            param_decl = child
+            break
+    if param_decl is None:
+        return None
+
+    type_node = param_decl.child_by_field_name("type")
+    if type_node is None:
+        # Fallback: scan children for the first type-like node when the
+        # ``type`` field is not exposed by this grammar revision.
+        for child in param_decl.children:
+            if child.type in {
+                "type_identifier",
+                "pointer_type",
+                "generic_type",
+            }:
+                type_node = child
+                break
+    if type_node is None:
+        return None
+
+    # Pointer receiver: strip the leading ``*``.
+    if type_node.type == "pointer_type":
+        for child in type_node.children:
+            if child.type in {"type_identifier", "generic_type"}:
+                type_node = child
+                break
+        else:
+            return None
+
+    # Generic instantiation: drop the type-argument list and keep the base.
+    if type_node.type == "generic_type":
+        base = type_node.child_by_field_name("type")
+        if base is None:
+            for child in type_node.children:
+                if child.type == "type_identifier":
+                    base = child
+                    break
+        if base is None:
+            return None
+        type_node = base
+
+    if type_node.type != "type_identifier":
+        return None
+    return type_node.text.decode("utf-8")
+
+
 def _symbol_from_function(node) -> Symbol | None:
-    """Build a Symbol for a ``function_declaration`` or ``method_declaration``."""
+    """Build a Symbol for a ``function_declaration`` or ``method_declaration``.
+
+    ``function_declaration`` always emits ``parent=None``. ``method_declaration``
+    populates ``parent`` from the receiver type name (pointer / value / unnamed
+    / generic receivers all reduce to the bare type identifier).
+    """
 
     name = _name_text(node)
     if name is None:
         return None
+    parent = None
+    if node.type == "method_declaration":
+        parent = _receiver_type_name(node)
     return Symbol(
         name=name,
         kind="function",
         start_line=node.start_point[0] + 1,
         end_line=node.end_point[0] + 1,
+        parent=parent,
     )
 
 

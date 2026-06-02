@@ -25,6 +25,20 @@ in ``docs/design/sub-file-claims.md``.
 Generics on the declaration name (``function foo<T>``) are dropped from the
 captured name because tree-sitter exposes the identifier via the ``name``
 field, which excludes the type-parameter clause.
+
+v0.16 also emits method-level symbols nested inside a ``class_declaration``.
+Each direct child of the class's ``class_body`` is examined and emitted with
+``parent=<class name>``:
+
+- ``method_definition`` -> ``kind='function'`` (covers regular methods, the
+  ``constructor``, static methods, async methods, getters and setters; the
+  ``get``/``set`` distinction is collapsed for v0.16).
+- ``public_field_definition`` whose value is an ``arrow_function`` or
+  ``function_expression`` -> ``kind='const'``.
+
+Nested classes inside a method body are NOT recursed into; only direct
+members of the outermost top-level class are emitted. This matches the
+coarseness contract from the design doc (one level of nesting only).
 """
 
 from __future__ import annotations
@@ -163,12 +177,93 @@ def _symbols_from_variable_declaration(node) -> list[Symbol]:
     return out
 
 
+def _method_name(node) -> str | None:
+    """Return the textual name of a class member node, or ``None``.
+
+    Tree-sitter exposes the name for both ``method_definition`` and
+    ``public_field_definition`` via the ``name`` field. Computed property
+    names (``[Symbol.iterator]() {}``) are not plain ``property_identifier``
+    nodes and are skipped -- they have no static name addressable from a
+    claim. The constructor is named ``constructor`` per the grammar.
+    """
+
+    name_node = node.child_by_field_name("name")
+    if name_node is None:
+        return None
+    if name_node.type not in {"property_identifier", "identifier"}:
+        return None
+    return name_node.text.decode("utf-8")
+
+
+def _symbols_from_class_body(class_node) -> list[Symbol]:
+    """Emit method-level symbols for a single ``class_declaration``.
+
+    Only direct children of the class's ``class_body`` are inspected. Nested
+    classes inside method bodies are NOT recursed into; the design doc keeps
+    coordination to one level of nesting.
+    """
+
+    class_name_node = class_node.child_by_field_name("name")
+    if class_name_node is None:
+        return []
+    class_name = class_name_node.text.decode("utf-8")
+
+    body = class_node.child_by_field_name("body")
+    if body is None or body.type != "class_body":
+        return []
+
+    out: list[Symbol] = []
+    for member in body.children:
+        if member.type == "method_definition":
+            name = _method_name(member)
+            if name is None:
+                continue
+            out.append(
+                Symbol(
+                    name=name,
+                    kind="function",
+                    start_line=member.start_point[0] + 1,
+                    end_line=member.end_point[0] + 1,
+                    parent=class_name,
+                )
+            )
+            continue
+
+        if member.type == "public_field_definition":
+            value_node = member.child_by_field_name("value")
+            if value_node is None or not _function_like(value_node):
+                continue
+            name = _method_name(member)
+            if name is None:
+                continue
+            out.append(
+                Symbol(
+                    name=name,
+                    kind="const",
+                    start_line=member.start_point[0] + 1,
+                    end_line=member.end_point[0] + 1,
+                    parent=class_name,
+                )
+            )
+            continue
+
+        # Other class members (index_signature, abstract_method_signature,
+        # plain property declarations without an arrow value, etc.) are not
+        # callable scopes and are skipped.
+
+    return out
+
+
 def extract(content: str) -> list[Symbol]:
     """Return top-level declarations as :class:`Symbol` instances.
 
-    Nested declarations (functions inside functions, classes inside blocks)
-    are intentionally excluded -- this implementation walks only the direct
-    children of the ``program`` node.
+    Top-level declarations (functions, classes, interfaces, types, enums,
+    function-valued ``const``/``let``/``var``) are walked from the direct
+    children of the ``program`` node. v0.16 additionally descends one level
+    into every top-level ``class_declaration`` to emit its methods and
+    arrow-valued fields with ``parent=<class name>``. Deeper nesting
+    (functions inside functions, classes inside methods) is intentionally
+    excluded.
     """
 
     parser = _tsx_parser()
@@ -198,6 +293,9 @@ def extract(content: str) -> list[Symbol]:
             sym = _symbol_from_named_declaration(decl, is_default)
             if sym is not None:
                 out.append(sym)
+            # v0.16: also emit method-level symbols for top-level classes.
+            if decl.type == "class_declaration":
+                out.extend(_symbols_from_class_body(decl))
             continue
 
         if decl.type in {"lexical_declaration", "variable_declaration"}:

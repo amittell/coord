@@ -141,7 +141,7 @@ CREATE INDEX IF NOT EXISTS idx_claims_engineer ON claims (engineer);
 """
 
 
-CURRENT_SCHEMA_VERSION = 9
+CURRENT_SCHEMA_VERSION = 10
 
 # Migration registry: list of (version, upgrade_sql) tuples applied in order.
 # Entry for version N is the SQL that upgrades a DB from version N-1 to N.
@@ -306,6 +306,27 @@ MIGRATIONS: list[tuple[int, str]] = [
         "DROP TABLE request_events_v8;\n"
         "CREATE INDEX idx_request_events_request ON request_events (request_id);\n"
         "CREATE INDEX idx_request_events_created ON request_events (created_at);",
+    ),
+    # v10: method-level (namespaced) symbol claims. ``claim_symbols``
+    # gains ``parent_symbol`` so a row can represent ``Foo::handleA``:
+    # parent_symbol='Foo', symbol_name='handleA'. NULL parent means
+    # top-level (legacy v8 semantics preserved). Two symbol claims
+    # overlap iff one's full path is a prefix of the other -- this
+    # gives v0.14 class/method auto-coexist mechanics without bumping
+    # the API surface: clients send ``"Foo::handleA"`` as a single
+    # string and the service splits it at the ``::`` separator.
+    #
+    # No table rebuild required: ALTER TABLE ADD COLUMN with a NULL
+    # default is in-place. The composite index on
+    # (file_path, symbol_name) stays useful for the v0.14 fast path; a
+    # new (file_path, parent_symbol) index supports the v0.16
+    # namespace overlap query which fetches every symbol row for a
+    # file and filters in Python.
+    (
+        10,
+        "ALTER TABLE claim_symbols ADD COLUMN parent_symbol TEXT;\n"
+        "CREATE INDEX idx_claim_symbols_file_parent "
+        "ON claim_symbols (file_path, parent_symbol);",
     ),
 ]
 
@@ -610,15 +631,25 @@ class Database:
     async def insert_claim_symbols(
         self,
         *,
-        rows: list[tuple[str, str, str, str, str]],
+        rows: list[tuple[str, str, str, str, str, str | None]],
     ) -> None:
         """Insert symbol rows for ``scope_type='symbol'`` claims.
 
-        Each row is ``(id, claim_id, file_path, symbol_name, symbol_kind)``.
-        The caller (service layer) generates the row ids and groups symbols
-        per claim. Idempotent against the ``UNIQUE (claim_id, file_path,
+        Each row is ``(id, claim_id, file_path, symbol_name, symbol_kind,
+        parent_symbol)``. ``parent_symbol`` is ``None`` for top-level
+        (v0.14 legacy semantics) and a class / receiver name for
+        method-level claims (v0.16). The caller (service layer) parses
+        the ``"Parent::child"`` API notation into the column pair before
+        calling this helper.
+
+        Idempotent against the ``UNIQUE (claim_id, file_path,
         symbol_name)`` index: a duplicate insert is silently ignored so
-        retries don't 500.
+        retries don't 500. (Note: the UNIQUE index does NOT include
+        parent_symbol, so two rows on the same claim that share
+        symbol_name but differ on parent_symbol would collide; v0.16
+        treats this as a non-event because the API doesn't generate
+        such collisions -- "Foo::handleA" and "Bar::handleA" go into
+        different claims, not the same one.)
         """
         if not rows:
             return
@@ -628,8 +659,9 @@ class Database:
             await conn.executemany(
                 """
                 INSERT OR IGNORE INTO claim_symbols
-                    (id, claim_id, file_path, symbol_name, symbol_kind)
-                VALUES (?, ?, ?, ?, ?)
+                    (id, claim_id, file_path, symbol_name, symbol_kind,
+                     parent_symbol)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
@@ -637,22 +669,68 @@ class Database:
 
     async def get_claim_symbols(
         self, claim_id: str
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, Any]]:
         """Return all symbol rows for a claim. Empty list for file-scope
-        claims or unknown claim_id."""
+        claims or unknown claim_id. ``parent_symbol`` is ``None`` for
+        top-level rows (v0.14) and a class / receiver name for
+        method-level rows (v0.16)."""
         await self.init()
         async with aiosqlite.connect(self.path) as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(
                 """
-                SELECT file_path, symbol_name, symbol_kind
+                SELECT file_path, symbol_name, symbol_kind, parent_symbol
                 FROM claim_symbols
                 WHERE claim_id = ?
-                ORDER BY file_path, symbol_name
+                ORDER BY file_path, parent_symbol, symbol_name
                 """,
                 (claim_id,),
             )
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+    async def get_symbol_rows_on_file(
+        self,
+        *,
+        file_path: str,
+        exclude_engineer: str | None = None,
+        exclude_session_ids: list[str] | None = None,
+        repo: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return every active symbol-scope row on ``file_path`` joined
+        with its owning claim. v0.16 namespace overlap is computed in
+        Python on top of this set: two-level prefix matching is cheap
+        enough that we don't push it into SQL.
+
+        Excludes the caller's own engineer / session_ids the same way
+        the file-overlap check does.
+        """
+        await self.init()
+        sql = (
+            "SELECT c.*, cs.symbol_name AS overlapping_symbol, "
+            "cs.symbol_kind AS overlapping_symbol_kind, "
+            "cs.parent_symbol AS overlapping_parent_symbol "
+            "FROM claim_symbols cs JOIN claims c ON c.id = cs.claim_id "
+            "WHERE cs.file_path = ? "
+            "AND c.released_at IS NULL "
+            "AND c.scope_type = 'symbol'"
+        )
+        params: list[Any] = [file_path]
+        if exclude_engineer:
+            sql += " AND c.engineer != ?"
+            params.append(exclude_engineer)
+        if exclude_session_ids:
+            ph = ",".join("?" for _ in exclude_session_ids)
+            sql += f" AND (c.session_id IS NULL OR c.session_id NOT IN ({ph}))"
+            params.extend(exclude_session_ids)
+        if repo is not None:
+            sql += " AND c.repo IS ?"
+            params.append(repo)
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(sql, params)
             rows = await cur.fetchall()
             return [dict(r) for r in rows]
 

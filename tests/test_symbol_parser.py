@@ -317,3 +317,153 @@ def test_regex_backend_documented_anonymous_default() -> None:
 
     assert _names(result) == ["default"]
     assert result[0].kind == "function"
+
+
+# ---------------------------------------------------------------------------
+# v0.16: methods inside classes
+# ---------------------------------------------------------------------------
+
+
+def _members_of(syms: list[Symbol], parent: str) -> list[Symbol]:
+    """Return symbols whose ``parent`` matches ``parent``, preserving order."""
+
+    return [s for s in syms if s.parent == parent]
+
+
+def test_class_method_extraction_basic(backend: str) -> None:
+    """A class with two plain methods emits class + both methods.
+
+    Foo is top-level (parent=None); handleA and handleB are members
+    (parent='Foo', kind='function').
+    """
+
+    src = "class Foo {\n  handleA() {}\n  handleB() {}\n}\n"
+    result = extract_symbols("basic.ts", src)
+
+    foo = _by_name(result, "Foo")
+    assert foo.kind == "class"
+    assert foo.parent is None
+
+    members = _members_of(result, "Foo")
+    member_names = [m.name for m in members]
+    assert "handleA" in member_names
+    assert "handleB" in member_names
+    for m in members:
+        assert m.kind == "function"
+        assert m.parent == "Foo"
+
+
+def test_class_method_with_modifiers(backend: str) -> None:
+    """async / static / public / private modifiers do not change the kind."""
+
+    src = (
+        "class Service {\n"
+        "  async fetchData() {}\n"
+        "  static build() {}\n"
+        "  public greet() {}\n"
+        "  private secret() {}\n"
+        "}\n"
+    )
+    result = extract_symbols("modifiers.ts", src)
+
+    members = _members_of(result, "Service")
+    member_names = [m.name for m in members]
+    for expected in ("fetchData", "build", "greet", "secret"):
+        assert expected in member_names, (expected, member_names)
+    for m in members:
+        assert m.kind == "function"
+        assert m.parent == "Service"
+
+
+def test_class_constructor_emitted(backend: str) -> None:
+    """The grammar names the constructor 'constructor' -- we emit it as such."""
+
+    src = (
+        "class Widget {\n"
+        "  constructor(public x: number) {}\n"
+        "  ping() {}\n"
+        "}\n"
+    )
+    result = extract_symbols("ctor.ts", src)
+    members = _members_of(result, "Widget")
+    names = [m.name for m in members]
+    assert "constructor" in names
+    ctor = _by_name(result, "constructor")
+    assert ctor.kind == "function"
+    assert ctor.parent == "Widget"
+
+
+def test_class_arrow_property_method(backend: str) -> None:
+    """`prop = (x) => x` inside a class body emits kind='const', parent=class."""
+
+    src = (
+        "class Holder {\n"
+        "  greet = (name: string) => name;\n"
+        "  ping() {}\n"
+        "}\n"
+    )
+    result = extract_symbols("arrow.tsx", src)
+
+    greet = _by_name(result, "greet")
+    assert greet.kind == "const"
+    assert greet.parent == "Holder"
+
+    ping = _by_name(result, "ping")
+    assert ping.kind == "function"
+    assert ping.parent == "Holder"
+
+
+def test_nested_class_methods(backend: str) -> None:
+    """Inner classes are excluded entirely; only Outer's direct methods land.
+
+    The tree-sitter backend recurses only one level (top-level class body) so
+    Inner has no presence at all. The regex backend cannot reliably tell that
+    Inner is nested, so its tolerance is looser: at minimum, ``Outer`` is a
+    class symbol and ``method`` is attributed to ``Outer``.
+    """
+
+    src = (
+        "class Outer {\n"
+        "  method() {\n"
+        "    class Inner {\n"
+        "      hidden() {}\n"
+        "    }\n"
+        "  }\n"
+        "}\n"
+    )
+    result = extract_symbols("nested.ts", src)
+
+    outer = _by_name(result, "Outer")
+    assert outer.kind == "class"
+    assert outer.parent is None
+
+    method = _by_name(result, "method")
+    assert method.kind == "function"
+    assert method.parent == "Outer"
+
+    # Inner must not be promoted to a top-level class symbol.
+    for s in result:
+        assert not (s.name == "Inner" and s.kind == "class" and s.parent is None)
+
+    if backend == "treesitter":
+        # tree-sitter has the structural information; ``hidden`` should not
+        # appear at all, and ``Inner`` should not surface as any symbol.
+        assert "hidden" not in _names(result)
+        assert "Inner" not in _names(result)
+
+
+def test_methods_disabled_outside_class(backend: str) -> None:
+    """Free-standing function declarations continue to emit parent=None."""
+
+    src = (
+        "function foo() { return 1; }\n"
+        "function bar() { return 2; }\n"
+    )
+    result = extract_symbols("free.ts", src)
+
+    foo = _by_name(result, "foo")
+    bar = _by_name(result, "bar")
+    assert foo.parent is None
+    assert bar.parent is None
+    assert foo.kind == "function"
+    assert bar.kind == "function"

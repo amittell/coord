@@ -177,8 +177,15 @@ def test_nested_function_excluded(backend: str) -> None:
     assert "inner" not in _names(result)
 
 
-def test_methods_inside_class_excluded(backend: str) -> None:
-    """Only the outer class is reported -- methods stay nested in v1."""
+def test_methods_emitted_with_parent(backend: str) -> None:
+    """v0.16: methods inside a class are emitted with ``parent`` set.
+
+    Pre-v0.16 this test asserted methods stayed nested and only the
+    enclosing class surfaced. v0.16 introduced method-level symbols so
+    ``__init__``, ``public``, and ``__repr__`` now each appear as a
+    function with ``parent='Service'``. Dunders are treated like any
+    other method -- there is no special-case exclusion.
+    """
 
     src = (
         "class Service:\n"
@@ -190,15 +197,25 @@ def test_methods_inside_class_excluded(backend: str) -> None:
         "        return 'S'\n"
     )
     result = extract_symbols("sample.py", src)
-    assert _names(result) == ["Service"]
-    # Dunder methods (``__init__``, ``__repr__``) must not leak to top level.
-    assert "__init__" not in _names(result)
-    assert "__repr__" not in _names(result)
-    assert "public" not in _names(result)
+    assert _names(result) == ["Service", "__init__", "public", "__repr__"]
+
+    service = _by_name(result, "Service")
+    assert service.kind == "class"
+    assert service.parent is None
+
+    for method_name in ("__init__", "public", "__repr__"):
+        method = _by_name(result, method_name)
+        assert method.kind == "function"
+        assert method.parent == "Service"
 
 
-def test_classmethod_inside_class_excluded(backend: str) -> None:
-    """A classmethod is still a method -- only the outer class appears."""
+def test_classmethod_emitted_with_parent(backend: str) -> None:
+    """A classmethod surfaces as a method symbol with ``parent`` set.
+
+    Pre-v0.16 the decorated ``@classmethod`` def stayed nested under the
+    enclosing class. v0.16 emits it as a function with ``parent='Registry'``
+    -- the decorator does not change the kind or the parent attribution.
+    """
 
     src = (
         "class Registry:\n"
@@ -207,8 +224,11 @@ def test_classmethod_inside_class_excluded(backend: str) -> None:
         "        pass\n"
     )
     result = extract_symbols("sample.py", src)
-    assert _names(result) == ["Registry"]
-    assert "register" not in _names(result)
+    assert _names(result) == ["Registry", "register"]
+
+    register = _by_name(result, "register")
+    assert register.kind == "function"
+    assert register.parent == "Registry"
 
 
 def test_name_main_guard_excludes_inner_def(backend: str) -> None:
@@ -296,3 +316,141 @@ def test_py_extension_dispatches_to_python_backend(backend: str) -> None:
     result = extract_symbols("foo.py", "def simple():\n    return 1\n")
     assert _names(result) == ["simple"]
     assert result[0].kind == "function"
+
+
+# ---------------------------------------------------------------------------
+# v0.16: methods inside classes
+# ---------------------------------------------------------------------------
+
+
+def test_class_method_extraction_basic(backend: str) -> None:
+    """A class with two methods emits three symbols: the class plus each method.
+
+    Methods follow the class in source order; both methods carry
+    ``parent='Foo'`` and ``kind='function'``.
+    """
+
+    src = (
+        "class Foo:\n"
+        "    def handleA(self):\n"
+        "        return 1\n"
+        "    def handleB(self):\n"
+        "        return 2\n"
+    )
+    result = extract_symbols("sample.py", src)
+    assert _names(result) == ["Foo", "handleA", "handleB"]
+
+    foo = _by_name(result, "Foo")
+    assert foo.kind == "class"
+    assert foo.parent is None
+
+    for method_name in ("handleA", "handleB"):
+        method = _by_name(result, method_name)
+        assert method.kind == "function"
+        assert method.parent == "Foo"
+
+
+def test_async_method_emitted(backend: str) -> None:
+    """An ``async def`` inside a class surfaces as kind='function', parent=class.
+
+    The dataclass has no ``async_function`` kind, so async methods collapse
+    into the same ``function`` kind as their synchronous siblings.
+    """
+
+    src = (
+        "class Client:\n"
+        "    async def fetch(self):\n"
+        "        return await load()\n"
+    )
+    result = extract_symbols("sample.py", src)
+    assert _names(result) == ["Client", "fetch"]
+
+    fetch = _by_name(result, "fetch")
+    assert fetch.kind == "function"
+    assert fetch.parent == "Client"
+
+
+def test_decorated_method_emitted(backend: str) -> None:
+    """Decorated methods (``@property``, ``@staticmethod``, ``@classmethod``)
+    surface as methods with ``parent`` set; the decorator does not change
+    the kind or parent attribution."""
+
+    src = (
+        "class Widget:\n"
+        "    @property\n"
+        "    def label(self):\n"
+        "        return self._label\n"
+        "    @staticmethod\n"
+        "    def helper():\n"
+        "        return 1\n"
+        "    @classmethod\n"
+        "    def from_dict(cls, data):\n"
+        "        return cls()\n"
+    )
+    result = extract_symbols("sample.py", src)
+    assert _names(result) == ["Widget", "label", "helper", "from_dict"]
+
+    for method_name in ("label", "helper", "from_dict"):
+        method = _by_name(result, method_name)
+        assert method.kind == "function"
+        assert method.parent == "Widget"
+
+
+def test_method_inside_nested_class(backend: str) -> None:
+    """A nested class inside another class is skipped entirely.
+
+    v0.16's ``parent`` model is two levels deep (top-level vs class member).
+    ``Outer::Inner::method`` would require a third level the dataclass does
+    not yet model, so both ``Inner`` itself and its methods are dropped.
+    Only ``Outer`` survives.
+    """
+
+    src = (
+        "class Outer:\n"
+        "    class Inner:\n"
+        "        def m(self):\n"
+        "            return 1\n"
+    )
+    result = extract_symbols("sample.py", src)
+    assert _names(result) == ["Outer"]
+    assert "Inner" not in _names(result)
+    assert "m" not in _names(result)
+
+
+def test_function_in_class_method_excluded(backend: str) -> None:
+    """A closure inside a method (three levels of nesting) is not emitted.
+
+    The class's method is emitted with ``parent='Holder'``, but the inner
+    ``helper`` function lives inside the method body and is not a direct
+    child of the class body, so it stays excluded -- same posture as the
+    pre-v0.16 ``test_nested_function_excluded`` rule at module scope.
+    """
+
+    src = (
+        "class Holder:\n"
+        "    def method(self):\n"
+        "        def helper():\n"
+        "            return 1\n"
+        "        return helper()\n"
+    )
+    result = extract_symbols("sample.py", src)
+    assert _names(result) == ["Holder", "method"]
+    assert "helper" not in _names(result)
+
+    method = _by_name(result, "method")
+    assert method.kind == "function"
+    assert method.parent == "Holder"
+
+
+def test_top_level_function_unaffected(backend: str) -> None:
+    """A free-standing ``def`` continues to emit with ``parent=None``.
+
+    Sanity check that the method pass does not contaminate top-level
+    symbols. ``foo`` is at module scope, not a class member.
+    """
+
+    src = "def foo():\n    return 1\n"
+    result = extract_symbols("sample.py", src)
+    assert _names(result) == ["foo"]
+    assert result[0].kind == "function"
+    assert result[0].parent is None

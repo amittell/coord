@@ -1119,3 +1119,89 @@ async def test_shared_file_holder_blocks_symbol_requester(
     rr = await client.post("/claims", headers=_AUTH, json=requester)
     # shared_file is explicitly non-narrowable -> conflict path stays 409.
     assert rr.status_code == 409
+
+
+# ---------------------------------------------------------------------------
+# v0.16: method-level (namespaced) symbol claims
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_method_disjoint_auto_coexists_within_class(
+    client: AsyncClient,
+) -> None:
+    """Two agents claiming different methods on the same class auto-coexist."""
+    body_a = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [_symbol_claim("src/auth/router.ts", ["Router::handleAuth"])],
+    }
+    body_b = {
+        "engineer": "bob",
+        "repo": "amittell/coord",
+        "claims": [_symbol_claim("src/auth/router.ts", ["Router::handleLogout"])],
+    }
+    ra = await client.post("/claims", headers=_AUTH, json=body_a)
+    assert ra.status_code == 200, ra.text
+    rb = await client.post("/claims", headers=_AUTH, json=body_b)
+    assert rb.status_code == 200, rb.text
+    assert rb.json()["claim_ids"], "different methods of same class must auto-coexist"
+
+
+@pytest.mark.asyncio
+async def test_method_same_path_conflicts(client: AsyncClient) -> None:
+    body_a = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [_symbol_claim("src/auth/router.ts", ["Router::handleAuth"])],
+    }
+    body_b = {
+        "engineer": "bob",
+        "repo": "amittell/coord",
+        "claims": [_symbol_claim("src/auth/router.ts", ["Router::handleAuth"])],
+    }
+    await client.post("/claims", headers=_AUTH, json=body_a)
+    rb = await client.post("/claims", headers=_AUTH, json=body_b)
+    assert rb.status_code == 409
+    payload = rb.json()
+    assert payload["conflicts"], "expected conflict on same method"
+    so = payload["conflicts"][0].get("symbol_overlap")
+    assert so and "Router::handleAuth" in so[0]["symbols"]
+
+
+@pytest.mark.asyncio
+async def test_class_claim_blocks_method_claim(client: AsyncClient) -> None:
+    """Claiming the whole class blocks a method claim on it."""
+    body_class = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [_symbol_claim("src/auth/router.ts", ["Router"])],
+    }
+    body_method = {
+        "engineer": "bob",
+        "repo": "amittell/coord",
+        "claims": [_symbol_claim("src/auth/router.ts", ["Router::handleAuth"])],
+    }
+    await client.post("/claims", headers=_AUTH, json=body_class)
+    rb = await client.post("/claims", headers=_AUTH, json=body_method)
+    assert rb.status_code == 409
+    so = rb.json()["conflicts"][0].get("symbol_overlap")
+    assert so and "Router::handleAuth" in so[0]["symbols"]
+
+
+@pytest.mark.asyncio
+async def test_method_on_different_classes_coexists(client: AsyncClient) -> None:
+    body_a = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [_symbol_claim("src/handlers.ts", ["AuthRouter::handle"])],
+    }
+    body_b = {
+        "engineer": "bob",
+        "repo": "amittell/coord",
+        "claims": [_symbol_claim("src/handlers.ts", ["UserRouter::handle"])],
+    }
+    await client.post("/claims", headers=_AUTH, json=body_a)
+    rb = await client.post("/claims", headers=_AUTH, json=body_b)
+    assert rb.status_code == 200, rb.text
+    assert rb.json()["claim_ids"], "same method name on different parents must coexist"

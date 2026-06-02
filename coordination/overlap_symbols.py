@@ -206,6 +206,55 @@ async def check_overlap(
     )
 
 
+SymbolPath = tuple[str | None, str]
+
+
+def parse_symbol_path(symbol: str) -> SymbolPath:
+    """Split a claim notation string into ``(parent, name)``.
+
+    ``"Foo"`` -> ``(None, "Foo")`` (top-level, v0.14 semantics).
+    ``"Foo::handleA"`` -> ``("Foo", "handleA")`` (method, v0.16+).
+    Recursive notation (``"A::B::C"``) is rejected as a programming
+    error in v0.16 -- the API contract is two levels only -- but the
+    parser tolerates it by treating everything after the first ``::``
+    as the leaf name so a future v0.17 nested model is a strict
+    extension, not a breaking change.
+    """
+    if "::" not in symbol:
+        return (None, symbol)
+    parent, _, name = symbol.partition("::")
+    return (parent, name)
+
+
+def format_symbol_path(parent: str | None, name: str) -> str:
+    """Inverse of :func:`parse_symbol_path`. Used to canonicalise
+    overlap-result strings the conflict response surfaces back to the
+    requester."""
+    return f"{parent}::{name}" if parent else name
+
+
+def symbol_paths_overlap(a: SymbolPath, b: SymbolPath) -> bool:
+    """Return True iff ``a`` and ``b`` overlap under the two-level
+    prefix-match rule.
+
+    - top-level vs top-level: same name.
+    - top-level vs method: the top-level name equals the method's
+      parent (claim on ``Foo`` covers every ``Foo::*`` method and vice
+      versa, mirroring the v0.14 rule that a file claim covers every
+      symbol in the file once the holder is narrowable).
+    - method vs method: same parent AND same name.
+    """
+    pa, na = a
+    pb, nb = b
+    if pa is None and pb is None:
+        return na == nb
+    if pa is None:
+        return na == pb
+    if pb is None:
+        return pa == nb
+    return pa == pb and na == nb
+
+
 async def _classify_symbol_symbol(
     *,
     db: Database,
@@ -215,31 +264,32 @@ async def _classify_symbol_symbol(
 ) -> OverlapResult:
     """Decide AUTO_COEXIST vs SYMBOL_OVERLAP for two symbol-scope claims.
 
-    Loads the holder's ``claim_symbols`` rows once, groups them by
-    file, and intersects with ``requester_symbols_by_file`` per file.
-    The "files to consider" set is the union of:
+    v0.16 namespace overlap: each symbol is a ``(parent, name)`` path
+    (parent is None for top-level, set for methods). Two claims
+    overlap on a file iff any pair of their symbol paths overlap
+    under :func:`symbol_paths_overlap` (two-level prefix matching).
 
-    - files the holder claimed (from ``get_claim_symbols``), and
-    - files the requester named in ``requester_symbols_by_file``.
-
-    Intersected with ``overlapping_paths`` when the path engine
-    returned concrete entries; when the heuristic path returned
-    ``"<unknown>"`` we fall back to the holder + requester file union
-    so symbol comparison still happens (otherwise a heuristic match
-    would always degrade to AUTO_COEXIST, which is unsafe).
+    Loads the holder's ``claim_symbols`` rows once and groups them by
+    file. Requester strings come pre-parsed from
+    ``requester_symbols_by_file`` (one ``"Foo::handleA"`` entry per
+    list slot); the service layer is responsible for parsing the
+    ``"Parent::child"`` notation at insert time, but this helper also
+    parses on read so callers that pass raw API strings work without
+    pre-processing.
     """
     holder_id = str(holder.get("id") or "")
     holder_symbols_rows = await db.get_claim_symbols(holder_id) if holder_id else []
-    holder_by_file: dict[str, set[str]] = {}
+    holder_by_file: dict[str, list[SymbolPath]] = {}
     for row in holder_symbols_rows:
         f = str(row["file_path"])
-        s = str(row["symbol_name"])
-        holder_by_file.setdefault(f, set()).add(s)
+        parent = row.get("parent_symbol")
+        parent_str: str | None = str(parent) if parent else None
+        name = str(row["symbol_name"])
+        holder_by_file.setdefault(f, []).append((parent_str, name))
 
-    requester_by_file: dict[str, set[str]] = {
-        str(f): {str(s) for s in syms}
-        for f, syms in requester_symbols_by_file.items()
-    }
+    requester_by_file: dict[str, list[SymbolPath]] = {}
+    for f, syms in requester_symbols_by_file.items():
+        requester_by_file[str(f)] = [parse_symbol_path(str(s)) for s in syms]
 
     candidate_files: set[str]
     if overlapping_paths == ("<unknown>",) or not overlapping_paths:
@@ -251,25 +301,31 @@ async def _classify_symbol_symbol(
 
     overlaps: list[tuple[str, tuple[str, ...]]] = []
     for f in sorted(candidate_files):
-        held = holder_by_file.get(f, set())
-        req = requester_by_file.get(f, set())
-        both = held & req
-        if both:
-            overlaps.append((f, tuple(sorted(both))))
+        held_paths = holder_by_file.get(f, [])
+        req_paths = requester_by_file.get(f, [])
+        overlapping_pairs: set[str] = set()
+        for a in held_paths:
+            for b in req_paths:
+                if symbol_paths_overlap(a, b):
+                    # Surface the requester's path in the response so
+                    # the 409 payload echoes what the caller sent.
+                    overlapping_pairs.add(format_symbol_path(b[0], b[1]))
+        if overlapping_pairs:
+            overlaps.append((f, tuple(sorted(overlapping_pairs))))
 
     if not overlaps:
         return OverlapResult(
             kind=OverlapKind.AUTO_COEXIST,
             overlapping_paths=overlapping_paths,
             overlapping_symbols=(),
-            notes="symbol-disjoint on every overlapping file",
+            notes="symbol-disjoint on every overlapping file (v0.16 namespace)",
         )
 
     return OverlapResult(
         kind=OverlapKind.SYMBOL_OVERLAP,
         overlapping_paths=overlapping_paths,
         overlapping_symbols=tuple(overlaps),
-        notes="symbol intersection on at least one overlapping file",
+        notes="symbol intersection on at least one overlapping file (v0.16 namespace)",
     )
 
 

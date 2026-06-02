@@ -115,7 +115,7 @@ async def _seed_symbol_claim(
     rows: list[tuple[str, str, str, str, str]] = []
     for f, syms in symbols_by_file.items():
         for s in syms:
-            rows.append((str(uuid4()), cid, f, s, "function"))
+            rows.append((str(uuid4()), cid, f, s, "function", None))
     await db.insert_claim_symbols(rows=rows)
     return cid
 

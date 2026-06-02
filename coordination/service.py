@@ -513,7 +513,7 @@ class CoordinationService:
 
         from coordination.db import _configure_sqlite
 
-        symbol_rows: list[tuple[str, str, str, str, str]] = []
+        symbol_rows: list[tuple[str, str, str, str, str, str | None]] = []
         async with aiosqlite.connect(self.db.path) as conn:
             await _configure_sqlite(conn)
             for cid in created:
@@ -537,14 +537,19 @@ class CoordinationService:
                         (want_scope, narrowable, cid),
                     )
                 if item.symbols:
-                    for name in item.symbols:
+                    for raw in item.symbols:
+                        # v0.16: split "Parent::child" notation at insert
+                        # time. parent_symbol=NULL for legacy top-level
+                        # entries; non-NULL for method-scope.
+                        parent, _, leaf = raw.partition("::") if "::" in raw else (None, "", raw)
                         symbol_rows.append(
                             (
                                 str(uuid4()),
                                 cid,
                                 item.pattern,
-                                name,
+                                leaf,
                                 "unknown",
+                                parent,
                             )
                         )
             await conn.commit()

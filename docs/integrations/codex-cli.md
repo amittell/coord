@@ -80,6 +80,16 @@ claim_files(
 )
 ```
 
+For a specific method on a class (v0.16+), use `Parent::child` notation:
+
+```python
+await claim_files(
+    engineer="alex/codex/main",
+    patterns=["src/auth/router.ts"],
+    symbols={"src/auth/router.ts": ["Router::handleAuth"]},
+)
+```
+
 A peer claiming a disjoint symbol set on the same file is granted automatically (`AUTO_COEXIST`) instead of hitting a `409`. See [../usage-guide.md](../usage-guide.md) for when symbol claims help and when file scope is still the right call.
 
 ## Auth resolution order

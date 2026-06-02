@@ -42,6 +42,25 @@ CREATE INDEX idx_claim_symbols_claim
     ON claim_symbols (claim_id);
 ```
 
+### Schema v10 (v0.16)
+
+```sql
+-- v10: nullable parent_symbol on claim_symbols. NULL means the symbol is
+-- top-level (function, class, const, etc.); non-NULL means the symbol is
+-- a method whose enclosing class / receiver type is `parent_symbol`. The
+-- service splits the wire-format `"Parent::child"` notation at insert time
+-- and stores the two parts in `symbol_name` and `parent_symbol` respectively.
+ALTER TABLE claim_symbols ADD COLUMN parent_symbol TEXT;
+CREATE INDEX idx_claim_symbols_parent
+    ON claim_symbols (file_path, parent_symbol, symbol_name);
+```
+
+Overlap uses a two-level prefix-matching rule for symbol-vs-symbol comparisons on the same file:
+
+- A claim on a bare symbol `Foo` (`parent_symbol IS NULL`, `symbol_name='Foo'`, kind `'class'`) matches every method whose `parent_symbol='Foo'`. The bare-class claim and any `Foo::method` claim are treated as overlapping (auto-block).
+- Two method claims `Foo::a` and `Foo::b` (same `parent_symbol='Foo'`, different `symbol_name`) are disjoint and `AUTO_COEXIST`.
+- `Foo::a` and `Bar::a` (different `parent_symbol`) are disjoint regardless of the shared leaf name.
+
 `claims.scope_type` is one of:
 - `'file'` (default, legacy): claim covers every byte of every matched path.
 - `'symbol'`: claim covers only the symbols enumerated in `claim_symbols` for this id. Module-level code (imports, top-level statements outside any declared symbol) is **not** covered; another claim is needed for those.
@@ -153,7 +172,36 @@ Path intersection: `{src/auth/login.ts}`. Holder is `file`/narrowable=true, requ
 4. Return `201` to requester.
 5. Holder learns about the narrow on its next `pending_requests` poll: a row with `kind='auto-narrow-notice'` informs them of the new partner. No action required.
 
-The holder's effective scope is "the file minus the partners' symbols". When the holder edits anything outside those symbols, it sees no conflict. When the holder tries to edit `handleLogin`, it's on them to coordinate with the partner directly (coord is advisory not enforcing — same posture as `coexist` today).
+The holder's effective scope is "the file minus the partners' symbols". When the holder edits anything outside those symbols, it sees no conflict. When the holder tries to edit `handleLogin`, it's on them to coordinate with the partner directly (coord is advisory not enforcing -- same posture as `coexist` today).
+
+### Worked example: bare class vs method (v0.16)
+
+Holder claim:
+```
+{type=file, pattern=src/auth/router.ts, scope_type=symbol, symbols=[Router]}
+```
+Stored: one `claim_symbols` row with `symbol_name='Router'`, `parent_symbol=NULL`, `symbol_kind='class'`.
+
+Requester:
+```
+{type=file, pattern=src/auth/router.ts, scope_type=symbol, symbols=[Router::handleAuth]}
+```
+Stored at insert time as `symbol_name='handleAuth'`, `parent_symbol='Router'`.
+
+Path intersection: `{src/auth/router.ts}`. Both symbol-scoped. Symbol overlap check: the holder's bare-class row (`Router`, parent NULL) matches the requester's row whose `parent_symbol='Router'`. `SYMBOL_OVERLAP({src/auth/router.ts: [Router::handleAuth]})` -> `409`. The reverse direction (holder = method, requester = bare class) symmetrically blocks.
+
+### Worked example: sibling methods (v0.16)
+
+Holder claim:
+```
+{type=file, pattern=src/auth/router.ts, scope_type=symbol, symbols=[Router::handleA]}
+```
+Requester:
+```
+{type=file, pattern=src/auth/router.ts, scope_type=symbol, symbols=[Router::handleB]}
+```
+
+Path intersection: `{src/auth/router.ts}`. Both rows have `parent_symbol='Router'` but distinct `symbol_name`. Symbol overlap is empty: `AUTO_COEXIST` -> `201`, both claims live with mutual `coexists_with`. A third agent claiming the bare `Router` then blocks against both partners (bare-class vs method rule above).
 
 ## State machine deltas
 
@@ -295,14 +343,14 @@ Pre-v0.14 clients:
 
 ## Rollout
 
-- **v0.14.0**: schema v8, parser layer (TS), service-layer overlap, API surface, MCP wrapper, doctor check, design doc + integration doc updates. Marked **experimental** in CHANGELOG — symbol overlap is opt-in via the `symbols` field; default behaviour for any caller that doesn't pass it is identical to v0.13.
+- **v0.14.0**: schema v8, parser layer (TS), service-layer overlap, API surface, MCP wrapper, doctor check, design doc + integration doc updates. Marked **experimental** in CHANGELOG -- symbol overlap is opt-in via the `symbols` field; default behaviour for any caller that doesn't pass it is identical to v0.13.
 - **v0.14.1**: dashboard surfaces symbol claims; `auto-coexist` / `auto-narrow` count is exposed under "/repos". Tree-sitter is upgraded from soft to hard dependency if metrics show <5% regex fallback.
 - **v0.15.0**: Python + Go parsers. Symbol claims marked stable.
-- **v0.16.0**: candidate: methods inside classes as separately claimable. Requires extending `claim_symbols` with `parent_symbol` and revising the kind-aware namespace logic.
+- **v0.16.0** (shipped): methods inside classes are individually claimable via `Parent::child` notation. Schema v10 adds `claim_symbols.parent_symbol`; the overlap algorithm gains a two-level prefix-matching rule so a bare-class claim and a method claim auto-block, while two sibling methods auto-coexist. TS/Python/Go parsers record the enclosing class / receiver type as `parent`. Non-method nested classes and nested namespaces remain out of scope -- candidate for v0.17.
 
 ## Open questions
 
-1. **Class methods.** v1 makes a class claim cover all its methods. Is that too coarse for large classes (e.g. a `Router` with 30 routes)? Decision: defer to v0.16 based on actual usage telemetry.
+1. **Class methods.** v1 makes a class claim cover all its methods. Is that too coarse for large classes (e.g. a `Router` with 30 routes)? **Shipped in v0.16:** methods are individually claimable via `Parent::child` notation. A claim on the bare class still covers every method (auto-blocks any `Parent::*` method claim, and vice versa); two sibling methods auto-coexist. Non-method nested classes are intentionally out of scope for v0.16 -- candidate for v0.17.
 2. **Renames.** If a holder claims `handleLogin` and the file is renamed mid-claim (or the symbol is renamed), the claim becomes orphaned. v1 behaviour: the claim survives (no enforcement), the pre-push hook will report stale symbols. v2 could re-validate on every conflict check, but that's expensive without an LSP.
 3. **Anonymous default export** (`export default function(...)`). v1 normalises to symbol name `default`. Two such claims on the same file overlap.
 4. **JSX inline components** (`const Foo = (props) => …`). v1 catches these via the `lexical_declaration` rule. Decorated React components may slip through the regex fallback.

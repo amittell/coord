@@ -24,7 +24,11 @@ Known false-negatives (documented so callers know the trade-off):
   (they start with ``//``) so build-tagged files behave like any other file.
 
 - Methods on pointer / value receivers parse correctly because the receiver
-  list ``(r *T)`` is optional in the leading regex.
+  list ``(r *T)`` is optional in the leading regex. v0.16 also captures the
+  receiver type as ``parent`` so a method ``func (s *Server) Start()`` emits
+  ``Symbol(name='Start', kind='function', parent='Server')``. Pointer (``*T``),
+  value (``T``), unnamed (``(*T)``) and generic (``(c *Container[T])``)
+  receivers all reduce to the bare type identifier.
 
 - Nested declarations are filtered by anchoring every pattern to column zero.
   Conventional Go formatting puts nested closures and types under
@@ -47,8 +51,17 @@ from . import Symbol
 # The receiver group covers methods; tree-sitter exposes method_declaration as
 # a separate node but for the regex backend we treat both as ``kind='function'``
 # because the conflict engine does not care which one fired.
+#
+# v0.16: capture the receiver type as ``parent``. The optional binding name
+# (``s`` in ``(s *Server)``) is consumed but not captured. A trailing ``*``
+# (pointer receiver) is allowed and stripped by virtue of being outside the
+# capture group. Generic receivers (``(c *Container[T])``) match because the
+# ``\w+`` only consumes the type identifier; the ``[T]`` clause is skipped by
+# the ``[^)]*`` tail.
 _FUNC_RE = re.compile(
-    r"^func\s+(?:\([^)]*\)\s+)?(?P<name>\w+)\s*[\(\[]",
+    r"^func\s+"
+    r"(?:\(\s*(?:\w+\s+)?\*?(?P<parent>\w+)[^)]*\)\s+)?"
+    r"(?P<name>\w+)\s*[\(\[]",
     re.MULTILINE,
 )
 
@@ -99,7 +112,9 @@ def extract(content: str) -> list[Symbol]:
     found: list[tuple[int, Symbol]] = []
     seen: set[tuple[str, str, int]] = set()
 
-    def _record(name: str, kind: str, offset: int) -> None:
+    def _record(
+        name: str, kind: str, offset: int, parent: str | None = None
+    ) -> None:
         line = _line_of(content, offset)
         key = (name, kind, line)
         if key in seen:
@@ -108,12 +123,23 @@ def extract(content: str) -> list[Symbol]:
         found.append(
             (
                 offset,
-                Symbol(name=name, kind=kind, start_line=line, end_line=line),
+                Symbol(
+                    name=name,
+                    kind=kind,
+                    start_line=line,
+                    end_line=line,
+                    parent=parent,
+                ),
             )
         )
 
     for match in _FUNC_RE.finditer(content):
-        _record(match.group("name"), "function", match.start())
+        _record(
+            match.group("name"),
+            "function",
+            match.start(),
+            parent=match.group("parent"),
+        )
 
     for match in _TYPE_INTERFACE_RE.finditer(content):
         _record(match.group("name"), "interface", match.start())
