@@ -6,6 +6,30 @@ readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{name = "Alex Mittell"}]
+keywords = [
+    "agents",
+    "coordination",
+    "mcp",
+    "claude-code",
+    "codex",
+    "cursor",
+    "multi-agent",
+    "file-locking",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Software Development :: Version Control",
+    "Typing :: Typed",
+]
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115.0",
@@ -41,6 +65,13 @@ dev = [
 coord = "coordination.cli:main"
 coord-mcp = "coordination.mcp_server:main"
 coord-api = "coordination.main:run"
+
+[project.urls]
+Homepage = "https://github.com/amittell/coord"
+Repository = "https://github.com/amittell/coord"
+Changelog = "https://github.com/amittell/coord/blob/main/CHANGELOG.md"
+Issues = "https://github.com/amittell/coord/issues"
+Documentation = "https://github.com/amittell/coord/tree/main/docs"
 
 [build-system]
 requires = ["hatchling"]

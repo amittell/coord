@@ -195,3 +195,63 @@ jobs:
           body: |
             Container image: `${{ steps.image.outputs.name }}:${{ steps.version.outputs.tag }}`
             Digest: `${{ steps.build.outputs.digest }}`
+
+  # Publish the Python package to PyPI via OIDC trusted publishing.
+  # No API tokens stored in repo secrets -- pypa/gh-action-pypi-publish
+  # exchanges this workflow's GitHub OIDC identity for a short-lived
+  # PyPI token at publish time. Requires a pending publisher registered
+  # at https://pypi.org/manage/account/publishing/ before the first
+  # publish succeeds; bootstrap via:
+  #   project name = multi-agent-coordination
+  #   owner        = amittell
+  #   repo         = coord
+  #   workflow     = release.yml
+  #   environment  = pypi
+  #
+  # Tag pushes publish to PyPI; workflow_dispatch publishes nothing
+  # (no version bump means no new artifact to upload).
+  publish-pypi:
+    name: Publish Python package to PyPI
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    environment:
+      name: pypi
+      url: https://pypi.org/p/multi-agent-coordination
+    permissions:
+      id-token: write       # required for OIDC trusted publishing
+      contents: read        # required for checkout
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Install build backend
+        run: python -m pip install --upgrade build
+
+      - name: Verify tag matches pyproject version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          pyproject_version=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')
+          tag_version="${REF_NAME#v}"
+          if [ "$pyproject_version" != "$tag_version" ]; then
+            echo "::error::pyproject.toml version ($pyproject_version) does not match git tag ($tag_version)" >&2
+            exit 1
+          fi
+          echo "Version match: $pyproject_version == $tag_version"
+
+      - name: Build sdist + wheel
+        run: python -m build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@76f52bc884231f62b9a034ebfe128415bbaabdfc  # v1.13.0
+        with:
+          # Trusted publisher exchange happens automatically when the
+          # workflow's OIDC token is presented to PyPI; no api token needed.
+          # Skip-existing handles re-runs of an already-published version
+          # gracefully.
+          skip-existing: true

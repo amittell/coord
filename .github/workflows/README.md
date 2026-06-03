@@ -51,6 +51,12 @@ Jobs:
   SPDX SBOM plus SLSA provenance attestations (BuildKit-native and
   GitHub-native), signs the image keyless with cosign, and (for real
   tag pushes) creates a GitHub Release with auto-generated notes.
+- `publish-pypi` - on real tag pushes only (skipped on
+  `workflow_dispatch`), builds the sdist + wheel, validates that the
+  tag matches `pyproject.toml`'s `version` field, and publishes to
+  PyPI via OIDC trusted publishing (no API token stored in repo
+  secrets). Bootstrap requires a one-time pending-publisher
+  registration on PyPI; see "PyPI trusted publishing" below.
 
 Tag behaviour:
 
@@ -196,6 +202,48 @@ Settings -> Secrets and variables -> Actions -> Variables
     SKIP_ATTESTATION = true     # older GHES without attestations API
     SKIP_SIGNING = true         # environments without Sigstore access
 ```
+
+### PyPI trusted publishing
+
+The `publish-pypi` job uploads to PyPI without an API token by
+exchanging GitHub's OIDC identity for a short-lived PyPI token at
+publish time. This requires a one-time pending-publisher
+registration on PyPI before the first publish succeeds.
+
+Bootstrap steps (one-time, by a project maintainer with PyPI
+account access):
+
+1. Sign in at `https://pypi.org`.
+2. Go to "Your account" -> "Publishing" -> "Add a new pending
+   publisher" (the form is at
+   `https://pypi.org/manage/account/publishing/`).
+3. Fill in:
+   - PyPI Project Name: `multi-agent-coordination`
+   - Owner: `amittell`
+   - Repository name: `coord`
+   - Workflow name: `release.yml`
+   - Environment name: `pypi`
+4. Save. PyPI now trusts this exact workflow file on this exact
+   repo to publish under the named project. The next tagged push
+   that runs the workflow will create the project on first
+   publish.
+
+GitHub side: create an environment called `pypi` under Settings
+-> Environments. Optionally add deployment protection rules
+(required reviewers, deployment branches, etc.) -- the
+environment binding alone is enough for OIDC to work.
+
+After bootstrap, every `git tag v0.X.Y && git push --tags`
+triggers a build + publish. The workflow refuses to publish if
+the tag version does not match the `version` field in
+`pyproject.toml`, so an accidental tag without a version bump is
+caught at the verification step.
+
+To pause PyPI publishing without disabling the whole release:
+remove the pending publisher in PyPI, or change the workflow's
+environment to a name that PyPI does not trust. The `:latest`
+container image and GitHub Release still publish from
+`publish-image`.
 
 ### Manual trigger (workflow_dispatch)
 
