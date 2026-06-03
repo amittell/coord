@@ -567,6 +567,14 @@ class CoordinationService:
                 metrics.claims_conflicts_total.inc()
 
         if conflicts:
+            # v0.22 hard auto-promote: when blocked patterns have crossed
+            # the configured hotspot threshold within the window, write
+            # a ``shared_file`` rule for them into the active
+            # ownership YAML and record an audit event. The current
+            # 409 response is unchanged -- the new rule governs the
+            # NEXT overlap on this pattern.
+            if self.settings.auto_promote_threshold > 0:
+                await self._maybe_auto_promote(conflicts)
             # v0.21: if the caller passed wait_seconds > 0, enqueue the
             # FIRST conflicting requester item behind its blocking
             # holder and long-poll for an auto-grant from a release.
@@ -652,6 +660,81 @@ class CoordinationService:
             warnings=zero_match_warnings,
             options=[],
         )
+
+    async def _maybe_auto_promote(
+        self, conflicts: list[ConflictEntry]
+    ) -> None:
+        """v0.22 hard auto-promote.
+
+        Inspect each unique ``your_pattern`` from this batch's
+        conflicts; for any pattern that the hotspot query reports as
+        having crossed ``auto_promote_threshold`` attempts within the
+        rolling ``auto_promote_window_days`` window, write a
+        ``shared_file`` rule into the active ownership YAML via
+        :meth:`promote_hotspot` (idempotent) and record an
+        ``auto-promote`` ``request_events`` row when the YAML actually
+        changed.
+
+        Called only when ``auto_promote_threshold > 0``. Failures from
+        the YAML patch (e.g. an operator-introduced parse error) are
+        logged and swallowed so a malformed ownership document cannot
+        break the 409 response path; the next claim that crosses the
+        threshold will retry.
+        """
+
+        threshold = self.settings.auto_promote_threshold
+        window = self.settings.auto_promote_window_days
+        seen: set[str] = set()
+        unique_patterns: list[str] = []
+        for entry in conflicts:
+            pat = entry.your_pattern
+            if pat in seen:
+                continue
+            seen.add(pat)
+            unique_patterns.append(pat)
+
+        for pattern in unique_patterns:
+            try:
+                hotspots = await self.db.hotspot_files(
+                    days=window,
+                    min_attempts=threshold,
+                )
+            except Exception:  # noqa: BLE001 - audit path is best-effort
+                logger.exception(
+                    "auto-promote: hotspot_files query failed for %r",
+                    pattern,
+                )
+                continue
+            if not any(h.get("pattern") == pattern for h in hotspots):
+                continue
+            before = await self.db.get_ownership_yaml() or ""
+            try:
+                after = await self.promote_hotspot(
+                    action="shared_file", pattern=pattern, note=None
+                )
+            except ValueError:
+                # patch helpers raise ValueError on a malformed stored
+                # YAML; log and move on so the conflict response still
+                # returns cleanly.
+                logger.exception(
+                    "auto-promote: failed to patch owners.yaml for %r",
+                    pattern,
+                )
+                continue
+            if after == before:
+                # Already in the rule set; idempotent no-op, no audit.
+                continue
+            await self.db.record_request_event(
+                event_type="auto-promote",
+                request_id=None,
+                actor_engineer=None,
+                actor_session_id=None,
+                detail={
+                    "pattern": pattern,
+                    "threshold": threshold,
+                    "window_days": window,
+                },
+            )
 
     async def _finalise_v14_scope(
         self,

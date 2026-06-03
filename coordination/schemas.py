@@ -232,3 +232,30 @@ class PromoteHotspotRequest(BaseModel):
             "reviewers can see why the operator flagged this pattern."
         ),
     )
+
+
+class QueuedRequestEntry(BaseModel):
+    """v0.22: a row from the FIFO queue (claim_queue), joined with the
+    blocking holder claim's engineer and pattern so the response can
+    show ``who am I waiting on?`` without a second query.
+
+    Surfaced via ``GET /requests?queued=true`` and the MCP
+    ``my_requests(queued=True)`` wrapper. ``kind`` distinguishes
+    queued rows from the existing request_events / requests rows the
+    same endpoints serve when the filter is not set.
+    """
+
+    kind: str = Field(default="queued", description="Always 'queued'.")
+    queue_id: str
+    blocking_claim_id: str
+    blocking_engineer: str | None = None
+    blocking_pattern: str | None = None
+    requester_engineer: str
+    requester_pattern: str
+    claim_type: str
+    symbols: list[str] | None = None
+    position: int
+    state: str
+    enqueued_at: str
+    expires_at: str
+    granted_claim_id: str | None = None

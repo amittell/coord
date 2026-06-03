@@ -138,6 +138,15 @@ curl -X POST http://127.0.0.1:8080/metrics/hotspots/promote \
 
 `action` is `"shared_file"` (promote the pattern to a `shared_file` rule) or `"split"` (annotate the pattern for a follow-up modularisation pass). Idempotent: applying the same action+pattern twice is a no-op. Operator still in the loop -- v0.21 only writes when actively poked, never on its own.
 
+#### Hard auto-promote (v0.22+)
+
+v0.22 adds an opt-in autopilot for the `shared_file` promotion. Two env vars on the service control it:
+
+- `COORD_AUTO_PROMOTE_THRESHOLD` (int, default `0` -- disabled). When set to `N > 0`, the conflict pipeline auto-writes a `shared_file` rule into `owners.yaml` whenever a file's blocked-claim attempts cross `N` within the rolling window.
+- `COORD_AUTO_PROMOTE_WINDOW_DAYS` (int, default `7`). The look-back window in days for the attempt count.
+
+Each auto-promotion is idempotent (the same pattern is never written twice) and is recorded as an `auto-promote` row in `request_events` for audit: the `detail` JSON carries the `pattern`, `threshold`, and `window_days` that triggered it. Leaving the threshold at `0` keeps v0.21 behaviour (operator-only writes via `POST /metrics/hotspots/promote`).
+
 ## Queueing claims (v0.21+)
 
 When `claim_files` would `409` against an active holder, the requester historically had to retry on a timer or file an explicit `request_release`. v0.21 adds a third option: pass `wait_seconds` and the service FIFO-queues the requester behind the blocking claim, long-polling for the holder to release.
@@ -152,6 +161,19 @@ claim_files(
 ```
 
 When the holder releases (manual `release_claims`, TTL expiry, request approval, or a `narrowed` / `coexist` decision), the service drains the FIFO and auto-grants the next entry. Multiple queued requesters are served in arrival order. The server caps `wait_seconds` at 600s; pass `0` (or omit) to preserve the immediate-409 behaviour from v0.13-v0.20. The MCP wrapper accepts `wait_seconds` directly on `claim_files`; the same field exists on `POST /claims` (see [./api-reference.md](./api-reference.md)).
+
+### Inspecting the queue (v0.22+)
+
+`GET /requests?queued=true` returns the live FIFO queue rows joined with the blocking holder's engineer and pattern, so "who am I waiting on?" is a single round-trip:
+
+```bash
+curl "http://127.0.0.1:8080/requests?queued=true" \
+  -H "Authorization: Bearer $COORD_AUTH_TOKEN"
+```
+
+Filter to a single repo by adding `&repo=amittell/coord`. Each row carries `kind`, `queue_id`, `blocking_claim_id`, `blocking_engineer`, `blocking_pattern`, `requester_engineer`, `requester_pattern`, `position` (FIFO index, 0 = head), `state`, `enqueued_at`, and `expires_at`. The MCP wrapper exposes the same filter as `my_requests(queued=True)` for use from an agent session.
+
+The dashboard surfaces the same data as a "pending queue" panel per repo with depth and the head-of-queue waiter so an operator can see at a glance which hotspots are accreting a queue.
 
 ## Monorepo wiring: `coord init --root`
 

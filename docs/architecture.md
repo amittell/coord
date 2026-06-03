@@ -132,6 +132,8 @@ Every transition writes one row to the append-only `request_events` table with a
 
 The long-poll on `POST /requests` is implemented as a 1s DB poll loop on the request row. This works regardless of how many replicas you run; the responder's transaction lands in WAL and the poller's next read picks it up.
 
+v0.21 adds a separate FIFO `claim_queue` state machine for `claim_files` callers who pass `wait_seconds > 0`: enqueued behind the blocking holder, drained on any release path, auto-granted in arrival order. v0.22 surfaces those queue rows live via `GET /requests?queued=true` (joined with the blocking holder's engineer + pattern) and via a per-repo "pending queue" dashboard panel showing depth and head-of-queue waiter.
+
 ## Auth model
 
 - Preferred mode: bearer-token protected API using `COORD_AUTH_TOKEN`

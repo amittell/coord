@@ -9,6 +9,27 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.22.0] - 2026-06-02
+
+### Added
+
+- Hard auto-promote. Settings.auto_promote_threshold and
+  auto_promote_window_days (envs COORD_AUTO_PROMOTE_THRESHOLD,
+  COORD_AUTO_PROMOTE_WINDOW_DAYS, both default 0/7). When set,
+  the conflict pipeline auto-writes a shared_file rule into
+  owners.yaml when a file's blocked-claim attempts cross the
+  threshold within the rolling window. Each promotion records an
+  auto-promote request_event for audit. Idempotent.
+- Queue visibility. GET /requests?queued=true returns live FIFO
+  queue rows joined with the blocking holder's engineer + pattern
+  (new QueuedRequestEntry schema; v0.22).
+- coord-mcp my_requests tool gains a queued kwarg passing the
+  filter through.
+- db.list_queued_with_holder helper (joined query, used by the
+  endpoint and the dashboard panel).
+- Dashboard "pending queue" panel per-repo showing depth + head-
+  of-queue waiter.
+
 ## [0.21.0] - 2026-06-02
 
 ### Added

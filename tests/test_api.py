@@ -1638,3 +1638,298 @@ async def test_queue_grants_in_fifo_order_on_release(
     assert carol_result.get("claim_ids", []) == [] or carol_result.get(
         "claim_ids"
     )
+
+
+# ---------------------------------------------------------------------------
+# v0.22: hard auto-promote
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+async def client_auto_promote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncClient:
+    """Variant of ``client`` with hard auto-promote enabled.
+
+    Threshold is 3 attempts within a 7-day window: the third 409
+    against the same pattern triggers the shared_file rule write.
+    """
+
+    db_path = tmp_path / "db.sqlite"
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "test-token")
+    monkeypatch.setenv("COORD_DATABASE_PATH", str(db_path))
+    monkeypatch.setenv("COORD_DISABLE_BACKGROUND_CLEANUP", "1")
+    monkeypatch.setenv("COORD_DISABLE_INSTANCE_LOCK", "1")
+    monkeypatch.delenv("COORD_REPO_ROOT", raising=False)
+    monkeypatch.setenv("COORD_AUTO_PROMOTE_THRESHOLD", "3")
+    monkeypatch.setenv("COORD_AUTO_PROMOTE_WINDOW_DAYS", "7")
+
+    from coordination import deps
+
+    deps.get_service.cache_clear()
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
+
+    deps.get_service.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_auto_promote_writes_rule_when_threshold_crossed(
+    client_auto_promote: AsyncClient,
+) -> None:
+    """3 distinct attempters bouncing on src/router.ts trips the
+    threshold; the 3rd 409 promotes the pattern into shared_files."""
+
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/router.ts"}],
+    }
+    rh = await client_auto_promote.post("/claims", headers=_AUTH, json=holder)
+    assert rh.status_code == 200, rh.text
+
+    # Before any 409 the YAML has no shared_files entry.
+    g0 = await client_auto_promote.get("/config/ownership", headers=_AUTH)
+    assert "src/router.ts" not in g0.text
+
+    for engineer in ("bob", "carol", "dave"):
+        rr = await client_auto_promote.post(
+            "/claims",
+            headers=_AUTH,
+            json={
+                "engineer": engineer,
+                "repo": "amittell/coord",
+                "claims": [{"type": "file", "pattern": "src/router.ts"}],
+            },
+        )
+        assert rr.json().get("claim_ids") == [], rr.text
+
+    g = await client_auto_promote.get("/config/ownership", headers=_AUTH)
+    assert g.status_code == 200
+    assert "shared_files" in g.text, g.text
+    assert "src/router.ts" in g.text, g.text
+
+
+@pytest.mark.asyncio
+async def test_auto_promote_idempotent_on_repeated_conflicts(
+    client_auto_promote: AsyncClient,
+) -> None:
+    """Once a pattern is promoted, further 409s do not rewrite the
+    YAML."""
+
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/router.ts"}],
+    }
+    rh = await client_auto_promote.post("/claims", headers=_AUTH, json=holder)
+    assert rh.status_code == 200, rh.text
+
+    # Cross the threshold.
+    for engineer in ("bob", "carol", "dave"):
+        await client_auto_promote.post(
+            "/claims",
+            headers=_AUTH,
+            json={
+                "engineer": engineer,
+                "repo": "amittell/coord",
+                "claims": [{"type": "file", "pattern": "src/router.ts"}],
+            },
+        )
+
+    g1 = await client_auto_promote.get("/config/ownership", headers=_AUTH)
+    assert "src/router.ts" in g1.text
+    snapshot = g1.text
+
+    # 5 more 409s on the same pattern; YAML must not change.
+    for engineer in ("eve", "frank", "grace", "heidi", "ivan"):
+        await client_auto_promote.post(
+            "/claims",
+            headers=_AUTH,
+            json={
+                "engineer": engineer,
+                "repo": "amittell/coord",
+                "claims": [{"type": "file", "pattern": "src/router.ts"}],
+            },
+        )
+
+    g2 = await client_auto_promote.get("/config/ownership", headers=_AUTH)
+    assert g2.text == snapshot
+
+
+@pytest.mark.asyncio
+async def test_auto_promote_disabled_when_threshold_zero(
+    client: AsyncClient,
+) -> None:
+    """Default config (threshold=0) leaves owners.yaml empty regardless
+    of how many 409s the same pattern accumulates."""
+
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/router.ts"}],
+    }
+    rh = await client.post("/claims", headers=_AUTH, json=holder)
+    assert rh.status_code == 200, rh.text
+
+    for i in range(10):
+        await client.post(
+            "/claims",
+            headers=_AUTH,
+            json={
+                "engineer": f"bouncer-{i}",
+                "repo": "amittell/coord",
+                "claims": [{"type": "file", "pattern": "src/router.ts"}],
+            },
+        )
+
+    g = await client.get("/config/ownership", headers=_AUTH)
+    # 204 No Content (no YAML ever written) is the success signal for
+    # "auto-promote did nothing"; 200 with a body that lacks the
+    # pattern is the other valid shape.
+    assert g.status_code in (200, 204), g.text
+    assert "src/router.ts" not in g.text
+    assert "shared_files" not in g.text
+
+
+# ---------------------------------------------------------------------------
+# v0.22: queue visibility
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_requests_queued_filter_returns_queue_rows(
+    client: AsyncClient,
+) -> None:
+    """GET /requests?queued=true surfaces FIFO queue rows joined with
+    the blocking holder's engineer/pattern."""
+    from coordination import deps
+
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/v22a.ts"}],
+    }
+    rh = await client.post("/claims", headers=_AUTH, json=holder)
+    assert rh.status_code == 200, rh.text
+    holder_cid = rh.json()["claim_ids"][0]
+
+    db = deps.get_service().db
+    await db.enqueue_claim_request(
+        blocking_claim_id=holder_cid,
+        requester_engineer="bob",
+        requester_session_id="bob-sess",
+        requester_branch=None,
+        requester_description=None,
+        repo="amittell/coord",
+        claim_type="file",
+        pattern="src/v22a.ts",
+        symbols=None,
+        narrowable=None,
+        ttl_hours=None,
+        wait_seconds=120,
+    )
+
+    r = await client.get("/requests?queued=true", headers=_AUTH)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["queued"] is True
+    assert body["count"] == 1
+    row = body["requests"][0]
+    assert row["kind"] == "queued"
+    assert row["blocking_claim_id"] == holder_cid
+    assert row["blocking_engineer"] == "alice"
+    assert row["blocking_pattern"] == "src/v22a.ts"
+    assert row["requester_engineer"] == "bob"
+    assert row["requester_pattern"] == "src/v22a.ts"
+    assert row["claim_type"] == "file"
+    assert row["position"] == 1
+    assert row["state"] == "waiting"
+    assert row["symbols"] is None
+
+
+@pytest.mark.asyncio
+async def test_list_requests_queued_filter_by_requester(
+    client: AsyncClient,
+) -> None:
+    """The requester filter narrows queue rows to a single engineer."""
+    from coordination import deps
+
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/v22b.ts"}],
+    }
+    rh = await client.post("/claims", headers=_AUTH, json=holder)
+    assert rh.status_code == 200, rh.text
+    holder_cid = rh.json()["claim_ids"][0]
+
+    db = deps.get_service().db
+    for engineer in ("bob", "carol"):
+        await db.enqueue_claim_request(
+            blocking_claim_id=holder_cid,
+            requester_engineer=engineer,
+            requester_session_id=f"{engineer}-sess",
+            requester_branch=None,
+            requester_description=None,
+            repo="amittell/coord",
+            claim_type="file",
+            pattern="src/v22b.ts",
+            symbols=None,
+            narrowable=None,
+            ttl_hours=None,
+            wait_seconds=120,
+        )
+
+    r = await client.get(
+        "/requests?queued=true&requester=bob", headers=_AUTH
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["queued"] is True
+    assert body["count"] == 1
+    assert body["requests"][0]["requester_engineer"] == "bob"
+
+
+@pytest.mark.asyncio
+async def test_list_requests_default_excludes_queue(
+    client: AsyncClient,
+) -> None:
+    """Without the queued flag the response is the legacy requests
+    table: no kind='queued' rows leak through, even when the FIFO
+    queue is non-empty."""
+    from coordination import deps
+
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/v22c.ts"}],
+    }
+    rh = await client.post("/claims", headers=_AUTH, json=holder)
+    assert rh.status_code == 200, rh.text
+    holder_cid = rh.json()["claim_ids"][0]
+
+    db = deps.get_service().db
+    await db.enqueue_claim_request(
+        blocking_claim_id=holder_cid,
+        requester_engineer="bob",
+        requester_session_id="bob-sess",
+        requester_branch=None,
+        requester_description=None,
+        repo="amittell/coord",
+        claim_type="file",
+        pattern="src/v22c.ts",
+        symbols=None,
+        narrowable=None,
+        ttl_hours=None,
+        wait_seconds=120,
+    )
+
+    r = await client.get("/requests", headers=_AUTH)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert "queued" not in body
+    for row in body["requests"]:
+        assert row.get("kind") != "queued"

@@ -94,6 +94,8 @@ A peer claiming a disjoint symbol set on the same file is granted automatically 
 
 As of v0.19 the TypeScript parser also walks recursively into nested class declarations, so symbol claims on `"Outer::Inner::method"` extract correctly end-to-end (the API has always accepted the notation; v0.19 makes parser-side validation match).
 
+To see the live FIFO queue for `claim_files` waiters (v0.22+), call `my_requests(queued=True)` -- the tool forwards `?queued=true` to `GET /requests` and returns the blocking holder's engineer + pattern alongside each waiter.
+
 ## Auth resolution order
 
 `coord-mcp` resolves `COORD_*` env vars in this order, with the first non-placeholder value winning:

@@ -31,6 +31,15 @@ class Settings(BaseSettings):
     # holder either responds (approve/deny) or the shortened TTL
     # fires and the claim auto-releases, freeing the requester.
     request_ttl_short_sec: int = 300
+    # v0.22 hard auto-promote: when a file's blocked-claim attempts
+    # cross ``auto_promote_threshold`` within the rolling
+    # ``auto_promote_window_days`` window, the conflict pipeline
+    # writes a ``shared_files`` entry for it into the active
+    # ownership YAML and records an ``auto-promote`` request_event.
+    # Set the threshold to 0 (default) to disable the feature; the
+    # v0.21 soft-promote endpoint stays available either way.
+    auto_promote_threshold: int = 0
+    auto_promote_window_days: int = 7
 
     @property
     def auth_mode(self) -> str:

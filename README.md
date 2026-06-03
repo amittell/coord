@@ -201,6 +201,14 @@ The dashboard's "promote to shared_file" / "split into modules" chips now have a
 
 `claim_files` now accepts `wait_seconds`. When the request would `409`, the requester is FIFO-queued behind the holder; on release the next queued requester is auto-granted. Eliminates the retry storm on hot files.
 
+### Hard auto-promote (v0.22)
+
+Set `COORD_AUTO_PROMOTE_THRESHOLD=N` (default 0, disabled) to have the conflict pipeline write a `shared_file` rule into `owners.yaml` whenever a file's blocked-claim attempts cross the threshold within the rolling `COORD_AUTO_PROMOTE_WINDOW_DAYS` (default 7). Idempotent; each promotion is recorded as an `auto-promote` `request_event`.
+
+### Queue visibility (v0.22)
+
+`GET /requests?queued=true` returns live FIFO queue rows joined with the blocking holder's engineer/pattern -- "who am I waiting on?" without a second query. The `coord-mcp` `my_requests` tool gains a `queued` kwarg passing the same filter through. Dashboard surfaces a "pending queue" panel per repo with depth + head-of-queue waiter.
+
 ## Local Assets
 
 - `.env.example`: environment variable template

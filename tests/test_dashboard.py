@@ -1095,3 +1095,78 @@ async def test_dashboard_hotspot_action_link_present(
     if next_row_start > 0:
         monitor_row = monitor_row[:next_row_start]
     assert 'class="hsapply"' not in monitor_row
+
+
+# ---------------------------------------------------------------------------
+# v0.22: pending queue panel
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dashboard_renders_pending_queue_panel(
+    svc: CoordinationService,
+) -> None:
+    """v0.22: a per-repo "pending queue" panel surfaces queue depth and
+    the head-of-queue waiter so an operator can spot agents piling up on
+    hot files. Source: Database.list_queued_with_holder."""
+    # Holder claim in a real repo so the queue rows can JOIN to a
+    # blocking_engineer / blocking_pattern.
+    await svc.db.insert_claims_batch(
+        engineer="alice-holder",
+        branch="main",
+        description="big refactor",
+        items=[
+            ("holder-q1", "file", "src/router.ts", "soft",
+             "2099-01-01T00:00:00Z"),
+        ],
+        session_id="sess-holder",
+        repo="amittell/coord",
+    )
+
+    # Enqueue three distinct requesters behind the holder, in order.
+    for requester in ("bob", "carol", "dave"):
+        await svc.db.enqueue_claim_request(
+            blocking_claim_id="holder-q1",
+            requester_engineer=requester,
+            requester_session_id=None,
+            requester_branch=None,
+            requester_description=None,
+            repo="amittell/coord",
+            claim_type="file",
+            pattern="src/router.ts",
+            symbols=None,
+            narrowable=None,
+            ttl_hours=4,
+            wait_seconds=60,
+        )
+
+    html_out = await render_dashboard()
+
+    # Panel header is present.
+    assert "<h2>pending queue</h2>" in html_out.lower()
+
+    # Slice the panel for tighter assertions. Anchor on the rendered
+    # <h2> so the CSS comment ("pending queue panel") in the inlined
+    # stylesheet can't match. The next panel in the page order is
+    # "repositories" (start of the split-7-5 row).
+    start = html_out.lower().index("<h2>pending queue</h2>")
+    end = html_out.lower().index("repositories", start)
+    panel = html_out[start:end]
+
+    # Repo is named and depth is 3.
+    assert "amittell/coord" in panel
+    assert ">3<" in panel
+    # Head-of-queue is the first enqueued waiter (bob, position 1).
+    assert "bob" in panel
+    # Blocking holder is identified in the head-of-queue subline.
+    assert "alice-holder" in panel
+
+
+@pytest.mark.asyncio
+async def test_dashboard_pending_queue_empty_state(
+    svc: CoordinationService,
+) -> None:
+    """With no queue rows, the panel still renders with a friendly
+    'no queued claims (good!)' placeholder."""
+    html_out = await render_dashboard()
+    assert "no queued claims" in html_out.lower()

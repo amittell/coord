@@ -410,15 +410,39 @@ The holder responds to an open request. Four decisions:
 
 A late respond (after the request has already terminalised) is recorded as a `responded-late` audit event but does not change state.
 
-## `GET /requests` (v0.9.0+)
+## `GET /requests` (v0.9.0+, extended in v0.22.0)
 
 List requests, filterable by:
 
 - `requester=<engineer>` (the requester's view, used by `my_requests`)
 - `claim_id=<id>` (every request ever filed against a claim)
 - `decision=pending | approved | denied | expired | resolved`
+- `queued=true|false` (v0.22+) -- when `true`, return live FIFO queue rows instead of the `requests` table. Joins the blocking holder's context so callers get the full "who am I waiting on?" picture in one call. `repo=<id>` may be combined with this flag to restrict the queue listing.
 
-Each row carries the joined holder context (`holder_engineer`, `holder_pattern`, `holder_repo`).
+When `queued=true`, each row is a `QueuedRequestEntry` rather than a normal request:
+
+```json
+{
+  "queued": [
+    {
+      "kind": "queued",
+      "queue_id": "q-...",
+      "blocking_claim_id": "claim-...",
+      "blocking_engineer": "alice/claude/main",
+      "blocking_pattern": "src/auth/login.ts",
+      "requester_engineer": "bob/codex/main",
+      "requester_pattern": "src/auth/login.ts",
+      "position": 0,
+      "state": "waiting",
+      "enqueued_at": "2026-06-02T17:11:00Z",
+      "expires_at": "2026-06-02T17:21:00Z"
+    }
+  ],
+  "count": 1
+}
+```
+
+`position` is the FIFO index (0 = head of queue); `state` is `waiting` until the blocking claim releases. The default (`queued=false` or omitted) preserves the v0.9 shape: each row carries the joined holder context (`holder_engineer`, `holder_pattern`, `holder_repo`).
 
 ## `GET /requests/{request_id}` (v0.9.0+)
 
@@ -427,6 +451,8 @@ Return the current state of a single request. Useful for polling `pending` reque
 ## `GET /requests/{request_id}/events` (v0.9.0+)
 
 Return the immutable audit timeline for a request, oldest first. Event types: `filed`, `notified`, `responded`, `expired`, `resolved`, `responded-late`. Each event has actor, session_id, timestamp, and a JSON `detail` blob with the per-event-type specifics.
+
+Auto-resolution / auto-promote audit (v0.14+, extended v0.22): server-side automatic decisions are recorded in `request_events` with `request_id=NULL`. `auto-coexist` and `auto-narrow` (v0.14) cover the symbol-claim resolutions described in [./design/sub-file-claims.md](./design/sub-file-claims.md). As of v0.22, `auto-promote` events appear in the same table whenever `COORD_AUTO_PROMOTE_THRESHOLD` triggers a `shared_file` rule write into `owners.yaml`; the `detail` JSON carries `pattern`, `threshold`, and `window_days`. These rows are visible via a global audit query (the per-request endpoint above only surfaces them when filtering by `request_id IS NULL`).
 
 ```json
 {

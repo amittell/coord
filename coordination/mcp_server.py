@@ -546,17 +546,31 @@ async def wait_for_request(
 
 
 @mcp.tool()
-async def my_requests(decision: str = "pending") -> dict[str, Any]:
+async def my_requests(
+    decision: str = "pending",
+    queued: bool | None = None,
+) -> dict[str, Any]:
     """List requests this engineer has filed, filtered by decision
     state. Defaults to ``pending`` so the most useful answer ('what
     am I still waiting on?') is the default. Pass ``decision=""`` to
-    list every request you've ever filed."""
+    list every request you've ever filed.
+
+    ``queued`` (v0.22+) flips the view to the live FIFO queue
+    (``claim_queue``) rather than the request_events table. When
+    ``True`` the response items carry ``kind='queued'`` and include
+    the blocking holder's engineer / pattern so you can see who you
+    are waiting on without a second call. ``None`` (default) or
+    ``False`` preserves the v0.21 request shape byte-identically so
+    pre-v0.22 servers see no difference.
+    """
     requester = os.environ.get("COORD_REQUESTER", "").strip() or os.environ.get(
         "COORD_USER", ""
     ).strip() or "agent"
     params: dict[str, Any] = {"requester": requester}
     if decision:
         params["decision"] = decision
+    if queued is not None and queued:
+        params["queued"] = "true"
     async with httpx.AsyncClient(timeout=30.0) as client:
         r = await client.get(
             f"{_base_url()}/requests",

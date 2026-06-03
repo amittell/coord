@@ -891,6 +891,53 @@ async def test_my_requests_filters_by_requester_and_decision(
     assert req.url.params.get("decision") == "pending"
 
 
+@pytest.mark.asyncio
+async def test_my_requests_with_queued_forwards_param(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """v0.22: queued=True surfaces on the GET as queued=true so the
+    server returns FIFO queue rows instead of the legacy requests
+    table."""
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.setenv("COORD_REQUESTER", "alice")
+    captured = _install_mock_transport(
+        monkeypatch,
+        _json_handler(
+            200, {"requests": [], "count": 0, "queued": True}
+        ),
+    )
+
+    await mcp_server.my_requests(queued=True)
+
+    req = captured[0]
+    assert req.url.params.get("queued") == "true"
+    assert req.url.params.get("requester") == "alice"
+
+
+@pytest.mark.asyncio
+async def test_my_requests_without_queued_omits_param(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """v0.22 backward compat: queued=None (default) and queued=False
+    must NOT emit the queued query param so the request shape stays
+    byte-identical to v0.21."""
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.setenv("COORD_REQUESTER", "alice")
+    captured = _install_mock_transport(
+        monkeypatch, _json_handler(200, {"requests": [], "count": 0})
+    )
+
+    await mcp_server.my_requests()
+    req_none = captured[-1]
+    assert "queued" not in req_none.url.params
+
+    await mcp_server.my_requests(queued=False)
+    req_false = captured[-1]
+    assert "queued" not in req_false.url.params
+
+
 # ---------------------------------------------------------------------------
 # v0.11.0 -- requested_scope on file_request, narrowed/coexist on respond
 # ---------------------------------------------------------------------------

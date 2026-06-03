@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import json
 import logging
 import os
 import time
@@ -476,20 +477,66 @@ async def respond_to_request(
 
 @app.get("/requests")
 async def list_requests(
-    requester: str | None = None,
-    claim_id: str | None = None,
-    decision: str | None = None,
+    requester: str | None = Query(default=None),
+    claim_id: str | None = Query(default=None),
+    decision: str | None = Query(default=None),
+    queued: bool = Query(default=False),
+    state: str | None = Query(default=None),
     _: None = Depends(require_auth),
 ) -> dict:
     """List requests filtered by requester, claim, or decision state.
     Used by both the requester (``my_requests``) and the operator
-    dashboard."""
-    rows = await get_service().list_requests(
+    dashboard.
+
+    v0.22: ``queued=true`` switches the response to the live FIFO queue
+    rows (``claim_queue``), joined with the blocking holder's engineer
+    and pattern so the requester can see ``who am I waiting on?`` in a
+    single round-trip. ``state`` further narrows the queue filter
+    (defaults to ``waiting``; pass an empty string is not supported --
+    omit the param to keep the default). ``requester`` continues to
+    apply, filtering queue rows by ``requester_engineer``.
+    """
+    if queued:
+        rows = await get_service().db.list_queued_with_holder(
+            engineer=requester,
+            state=state or "waiting",
+        )
+        out: list[dict] = []
+        for r in rows:
+            symbols_field: list[str] | None = None
+            raw_symbols = r.get("symbols")
+            if raw_symbols:
+                try:
+                    parsed = json.loads(raw_symbols)
+                    if isinstance(parsed, list):
+                        symbols_field = [str(s) for s in parsed]
+                except (TypeError, ValueError):
+                    symbols_field = None
+            out.append(
+                {
+                    "kind": "queued",
+                    "queue_id": r["id"],
+                    "blocking_claim_id": r["blocking_claim_id"],
+                    "blocking_engineer": r.get("blocking_engineer"),
+                    "blocking_pattern": r.get("blocking_pattern"),
+                    "requester_engineer": r["requester_engineer"],
+                    "requester_pattern": r["pattern"],
+                    "claim_type": r["claim_type"],
+                    "symbols": symbols_field,
+                    "position": int(r["position"]),
+                    "state": r["state"],
+                    "enqueued_at": r["enqueued_at"],
+                    "expires_at": r["expires_at"],
+                    "granted_claim_id": r.get("granted_claim_id"),
+                }
+            )
+        return {"requests": out, "count": len(out), "queued": True}
+    rows_legacy = await get_service().list_requests(
         requester_engineer=requester,
         claim_id=claim_id,
         decision=decision,
     )
-    return {"requests": rows, "count": len(rows)}
+    return {"requests": rows_legacy, "count": len(rows_legacy)}
 
 
 @app.get("/requests/{request_id}")

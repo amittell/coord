@@ -675,6 +675,35 @@ tbody tr td.empty {
   opacity: 0.7;
 }
 .hotspots .hsapply:hover { opacity: 1; }
+
+/* v0.22 pending queue panel */
+.queue .qrow {
+  display: grid;
+  grid-template-columns: 24ch 6ch 1fr;
+  gap: calc(var(--grid) * 2);
+  align-items: baseline;
+  padding: calc(var(--grid)) 0;
+  border-bottom: 1px dashed var(--hairline);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.queue .qrow:last-child { border-bottom: none; }
+.queue .qrepo { color: var(--phosphor); }
+.queue .qrepo, .queue .qhead {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.queue .qdepth {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--amber);
+}
+.queue .qhead {
+  color: var(--muted);
+  font-size: 10.5px;
+  letter-spacing: 0.02em;
+}
 """
 
 
@@ -704,6 +733,7 @@ async def render_dashboard() -> str:
     auto_resolutions = await svc.db.count_auto_resolutions_since(window_hours=24)
     auto_resolution_series = await svc.db.daily_auto_resolutions(days=30)
     hotspot_rows = await svc.db.hotspot_files(days=30, min_attempts=5, limit=10)
+    queued_rows = await svc.db.list_queued_with_holder(state="waiting", limit=100)
 
     claims_by_id: dict[str, dict[str, Any]] = {
         str(c["id"]): c for c in recent if c.get("id")
@@ -1132,6 +1162,65 @@ async def render_dashboard() -> str:
         '</section>'
     )
 
+    # v0.22: pending queue panel. Surface per-repo queue depth + the
+    # head-of-queue waiter so an operator can spot agents piling up on
+    # hot files at a glance. Source: Database.list_queued_with_holder
+    # (LEFT JOIN to claims so cascade-deleted holders still render with
+    # NULL blocking_engineer / blocking_pattern). Read-only signal --
+    # actuation lives in the queue API itself.
+    queue_by_repo: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for qr in queued_rows:
+        repo_key = str(qr.get("repo") or "(unattributed)")
+        queue_by_repo[repo_key].append(qr)
+
+    if queue_by_repo:
+        queue_lines: list[str] = []
+        for repo_key in sorted(queue_by_repo):
+            entries = queue_by_repo[repo_key]
+            depth = len(entries)
+            # Head-of-queue: smallest position; ties (or NULL positions)
+            # fall back to earliest enqueued_at.
+            def _head_key(row: dict[str, Any]) -> tuple[int, str]:
+                pos_raw = row.get("position")
+                try:
+                    pos_val = int(pos_raw) if pos_raw is not None else 1_000_000
+                except (TypeError, ValueError):
+                    pos_val = 1_000_000
+                return (pos_val, str(row.get("enqueued_at") or ""))
+
+            head = min(entries, key=_head_key)
+            head_pos = head.get("position") or 1
+            requester = str(head.get("requester_engineer") or "?")
+            blocker = str(head.get("blocking_engineer") or "(holder gone)")
+            blocking_pattern = str(head.get("blocking_pattern") or "?")
+            head_desc = (
+                f"{_esc(requester)} waiting on {_esc(blocker)} for "
+                f"<span class='pattern'>{_esc(blocking_pattern)}</span> "
+                f"(pos {int(head_pos)})"
+            )
+            queue_lines.append(
+                '<div class="qrow">'
+                f'<div class="qrepo">{_esc(repo_key)}</div>'
+                f'<div class="qdepth">{depth}</div>'
+                f'<div class="qhead">{head_desc}</div>'
+                '</div>'
+            )
+        queue_body = "".join(queue_lines)
+    else:
+        queue_body = (
+            '<div class="empty" style="padding:calc(var(--grid) * 2)">'
+            'no queued claims (good!)</div>'
+        )
+    queue_html = (
+        '<section class="panel">'
+        '<header><h2>pending queue</h2>'
+        f'<span class="meta">{len(queued_rows)} waiting · {len(queue_by_repo)} repos</span></header>'
+        '<div class="queue" style="padding:calc(var(--grid) * 2)">'
+        + queue_body +
+        '</div>'
+        '</section>'
+    )
+
     auto_resolutions_html = (
         '<section class="panel">'
         '<header><h2>auto-resolutions (24h)</h2>'
@@ -1197,6 +1286,8 @@ async def render_dashboard() -> str:
     {heatmap_html}
 
     {hotspots_html}
+
+    {queue_html}
 
     <div class="row split-7-5">
       <section class="panel">

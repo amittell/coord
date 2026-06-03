@@ -1085,6 +1085,52 @@ class Database:
             rows = await cur.fetchall()
             return [dict(r) for r in rows]
 
+    async def list_queued_with_holder(
+        self,
+        *,
+        engineer: str | None = None,
+        state: str | None = "waiting",
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """v0.22: queue rows joined with the blocking holder's engineer
+        and pattern so a single query answers ``who am I waiting on?``.
+
+        Filters on requester engineer when ``engineer`` is set, and on
+        queue state when ``state`` is set (default 'waiting' so the
+        operator-facing endpoint only sees live entries; pass None to
+        include granted/expired for forensic queries).
+
+        The join is LEFT so a queue row whose holder has been
+        cascade-deleted still surfaces with NULL holder fields rather
+        than disappearing -- the requester deserves to see "the holder
+        you were behind no longer exists" instead of a silent miss.
+        """
+        await self.init()
+        sql = (
+            "SELECT cq.*, c.engineer AS blocking_engineer, "
+            "c.pattern AS blocking_pattern "
+            "FROM claim_queue cq "
+            "LEFT JOIN claims c ON c.id = cq.blocking_claim_id"
+        )
+        clauses: list[str] = []
+        params: list[Any] = []
+        if engineer:
+            clauses.append("cq.requester_engineer = ?")
+            params.append(engineer)
+        if state:
+            clauses.append("cq.state = ?")
+            params.append(state)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY cq.enqueued_at DESC LIMIT ?"
+        params.append(limit)
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(sql, params)
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
     async def touch_session_activity(self, session_id: str) -> int:
         """Bump ``last_activity`` on every active claim that belongs to
         the given session. Returns the rowcount so callers can log /
