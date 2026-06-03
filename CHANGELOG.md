@@ -9,6 +9,46 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.24.0] - 2026-06-02
+
+### Added
+
+- Cross-process FIFO queue backend. service._enqueue_and_wait
+  refactored from pure asyncio.Event wait to a hybrid loop: short
+  event-wait (same-process fast path) plus a DB state poll every
+  ~0.5s (catches cross-process grants made by another replica).
+- db.get_queue_entry(queue_id) helper used by the poll path.
+- 3 new tests covering same-process and cross-process grant paths.
+
+### Changed
+
+- Coord can now be deployed multi-replica without losing queued-
+  waiter notifications. No config knob to flip; the hybrid wait is
+  the default and is byte-compatible with the v0.21 in-process
+  fast path.
+
+## [0.23.0] - 2026-06-02
+
+### Added
+
+- Auto-demote. Closes the v0.22 one-way ratchet. A coord-managed
+  shared_files entry (marked with the ``# auto-promoted=YYYY-MM-DD``
+  comment suffix in owners.yaml) is removed by a background sweep
+  when its rolling hotspot count stays below
+  COORD_AUTO_PROMOTE_THRESHOLD for COORD_AUTO_DEMOTE_WINDOW_DAYS
+  days. Sweep cadence: COORD_AUTO_DEMOTE_INTERVAL_SEC (default
+  3600). Operator-added entries (no marker) are left alone.
+- ownership.py extended: patch_owners_yaml_with_shared_file gains
+  a ``managed=True`` kwarg that adds the marker, plus new helpers
+  list_coord_managed_shared_files and patch_owners_yaml_remove_shared_file.
+- Service.promote_hotspot signature gains ``managed=False`` kwarg
+  and v0.22's _maybe_auto_promote now passes managed=True so demote
+  can distinguish coord-owned entries.
+- New auto-demote request_event type recorded per removal.
+- Settings.auto_demote_interval_sec (default 3600) and
+  auto_demote_window_days (default 14).
+- 4 new tests.
+
 ## [0.22.0] - 2026-06-02
 
 ### Added

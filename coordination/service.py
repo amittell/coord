@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time as _time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import logging
@@ -112,6 +113,17 @@ def _coexist_partner_ids_from_rows(rows: list[dict[str, Any]]) -> set[str]:
 # event. Per-process state: a restart causes outstanding long-polls to
 # time out and the client to retry, which is the safe failure mode.
 _QUEUE_WAITERS: dict[str, tuple[asyncio.Event, dict[str, Any]]] = {}
+
+# v0.24: cross-process queue backend. The in-memory ``_QUEUE_WAITERS``
+# event only fires when the release happens in the same Python process
+# as the long-poll. In multi-replica deployments (one replica long-polls,
+# another handles the release) the waiter never wakes via the event.
+# ``_enqueue_and_wait`` runs a hybrid loop: short event-wait (fast path
+# when same-process) plus a DB state poll on ``POLL_INTERVAL`` so a
+# cross-process grant/expiry is observed within that interval. 0.5s is a
+# balance between perceived latency (near-instant grants) and SQLite
+# read pressure when many waiters are stacked.
+POLL_INTERVAL = 0.5
 
 
 def _register_waiter(queue_id: str) -> tuple[asyncio.Event, dict[str, Any]]:
@@ -710,7 +722,10 @@ class CoordinationService:
             before = await self.db.get_ownership_yaml() or ""
             try:
                 after = await self.promote_hotspot(
-                    action="shared_file", pattern=pattern, note=None
+                    action="shared_file",
+                    pattern=pattern,
+                    note=None,
+                    managed=True,
                 )
             except ValueError:
                 # patch helpers raise ValueError on a malformed stored
@@ -1132,26 +1147,65 @@ class CoordinationService:
             wait_seconds=wait_seconds,
         )
 
+        # v0.24: hybrid wait loop. Short event-wait covers the
+        # same-process fast path (release-drain in this Python process
+        # fires ``_notify_waiter`` and we wake instantly); the DB poll
+        # on each iteration covers the cross-process case where another
+        # replica marks the queue row granted/expired without our
+        # in-memory event ever firing.
         event, payload = _register_waiter(entry["id"])
+        deadline = _time.monotonic() + wait_seconds
+        granted_cid: str | None = None
         try:
-            await asyncio.wait_for(event.wait(), timeout=wait_seconds)
-        except (asyncio.TimeoutError, TimeoutError):
-            await self.db.mark_queue_expired(entry["id"])
+            while True:
+                time_remaining = deadline - _time.monotonic()
+                if time_remaining <= 0:
+                    break
+                try:
+                    await asyncio.wait_for(
+                        event.wait(),
+                        timeout=min(POLL_INTERVAL, time_remaining),
+                    )
+                except (asyncio.TimeoutError, TimeoutError):
+                    pass
+                # Whether the event fired OR the short wait timed out,
+                # check both the in-memory payload and the DB state for
+                # a verdict.
+                if payload.get("granted_claim_id"):
+                    granted_cid = payload["granted_claim_id"]
+                    break
+                if event.is_set():
+                    # Same-process expiry: ``_notify_waiter`` was called
+                    # with ``granted_claim_id=None`` (drain failed). The
+                    # payload above is empty so fall through to the
+                    # ``None`` return.
+                    break
+                # Cross-process check: did another replica mark this
+                # entry granted or expired?
+                row = await self.db.get_queue_entry(entry["id"])
+                if row is None:
+                    # Cascade-deleted; treat as expired.
+                    break
+                if row["state"] == "granted" and row.get("granted_claim_id"):
+                    granted_cid = row["granted_claim_id"]
+                    break
+                if row["state"] in ("expired", "cancelled"):
+                    break
+        finally:
             _drop_waiter(entry["id"])
-            return None
-        _drop_waiter(entry["id"])
-        granted_cid = payload.get("granted_claim_id")
-        if not granted_cid:
-            # Drain ran but the grant attempt re-conflicted; mark
-            # expired so the queue row reflects reality and surface the
-            # original 409 to the caller.
-            return None
-        return CreateClaimsResponse(
-            claim_ids=[granted_cid],
-            conflicts=[],
-            warnings=[],
-            options=[],
-        )
+
+        if granted_cid:
+            return CreateClaimsResponse(
+                claim_ids=[granted_cid],
+                conflicts=[],
+                warnings=[],
+                options=[],
+            )
+        # Mark expired in case the loop ran out of time without a state
+        # change (DB still 'waiting' or 'in_progress'). Idempotent: a
+        # row that is already terminal stays terminal.
+        await self.db.mark_queue_expired(entry["id"])
+        return None
 
     async def _drain_queue_for(self, released_claim_id: str) -> None:
         """Pop FIFO queue entries waiting on ``released_claim_id`` and
@@ -1257,12 +1311,18 @@ class CoordinationService:
         action: str,
         pattern: str,
         note: str | None,
+        managed: bool = False,
     ) -> str:
         """v0.21 soft auto-promote: write ``pattern`` into the active
         owners.yaml as either a shared_file rule (action='shared_file')
         or a split-suggestion entry (action='split'). Idempotent.
 
         Returns the patched YAML so the operator can verify the result.
+
+        ``managed=True`` (v0.23) tags a ``shared_file`` insertion with
+        the ``# auto-promoted=YYYY-MM-DD`` marker so the auto-demote
+        sweep can later distinguish coord-owned entries from operator
+        ones. Ignored for ``action='split'``.
         """
         from coordination.ownership import (
             patch_owners_yaml_with_shared_file,
@@ -1271,7 +1331,9 @@ class CoordinationService:
 
         current = await self.db.get_ownership_yaml() or ""
         if action == "shared_file":
-            patched = patch_owners_yaml_with_shared_file(current, pattern)
+            patched = patch_owners_yaml_with_shared_file(
+                current, pattern, managed=managed
+            )
         elif action == "split":
             patched = patch_owners_yaml_with_split_suggestion(
                 current,
@@ -1290,6 +1352,105 @@ class CoordinationService:
         if patched != current:
             await self.db.set_ownership_yaml(patched)
         return patched
+
+    async def _maybe_auto_demote(self) -> int:
+        """v0.23 auto-demote sweep.
+
+        Inspect the active owners.yaml for coord-managed
+        ``shared_files`` entries (those tagged with the
+        ``# auto-promoted=YYYY-MM-DD`` marker by
+        :meth:`_maybe_auto_promote`). For each one, compute the file's
+        rolling 409 count via
+        :meth:`Database.hotspot_files` with
+        ``days=settings.auto_demote_window_days`` and
+        ``min_attempts=1`` so even a single recent attempt keeps the
+        entry; if the count is strictly below
+        ``settings.auto_promote_threshold`` the entry is removed and
+        an ``auto-demote`` ``request_events`` row is recorded.
+
+        Operator-added entries (no marker) are never touched -- the
+        sweep is the inverse half of :meth:`_maybe_auto_promote` and
+        deliberately stays in its lane.
+
+        Returns the number of entries removed. Skipped silently when
+        ``auto_promote_threshold == 0`` (the feature is disabled). YAML
+        parse errors are logged and swallowed so a malformed operator
+        document cannot break the background loop.
+        """
+        from coordination.ownership import (
+            list_coord_managed_shared_files,
+            patch_owners_yaml_remove_shared_file,
+        )
+
+        threshold = self.settings.auto_promote_threshold
+        if threshold <= 0:
+            return 0
+        window_days = self.settings.auto_demote_window_days
+
+        current = await self.db.get_ownership_yaml() or ""
+        if not current.strip():
+            return 0
+        try:
+            managed_entries = list_coord_managed_shared_files(current)
+        except Exception:  # noqa: BLE001 - sweep is best-effort
+            logger.exception("auto-demote: failed to parse owners.yaml")
+            return 0
+        if not managed_entries:
+            return 0
+
+        try:
+            hotspots = await self.db.hotspot_files(
+                days=window_days,
+                min_attempts=1,
+            )
+        except Exception:  # noqa: BLE001 - sweep is best-effort
+            logger.exception("auto-demote: hotspot_files query failed")
+            return 0
+        counts: dict[str, int] = {}
+        for h in hotspots:
+            pat = h.get("pattern")
+            if not isinstance(pat, str):
+                continue
+            counts[pat] = counts.get(pat, 0) + int(h.get("attempts") or 0)
+
+        removed = 0
+        patched = current
+        for pattern, _promoted_at in managed_entries:
+            count_in_window = counts.get(pattern, 0)
+            if count_in_window >= threshold:
+                continue
+            try:
+                next_patched = patch_owners_yaml_remove_shared_file(
+                    patched, pattern
+                )
+            except ValueError:
+                logger.exception(
+                    "auto-demote: failed to remove %r from owners.yaml",
+                    pattern,
+                )
+                continue
+            if next_patched == patched:
+                # Idempotent no-op: already absent. Skip the audit row
+                # so we don't spam events on every sweep.
+                continue
+            patched = next_patched
+            await self.db.record_request_event(
+                event_type="auto-demote",
+                request_id=None,
+                actor_engineer=None,
+                actor_session_id=None,
+                detail={
+                    "pattern": pattern,
+                    "count_in_window": count_in_window,
+                    "threshold": threshold,
+                    "window_days": window_days,
+                },
+            )
+            removed += 1
+
+        if patched != current:
+            await self.db.set_ownership_yaml(patched)
+        return removed
 
 
 def build_service() -> CoordinationService:

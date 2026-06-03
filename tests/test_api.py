@@ -1795,6 +1795,221 @@ async def test_auto_promote_disabled_when_threshold_zero(
 
 
 # ---------------------------------------------------------------------------
+# v0.23: ownership helpers (marker round-trip)
+# ---------------------------------------------------------------------------
+
+
+def test_ownership_managed_marker_round_trip() -> None:
+    """The managed marker survives a write -> list -> remove round trip
+    and the list helper ignores operator-added entries."""
+    from coordination.ownership import (
+        list_coord_managed_shared_files,
+        patch_owners_yaml_remove_shared_file,
+        patch_owners_yaml_with_shared_file,
+    )
+
+    # Operator-seeded entry plus a coord-managed one.
+    yaml_text = "shared_files:\n  - src/operator.ts\n"
+    yaml_text = patch_owners_yaml_with_shared_file(
+        yaml_text,
+        "src/managed.ts",
+        managed=True,
+        promoted_at="2026-06-02",
+    )
+
+    entries = list_coord_managed_shared_files(yaml_text)
+    # Only the managed entry is reported; the operator one is invisible.
+    assert entries == [("src/managed.ts", "2026-06-02")]
+    # The marker is a YAML comment, so a strict parser still sees just
+    # the pattern string.
+    import yaml as _yaml
+
+    parsed = _yaml.safe_load(yaml_text)
+    assert parsed == {
+        "shared_files": ["src/operator.ts", "src/managed.ts"]
+    }
+
+    # Removing the managed entry leaves the operator one intact.
+    after = patch_owners_yaml_remove_shared_file(yaml_text, "src/managed.ts")
+    assert "src/managed.ts" not in after
+    assert "src/operator.ts" in after
+    assert list_coord_managed_shared_files(after) == []
+
+
+# ---------------------------------------------------------------------------
+# v0.23: auto-demote
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+async def client_auto_demote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncClient:
+    """Variant of ``client`` with auto-promote AND auto-demote enabled.
+
+    Threshold is 3 attempts within the auto-promote window (7 days);
+    the auto-demote sweep uses a 14-day rolling window. The background
+    auto-demote loop is suppressed via ``COORD_DISABLE_BACKGROUND_CLEANUP``
+    so the test drives ``_maybe_auto_demote`` directly and the sweep
+    state is deterministic.
+    """
+    db_path = tmp_path / "db.sqlite"
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "test-token")
+    monkeypatch.setenv("COORD_DATABASE_PATH", str(db_path))
+    monkeypatch.setenv("COORD_DISABLE_BACKGROUND_CLEANUP", "1")
+    monkeypatch.setenv("COORD_DISABLE_INSTANCE_LOCK", "1")
+    monkeypatch.delenv("COORD_REPO_ROOT", raising=False)
+    monkeypatch.setenv("COORD_AUTO_PROMOTE_THRESHOLD", "3")
+    monkeypatch.setenv("COORD_AUTO_PROMOTE_WINDOW_DAYS", "7")
+    monkeypatch.setenv("COORD_AUTO_DEMOTE_WINDOW_DAYS", "14")
+
+    from coordination import deps
+
+    deps.get_service.cache_clear()
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
+
+    deps.get_service.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_auto_demote_removes_dormant_entry(
+    client_auto_demote: AsyncClient,
+) -> None:
+    """A coord-managed shared_files entry with no recent 409 activity
+    is removed by the sweep and an ``auto-demote`` audit row is
+    recorded."""
+    from coordination import deps
+    from coordination.ownership import (
+        list_coord_managed_shared_files,
+        patch_owners_yaml_with_shared_file,
+    )
+
+    svc = deps.get_service()
+    seeded = patch_owners_yaml_with_shared_file(
+        "", "src/dormant.ts", managed=True, promoted_at="2026-01-01"
+    )
+    await svc.db.set_ownership_yaml(seeded)
+    assert list_coord_managed_shared_files(seeded) == [
+        ("src/dormant.ts", "2026-01-01")
+    ]
+
+    removed = await svc._maybe_auto_demote()
+    assert removed == 1
+
+    after = await svc.db.get_ownership_yaml() or ""
+    assert "src/dormant.ts" not in after
+    assert list_coord_managed_shared_files(after) == []
+
+    # Audit row was recorded with the expected detail shape.
+    import aiosqlite
+
+    async with aiosqlite.connect(svc.db.path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute(
+            "SELECT event_type, detail FROM request_events "
+            "WHERE event_type = 'auto-demote'"
+        )
+        rows = [dict(r) for r in await cur.fetchall()]
+    assert len(rows) == 1
+    import json as _json
+
+    detail = _json.loads(rows[0]["detail"])
+    assert detail["pattern"] == "src/dormant.ts"
+    assert detail["threshold"] == 3
+    assert detail["window_days"] == 14
+    assert detail["count_in_window"] == 0
+
+
+@pytest.mark.asyncio
+async def test_auto_demote_skips_operator_added_entries(
+    client_auto_demote: AsyncClient,
+) -> None:
+    """Operator-added shared_files entries (no marker) are immune to
+    the sweep even when they have zero 409 activity."""
+    from coordination import deps
+    from coordination.ownership import (
+        list_coord_managed_shared_files,
+        patch_owners_yaml_with_shared_file,
+    )
+
+    svc = deps.get_service()
+    # Operator first, then a managed entry.
+    seeded = "shared_files:\n  - src/operator.ts\n"
+    seeded = patch_owners_yaml_with_shared_file(
+        seeded, "src/managed.ts", managed=True, promoted_at="2026-01-01"
+    )
+    await svc.db.set_ownership_yaml(seeded)
+
+    removed = await svc._maybe_auto_demote()
+    assert removed == 1
+
+    after = await svc.db.get_ownership_yaml() or ""
+    # Managed entry gone, operator entry intact.
+    assert "src/managed.ts" not in after
+    assert "src/operator.ts" in after
+    assert list_coord_managed_shared_files(after) == []
+
+
+@pytest.mark.asyncio
+async def test_auto_demote_skips_active_entries(
+    client_auto_demote: AsyncClient,
+) -> None:
+    """A managed entry whose pattern is still drawing 409s at or above
+    the threshold is left in place."""
+    from coordination import deps
+    from coordination.ownership import (
+        list_coord_managed_shared_files,
+        patch_owners_yaml_with_shared_file,
+    )
+
+    svc = deps.get_service()
+
+    # Seed a managed entry for a pattern we are about to trigger
+    # conflicts on.
+    seeded = patch_owners_yaml_with_shared_file(
+        "", "src/active.ts", managed=True, promoted_at="2026-01-01"
+    )
+    await svc.db.set_ownership_yaml(seeded)
+
+    # Drive conflict_log activity: holder + 3 attempters all racing on
+    # the same pattern. The hotspot query keys on the holder's
+    # ``claims.repo`` so we tag every claim with the same repo.
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/active.ts"}],
+    }
+    rh = await client_auto_demote.post(
+        "/claims", headers=_AUTH, json=holder
+    )
+    assert rh.status_code == 200, rh.text
+    for engineer in ("bob", "carol", "dave"):
+        rr = await client_auto_demote.post(
+            "/claims",
+            headers=_AUTH,
+            json={
+                "engineer": engineer,
+                "repo": "amittell/coord",
+                "claims": [{"type": "file", "pattern": "src/active.ts"}],
+            },
+        )
+        # Conflict path returns claim_ids=[] regardless of status code.
+        assert rr.json().get("claim_ids") == [], rr.text
+
+    # Sweep should NOT touch this entry: count_in_window >= threshold.
+    removed = await svc._maybe_auto_demote()
+    assert removed == 0
+
+    after = await svc.db.get_ownership_yaml() or ""
+    assert "src/active.ts" in after
+    managed = list_coord_managed_shared_files(after)
+    assert managed and managed[0][0] == "src/active.ts"
+
+
+# ---------------------------------------------------------------------------
 # v0.22: queue visibility
 # ---------------------------------------------------------------------------
 
@@ -1933,3 +2148,173 @@ async def test_list_requests_default_excludes_queue(
     assert "queued" not in body
     for row in body["requests"]:
         assert row.get("kind") != "queued"
+
+
+# ---------------------------------------------------------------------------
+# v0.24: cross-process queue backend
+# ---------------------------------------------------------------------------
+
+
+async def _wait_for_queue_id(
+    client: AsyncClient, requester: str, timeout: float = 2.0
+) -> str:
+    """Poll GET /requests?queued=true until a row appears for the given
+    requester engineer and return its queue id. Used by the v0.24 tests
+    to discover the queue_id that an in-flight POST /claims long-poll
+    just enqueued."""
+
+    import asyncio as _asyncio
+
+    deadline = _asyncio.get_event_loop().time() + timeout
+    while _asyncio.get_event_loop().time() < deadline:
+        r = await client.get(
+            f"/requests?queued=true&requester={requester}", headers=_AUTH
+        )
+        if r.status_code == 200:
+            rows = r.json().get("requests", [])
+            for row in rows:
+                if (
+                    row.get("requester_engineer") == requester
+                    and row.get("state") == "waiting"
+                ):
+                    return row["queue_id"]
+        await _asyncio.sleep(0.05)
+    raise AssertionError(
+        f"queue row for requester {requester!r} did not appear within "
+        f"{timeout}s"
+    )
+
+
+@pytest.mark.asyncio
+async def test_queue_grant_visible_without_in_process_event(
+    client: AsyncClient,
+) -> None:
+    """v0.24: a grant marked directly in the DB (simulating another
+    replica releasing in a different Python process) wakes the
+    long-poll via the polling path even though the in-memory
+    ``_notify_waiter`` event never fires."""
+    import asyncio as _asyncio
+    from uuid import uuid4
+
+    from coordination import deps
+
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/v24a.ts"}],
+    }
+    rh = await client.post("/claims", headers=_AUTH, json=holder)
+    assert rh.status_code == 200, rh.text
+
+    async def queued_request() -> dict:
+        body = {
+            "engineer": "bob",
+            "repo": "amittell/coord",
+            "claims": [{"type": "file", "pattern": "src/v24a.ts"}],
+            "wait_seconds": 5,
+        }
+        return (await client.post("/claims", headers=_AUTH, json=body)).json()
+
+    waiter = _asyncio.create_task(queued_request())
+    queue_id = await _wait_for_queue_id(client, "bob")
+
+    fake_claim_id = str(uuid4())
+    db = deps.get_service().db
+    # Cross-process simulation: persist the grant directly without
+    # routing through _notify_waiter, so the in-memory event stays
+    # unset. The waiter must observe the DB transition via the poll.
+    await db.mark_queue_granted(queue_id, fake_claim_id)
+
+    result = await _asyncio.wait_for(waiter, timeout=3.0)
+    assert result.get("claim_ids") == [fake_claim_id], result
+    assert result.get("conflicts") == [], result
+
+
+@pytest.mark.asyncio
+async def test_queue_expiry_visible_without_in_process_event(
+    client: AsyncClient,
+) -> None:
+    """v0.24: an expiry marked directly in the DB (simulating another
+    replica timing out the entry) wakes the long-poll via the polling
+    path. Response surfaces the legacy 409 conflict payload."""
+    import asyncio as _asyncio
+
+    from coordination import deps
+
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/v24b.ts"}],
+    }
+    rh = await client.post("/claims", headers=_AUTH, json=holder)
+    assert rh.status_code == 200, rh.text
+
+    async def queued_request() -> dict:
+        body = {
+            "engineer": "bob",
+            "repo": "amittell/coord",
+            "claims": [{"type": "file", "pattern": "src/v24b.ts"}],
+            "wait_seconds": 5,
+        }
+        return (await client.post("/claims", headers=_AUTH, json=body)).json()
+
+    waiter = _asyncio.create_task(queued_request())
+    queue_id = await _wait_for_queue_id(client, "bob")
+
+    db = deps.get_service().db
+    # Cross-process simulation: mark expired without firing the
+    # in-memory event. The poll path should observe state='expired'
+    # and surface the conflict payload to the caller.
+    await db.mark_queue_expired(queue_id)
+
+    result = await _asyncio.wait_for(waiter, timeout=3.0)
+    assert result.get("claim_ids") == [], result
+    assert result.get("conflicts"), (
+        f"expiry must surface conflict payload; got {result}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_in_process_event_still_works(
+    client: AsyncClient,
+) -> None:
+    """v0.24: the existing same-process FIFO release path (event-driven
+    auto-grant via _drain_queue_for) keeps working unchanged. Proves
+    the event fast-path coexists with the new polling path."""
+    import asyncio as _asyncio
+
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/v24c.ts"}],
+    }
+    rh = await client.post("/claims", headers=_AUTH, json=holder)
+    assert rh.status_code == 200, rh.text
+    holder_cid = rh.json()["claim_ids"][0]
+
+    async def queued_request() -> dict:
+        body = {
+            "engineer": "bob",
+            "repo": "amittell/coord",
+            "claims": [{"type": "file", "pattern": "src/v24c.ts"}],
+            "wait_seconds": 10,
+        }
+        return (await client.post("/claims", headers=_AUTH, json=body)).json()
+
+    waiter = _asyncio.create_task(queued_request())
+    # Give bob's POST time to enqueue before we release.
+    await _wait_for_queue_id(client, "bob")
+
+    rel = await client.post(
+        "/claims/release",
+        headers=_AUTH,
+        json={"claim_ids": [holder_cid], "engineer": "alice"},
+    )
+    assert rel.status_code == 200, rel.text
+
+    result = await _asyncio.wait_for(waiter, timeout=5.0)
+    assert result.get("claim_ids"), (
+        f"bob should be auto-granted via the in-process event path; "
+        f"got {result}"
+    )
+    assert result.get("conflicts") == [], result

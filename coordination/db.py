@@ -1049,6 +1049,23 @@ class Database:
             )
             await conn.commit()
 
+    async def get_queue_entry(self, queue_id: str) -> dict[str, Any] | None:
+        """v0.24: fetch a single claim_queue row by id. Returns None if
+        the row was deleted/cascade-released. Used by the cross-process
+        queue poll path so a waiter can see state changes made by another
+        Python process (no in-memory asyncio.Event will fire for those).
+        """
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                "SELECT * FROM claim_queue WHERE id = ?",
+                (queue_id,),
+            )
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
     async def expire_stale_queue_entries(self, now_iso: str | None = None) -> int:
         """Mark every waiting queue entry whose ``expires_at`` has
         passed as ``expired``. Called from the background cleanup

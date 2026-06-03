@@ -67,13 +67,32 @@ async def lifespan(app: FastAPI):
                 logger.exception("Failed to expire stale claims")
             await asyncio.sleep(settings.cleanup_interval_sec)
 
+    async def auto_demote_loop() -> None:
+        """v0.23 background sweep: every
+        ``settings.auto_demote_interval_sec`` seconds, ask the service
+        to demote coord-managed ``shared_files`` entries whose rolling
+        409 count has dropped below ``auto_promote_threshold``.
+        Disabled when the interval is 0 or threshold is 0 (the service
+        layer short-circuits the latter)."""
+        while True:
+            try:
+                await get_service()._maybe_auto_demote()
+            except Exception:  # pragma: no cover - background failures are logged
+                logger.exception("Failed to run auto-demote sweep")
+            await asyncio.sleep(settings.auto_demote_interval_sec)
+
     task = asyncio.create_task(cleanup_loop())
+    tasks: list[asyncio.Task] = [task]
+    if settings.auto_demote_interval_sec > 0:
+        tasks.append(asyncio.create_task(auto_demote_loop()))
     yield
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    for t in tasks:
+        t.cancel()
+    for t in tasks:
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="Multi-Agent Coordination", version=__version__, lifespan=lifespan)

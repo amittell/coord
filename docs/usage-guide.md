@@ -147,6 +147,23 @@ v0.22 adds an opt-in autopilot for the `shared_file` promotion. Two env vars on 
 
 Each auto-promotion is idempotent (the same pattern is never written twice) and is recorded as an `auto-promote` row in `request_events` for audit: the `detail` JSON carries the `pattern`, `threshold`, and `window_days` that triggered it. Leaving the threshold at `0` keeps v0.21 behaviour (operator-only writes via `POST /metrics/hotspots/promote`).
 
+#### Auto-demote (v0.23+)
+
+v0.23 closes the one-way ratchet introduced by v0.22's hard auto-promote. The promoter now marks every coord-managed entry with a trailing YAML comment so the demote sweep can tell coord-owned rules apart from operator-authored ones:
+
+```yaml
+shared_files:
+  - pattern: "src/router.ts"  # auto-promoted=2026-06-02
+  - pattern: "package-lock.json"  # operator added, no marker
+```
+
+A background sweep then reverses the promotion when the hotspot pressure has actually gone away. Two env vars on the service control it:
+
+- `COORD_AUTO_DEMOTE_WINDOW_DAYS` (int, default `14`). A marked entry is eligible for removal when its rolling hotspot count over this window stays strictly below `COORD_AUTO_PROMOTE_THRESHOLD`.
+- `COORD_AUTO_DEMOTE_INTERVAL_SEC` (int, default `3600`). How often the sweep runs.
+
+Each removal writes a `request_event` of type `auto-demote` with `pattern`, `count_in_window`, `threshold`, and `window_days` in the `detail` JSON so the audit trail tells the full promote-then-demote story. Operator-added entries (no `# auto-promoted=` marker) are left alone -- the demote path is opt-in by virtue of also being opt-in to promotion.
+
 ## Queueing claims (v0.21+)
 
 When `claim_files` would `409` against an active holder, the requester historically had to retry on a timer or file an explicit `request_release`. v0.21 adds a third option: pass `wait_seconds` and the service FIFO-queues the requester behind the blocking claim, long-polling for the holder to release.
@@ -174,6 +191,12 @@ curl "http://127.0.0.1:8080/requests?queued=true" \
 Filter to a single repo by adding `&repo=amittell/coord`. Each row carries `kind`, `queue_id`, `blocking_claim_id`, `blocking_engineer`, `blocking_pattern`, `requester_engineer`, `requester_pattern`, `position` (FIFO index, 0 = head), `state`, `enqueued_at`, and `expires_at`. The MCP wrapper exposes the same filter as `my_requests(queued=True)` for use from an agent session.
 
 The dashboard surfaces the same data as a "pending queue" panel per repo with depth and the head-of-queue waiter so an operator can see at a glance which hotspots are accreting a queue.
+
+### Multi-replica deployment (v0.24+)
+
+v0.24 makes the FIFO queue safe to run behind a load balancer with more than one coord replica. Previously, a waiter parked on `claim_files(wait_seconds=...)` woke up only when the holder's release landed in the same Python process via an in-memory `asyncio.Event`. If the release happened on a different replica, the waiter sat until its `wait_seconds` deadline regardless of whether the scope was actually free.
+
+The wait loop is now a hybrid: it still arms the in-memory event for the same-process fast path, and it additionally polls the queue's DB row every ~0.5s. Same-process grants still wake instantly; cross-process grants wake within the poll interval. No config knob to flip -- the hybrid wait is the default, byte-compatible with the v0.21 single-replica behaviour. Multi-replica coord deployments (rolling restarts, horizontal scaling, blue/green) no longer drop queued-waiter notifications.
 
 ## Monorepo wiring: `coord init --root`
 

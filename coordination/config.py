@@ -40,6 +40,16 @@ class Settings(BaseSettings):
     # v0.21 soft-promote endpoint stays available either way.
     auto_promote_threshold: int = 0
     auto_promote_window_days: int = 7
+    # v0.23 auto-demote: closes the v0.22 one-way ratchet. A
+    # coord-managed shared_files entry (marked with the
+    # ``# auto-promoted=YYYY-MM-DD`` comment suffix in owners.yaml) is
+    # removed when its underlying hotspot count stays below
+    # ``auto_promote_threshold`` for ``auto_demote_window_days`` days.
+    # ``auto_demote_interval_sec`` controls the background sweep
+    # cadence; set to 0 to disable the sweep entirely (the soft-promote
+    # endpoint and v0.22 hard auto-promote remain available either way).
+    auto_demote_interval_sec: int = 3600
+    auto_demote_window_days: int = 14
 
     @property
     def auth_mode(self) -> str:

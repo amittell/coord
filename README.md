@@ -209,6 +209,24 @@ Set `COORD_AUTO_PROMOTE_THRESHOLD=N` (default 0, disabled) to have the conflict 
 
 `GET /requests?queued=true` returns live FIFO queue rows joined with the blocking holder's engineer/pattern -- "who am I waiting on?" without a second query. The `coord-mcp` `my_requests` tool gains a `queued` kwarg passing the same filter through. Dashboard surfaces a "pending queue" panel per repo with depth + head-of-queue waiter.
 
+### Auto-demote (v0.23)
+
+Coord-managed shared_files entries (added by hard auto-promote, marked
+with the ``# auto-promoted=DATE`` comment in owners.yaml) are
+auto-removed when their rolling hotspot count stays below
+COORD_AUTO_PROMOTE_THRESHOLD for COORD_AUTO_DEMOTE_WINDOW_DAYS
+(default 14) days. Each removal is recorded as an auto-demote
+request_event. Sweep cadence: COORD_AUTO_DEMOTE_INTERVAL_SEC (default
+3600). Operator-added entries (no marker) are left alone.
+
+### Cross-process FIFO queue (v0.24)
+
+The queue's long-poll now falls back to DB polling when the release
+happens in a different replica than the waiter. Same-process grants
+still wake instantly via the in-memory event registry; cross-process
+grants wake within the poll interval (0.5s). Coord can now be
+deployed multi-replica without losing queued-waiter notifications.
+
 ## Local Assets
 
 - `.env.example`: environment variable template
