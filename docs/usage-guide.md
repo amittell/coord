@@ -177,6 +177,14 @@ shared_files:
 
 The v0.23 auto-demote sweep skips any entry carrying `# coord-managed=permanent` even when the rolling hotspot count drops below `COORD_AUTO_PROMOTE_THRESHOLD` for the full `COORD_AUTO_DEMOTE_WINDOW_DAYS` window. An entry can carry both the `auto-promoted=DATE` marker (coord wrote it) and the `coord-managed=permanent` marker (operator wants it kept): operator intent wins and the entry is treated as permanent. Use the `ownership.list_permanent_shared_files` helper to enumerate every pinned entry programmatically.
 
+#### Subtree auto-promote (v0.26+)
+
+By v0.25 the hard auto-promote ratchet writes one `shared_files` entry per hot file. On repos where the same directory accretes three or four sibling hotspots in a single window (a fresh feature folder, a generated client, an auth refactor that touches every route module), the `owners.yaml` ends up with N near-identical lines that say roughly the same thing. v0.26 collapses this case to a single subtree glob:
+
+- `COORD_AUTO_PROMOTE_SUBTREE_MIN_FILES` (int, default `3`). When this many or more auto-promoted files in a single batch share a directory ancestor, coord writes the subtree glob (e.g. `src/auth/**`) once instead of N individual file entries. Setting to `0` disables subtree-level promotion and keeps the per-file behaviour.
+
+The subtree write goes through the same `auto-promote` `request_event` audit path as a normal per-file promotion, with `detail.subtree=true`, `detail.source_count`, and `detail.source_patterns` listing the underlying files that triggered the rollup. Auto-demote treats the subtree entry like any other coord-managed `shared_files` entry: the rolling hotspot count is taken across the matched paths and the entry is removed when the pressure subsides (or pinned indefinitely if an operator adds `# coord-managed=permanent`).
+
 ## Queueing claims (v0.21+)
 
 When `claim_files` would `409` against an active holder, the requester historically had to retry on a timer or file an explicit `request_release`. v0.21 adds a third option: pass `wait_seconds` and the service FIFO-queues the requester behind the blocking claim, long-polling for the holder to release.
@@ -211,6 +219,36 @@ curl -X POST http://127.0.0.1:8080/claims \
 ```
 
 `urgency` is optional and defaults to `normal`, which preserves strict FIFO for any caller that doesn't pass it (byte-compatible with v0.21-v0.24). The MCP wrapper exposes `urgency` as an optional kwarg on `claim_files`; omit it when arrival order is fine, set it when the work genuinely cannot wait its turn. Priority only takes effect when combined with `wait_seconds > 0`; an immediate-409 call is unchanged.
+
+### Priority age boost (v0.26+)
+
+Strict priority DESC + position ASC is the right order most of the time, but it can starve a `normal` waiter when a steady stream of `high` or `blocking` traffic keeps jumping in front of it. v0.26 adds an age-based one-level boost so the longest-waiting entries always make progress:
+
+- `COORD_QUEUE_AGE_BOOST_SECONDS` (int, default `60`). A waiting queue entry whose age exceeds this many seconds is treated as one priority level higher for pop ordering (`normal` -> `high`, `low` -> `normal`, etc.; `blocking` is already top of the ladder). Recomputed per pop -- no extra writes, no separate sweep. Setting to `0` disables the boost and restores the strict v0.25 priority order.
+
+The boost is computed inline in `db.pop_next_waiting_queue_entry` via a SQL `CASE` against `enqueued_at`, so it adds no extra rows or background work: each pop sees the freshest age and the next pop re-evaluates from scratch. This makes the queue self-healing under bursty `blocking` traffic without changing the byte-shape of any client-facing field.
+
+### Cancelling a queued claim (v0.26+)
+
+When a queued `claim_files` call is no longer worth waiting for (the agent decided to take a different approach, a sibling subagent took the work, the operator is shutting down a session), v0.26 lets the requester abandon the wait explicitly rather than holding the slot until `wait_seconds` expires:
+
+```bash
+curl -X DELETE "http://127.0.0.1:8080/requests/<queue-id>?engineer=alex/claude/main" \
+  -H "Authorization: Bearer $COORD_AUTH_TOKEN"
+```
+
+The endpoint marks the entry `cancelled` in `claim_queue` and wakes its in-process long-poll immediately so the requester's `claim_files` call returns straight away instead of timing out at `wait_seconds`. Passing `?engineer=` scopes the cancellation to that engineer so a different agent on the same coord instance cannot accidentally cancel a peer's queued wait. Cancelled entries are skipped on the next pop, so the head of the queue automatically advances to the next eligible waiter.
+
+The MCP wrapper exposes the same operation as `cancel_queue_request(queue_id="...", engineer="...")`:
+
+```python
+cancel_queue_request(
+    queue_id="q-abc123",
+    engineer="alex/claude/main",
+)
+```
+
+Useful when an agent decides to abandon a wait early without writing a manual HTTP call.
 
 ### Inspecting the queue (v0.22+)
 

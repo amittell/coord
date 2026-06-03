@@ -581,6 +581,25 @@ async def get_request_events(
     return {"events": rows, "count": len(rows)}
 
 
+@app.delete("/requests/{queue_id}")
+async def cancel_request(
+    queue_id: str,
+    engineer: str | None = Query(default=None),
+    _: None = Depends(require_auth),
+) -> dict:
+    """v0.26: cancel a queued claim_files request before its
+    wait_seconds timeout fires. When ``engineer`` is supplied the
+    cancellation is scoped to that engineer (prevents cross-engineer
+    interference). Returns {ok, cancelled} -- cancelled=True when a
+    waiting/in_progress row was actually transitioned to cancelled,
+    False when the row was already terminal or unknown.
+    """
+    cancelled = await get_service().cancel_queue_request(
+        queue_id, engineer=engineer
+    )
+    return {"ok": True, "cancelled": cancelled, "queue_id": queue_id}
+
+
 @app.delete("/claims/{claim_id}")
 async def delete_claim(
     claim_id: str,

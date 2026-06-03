@@ -9,6 +9,29 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.26.0] - 2026-06-03
+
+### Added
+
+- Pattern-class granularity in hard auto-promote. When
+  COORD_AUTO_PROMOTE_SUBTREE_MIN_FILES (default 3) or more
+  auto-promoted files share a directory ancestor, coord writes
+  the subtree glob (e.g. ``src/auth/**``) once instead of N
+  individual entries. Subtree audit events record the source
+  patterns + source_count for traceability. Set to 0 to disable.
+- Priority age boost. db.pop_next_waiting_queue_entry now factors
+  age into the priority ordering: an entry waiting longer than
+  COORD_QUEUE_AGE_BOOST_SECONDS (default 60s) is treated as one
+  priority level higher. Recomputed per pop -- no extra writes,
+  no separate sweep. Set to 0 to disable.
+- Queue cancellation API. DELETE /requests/{queue_id} marks a
+  waiting queue entry cancelled and wakes its in-process long-poll
+  immediately. Optional ?engineer= query scopes the cancellation
+  to that engineer (prevents cross-engineer interference).
+- New service.cancel_queue_request method + db.cancel_queue_entry
+  helper.
+- New coord-mcp cancel_queue_request(queue_id, engineer=) tool.
+
 ## [0.25.0] - 2026-06-02
 
 ### Added

@@ -676,16 +676,31 @@ class CoordinationService:
     async def _maybe_auto_promote(
         self, conflicts: list[ConflictEntry]
     ) -> None:
-        """v0.22 hard auto-promote.
+        """v0.22 hard auto-promote with v0.26 pattern-class granularity.
 
-        Inspect each unique ``your_pattern`` from this batch's
-        conflicts; for any pattern that the hotspot query reports as
-        having crossed ``auto_promote_threshold`` attempts within the
-        rolling ``auto_promote_window_days`` window, write a
-        ``shared_file`` rule into the active ownership YAML via
-        :meth:`promote_hotspot` (idempotent) and record an
-        ``auto-promote`` ``request_events`` row when the YAML actually
-        changed.
+        Two-phase process.
+
+        Phase 1 collects every unique ``your_pattern`` from this batch
+        that the hotspot query reports as having crossed
+        ``auto_promote_threshold`` attempts within the rolling
+        ``auto_promote_window_days`` window.
+
+        Phase 2 groups qualifying leaves by their parent directory
+        (everything up to the last ``/``; top-level files share the
+        empty-string bucket). For each directory that has at least
+        ``auto_promote_subtree_min_files`` qualifying leaves, the
+        subtree glob ``{dir}/**`` is written into the active ownership
+        YAML once (instead of writing each leaf as a separate
+        ``shared_files`` entry). For directories with fewer qualifying
+        leaves, each leaf is promoted individually -- the v0.22
+        behaviour. When ``auto_promote_subtree_min_files == 0``,
+        Phase 2 is skipped entirely so the v0.22 per-file behaviour is
+        preserved exactly.
+
+        Audit ``request_events`` rows record the resulting YAML change:
+        subtree promotes carry ``subtree=True`` plus the list of source
+        leaves and the source count; per-file promotes carry
+        ``subtree=False``.
 
         Called only when ``auto_promote_threshold > 0``. Failures from
         the YAML patch (e.g. an operator-introduced parse error) are
@@ -696,6 +711,11 @@ class CoordinationService:
 
         threshold = self.settings.auto_promote_threshold
         window = self.settings.auto_promote_window_days
+        subtree_min = self.settings.auto_promote_subtree_min_files
+
+        # Deduplicate ``your_pattern`` across the batch while
+        # preserving first-seen order so the audit log mirrors the
+        # order the agent's own request emitted them.
         seen: set[str] = set()
         unique_patterns: list[str] = []
         for entry in conflicts:
@@ -704,21 +724,98 @@ class CoordinationService:
                 continue
             seen.add(pat)
             unique_patterns.append(pat)
+        if not unique_patterns:
+            return
 
-        for pattern in unique_patterns:
+        # Single hotspot query covers every candidate in this batch; we
+        # then filter the result against ``unique_patterns``. This also
+        # means a malformed query short-circuits the whole batch rather
+        # than retrying per-pattern.
+        try:
+            hotspots = await self.db.hotspot_files(
+                days=window,
+                min_attempts=threshold,
+            )
+        except Exception:  # noqa: BLE001 - audit path is best-effort
+            logger.exception(
+                "auto-promote: hotspot_files query failed; skipping batch"
+            )
+            return
+        hot_patterns: set[str] = {
+            str(h["pattern"]) for h in hotspots if h.get("pattern")
+        }
+
+        # Phase 1: qualifying leaves preserve their input order.
+        qualifying: list[str] = [
+            p for p in unique_patterns if p in hot_patterns
+        ]
+        if not qualifying:
+            return
+
+        # Phase 2: group by parent directory unless subtree promotion
+        # is disabled. ``covered_by_subtree`` collects leaves that
+        # were promoted via their subtree glob so we don't also emit
+        # individual entries for them.
+        groups: dict[str, list[str]] = {}
+        for pattern in qualifying:
+            parent = pattern.rsplit("/", 1)[0] if "/" in pattern else ""
+            groups.setdefault(parent, []).append(pattern)
+
+        subtree_promotions: list[tuple[str, list[str]]] = []
+        leaf_promotions: list[str] = []
+        if subtree_min > 0:
+            for parent, leaves in groups.items():
+                if not parent:
+                    # Top-level files have no meaningful subtree;
+                    # always promote individually.
+                    leaf_promotions.extend(leaves)
+                    continue
+                if len(leaves) >= subtree_min:
+                    subtree_promotions.append(
+                        (f"{parent}/**", list(leaves))
+                    )
+                else:
+                    leaf_promotions.extend(leaves)
+        else:
+            leaf_promotions.extend(qualifying)
+
+        # Subtree promotions first so the YAML reads top-down as
+        # "broad rule then any per-file specifics" -- matches how an
+        # operator would hand-write the file.
+        for subtree_glob, source_leaves in subtree_promotions:
+            before = await self.db.get_ownership_yaml() or ""
             try:
-                hotspots = await self.db.hotspot_files(
-                    days=window,
-                    min_attempts=threshold,
+                after = await self.promote_hotspot(
+                    action="shared_file",
+                    pattern=subtree_glob,
+                    note=None,
+                    managed=True,
                 )
-            except Exception:  # noqa: BLE001 - audit path is best-effort
+            except ValueError:
                 logger.exception(
-                    "auto-promote: hotspot_files query failed for %r",
-                    pattern,
+                    "auto-promote: failed to patch owners.yaml for %r",
+                    subtree_glob,
                 )
                 continue
-            if not any(h.get("pattern") == pattern for h in hotspots):
+            if after == before:
+                # Already present; idempotent no-op, no audit.
                 continue
+            await self.db.record_request_event(
+                event_type="auto-promote",
+                request_id=None,
+                actor_engineer=None,
+                actor_session_id=None,
+                detail={
+                    "pattern": subtree_glob,
+                    "source_count": len(source_leaves),
+                    "source_patterns": source_leaves,
+                    "threshold": threshold,
+                    "window_days": window,
+                    "subtree": True,
+                },
+            )
+
+        for pattern in leaf_promotions:
             before = await self.db.get_ownership_yaml() or ""
             try:
                 after = await self.promote_hotspot(
@@ -748,6 +845,7 @@ class CoordinationService:
                     "pattern": pattern,
                     "threshold": threshold,
                     "window_days": window,
+                    "subtree": False,
                 },
             )
 
@@ -1101,6 +1199,32 @@ class CoordinationService:
             await self._drain_queue_for(cid)
         return n
 
+    async def cancel_queue_request(
+        self,
+        queue_id: str,
+        *,
+        engineer: str | None = None,
+    ) -> bool:
+        """v0.26: cancel a waiting queue entry and wake its in-process
+        long-poll. Returns True when the row was cancelled, False when
+        the row is missing or already terminal.
+
+        The waiter (if same-process) sees event.is_set() True with
+        payload {granted_claim_id: None, cancelled: True}; the
+        _enqueue_and_wait loop treats this as a non-grant and returns
+        None so the caller surfaces the legacy 409 + the cancelled
+        marker.
+        """
+        cancelled = await self.db.cancel_queue_entry(
+            queue_id, requester_engineer=engineer
+        )
+        if cancelled:
+            _notify_waiter(
+                queue_id,
+                {"granted_claim_id": None, "cancelled": True},
+            )
+        return cancelled
+
     # ------------------------------------------------------------------
     # v0.21 FIFO queue
     # ------------------------------------------------------------------
@@ -1157,6 +1281,10 @@ class CoordinationService:
         event, payload = _register_waiter(entry["id"])
         deadline = _time.monotonic() + wait_seconds
         granted_cid: str | None = None
+        # v0.26: track whether the wait exited via a cancellation so we
+        # don't clobber the 'cancelled' DB state with 'expired' after the
+        # loop falls through.
+        was_cancelled = False
         try:
             while True:
                 time_remaining = deadline - _time.monotonic()
@@ -1175,6 +1303,13 @@ class CoordinationService:
                 if payload.get("granted_claim_id"):
                     granted_cid = payload["granted_claim_id"]
                     break
+                if event.is_set() and payload.get("cancelled"):
+                    # v0.26: requester invoked DELETE /requests/{queue_id}
+                    # while we were waiting. Bail out via the no-grant
+                    # branch so the caller surfaces the legacy 409
+                    # conflict-shape response.
+                    was_cancelled = True
+                    break
                 if event.is_set():
                     # Same-process expiry: ``_notify_waiter`` was called
                     # with ``granted_claim_id=None`` (drain failed). The
@@ -1190,7 +1325,10 @@ class CoordinationService:
                 if row["state"] == "granted" and row.get("granted_claim_id"):
                     granted_cid = row["granted_claim_id"]
                     break
-                if row["state"] in ("expired", "cancelled"):
+                if row["state"] == "cancelled":
+                    was_cancelled = True
+                    break
+                if row["state"] == "expired":
                     break
         finally:
             _drop_waiter(entry["id"])
@@ -1204,8 +1342,11 @@ class CoordinationService:
             )
         # Mark expired in case the loop ran out of time without a state
         # change (DB still 'waiting' or 'in_progress'). Idempotent: a
-        # row that is already terminal stays terminal.
-        await self.db.mark_queue_expired(entry["id"])
+        # row that is already terminal stays terminal. v0.26: skip when
+        # the requester cancelled -- otherwise we'd clobber the
+        # 'cancelled' state with 'expired'.
+        if not was_cancelled:
+            await self.db.mark_queue_expired(entry["id"])
         return None
 
     async def _drain_queue_for(self, released_claim_id: str) -> None:
@@ -1226,7 +1367,8 @@ class CoordinationService:
 
         while True:
             entry = await self.db.pop_next_waiting_queue_entry(
-                released_claim_id
+                released_claim_id,
+                age_boost_seconds=self.settings.queue_age_boost_seconds,
             )
             if entry is None:
                 return

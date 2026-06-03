@@ -448,6 +448,39 @@ When `queued=true`, each row is a `QueuedRequestEntry` rather than a normal requ
 
 `position` is the FIFO index (0 = head of queue); `state` is `waiting` until the blocking claim releases. The default (`queued=false` or omitted) preserves the v0.9 shape: each row carries the joined holder context (`holder_engineer`, `holder_pattern`, `holder_repo`).
 
+## `DELETE /requests/{queue_id}` (v0.26.0+)
+
+Cancel a waiting FIFO queue entry created by a `claim_files` call with `wait_seconds > 0`. The endpoint marks the entry `cancelled` in `claim_queue` and wakes its in-process long-poll immediately so the requester's `claim_files` call returns straight away instead of waiting out the deadline. Cancelled entries are skipped on the next pop, so the head of the queue automatically advances to the next eligible waiter.
+
+Path param:
+
+- `queue_id` (required): the `queue_id` returned by `GET /requests?queued=true` (or surfaced in the dashboard's "pending queue" panel).
+
+Query params:
+
+- `engineer` (str, optional): scope the cancellation to this engineer name. When set, the call only cancels the entry if its `requester_engineer` matches; mismatches return `404`. Prevents cross-engineer interference on a shared coord instance.
+
+Example:
+
+```bash
+curl -X DELETE "http://127.0.0.1:8080/requests/q-abc123?engineer=alex/claude/main" \
+  -H "Authorization: Bearer $COORD_AUTH_TOKEN"
+```
+
+Response shape:
+
+```json
+{
+  "ok": true,
+  "cancelled": true,
+  "queue_id": "q-abc123"
+}
+```
+
+`cancelled` is `true` when the entry transitioned `waiting -> cancelled` on this call, `false` when the entry already terminalised (granted, expired, or previously cancelled) and the call was a no-op. `404` when `queue_id` is unknown or the optional `engineer` scope does not match.
+
+The MCP wrapper exposes the same operation as `cancel_queue_request(queue_id, engineer=None)`.
+
 ## `GET /requests/{request_id}` (v0.9.0+)
 
 Return the current state of a single request. Useful for polling `pending` requests to follow a long-poll that timed out.
@@ -456,7 +489,7 @@ Return the current state of a single request. Useful for polling `pending` reque
 
 Return the immutable audit timeline for a request, oldest first. Event types: `filed`, `notified`, `responded`, `expired`, `resolved`, `responded-late`. Each event has actor, session_id, timestamp, and a JSON `detail` blob with the per-event-type specifics.
 
-Auto-resolution / auto-promote audit (v0.14+, extended v0.22, v0.23): server-side automatic decisions are recorded in `request_events` with `request_id=NULL`. `auto-coexist` and `auto-narrow` (v0.14) cover the symbol-claim resolutions described in [./design/sub-file-claims.md](./design/sub-file-claims.md). As of v0.22, `auto-promote` events appear in the same table whenever `COORD_AUTO_PROMOTE_THRESHOLD` triggers a `shared_file` rule write into `owners.yaml`; the `detail` JSON carries `pattern`, `threshold`, and `window_days`. As of v0.23, `auto-demote` rows can also appear: each one is written when the background sweep removes a coord-managed `shared_file` entry whose rolling hotspot count has stayed below the promote threshold for `COORD_AUTO_DEMOTE_WINDOW_DAYS` days; the `detail` JSON carries `pattern`, `count_in_window`, `threshold`, and `window_days`. These rows are visible via a global audit query (the per-request endpoint above only surfaces them when filtering by `request_id IS NULL`).
+Auto-resolution / auto-promote audit (v0.14+, extended v0.22, v0.23, v0.26): server-side automatic decisions are recorded in `request_events` with `request_id=NULL`. `auto-coexist` and `auto-narrow` (v0.14) cover the symbol-claim resolutions described in [./design/sub-file-claims.md](./design/sub-file-claims.md). As of v0.22, `auto-promote` events appear in the same table whenever `COORD_AUTO_PROMOTE_THRESHOLD` triggers a `shared_file` rule write into `owners.yaml`; the `detail` JSON carries `pattern`, `threshold`, and `window_days`. As of v0.23, `auto-demote` rows can also appear: each one is written when the background sweep removes a coord-managed `shared_file` entry whose rolling hotspot count has stayed below the promote threshold for `COORD_AUTO_DEMOTE_WINDOW_DAYS` days; the `detail` JSON carries `pattern`, `count_in_window`, `threshold`, and `window_days`. As of v0.26, an `auto-promote` row whose `detail.subtree` is `true` indicates a subtree-level promotion: coord wrote a single subtree glob (e.g. `src/auth/**`) instead of N individual file entries because `COORD_AUTO_PROMOTE_SUBTREE_MIN_FILES` (default `3`) or more files in the batch shared a directory ancestor. The `detail` JSON for a subtree row additionally carries `source_count` and `source_patterns` (the list of underlying file patterns that triggered the rollup) so the audit trail tells the full per-file -> per-subtree story. These rows are visible via a global audit query (the per-request endpoint above only surfaces them when filtering by `request_id IS NULL`).
 
 ```json
 {

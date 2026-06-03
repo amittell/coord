@@ -246,6 +246,28 @@ by priority DESC then position ASC so blocking work jumps ahead of
 normal traffic. Default normal preserves strict FIFO for legacy
 callers. coord-mcp claim_files accepts urgency as an optional kwarg.
 
+### Subtree auto-promote (v0.26)
+
+When COORD_AUTO_PROMOTE_SUBTREE_MIN_FILES (default 3) or more
+auto-promoted files share a directory ancestor, coord writes the
+subtree glob (e.g. ``src/auth/**``) once instead of N individual
+entries. Set to 0 to disable subtree-level promotion.
+
+### Priority age boost (v0.26)
+
+A waiting queue entry whose age exceeds
+COORD_QUEUE_AGE_BOOST_SECONDS (default 60s) is treated as one
+priority level higher for pop ordering. Prevents normal/low
+waiters from starving under a steady stream of high/blocking
+entries. Set to 0 to disable.
+
+### Queue cancellation (v0.26)
+
+DELETE /requests/{queue_id} marks a waiting queue entry cancelled
+and wakes its in-process long-poll. coord-mcp gets a
+cancel_queue_request(queue_id, engineer=) tool. Useful when an
+agent decides to abandon a wait early.
+
 ## Local Assets
 
 - `.env.example`: environment variable template

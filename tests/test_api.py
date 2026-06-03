@@ -1796,6 +1796,202 @@ async def test_auto_promote_disabled_when_threshold_zero(
 
 
 # ---------------------------------------------------------------------------
+# v0.26: pattern-class granularity
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+async def client_auto_promote_subtree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncClient:
+    """v0.26 variant of ``client_auto_promote`` with the subtree-min
+    setting left at its default (3). Threshold of 1 means the very
+    first 409 against a leaf qualifies it, which lets the test seed
+    multiple hot leaves with a single bounce each instead of running
+    the full threshold pass per file.
+    """
+
+    db_path = tmp_path / "db.sqlite"
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "test-token")
+    monkeypatch.setenv("COORD_DATABASE_PATH", str(db_path))
+    monkeypatch.setenv("COORD_DISABLE_BACKGROUND_CLEANUP", "1")
+    monkeypatch.setenv("COORD_DISABLE_INSTANCE_LOCK", "1")
+    monkeypatch.delenv("COORD_REPO_ROOT", raising=False)
+    monkeypatch.setenv("COORD_AUTO_PROMOTE_THRESHOLD", "1")
+    monkeypatch.setenv("COORD_AUTO_PROMOTE_WINDOW_DAYS", "7")
+    monkeypatch.delenv("COORD_AUTO_PROMOTE_SUBTREE_MIN_FILES", raising=False)
+
+    from coordination import deps
+
+    deps.get_service.cache_clear()
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
+
+    deps.get_service.cache_clear()
+
+
+async def _seed_holder_and_bounce(
+    ac: AsyncClient,
+    *,
+    holder_engineer: str,
+    holder_pattern: str,
+    bouncer_files: list[str],
+) -> None:
+    """Helper: holder claims ``holder_pattern``; then a single bouncer
+    request asks for every leaf in ``bouncer_files`` in one batch. The
+    batch 409s, every leaf is recorded in ``conflict_log``, and the
+    final 409 is the one whose ``_maybe_auto_promote`` call sees the
+    full grouping in its conflicts list (per the v0.26 contract).
+    """
+    rh = await ac.post(
+        "/claims",
+        headers=_AUTH,
+        json={
+            "engineer": holder_engineer,
+            "repo": "amittell/coord",
+            "claims": [{"type": "file", "pattern": holder_pattern}],
+        },
+    )
+    assert rh.status_code == 200, rh.text
+
+    rr = await ac.post(
+        "/claims",
+        headers=_AUTH,
+        json={
+            "engineer": "bouncer",
+            "repo": "amittell/coord",
+            "claims": [
+                {"type": "file", "pattern": leaf} for leaf in bouncer_files
+            ],
+        },
+    )
+    # 409 (canonical) or 200-with-empty-claim_ids (legacy shape); what
+    # matters is that the attempts landed in conflict_log so the hotspot
+    # query can see them.
+    assert rr.status_code in (200, 409), rr.text
+    assert rr.json().get("claim_ids") == [], rr.text
+
+
+@pytest.mark.asyncio
+async def test_subtree_promote_when_n_files_share_directory(
+    client_auto_promote_subtree: AsyncClient,
+) -> None:
+    """4 hot leaves under ``src/auth/`` (>= default subtree_min=3)
+    collapse into a single ``src/auth/**`` shared_files entry; the
+    individual leaves are NOT written as their own entries."""
+
+    leaves = [
+        "src/auth/login.ts",
+        "src/auth/logout.ts",
+        "src/auth/oauth.ts",
+        "src/auth/session.ts",
+    ]
+    # Holder pattern covers the whole subtree so every bouncer 409s
+    # against the same claim.
+    await _seed_holder_and_bounce(
+        client_auto_promote_subtree,
+        holder_engineer="alice",
+        holder_pattern="src/auth/**",
+        bouncer_files=leaves,
+    )
+
+    g = await client_auto_promote_subtree.get(
+        "/config/ownership", headers=_AUTH
+    )
+    assert g.status_code == 200, g.text
+    body = g.text
+    assert "shared_files" in body, body
+    assert "src/auth/**" in body, body
+    # The leaves must NOT also be present as individual shared_files
+    # entries; the subtree glob subsumes them.
+    for leaf in leaves:
+        assert leaf not in body, (
+            f"leaf {leaf!r} should be covered by subtree glob, not its "
+            f"own entry; got:\n{body}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_subtree_threshold_not_crossed_falls_back_to_per_file(
+    client_auto_promote_subtree: AsyncClient,
+) -> None:
+    """Only 2 hot leaves under ``src/auth/`` (< default subtree_min=3).
+    Both leaves are written individually; no subtree glob appears."""
+
+    leaves = ["src/auth/login.ts", "src/auth/logout.ts"]
+    await _seed_holder_and_bounce(
+        client_auto_promote_subtree,
+        holder_engineer="alice",
+        holder_pattern="src/auth/**",
+        bouncer_files=leaves,
+    )
+
+    g = await client_auto_promote_subtree.get(
+        "/config/ownership", headers=_AUTH
+    )
+    assert g.status_code == 200, g.text
+    body = g.text
+    assert "shared_files" in body, body
+    assert "src/auth/**" not in body, body
+    for leaf in leaves:
+        assert leaf in body, body
+
+
+@pytest.mark.asyncio
+async def test_subtree_disabled_when_setting_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``COORD_AUTO_PROMOTE_SUBTREE_MIN_FILES=0`` preserves the v0.22
+    per-file behaviour even when 5 leaves share the same directory."""
+
+    db_path = tmp_path / "db.sqlite"
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "test-token")
+    monkeypatch.setenv("COORD_DATABASE_PATH", str(db_path))
+    monkeypatch.setenv("COORD_DISABLE_BACKGROUND_CLEANUP", "1")
+    monkeypatch.setenv("COORD_DISABLE_INSTANCE_LOCK", "1")
+    monkeypatch.delenv("COORD_REPO_ROOT", raising=False)
+    monkeypatch.setenv("COORD_AUTO_PROMOTE_THRESHOLD", "1")
+    monkeypatch.setenv("COORD_AUTO_PROMOTE_WINDOW_DAYS", "7")
+    monkeypatch.setenv("COORD_AUTO_PROMOTE_SUBTREE_MIN_FILES", "0")
+
+    from coordination import deps
+
+    deps.get_service.cache_clear()
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as ac:
+            leaves = [
+                "src/auth/login.ts",
+                "src/auth/logout.ts",
+                "src/auth/oauth.ts",
+                "src/auth/session.ts",
+                "src/auth/tokens.ts",
+            ]
+            await _seed_holder_and_bounce(
+                ac,
+                holder_engineer="alice",
+                holder_pattern="src/auth/**",
+                bouncer_files=leaves,
+            )
+
+            g = await ac.get("/config/ownership", headers=_AUTH)
+            assert g.status_code == 200, g.text
+            body = g.text
+            assert "shared_files" in body, body
+            # Subtree promotion is disabled: every leaf gets its own
+            # entry and no ``src/auth/**`` glob is written by coord.
+            assert "src/auth/**" not in body, body
+            for leaf in leaves:
+                assert leaf in body, body
+    finally:
+        deps.get_service.cache_clear()
+
+
+# ---------------------------------------------------------------------------
 # v0.23: ownership helpers (marker round-trip)
 # ---------------------------------------------------------------------------
 
@@ -2608,3 +2804,475 @@ async def test_queue_priority_unknown_value_coerces_to_normal(
         await waiter
     except (_asyncio.CancelledError, Exception):
         pass
+
+
+# ---------------------------------------------------------------------------
+# v0.26: priority age boost
+#
+# pop_next_waiting_queue_entry lifts a waiting entry's effective rank by one
+# priority level once it has been waiting longer than
+# settings.queue_age_boost_seconds. Prevents low/normal waiters from starving
+# under a steady stream of high/blocking entries. Boost is computed inline in
+# the SQL CASE expression on the pop path -- no separate sweep, no writes.
+# ---------------------------------------------------------------------------
+
+
+async def _backdate_queue_entry(
+    db: Database, queue_id: str, seconds_ago: int
+) -> None:
+    """Rewrite a claim_queue row's ``enqueued_at`` to N seconds in the past
+    so the age boost can be exercised deterministically (no real sleeps).
+    Uses raw aiosqlite because no public Database helper backdates queue
+    rows -- this is a v0.26 test fixture, not a production code path.
+    """
+    import aiosqlite
+    from datetime import UTC, datetime, timedelta
+
+    past = datetime.now(UTC) - timedelta(seconds=seconds_ago)
+    past_iso = past.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    async with aiosqlite.connect(db.path) as conn:
+        await conn.execute(
+            "UPDATE claim_queue SET enqueued_at = ? WHERE id = ?",
+            (past_iso, queue_id),
+        )
+        await conn.commit()
+
+
+@pytest.mark.asyncio
+async def test_age_boost_lifts_old_normal_above_fresh_normal(
+    client: AsyncClient,
+) -> None:
+    """Two normal-priority waiters: the older one's enqueued_at is
+    backdated 120s into the past, the fresh one was enqueued just now.
+    With age_boost_seconds=60 the old waiter's effective rank rises to
+    'high' while the fresh waiter stays at 'normal', so the old waiter
+    pops first despite being inserted at position 2 (fresh enqueued
+    first at position 1). The behavioural assertion is that age boost
+    overrides position-tiebreak: even though both have the same
+    declared priority, the old one wins because the boost lifts its
+    effective rank above the fresh one's.
+    """
+    from coordination import deps
+
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/v26_a.ts"}],
+    }
+    rh = await client.post("/claims", headers=_AUTH, json=holder)
+    assert rh.status_code == 200, rh.text
+    holder_cid = rh.json()["claim_ids"][0]
+
+    db = deps.get_service().db
+
+    # Enqueue fresh waiter FIRST so it gets position=1. If position were
+    # the deciding factor, fresh would win. The old waiter at position=2
+    # only wins because age boost lifts its effective rank above fresh's.
+    fresh = await db.enqueue_claim_request(
+        blocking_claim_id=holder_cid,
+        requester_engineer="fresh",
+        requester_session_id="fresh-sess",
+        requester_branch=None,
+        requester_description=None,
+        repo="amittell/coord",
+        claim_type="file",
+        pattern="src/v26_a.ts",
+        symbols=None,
+        narrowable=None,
+        ttl_hours=None,
+        wait_seconds=120,
+        priority="normal",
+    )
+    old = await db.enqueue_claim_request(
+        blocking_claim_id=holder_cid,
+        requester_engineer="old",
+        requester_session_id="old-sess",
+        requester_branch=None,
+        requester_description=None,
+        repo="amittell/coord",
+        claim_type="file",
+        pattern="src/v26_a.ts",
+        symbols=None,
+        narrowable=None,
+        ttl_hours=None,
+        wait_seconds=120,
+        priority="normal",
+    )
+    assert fresh["position"] == 1
+    assert old["position"] == 2
+
+    # Backdate the "old" entry to look 120s old; the fresh one's
+    # enqueued_at stays at now.
+    await _backdate_queue_entry(db, old["id"], seconds_ago=120)
+
+    popped = await db.pop_next_waiting_queue_entry(
+        holder_cid, age_boost_seconds=60
+    )
+    assert popped is not None
+    assert popped["requester_engineer"] == "old", (
+        "old normal waiter (backdated 120s, threshold 60s) must out-pop "
+        f"fresh normal at position 1; got {popped['requester_engineer']!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_age_boost_lifts_normal_to_high_against_fresh_high(
+    client: AsyncClient,
+) -> None:
+    """Old normal-priority waiter (backdated past the boost threshold)
+    vs fresh high-priority waiter. Normal rank is 2, high rank is 3;
+    age boost adds 1 to the old normal so its effective rank becomes 3,
+    tying fresh high's 3. With equal effective rank the tiebreaker is
+    position ASC: old normal was enqueued first (position=1), fresh
+    high enqueued second (position=2), so old normal wins on the
+    position tiebreak. Documenting that explicitly because the win is
+    age + position, not age alone.
+    """
+    from coordination import deps
+
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/v26_b.ts"}],
+    }
+    rh = await client.post("/claims", headers=_AUTH, json=holder)
+    assert rh.status_code == 200, rh.text
+    holder_cid = rh.json()["claim_ids"][0]
+
+    db = deps.get_service().db
+
+    # Old normal enqueues first -- position=1.
+    old = await db.enqueue_claim_request(
+        blocking_claim_id=holder_cid,
+        requester_engineer="old_normal",
+        requester_session_id="old-sess",
+        requester_branch=None,
+        requester_description=None,
+        repo="amittell/coord",
+        claim_type="file",
+        pattern="src/v26_b.ts",
+        symbols=None,
+        narrowable=None,
+        ttl_hours=None,
+        wait_seconds=120,
+        priority="normal",
+    )
+    # Fresh high enqueues second -- position=2.
+    fresh = await db.enqueue_claim_request(
+        blocking_claim_id=holder_cid,
+        requester_engineer="fresh_high",
+        requester_session_id="fresh-sess",
+        requester_branch=None,
+        requester_description=None,
+        repo="amittell/coord",
+        claim_type="file",
+        pattern="src/v26_b.ts",
+        symbols=None,
+        narrowable=None,
+        ttl_hours=None,
+        wait_seconds=120,
+        priority="high",
+    )
+    assert old["position"] == 1
+    assert fresh["position"] == 2
+
+    # Backdate the old normal to look 120s old. With boost threshold 60s
+    # the old normal's effective rank rises from 2 to 3, matching fresh
+    # high's rank of 3. Position ASC tiebreak picks old (position=1).
+    await _backdate_queue_entry(db, old["id"], seconds_ago=120)
+
+    popped = await db.pop_next_waiting_queue_entry(
+        holder_cid, age_boost_seconds=60
+    )
+    assert popped is not None
+    assert popped["requester_engineer"] == "old_normal", (
+        "old normal (boosted rank=3) ties fresh high (rank=3); position "
+        "ASC tiebreak picks old at position=1; "
+        f"got {popped['requester_engineer']!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_age_boost_disabled_when_setting_zero(
+    client: AsyncClient,
+) -> None:
+    """With age_boost_seconds=0 the boost never fires and v0.25 strict-
+    priority ordering is preserved: fresh high beats old normal no
+    matter how old the normal entry is.
+    """
+    from coordination import deps
+
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/v26_c.ts"}],
+    }
+    rh = await client.post("/claims", headers=_AUTH, json=holder)
+    assert rh.status_code == 200, rh.text
+    holder_cid = rh.json()["claim_ids"][0]
+
+    db = deps.get_service().db
+
+    old = await db.enqueue_claim_request(
+        blocking_claim_id=holder_cid,
+        requester_engineer="old_normal",
+        requester_session_id="old-sess",
+        requester_branch=None,
+        requester_description=None,
+        repo="amittell/coord",
+        claim_type="file",
+        pattern="src/v26_c.ts",
+        symbols=None,
+        narrowable=None,
+        ttl_hours=None,
+        wait_seconds=120,
+        priority="normal",
+    )
+    await db.enqueue_claim_request(
+        blocking_claim_id=holder_cid,
+        requester_engineer="fresh_high",
+        requester_session_id="fresh-sess",
+        requester_branch=None,
+        requester_description=None,
+        repo="amittell/coord",
+        claim_type="file",
+        pattern="src/v26_c.ts",
+        symbols=None,
+        narrowable=None,
+        ttl_hours=None,
+        wait_seconds=120,
+        priority="high",
+    )
+
+    # Backdate old normal aggressively -- 1 full hour. With boost=0 the
+    # SQL CASE short-circuits and the age expression never fires, so the
+    # rank stays at the declared priority (normal=2 < high=3).
+    await _backdate_queue_entry(db, old["id"], seconds_ago=3600)
+
+    popped = await db.pop_next_waiting_queue_entry(
+        holder_cid, age_boost_seconds=0
+    )
+    assert popped is not None
+    assert popped["requester_engineer"] == "fresh_high", (
+        "with boost disabled, strict declared priority must hold: fresh "
+        "high (rank=3) beats backdated normal (rank=2); "
+        f"got {popped['requester_engineer']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# v0.26: queue cancellation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cancel_queue_request_marks_cancelled(
+    client: AsyncClient,
+) -> None:
+    """DELETE /requests/{queue_id} on a waiting row transitions it to
+    'cancelled' and the response carries cancelled=True."""
+    from coordination import deps
+
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/v26a.ts"}],
+    }
+    rh = await client.post("/claims", headers=_AUTH, json=holder)
+    assert rh.status_code == 200, rh.text
+    holder_cid = rh.json()["claim_ids"][0]
+
+    db = deps.get_service().db
+    entry = await db.enqueue_claim_request(
+        blocking_claim_id=holder_cid,
+        requester_engineer="bob",
+        requester_session_id="bob-sess",
+        requester_branch=None,
+        requester_description=None,
+        repo="amittell/coord",
+        claim_type="file",
+        pattern="src/v26a.ts",
+        symbols=None,
+        narrowable=None,
+        ttl_hours=None,
+        wait_seconds=120,
+    )
+    queue_id = entry["id"]
+
+    r = await client.delete(f"/requests/{queue_id}", headers=_AUTH)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body == {"ok": True, "cancelled": True, "queue_id": queue_id}
+
+    row = await db.get_queue_entry(queue_id)
+    assert row is not None
+    assert row["state"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_cancel_already_terminal_returns_false(
+    client: AsyncClient,
+) -> None:
+    """Terminal rows (granted/expired/cancelled) cannot be cancelled
+    again. The DELETE returns cancelled=False so the requester can tell
+    the row wasn't waiting."""
+    from coordination import deps
+
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/v26b.ts"}],
+    }
+    rh = await client.post("/claims", headers=_AUTH, json=holder)
+    assert rh.status_code == 200, rh.text
+    holder_cid = rh.json()["claim_ids"][0]
+
+    db = deps.get_service().db
+    entry = await db.enqueue_claim_request(
+        blocking_claim_id=holder_cid,
+        requester_engineer="bob",
+        requester_session_id="bob-sess",
+        requester_branch=None,
+        requester_description=None,
+        repo="amittell/coord",
+        claim_type="file",
+        pattern="src/v26b.ts",
+        symbols=None,
+        narrowable=None,
+        ttl_hours=None,
+        wait_seconds=120,
+    )
+    queue_id = entry["id"]
+
+    # Force the row into a terminal state directly, simulating a
+    # successful grant that landed before the requester thought to
+    # cancel.
+    await db.mark_queue_expired(queue_id)
+
+    r = await client.delete(f"/requests/{queue_id}", headers=_AUTH)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert body["cancelled"] is False
+    assert body["queue_id"] == queue_id
+
+    # Row stays in its prior terminal state; cancellation didn't clobber.
+    row = await db.get_queue_entry(queue_id)
+    assert row is not None
+    assert row["state"] == "expired"
+
+
+@pytest.mark.asyncio
+async def test_cancel_with_engineer_filter_rejects_mismatch(
+    client: AsyncClient,
+) -> None:
+    """When ?engineer= is supplied the cancellation only takes effect
+    if the row belongs to that engineer. A mismatched engineer gets
+    cancelled=False and the row stays waiting; the matching engineer
+    then succeeds."""
+    from coordination import deps
+
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/v26c.ts"}],
+    }
+    rh = await client.post("/claims", headers=_AUTH, json=holder)
+    assert rh.status_code == 200, rh.text
+    holder_cid = rh.json()["claim_ids"][0]
+
+    db = deps.get_service().db
+    entry = await db.enqueue_claim_request(
+        blocking_claim_id=holder_cid,
+        requester_engineer="bob",
+        requester_session_id="bob-sess",
+        requester_branch=None,
+        requester_description=None,
+        repo="amittell/coord",
+        claim_type="file",
+        pattern="src/v26c.ts",
+        symbols=None,
+        narrowable=None,
+        ttl_hours=None,
+        wait_seconds=120,
+    )
+    queue_id = entry["id"]
+
+    # Carol tries to cancel bob's wait; the engineer filter rejects it.
+    r_bad = await client.delete(
+        f"/requests/{queue_id}?engineer=carol", headers=_AUTH
+    )
+    assert r_bad.status_code == 200, r_bad.text
+    assert r_bad.json()["cancelled"] is False
+
+    row = await db.get_queue_entry(queue_id)
+    assert row is not None
+    assert row["state"] == "waiting"
+
+    # Bob cancels his own row; success.
+    r_ok = await client.delete(
+        f"/requests/{queue_id}?engineer=bob", headers=_AUTH
+    )
+    assert r_ok.status_code == 200, r_ok.text
+    assert r_ok.json()["cancelled"] is True
+
+    row_after = await db.get_queue_entry(queue_id)
+    assert row_after is not None
+    assert row_after["state"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_long_poll_wakes_on_cancellation(
+    client: AsyncClient,
+) -> None:
+    """An in-flight POST /claims long-poll wakes promptly when its
+    queue row is cancelled via DELETE /requests/{queue_id}. The waiter
+    returns the legacy conflict-shape (claim_ids=[]) within ~POLL_INTERVAL,
+    not the full wait_seconds window."""
+    import asyncio as _asyncio
+    import time as _time
+
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/v26d.ts"}],
+    }
+    rh = await client.post("/claims", headers=_AUTH, json=holder)
+    assert rh.status_code == 200, rh.text
+
+    async def queued_request() -> dict:
+        body = {
+            "engineer": "bob",
+            "repo": "amittell/coord",
+            "claims": [{"type": "file", "pattern": "src/v26d.ts"}],
+            "wait_seconds": 5,
+        }
+        return (await client.post("/claims", headers=_AUTH, json=body)).json()
+
+    waiter = _asyncio.create_task(queued_request())
+    queue_id = await _wait_for_queue_id(client, "bob")
+
+    # Cancel from a separate task; the waiter should wake promptly.
+    start = _time.monotonic()
+    r_cancel = await client.delete(
+        f"/requests/{queue_id}", headers=_AUTH
+    )
+    assert r_cancel.status_code == 200, r_cancel.text
+    assert r_cancel.json()["cancelled"] is True
+
+    result = await _asyncio.wait_for(waiter, timeout=3.0)
+    elapsed = _time.monotonic() - start
+    # Conflict-shape response: empty claim_ids plus the original
+    # conflict payload that the legacy 409 path would have returned.
+    assert result.get("claim_ids") == [], result
+    assert result.get("conflicts"), (
+        f"cancelled long-poll must still surface the conflict payload; "
+        f"got {result}"
+    )
+    # POLL_INTERVAL is 0.5s; cancellation should be observed within ~1s
+    # of the DELETE (one poll iteration + a little scheduling slack).
+    # We assert under 2.0s to keep the test stable under CI load.
+    assert elapsed < 2.0, (
+        f"long-poll did not wake promptly on cancellation; "
+        f"elapsed={elapsed:.2f}s"
+    )

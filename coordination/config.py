@@ -50,6 +50,21 @@ class Settings(BaseSettings):
     # endpoint and v0.22 hard auto-promote remain available either way).
     auto_demote_interval_sec: int = 3600
     auto_demote_window_days: int = 14
+    # v0.26 pattern-class granularity: when this many auto-promoted
+    # files share a common directory ancestor, the conflict pipeline
+    # promotes the subtree glob (``src/auth/**``) once instead of
+    # writing each leaf as its own shared_files entry. Set to 0 to
+    # disable subtree-level promotion (the v0.22 per-file behaviour
+    # is then preserved exactly).
+    auto_promote_subtree_min_files: int = 3
+    # v0.26 queue age boost: a waiting queue entry whose age (now -
+    # enqueued_at) exceeds this many seconds is treated as one
+    # priority level higher than its declared priority for the
+    # purposes of pop ordering. Prevents low/normal-priority
+    # waiters from starving under a steady stream of high/blocking
+    # entries. Set to 0 to disable the boost (strict declared
+    # priority ordering, the v0.25 behaviour).
+    queue_age_boost_seconds: int = 60
 
     @property
     def auth_mode(self) -> str:

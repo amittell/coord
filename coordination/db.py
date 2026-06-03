@@ -1019,15 +1019,25 @@ class Database:
         }
 
     async def pop_next_waiting_queue_entry(
-        self, blocking_claim_id: str
+        self,
+        blocking_claim_id: str,
+        *,
+        age_boost_seconds: int = 0,
     ) -> dict[str, Any] | None:
         """Return the head-of-queue waiting entry for ``blocking_claim_id``,
         marking it as ``in_progress`` so a concurrent release-drain on the
         same claim doesn't double-grant. The service layer either calls
         :meth:`mark_queue_granted` (success) or :meth:`mark_queue_expired`
         / re-enqueue (failure) before returning.
+
+        v0.26: ``age_boost_seconds`` lifts a waiting entry's effective
+        priority by one level once it has been waiting longer than that
+        many seconds. Prevents low/normal-priority waiters from starving
+        under a steady stream of high/blocking entries. ``0`` disables
+        the boost (strict declared-priority ordering, the v0.25 behaviour).
         """
         await self.init()
+        boost_threshold = max(0, int(age_boost_seconds))
         async with aiosqlite.connect(self.path) as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
@@ -1036,17 +1046,32 @@ class Database:
             # low) before position ASC so urgent waiters jump ahead of
             # earlier-but-lower-priority entries. SQLite has no ENUM, so
             # we map the priority string to an integer ordinal via CASE.
+            #
+            # v0.26: when ``age_boost_seconds`` > 0, add +1 to the rank of
+            # any entry whose age (now - enqueued_at) exceeds the threshold,
+            # so an old normal waiter floats to an effective 'high' rank
+            # and breaks the tie via position ASC. The age expression uses
+            # ``strftime('%s', ...)`` for an integer epoch comparison; if
+            # enqueued_at is malformed the inner strftime returns NULL
+            # and the COALESCE keeps the age at 0 (no boost), so the v0.25
+            # behaviour is preserved on bad data.
             cur = await conn.execute(
-                "SELECT *, CASE priority "
+                "SELECT *, ("
+                "CASE priority "
                 "WHEN 'blocking' THEN 4 "
                 "WHEN 'high' THEN 3 "
                 "WHEN 'normal' THEN 2 "
                 "WHEN 'low' THEN 1 "
-                "ELSE 2 END AS _prio_rank "
+                "ELSE 2 END"
+                " + CASE WHEN ? > 0 AND COALESCE("
+                "CAST(strftime('%s','now') AS INTEGER) - "
+                "CAST(strftime('%s', enqueued_at) AS INTEGER), 0) > ? "
+                "THEN 1 ELSE 0 END"
+                ") AS _prio_rank "
                 "FROM claim_queue "
                 "WHERE blocking_claim_id = ? AND state = 'waiting' "
                 "ORDER BY _prio_rank DESC, position ASC LIMIT 1",
-                (blocking_claim_id,),
+                (boost_threshold, boost_threshold, blocking_claim_id),
             )
             row = await cur.fetchone()
             if row is None:
@@ -1087,6 +1112,42 @@ class Database:
                 (queue_id,),
             )
             await conn.commit()
+
+    async def cancel_queue_entry(
+        self,
+        queue_id: str,
+        *,
+        requester_engineer: str | None = None,
+    ) -> bool:
+        """v0.26: mark a waiting queue entry as cancelled.
+
+        When ``requester_engineer`` is set, the cancellation only takes
+        effect if the queue row belongs to that engineer -- prevents
+        other engineers from cancelling someone else's wait via a stolen
+        queue_id. Returns True when a row was actually transitioned,
+        False when the row is missing or in a non-waiting/in-progress
+        state.
+        """
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            await _configure_sqlite(conn)
+            if requester_engineer is not None:
+                cur = await conn.execute(
+                    "UPDATE claim_queue SET state = 'cancelled' "
+                    "WHERE id = ? "
+                    "AND state IN ('waiting', 'in_progress') "
+                    "AND requester_engineer = ?",
+                    (queue_id, requester_engineer),
+                )
+            else:
+                cur = await conn.execute(
+                    "UPDATE claim_queue SET state = 'cancelled' "
+                    "WHERE id = ? "
+                    "AND state IN ('waiting', 'in_progress')",
+                    (queue_id,),
+                )
+            await conn.commit()
+            return (cur.rowcount or 0) > 0
 
     async def get_queue_entry(self, queue_id: str) -> dict[str, Any] | None:
         """v0.24: fetch a single claim_queue row by id. Returns None if

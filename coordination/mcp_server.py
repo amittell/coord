@@ -618,6 +618,30 @@ async def release_session(session_id: str | None = None) -> dict[str, Any]:
         return r.json()
 
 
+@mcp.tool()
+async def cancel_queue_request(
+    queue_id: str,
+    engineer: str | None = None,
+) -> dict[str, Any]:
+    """Cancel a queued claim_files request you previously started
+    with wait_seconds > 0. The queue_id is the value the wrapper
+    returns when it long-polls (look in /requests?queued=true if
+    you need to discover it). When engineer is provided the
+    cancellation is scoped to that engineer -- prevents an agent
+    from accidentally cancelling another agent's wait."""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        params: dict[str, Any] = {}
+        if engineer:
+            params["engineer"] = engineer
+        r = await client.delete(
+            f"{_base_url()}/requests/{queue_id}",
+            params=params,
+            headers=_headers(),
+        )
+        r.raise_for_status()
+        return r.json()
+
+
 # ---------------------------------------------------------------------------
 # sessions.live marker
 #

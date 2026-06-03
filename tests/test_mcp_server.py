@@ -2071,3 +2071,38 @@ async def test_claim_files_without_urgency_omits_key(
 
     body = _json.loads(captured[0].content.decode("utf-8"))
     assert "urgency" not in body
+
+
+# ---------------------------------------------------------------------------
+# v0.26: queue cancellation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cancel_queue_request_tool_forwards_delete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cancel_queue_request issues DELETE /requests/{queue_id} with the
+    optional engineer scope on the query string so the server can
+    reject cross-engineer cancellations."""
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    captured = _install_mock_transport(
+        monkeypatch,
+        _json_handler(
+            200, {"ok": True, "cancelled": True, "queue_id": "q123"}
+        ),
+    )
+
+    result = await mcp_server.cancel_queue_request(
+        queue_id="q123", engineer="bob"
+    )
+
+    assert result == {"ok": True, "cancelled": True, "queue_id": "q123"}
+    assert len(captured) == 1
+    req = captured[0]
+    assert req.method == "DELETE"
+    assert "q123" in str(req.url)
+    assert str(req.url).startswith("http://svc:8080/requests/q123")
+    assert req.url.params.get("engineer") == "bob"
+    assert req.headers.get("Authorization") == "Bearer tok"
