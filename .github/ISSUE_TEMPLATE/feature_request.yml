@@ -1,0 +1,37 @@
+name: Feature request
+description: Suggest a new capability or behaviour change for coord.
+title: "[feat]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing, please skim `./docs/design/roadmap.md` to see whether your idea overlaps something already queued. If it does, comment on the linked issue instead of opening a new one.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem you're trying to solve
+      description: What's the underlying user need? Describe the friction, not the proposed implementation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: What would the API, MCP tool, dashboard surface, or CLI command look like? Sketch the smallest version that solves the problem.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What workarounds exist today, and why are they insufficient?
+
+  - type: textarea
+    id: roadmap
+    attributes:
+      label: Roadmap fit
+      description: Optional. If you've checked `./docs/design/roadmap.md`, note any related queued item or explain where this would slot in.

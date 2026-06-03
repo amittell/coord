@@ -6,6 +6,7 @@ from coordination import BANNER, __version__
 from coordination.cli_doctor import run_doctor
 from coordination.cli_init import run_init
 from coordination.cli_ops import run_claims, run_release, run_status, run_stop
+from coordination.cli_outbox import add_outbox_subparser
 from coordination.cli_start import run_start
 from coordination.cli_update_notice import maybe_emit_update_notice
 from coordination.cli_upgrade import run_upgrade
@@ -28,6 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  coord status      Print health of the configured service\n"
             "  coord claims      List active claims\n"
             "  coord release     Release a claim by id\n"
+            "  coord outbox      Inspect / retry / purge the webhook outbox\n"
             "\n"
             "Advanced entry points:\n"
             "  coord-api         Raw uvicorn runner for the FastAPI app (coordination.main:app)\n"
@@ -217,6 +219,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Engineer id that owns the claim (required)",
     )
     release.set_defaults(func=run_release)
+
+    add_outbox_subparser(sub)
 
     internal = sub.add_parser("_serve")
     internal.set_defaults(func=lambda _: _run_internal_server())

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Setup or runtime troubleshooting
+    url: https://github.com/amittell/coord/blob/main/docs/troubleshooting.md
+    about: Most setup and runtime issues are covered here. Try this before opening a bug report.
+  - name: Report a security vulnerability
+    url: https://github.com/amittell/coord/security/advisories/new
+    about: Do not file a public issue for security reports. Open a private advisory instead. See SECURITY.md for the policy.

@@ -1,54 +1,43 @@
 version: 2
 updates:
-  # GitHub Actions. Pinned by full commit SHA with a trailing version
-  # comment; Dependabot bumps both together. Group everything to keep
-  # updates as a single monthly PR rather than a swarm.
-  - package-ecosystem: "github-actions"
-    directory: "/"
-    schedule:
-      interval: "monthly"
-      day: "monday"
-    open-pull-requests-limit: 3
-    groups:
-      actions-all:
-        patterns:
-          - "*"
-
-  # Python dependencies. Split into two groups so a single bumpy major
-  # on a dev tool does not spawn a four-way CI burn while still keeping
-  # production-dependency majors visible for focused review.
-  #
-  #   dev-tools        - pytest, pytest-asyncio, ruff, mypy, etc.
-  #                      Bundled across ALL update types (major included)
-  #                      because dev tools are iterated lockstep and a
-  #                      single failed group CI run is cheaper than four
-  #                      sequential rebases.
-  #   production-safe  - fastapi, pydantic, uvicorn, mcp, etc.
-  #                      Minor + patch only. Production majors (e.g.
-  #                      pydantic 2.x -> 3.x) still open as their own PR
-  #                      for a careful review.
+  # Python dependencies declared in the root pyproject.toml. Group
+  # patch + minor bumps together so they land as a single PR per week;
+  # majors still open as their own PR for focused review.
   - package-ecosystem: "pip"
     directory: "/"
     schedule:
-      interval: "monthly"
+      interval: "weekly"
       day: "monday"
-    open-pull-requests-limit: 3
+    open-pull-requests-limit: 5
     groups:
-      dev-tools:
-        dependency-type: "development"
-      production-safe:
-        dependency-type: "production"
+      python-minor-and-patch:
         update-types:
           - "minor"
           - "patch"
 
-  # Dockerfile base image. Group everything (including majors) into one
-  # PR; python 3.x base-image bumps are infrequent and we smoke-test
-  # locally via `make docker-smoke` before merging.
+  # GitHub Actions used in .github/workflows/. Dependabot is allowed
+  # to auto-update action SHAs here, which is the whole point of the
+  # pinning discipline. Group patch + minor bumps; majors stay
+  # individual.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    groups:
+      actions-minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Dockerfile base image. Container ships via the release workflow,
+  # so keep base-image updates visible. Weekly cadence, all bumps in
+  # one PR.
   - package-ecosystem: "docker"
     directory: "/"
     schedule:
-      interval: "monthly"
+      interval: "weekly"
       day: "monday"
     open-pull-requests-limit: 2
     groups:

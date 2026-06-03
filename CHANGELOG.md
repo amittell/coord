@@ -9,6 +9,27 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.27.1] - 2026-06-03
+
+### Added
+
+- ``coord outbox`` CLI for v0.27 webhook outbox management.
+  - ``coord outbox stats`` shows per-event-type counts
+    (delivered / failed / pending / exhausted) over a rolling window
+    (default 24h, ``--hours N`` to change). ``--json`` emits a
+    machine-readable payload mirroring the dashboard panel.
+  - ``coord outbox tail -n N`` shows the N most recent rows
+    (default 20), oldest-first within the slice, with status,
+    event_type, event_age, and a truncated last_error. ``--json``
+    emits the row list verbatim.
+  - ``coord outbox retry [--exhausted | --failed | --all]`` resets
+    ``retry_count`` to 0 and ``next_attempt_at`` to now on selected
+    rows, clearing ``last_error`` and flipping status back to
+    ``pending`` so the delivery loop picks them up.
+  - ``coord outbox purge [--delivered | --exhausted | --all-terminal]``
+    DELETEs rows in terminal states. ``--dry-run`` is available on
+    both mutators and reports the row count without writing.
+
 ## [0.27.0] - 2026-06-03
 
 ### Added

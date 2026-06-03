@@ -1,0 +1,85 @@
+name: Bug report
+description: Report a defect in coord (HTTP API, MCP bridge, dashboard, CLI).
+title: "[bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a report. Please run `coord doctor` first; it catches the majority of setup issues without needing a maintainer.
+
+  - type: input
+    id: version
+    attributes:
+      label: coord version
+      description: Output of `coord --version` or the tag you installed.
+      placeholder: "0.27.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mcp_client
+    attributes:
+      label: MCP client
+      description: Which agent harness are you driving coord with?
+      options:
+        - Claude Code
+        - Codex CLI
+        - Cursor
+        - Other (describe in steps to reproduce)
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      description: Operating system and version. Include container runtime if applicable.
+      placeholder: "macOS 14.5 / Ubuntu 24.04 / Docker 27 on Debian 12"
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Minimal sequence of commands or API calls that triggers the bug.
+      placeholder: |
+        1. `coord start --background`
+        2. From a second shell: `coord init --tool claude --mode local --yes`
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What actually happened? Include exit codes, error messages, or HTTP status.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant output from the service log, MCP stderr, or `coord doctor`. Redact any token values before pasting.
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Have you checked
+      options:
+        - label: I searched existing issues (open and closed) for a duplicate.
+          required: true
+        - label: I read `./docs/troubleshooting.md`.
+          required: true
+        - label: I ran `coord doctor` and reviewed its output.
+          required: true
