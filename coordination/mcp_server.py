@@ -263,6 +263,7 @@ async def claim_files(
     symbols: dict[str, list[str]] | None = None,
     narrowable: bool | None = None,
     wait_seconds: int | None = None,
+    urgency: str | None = None,  # NEW v0.25
 ) -> dict[str, Any]:
     """Claim files or glob patterns before editing; returns claim_ids or conflicts.
 
@@ -291,6 +292,17 @@ async def claim_files(
     ``wait_seconds=0`` or ``None`` preserves the v0.13-v0.20
     immediate-409 behaviour and the key is omitted from the POST body
     so pre-v0.21 servers see a byte-identical request shape.
+
+    ``urgency`` (v0.25+) is a queue priority hint. One of ``'low'``,
+    ``'normal'``, ``'high'``, ``'blocking'`` (matches the v0.9
+    release-request urgency vocabulary). When set together with a
+    positive ``wait_seconds`` the queue entry the conflict path
+    enqueues lands at the requested priority, jumping ahead of
+    earlier-but-lower-priority waiters. ``None`` (the default) omits
+    the key from the POST body so pre-v0.25 servers see a
+    byte-identical request shape and the DB layer falls back to the
+    strict-FIFO default of ``'normal'``. Unknown values are silently
+    coerced to ``'normal'`` server-side.
 
     For backward compatibility the wrapper omits the ``symbols`` and
     ``narrowable`` keys from each ``claims[i]`` payload entry when they
@@ -363,6 +375,11 @@ async def claim_files(
     # servers see no difference.
     if wait_seconds is not None and wait_seconds > 0:
         body["wait_seconds"] = wait_seconds
+    # v0.25: only forward urgency when explicitly set. Mirrors the
+    # wait_seconds passthrough so pre-v0.25 servers see a byte-identical
+    # request shape; the DB layer defaults absent priority to 'normal'.
+    if urgency is not None:
+        body["urgency"] = urgency
     async with httpx.AsyncClient(timeout=30.0) as client:
         r = await client.post(f"{_base_url()}/claims", json=body, headers={**_headers(), "Content-Type": "application/json"})
         if r.status_code in (400, 409):

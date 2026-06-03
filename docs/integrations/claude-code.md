@@ -107,6 +107,8 @@ As of v0.19 the TypeScript parser also walks recursively into nested class decla
 
 To see the live FIFO queue for `claim_files` waiters (v0.22+), call `my_requests(queued=True)` -- the tool forwards `?queued=true` to `GET /requests` and returns the blocking holder's engineer + pattern alongside each waiter.
 
+To jump ahead of normal-priority waiters when the work genuinely cannot wait (v0.25+), pass `urgency` alongside `wait_seconds`: `claim_files(engineer="alex/claude/hotfix", patterns=["src/auth/login.ts"], wait_seconds=30, urgency="high", description="prod regression")`. The FIFO queue orders by priority DESC then arrival, so a `high` or `blocking` waiter jumps ahead of `normal` traffic. Default `normal` preserves strict FIFO.
+
 ## Auth resolution order
 
 `coord-mcp` resolves `COORD_*` env vars in this order, with the first non-placeholder value winning:

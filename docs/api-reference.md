@@ -64,6 +64,10 @@ The top-level body accepts an optional `wait_seconds` field added in v0.21:
 
 - `wait_seconds` (int, default `0`, range `0..600`): when the request would `409`, FIFO-queue the caller behind the blocking holder and long-poll for up to this many seconds for the holder to release. On release (manual `release_claims`, TTL expiry, request approval, or a `narrowed` / `coexist` decision) the service drains the queue and auto-grants the next entry in arrival order. `0` (or omitted) preserves the v0.13-v0.20 immediate-409 behaviour. The server caps the value at 600.
 
+The top-level body also accepts an optional `urgency` field added in v0.25:
+
+- `urgency` (str, default `"normal"`, one of `"low" | "normal" | "high" | "blocking"`): priority hint applied when the call is queued via `wait_seconds > 0`. The FIFO queue orders entries by priority DESC then position ASC, so a `blocking` waiter jumps ahead of any `high` / `normal` / `low` traffic without violating arrival order within a single priority band. Default `"normal"` preserves strict FIFO for callers that don't pass it (byte-compatible with v0.21-v0.24). Same vocabulary as the v0.9 release-request `urgency` field. The hint has no effect when `wait_seconds` is `0` or omitted, because no enqueue happens.
+
 Each `ClaimItem` accepts two optional fields added in v0.14:
 
 - `symbols` (`list[str]`): top-level symbol names within `pattern`. When present and non-empty, the claim becomes `scope_type='symbol'` and covers only the listed declarations; imports and module-level statements are explicitly not covered. When `pattern` is a glob, the symbol list applies to every matched file -- pass separate claim items if you want per-file granularity. Empty or absent: `scope_type='file'` (legacy behaviour). Entries containing `::` are interpreted as method-scope (v0.16+): `"Router::handleAuth"` claims the `handleAuth` method on the `Router` class. The server splits at insert time and stores `Router` as the parent and `handleAuth` as the leaf. Two-level only -- nested classes / nested namespaces are not yet supported.

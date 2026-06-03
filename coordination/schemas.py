@@ -74,6 +74,18 @@ class CreateClaimsRequest(BaseModel):
             "behaviour."
         ),
     )
+    urgency: str | None = Field(
+        default=None,
+        description=(
+            "v0.25 queue priority hint. One of 'low' | 'normal' | 'high' |"
+            " 'blocking' (matches the v0.9 release-request urgency "
+            "vocabulary). When set AND wait_seconds > 0 puts the queue "
+            "entry the conflict path enqueues at the requested priority. "
+            "Default None coerces to 'normal' on the wire so legacy "
+            "behaviour (strict FIFO) is preserved. Unknown values "
+            "silently coerce to 'normal' at the DB layer."
+        ),
+    )
 
 
 class ConflictingClaim(BaseModel):

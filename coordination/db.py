@@ -141,7 +141,7 @@ CREATE INDEX IF NOT EXISTS idx_claims_engineer ON claims (engineer);
 """
 
 
-CURRENT_SCHEMA_VERSION = 11
+CURRENT_SCHEMA_VERSION = 12
 
 # Migration registry: list of (version, upgrade_sql) tuples applied in order.
 # Entry for version N is the SQL that upgrades a DB from version N-1 to N.
@@ -368,6 +368,24 @@ MIGRATIONS: list[tuple[int, str]] = [
         "ON claim_queue (blocking_claim_id, state, position);\n"
         "CREATE INDEX idx_claim_queue_requester "
         "ON claim_queue (requester_engineer, state);",
+    ),
+    # v12: queue priority hints. ``claim_queue.priority`` lifts the
+    # v0.9 release-request ``urgency`` vocabulary (low|normal|high|
+    # blocking) into the v0.21 FIFO queue so a high-urgency requester
+    # can jump ahead of normal traffic. Default 'normal' preserves
+    # strict FIFO for pre-v0.25 callers (every existing row backfills
+    # to normal and orders by position as before).
+    #
+    # pop_next_waiting_queue_entry orders by a CASE expression that
+    # maps the string priority to an integer ordinal -- SQLite has no
+    # ENUM type, and storing a TEXT lets us match the v0.9 wire
+    # format without an extra translation layer at the API boundary.
+    (
+        12,
+        "ALTER TABLE claim_queue ADD COLUMN priority TEXT NOT NULL "
+        "DEFAULT 'normal';\n"
+        "CREATE INDEX idx_claim_queue_blocking_priority "
+        "ON claim_queue (blocking_claim_id, state, priority, position);",
     ),
 ]
 
@@ -915,6 +933,7 @@ class Database:
         narrowable: bool | None,
         ttl_hours: int | None,
         wait_seconds: int,
+        priority: str = "normal",
     ) -> dict[str, Any]:
         """Enqueue a v0.21 FIFO claim request behind a blocking holder.
 
@@ -952,15 +971,23 @@ class Database:
             )
             row = await cur.fetchone()
             next_position = int((row["p"] if row else 0) or 0) + 1
+            # v0.25: priority is one of low|normal|high|blocking. Unknown
+            # values silently coerce to 'normal' so a typo never breaks
+            # the enqueue path.
+            normalised_priority = (
+                priority
+                if priority in ("low", "normal", "high", "blocking")
+                else "normal"
+            )
             await conn.execute(
                 "INSERT INTO claim_queue ("
                 "id, blocking_claim_id, requester_engineer, "
                 "requester_session_id, requester_branch, "
                 "requester_description, repo, claim_type, pattern, "
                 "symbols, narrowable, ttl_hours, position, state, "
-                "enqueued_at, expires_at) "
+                "enqueued_at, expires_at, priority) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                "'waiting', ?, ?)",
+                "'waiting', ?, ?, ?)",
                 (
                     new_id,
                     blocking_claim_id,
@@ -977,6 +1004,7 @@ class Database:
                     next_position,
                     now_iso,
                     expires_iso,
+                    normalised_priority,
                 ),
             )
             await conn.commit()
@@ -987,6 +1015,7 @@ class Database:
             "state": "waiting",
             "enqueued_at": now_iso,
             "expires_at": expires_iso,
+            "priority": normalised_priority,
         }
 
     async def pop_next_waiting_queue_entry(
@@ -1003,10 +1032,20 @@ class Database:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             await conn.execute("BEGIN IMMEDIATE")
+            # v0.25: order by priority DESC (blocking > high > normal >
+            # low) before position ASC so urgent waiters jump ahead of
+            # earlier-but-lower-priority entries. SQLite has no ENUM, so
+            # we map the priority string to an integer ordinal via CASE.
             cur = await conn.execute(
-                "SELECT * FROM claim_queue "
+                "SELECT *, CASE priority "
+                "WHEN 'blocking' THEN 4 "
+                "WHEN 'high' THEN 3 "
+                "WHEN 'normal' THEN 2 "
+                "WHEN 'low' THEN 1 "
+                "ELSE 2 END AS _prio_rank "
+                "FROM claim_queue "
                 "WHERE blocking_claim_id = ? AND state = 'waiting' "
-                "ORDER BY position ASC LIMIT 1",
+                "ORDER BY _prio_rank DESC, position ASC LIMIT 1",
                 (blocking_claim_id,),
             )
             row = await cur.fetchone()

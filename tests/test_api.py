@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -2010,6 +2011,104 @@ async def test_auto_demote_skips_active_entries(
 
 
 # ---------------------------------------------------------------------------
+# v0.25: permanent-marker (pinned shared_files entries)
+# ---------------------------------------------------------------------------
+
+
+def test_ownership_lists_permanent_marker() -> None:
+    """``list_permanent_shared_files`` returns every entry whose line
+    carries the operator-set ``# coord-managed=permanent`` marker,
+    including entries that also carry the auto-promoted marker."""
+    from coordination.ownership import list_permanent_shared_files
+
+    yaml_text = (
+        "shared_files:\n"
+        "  - src/auto.ts  # auto-promoted=2026-06-02\n"
+        "  - src/pinned.ts  # coord-managed=permanent\n"
+        "  - src/operator.ts\n"
+        "  - src/both.ts  # auto-promoted=2026-06-02 coord-managed=permanent\n"
+    )
+
+    pinned = list_permanent_shared_files(yaml_text)
+    assert set(pinned) == {"src/pinned.ts", "src/both.ts"}
+
+
+@pytest.mark.asyncio
+async def test_auto_demote_skips_permanent_entries(
+    client_auto_demote: AsyncClient,
+) -> None:
+    """A shared_files entry that is both auto-promoted AND pinned with
+    the operator ``# coord-managed=permanent`` marker survives the
+    sweep even when its rolling 409 count is zero."""
+    from coordination import deps
+    from coordination.ownership import (
+        list_coord_managed_shared_files,
+        list_permanent_shared_files,
+    )
+
+    svc = deps.get_service()
+    # Hand-crafted YAML: the entry carries both markers so the parser
+    # sees it as managed AND the sweep guard sees it as pinned.
+    seeded = (
+        "shared_files:\n"
+        "  - src/pinned.ts  # auto-promoted=2026-01-01 coord-managed=permanent\n"
+    )
+    await svc.db.set_ownership_yaml(seeded)
+    assert list_coord_managed_shared_files(seeded) == [
+        ("src/pinned.ts", "2026-01-01")
+    ]
+    assert list_permanent_shared_files(seeded) == ["src/pinned.ts"]
+
+    # Threshold 3 and zero conflict_log activity would normally demote;
+    # the permanent marker must keep the entry in place.
+    removed = await svc._maybe_auto_demote()
+    assert removed == 0
+
+    after = await svc.db.get_ownership_yaml() or ""
+    assert "src/pinned.ts" in after
+    assert list_permanent_shared_files(after) == ["src/pinned.ts"]
+
+
+@pytest.mark.asyncio
+async def test_auto_demote_removes_managed_non_permanent_when_dormant(
+    client_auto_demote: AsyncClient,
+) -> None:
+    """Mixed seed regression: a pinned permanent entry and a plain
+    managed entry both sit dormant. The sweep removes only the
+    managed-only one; the permanent entry is untouched."""
+    from coordination import deps
+    from coordination.ownership import (
+        list_coord_managed_shared_files,
+        list_permanent_shared_files,
+        patch_owners_yaml_with_shared_file,
+    )
+
+    svc = deps.get_service()
+    # Plain managed entry (will be demoted).
+    seeded = patch_owners_yaml_with_shared_file(
+        "", "src/dormant.ts", managed=True, promoted_at="2026-01-01"
+    )
+    # Append a pinned permanent entry by hand (operators do this in
+    # owners.yaml; there's no auto-promote path that writes the
+    # permanent marker).
+    if not seeded.endswith("\n"):
+        seeded += "\n"
+    seeded += "  - src/pinned.ts  # coord-managed=permanent\n"
+    await svc.db.set_ownership_yaml(seeded)
+
+    removed = await svc._maybe_auto_demote()
+    assert removed == 1
+
+    after = await svc.db.get_ownership_yaml() or ""
+    assert "src/dormant.ts" not in after
+    assert "src/pinned.ts" in after
+    # The pinned entry has no auto-promoted marker, so the managed
+    # helper reports nothing; the permanent helper still sees it.
+    assert list_coord_managed_shared_files(after) == []
+    assert list_permanent_shared_files(after) == ["src/pinned.ts"]
+
+
+# ---------------------------------------------------------------------------
 # v0.22: queue visibility
 # ---------------------------------------------------------------------------
 
@@ -2318,3 +2417,194 @@ async def test_in_process_event_still_works(
         f"got {result}"
     )
     assert result.get("conflicts") == [], result
+
+
+# ---------------------------------------------------------------------------
+# v0.25: queue priority hints
+#
+# urgency on CreateClaimsRequest threads into claim_queue.priority so the
+# drain path can grant high/blocking waiters ahead of earlier-but-lower-
+# priority entries. Unknown values coerce to 'normal' so a typo never
+# breaks enqueue. Absent urgency preserves strict v0.21 FIFO.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_queue_priority_blocking_jumps_ahead(
+    client: AsyncClient,
+) -> None:
+    """Three waiters enqueued in FIFO order bob, carol, dan with
+    priorities normal, high, blocking. When the holder releases, the
+    drain pops by priority DESC (blocking > high > normal) so dan wins
+    even though he enqueued last; carol and bob get processed in
+    priority order behind him (they re-conflict against dan's new claim
+    and surface the conflict payload). The behavioural assertion is
+    that strict-FIFO bob does NOT win -- priority overrides position."""
+    import asyncio as _asyncio
+
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/x.ts"}],
+    }
+    rh = await client.post("/claims", headers=_AUTH, json=holder)
+    assert rh.status_code == 200, rh.text
+    holder_cid = rh.json()["claim_ids"][0]
+
+    async def queued_request(
+        engineer: str, urgency: str | None
+    ) -> dict:
+        body: dict[str, Any] = {
+            "engineer": engineer,
+            "repo": "amittell/coord",
+            "claims": [{"type": "file", "pattern": "src/x.ts"}],
+            "wait_seconds": 10,
+        }
+        if urgency is not None:
+            body["urgency"] = urgency
+        return (await client.post("/claims", headers=_AUTH, json=body)).json()
+
+    # Enqueue in FIFO order bob, carol, dan. With strict FIFO bob would
+    # win; with priority dan (blocking) jumps to the head, carol (high)
+    # second, bob (normal) last.
+    bob_task = _asyncio.create_task(queued_request("bob", None))
+    await _asyncio.sleep(0.05)
+    carol_task = _asyncio.create_task(queued_request("carol", "high"))
+    await _asyncio.sleep(0.05)
+    dan_task = _asyncio.create_task(queued_request("dan", "blocking"))
+    await _asyncio.sleep(0.05)
+
+    # Release the holder; the drain pops by priority DESC.
+    rel = await client.post(
+        "/claims/release",
+        headers=_AUTH,
+        json={"claim_ids": [holder_cid], "engineer": "alice"},
+    )
+    assert rel.status_code == 200, rel.text
+
+    dan_result = await _asyncio.wait_for(dan_task, timeout=5)
+    carol_result = await _asyncio.wait_for(carol_task, timeout=5)
+    bob_result = await _asyncio.wait_for(bob_task, timeout=5)
+
+    # Dan (blocking) wins even though he enqueued last.
+    assert dan_result.get("claim_ids"), (
+        f"dan (blocking) should be auto-granted first; got {dan_result}"
+    )
+    # Bob (normal, enqueued FIRST) must NOT win -- priority beat his
+    # FIFO position. The drain's second/third pops see dan's new claim
+    # and re-conflict carol and bob, so both surface conflict payloads.
+    assert bob_result.get("claim_ids") == [], (
+        f"bob (normal) should NOT win over dan (blocking); got {bob_result}"
+    )
+    # Carol also lost to dan; she surfaces a conflict shape. The
+    # implementation-level guarantee we care about is that carol was
+    # popped from the queue ahead of bob (the priority-DESC ORDER BY
+    # is what determines who gets the (failed) grant attempt first).
+    assert carol_result.get("claim_ids") == [], (
+        f"carol (high) should NOT win over dan (blocking); got {carol_result}"
+    )
+    assert carol_result.get("conflicts"), (
+        f"carol should surface a conflict payload after losing to dan; "
+        f"got {carol_result}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_queue_priority_default_normal_preserves_fifo(
+    client: AsyncClient,
+) -> None:
+    """Two waiters with no urgency (both default 'normal') retain strict
+    FIFO: the first to enqueue is the first to be granted."""
+    import asyncio as _asyncio
+
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/x_fifo.ts"}],
+    }
+    rh = await client.post("/claims", headers=_AUTH, json=holder)
+    assert rh.status_code == 200, rh.text
+    holder_cid = rh.json()["claim_ids"][0]
+
+    async def queued_request(engineer: str) -> dict:
+        body = {
+            "engineer": engineer,
+            "repo": "amittell/coord",
+            "claims": [{"type": "file", "pattern": "src/x_fifo.ts"}],
+            "wait_seconds": 10,
+        }
+        return (await client.post("/claims", headers=_AUTH, json=body)).json()
+
+    bob_task = _asyncio.create_task(queued_request("bob"))
+    await _asyncio.sleep(0.05)
+    carol_task = _asyncio.create_task(queued_request("carol"))
+    await _asyncio.sleep(0.05)
+
+    rel = await client.post(
+        "/claims/release",
+        headers=_AUTH,
+        json={"claim_ids": [holder_cid], "engineer": "alice"},
+    )
+    assert rel.status_code == 200, rel.text
+
+    # Bob (enqueued first) wins under strict FIFO.
+    bob_result = await _asyncio.wait_for(bob_task, timeout=5)
+    assert bob_result.get("claim_ids"), (
+        f"bob (first-enqueued, normal) should be granted first; "
+        f"got {bob_result}"
+    )
+
+    # Carol's wait either times out (still waiting on bob) or also gets
+    # granted if bob's claim was released somehow; we only assert the
+    # shape is well-formed.
+    carol_result = await _asyncio.wait_for(carol_task, timeout=15)
+    assert "claim_ids" in carol_result
+
+
+@pytest.mark.asyncio
+async def test_queue_priority_unknown_value_coerces_to_normal(
+    client: AsyncClient,
+) -> None:
+    """A garbage urgency string must not crash the enqueue path: the
+    DB layer silently coerces unknown values to 'normal' so the row
+    lands at the default priority and FIFO still applies."""
+    import asyncio as _asyncio
+
+    from coordination import deps
+
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/x_coerce.ts"}],
+    }
+    rh = await client.post("/claims", headers=_AUTH, json=holder)
+    assert rh.status_code == 200, rh.text
+
+    async def queued_request() -> dict:
+        body = {
+            "engineer": "bob",
+            "repo": "amittell/coord",
+            "claims": [{"type": "file", "pattern": "src/x_coerce.ts"}],
+            "wait_seconds": 5,
+            "urgency": "whatever",
+        }
+        return (await client.post("/claims", headers=_AUTH, json=body)).json()
+
+    waiter = _asyncio.create_task(queued_request())
+    # Give the POST time to enqueue, then snapshot the queue row to
+    # verify the DB layer coerced the garbage urgency to 'normal'.
+    await _wait_for_queue_id(client, "bob")
+    db = deps.get_service().db
+    rows = await db.list_queued_with_holder(engineer="bob")
+    assert rows, "queue row for bob should exist"
+    assert rows[0]["priority"] == "normal", (
+        f"unknown urgency must coerce to 'normal'; got {rows[0]['priority']!r}"
+    )
+
+    # Cancel the long-poll cleanly so the test exits without waiting
+    # the full wait_seconds window.
+    waiter.cancel()
+    try:
+        await waiter
+    except (_asyncio.CancelledError, Exception):
+        pass

@@ -164,6 +164,19 @@ A background sweep then reverses the promotion when the hotspot pressure has act
 
 Each removal writes a `request_event` of type `auto-demote` with `pattern`, `count_in_window`, `threshold`, and `window_days` in the `detail` JSON so the audit trail tells the full promote-then-demote story. Operator-added entries (no `# auto-promoted=` marker) are left alone -- the demote path is opt-in by virtue of also being opt-in to promotion.
 
+#### Permanent shared-file pin (v0.25+)
+
+Some `shared_files` entries are inherently long-lived (`package-lock.json`, the app shell, a routing table) and you want them to stay pinned regardless of whether the rolling hotspot count drops to zero. v0.25 adds a second YAML marker for this case:
+
+```yaml
+shared_files:
+  - pattern: "package-lock.json"  # coord-managed=permanent
+  - pattern: "src/router.ts"  # auto-promoted=2026-06-02 coord-managed=permanent
+  - pattern: "src/auth/session.ts"  # auto-promoted=2026-06-02
+```
+
+The v0.23 auto-demote sweep skips any entry carrying `# coord-managed=permanent` even when the rolling hotspot count drops below `COORD_AUTO_PROMOTE_THRESHOLD` for the full `COORD_AUTO_DEMOTE_WINDOW_DAYS` window. An entry can carry both the `auto-promoted=DATE` marker (coord wrote it) and the `coord-managed=permanent` marker (operator wants it kept): operator intent wins and the entry is treated as permanent. Use the `ownership.list_permanent_shared_files` helper to enumerate every pinned entry programmatically.
+
 ## Queueing claims (v0.21+)
 
 When `claim_files` would `409` against an active holder, the requester historically had to retry on a timer or file an explicit `request_release`. v0.21 adds a third option: pass `wait_seconds` and the service FIFO-queues the requester behind the blocking claim, long-polling for the holder to release.
@@ -178,6 +191,26 @@ claim_files(
 ```
 
 When the holder releases (manual `release_claims`, TTL expiry, request approval, or a `narrowed` / `coexist` decision), the service drains the FIFO and auto-grants the next entry. Multiple queued requesters are served in arrival order. The server caps `wait_seconds` at 600s; pass `0` (or omit) to preserve the immediate-409 behaviour from v0.13-v0.20. The MCP wrapper accepts `wait_seconds` directly on `claim_files`; the same field exists on `POST /claims` (see [./api-reference.md](./api-reference.md)).
+
+### Priority hints (v0.25+)
+
+Strict FIFO is fair but unhelpful when a `blocking` fix lands behind ten `normal` waiters that are happy to retry. v0.25 lets the requester tag the queued entry with an `urgency` hint and changes the dequeue order to priority DESC then position ASC, so a `blocking` waiter jumps ahead of any `high` / `normal` / `low` traffic without violating arrival order within a single priority band. The vocabulary is the same as the v0.9 release-request urgency field: `low | normal | high | blocking`.
+
+```bash
+curl -X POST http://127.0.0.1:8080/claims \
+  -H "Authorization: Bearer $COORD_AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "engineer": "alex/claude/hotfix",
+    "branch": "alex/hotfix-1234",
+    "description": "production auth regression",
+    "claims": [{"type": "file", "pattern": "src/auth/login.ts"}],
+    "wait_seconds": 60,
+    "urgency": "blocking"
+  }'
+```
+
+`urgency` is optional and defaults to `normal`, which preserves strict FIFO for any caller that doesn't pass it (byte-compatible with v0.21-v0.24). The MCP wrapper exposes `urgency` as an optional kwarg on `claim_files`; omit it when arrival order is fine, set it when the work genuinely cannot wait its turn. Priority only takes effect when combined with `wait_seconds > 0`; an immediate-409 call is unchanged.
 
 ### Inspecting the queue (v0.22+)
 

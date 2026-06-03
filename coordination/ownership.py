@@ -107,6 +107,22 @@ def load_ownership_from_file(path: Path) -> list[PathRule]:
 # managed entry through PyYAML and gets back just the pattern string.
 _MANAGED_MARKER_RE = re.compile(r"#\s*auto-promoted=(\d{4}-\d{2}-\d{2})\b")
 
+# v0.25 operator-set marker that pins a ``shared_files`` entry so the
+# auto-demote sweep skips it even when its rolling 409 count drops
+# below threshold. Operators add the comment by hand in owners.yaml
+# (typically on patterns like ``package-lock.json``, the app shell, or
+# a schema index) when a rule should outlive its hotspot activity.
+# Like the auto-promoted marker, this is a YAML comment so it has no
+# semantic effect on parsing. Matched as a bare token so it composes
+# with the auto-promoted marker on the same comment line, e.g.::
+#
+#     - src/router.ts  # auto-promoted=2026-06-02 coord-managed=permanent
+#
+# The token-only form is matched against the comment portion of the
+# line (everything after the first ``#``) so we never mistake a path
+# segment for the marker.
+_PERMANENT_MARKER_RE = re.compile(r"\bcoord-managed=permanent\b")
+
 # Regex that finds the top-level ``shared_files:`` key. Anchored to the
 # start of a line and rejects any leading whitespace so it never matches
 # a nested ``shared_files:`` mapping inside ``modules`` / ``areas``.
@@ -332,6 +348,58 @@ def list_coord_managed_shared_files(yaml_text: str) -> list[tuple[str, str]]:
         if marker is None:
             continue
         out.append((pattern, marker.group(1)))
+    return out
+
+
+def list_permanent_shared_files(yaml_text: str) -> list[str]:
+    """Return every shared_files entry whose line carries the
+    operator-set ``# coord-managed=permanent`` marker.
+
+    These entries are excluded from v0.23 auto-demote sweeps even if
+    their rolling hotspot count drops below threshold. Operators add
+    the marker by hand in owners.yaml when they want a rule pinned
+    (e.g. package-lock.json, app shell, schema index).
+
+    A pattern may carry both the auto-promoted marker and the
+    permanent marker; in that case it is reported here (operator
+    intent wins) so the sweep treats it as pinned.
+    """
+    if not yaml_text or not yaml_text.strip():
+        return []
+    text = yaml_text if yaml_text.endswith("\n") else yaml_text + "\n"
+    header_match = _SHARED_FILES_HEADER_RE.search(text)
+    if header_match is None:
+        return []
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    header_line_no = -1
+    char_offset = 0
+    for idx, ln in enumerate(lines):
+        end_offset = char_offset + len(ln) + 1
+        if char_offset <= header_match.start() < end_offset:
+            header_line_no = idx
+            break
+        char_offset = end_offset
+    if header_line_no < 0:
+        return []
+    block_start, block_end = _shared_files_block_range(lines, header_line_no)
+    out: list[str] = []
+    for i in range(block_start, block_end):
+        line = lines[i]
+        pattern = _list_item_pattern(line)
+        if pattern is None:
+            continue
+        # The marker lives in the comment portion of the line. Scope
+        # the search to text after the first ``#`` so a stray
+        # ``coord-managed=permanent`` substring inside the pattern
+        # itself cannot trip the guard.
+        if "#" not in line:
+            continue
+        comment = line.split("#", 1)[1]
+        if _PERMANENT_MARKER_RE.search(comment) is None:
+            continue
+        out.append(pattern)
     return out
 
 

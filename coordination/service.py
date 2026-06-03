@@ -1145,6 +1145,7 @@ class CoordinationService:
             narrowable=target_item.narrowable,
             ttl_hours=body.ttl_hours,
             wait_seconds=wait_seconds,
+            priority=body.urgency or "normal",
         )
 
         # v0.24: hybrid wait loop. Short event-wait covers the
@@ -1372,6 +1373,14 @@ class CoordinationService:
         sweep is the inverse half of :meth:`_maybe_auto_promote` and
         deliberately stays in its lane.
 
+        v0.25: entries carrying the operator-set
+        ``# coord-managed=permanent`` marker are also skipped. Operators
+        pin a pattern (typically a package lock file, an app shell, or
+        a schema index) when they want it to outlive its rolling
+        hotspot activity. A pattern that carries both the
+        auto-promoted marker and the permanent marker is treated as
+        permanent: operator intent wins.
+
         Returns the number of entries removed. Skipped silently when
         ``auto_promote_threshold == 0`` (the feature is disabled). YAML
         parse errors are logged and swallowed so a malformed operator
@@ -1379,6 +1388,7 @@ class CoordinationService:
         """
         from coordination.ownership import (
             list_coord_managed_shared_files,
+            list_permanent_shared_files,
             patch_owners_yaml_remove_shared_file,
         )
 
@@ -1392,9 +1402,16 @@ class CoordinationService:
             return 0
         try:
             managed_entries = list_coord_managed_shared_files(current)
+            permanent_patterns = set(list_permanent_shared_files(current))
         except Exception:  # noqa: BLE001 - sweep is best-effort
             logger.exception("auto-demote: failed to parse owners.yaml")
             return 0
+        if permanent_patterns:
+            managed_entries = [
+                (pat, when)
+                for pat, when in managed_entries
+                if pat not in permanent_patterns
+            ]
         if not managed_entries:
             return 0
 

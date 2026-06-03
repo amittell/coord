@@ -9,6 +9,30 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.25.0] - 2026-06-02
+
+### Added
+
+- Permanent shared-file pin. Operators append
+  ``# coord-managed=permanent`` to a shared_files line in
+  owners.yaml; the v0.23 auto-demote sweep skips any entry carrying
+  this marker even when the rolling hotspot count drops to zero.
+  Entries can carry BOTH the auto-promoted=DATE and the
+  coord-managed=permanent markers (operator intent wins).
+- ownership.list_permanent_shared_files helper.
+- Schema v12: claim_queue.priority TEXT NOT NULL DEFAULT 'normal'.
+- Queue priority hints. CreateClaimsRequest gains urgency
+  (low|normal|high|blocking, matches v0.9 release-request urgency
+  vocabulary). When combined with wait_seconds > 0, the FIFO queue
+  orders by priority DESC then position ASC so urgent work jumps
+  ahead of normal traffic. Default 'normal' preserves strict FIFO
+  for legacy callers.
+- db.enqueue_claim_request gains priority kwarg.
+  db.pop_next_waiting_queue_entry orders by priority via a CASE
+  expression (SQLite has no ENUM).
+- coord-mcp claim_files exposes urgency as an optional kwarg
+  (omitted from body when None; byte-identical to v0.24 shape).
+
 ## [0.24.0] - 2026-06-02
 
 ### Added

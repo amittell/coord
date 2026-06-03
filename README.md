@@ -227,6 +227,25 @@ still wake instantly via the in-memory event registry; cross-process
 grants wake within the poll interval (0.5s). Coord can now be
 deployed multi-replica without losing queued-waiter notifications.
 
+### Permanent shared-file pin (v0.25)
+
+Operators can pin a shared_files entry against auto-demote by
+appending ``# coord-managed=permanent`` to its YAML line.
+package-lock.json and the app shell are typical candidates. The
+v0.23 sweep skips any entry carrying this marker even when the
+rolling hotspot count drops to zero. An entry can carry both the
+auto-promoted=DATE and coord-managed=permanent markers (operator
+intent wins).
+
+### Queue priority hints (v0.25)
+
+CreateClaimsRequest gains an ``urgency`` field accepting
+low|normal|high|blocking (same vocabulary as v0.9 release-request
+urgency). When combined with wait_seconds, the FIFO queue orders
+by priority DESC then position ASC so blocking work jumps ahead of
+normal traffic. Default normal preserves strict FIFO for legacy
+callers. coord-mcp claim_files accepts urgency as an optional kwarg.
+
 ## Local Assets
 
 - `.env.example`: environment variable template

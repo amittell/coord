@@ -2005,3 +2005,69 @@ async def test_claim_files_zero_wait_seconds_omits_key(
 
     body = _json.loads(captured[0].content.decode("utf-8"))
     assert "wait_seconds" not in body
+
+
+# ---------------------------------------------------------------------------
+# v0.25: claim_files urgency passthrough
+#
+# urgency forwards a v0.9-style priority hint (low|normal|high|blocking)
+# into the POST body so the v0.25 service can land the queue row at the
+# requested priority. None omits the key so pre-v0.25 servers see a
+# byte-identical request shape.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_claim_files_with_urgency_forwards_to_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit ``urgency`` must land on the POST body verbatim so the
+    v0.25 service can pipe it through to claim_queue.priority."""
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    captured = _install_mock_transport(
+        monkeypatch,
+        _json_handler(
+            200,
+            {"claim_ids": ["c1"], "conflicts": [], "warnings": [], "options": []},
+        ),
+    )
+
+    await mcp_server.claim_files(
+        engineer="alice",
+        patterns=["src/auth/login.ts"],
+        wait_seconds=30,
+        urgency="high",
+    )
+
+    import json as _json
+
+    body = _json.loads(captured[0].content.decode("utf-8"))
+    assert body["urgency"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_claim_files_without_urgency_omits_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Backward-compat guarantee: when the caller omits ``urgency`` the
+    POST body must NOT carry the key at all. Byte-identical to v0.24."""
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    captured = _install_mock_transport(
+        monkeypatch,
+        _json_handler(
+            200,
+            {"claim_ids": ["c1"], "conflicts": [], "warnings": [], "options": []},
+        ),
+    )
+
+    await mcp_server.claim_files(
+        engineer="alice",
+        patterns=["src/auth/login.ts"],
+    )
+
+    import json as _json
+
+    body = _json.loads(captured[0].content.decode("utf-8"))
+    assert "urgency" not in body
