@@ -376,6 +376,67 @@ The full lifecycle is recorded in an append-only `request_events` audit log quer
 
 The MCP wrappers (`request_release`, `respond_to_request`, `wait_for_request`, `my_requests`) are usually what an agent uses; the curl recipes above are useful when debugging.
 
+## Receiving webhooks (v0.27+)
+
+v0.27 turns the previously-pull-only event stream (dashboard, `/metrics/*`, `GET /requests/{id}/events`) into a pushable feed. Set `COORD_WEBHOOK_URL` on the service and every emitted event is enqueued in the `webhook_outbox` table and POSTed to that URL by a background delivery loop. Operators stand up a small HTTPS receiver (a Cloudflare Worker, a tiny FastAPI app behind a reverse proxy, a Slack incoming-webhook bridge) that verifies the signature and reacts -- post to a channel, page an oncall, comment on a PR.
+
+### Payload shape
+
+Every delivery is a `POST` with `Content-Type: application/json` and the following body:
+
+```json
+{
+  "event_type": "auto-promote",
+  "timestamp": "2026-06-03T14:22:00Z",
+  "detail": {
+    "pattern": "src/auth/login.ts",
+    "threshold": 5,
+    "window_days": 7
+  }
+}
+```
+
+`event_type` is one of `claim_granted`, `auto-coexist`, `auto-narrow`, `auto-promote`, `auto-promote-subtree`, `auto-demote`, `queue_grant`, `queue_cancel`. `detail` is the same JSON blob recorded in the `request_events` audit row for that event, so a receiver that already understands the audit log shape can reuse the same parsing.
+
+### Verifying `X-Coord-Signature`
+
+Two headers travel with every POST:
+
+- `X-Coord-Event-Type` -- the event type (also present in the body; the header lets a receiver filter without parsing JSON).
+- `X-Coord-Signature` -- the hex-encoded HMAC-SHA256 of the raw request body, computed using `COORD_WEBHOOK_SECRET`. Verify before trusting any field.
+
+Python verification:
+
+```python
+import hmac, hashlib
+
+def verify(raw_body: bytes, signature_header: str, secret: str) -> bool:
+    expected = hmac.new(
+        secret.encode("utf-8"), raw_body, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature_header)
+```
+
+Always use `hmac.compare_digest` (or the equivalent constant-time comparator in your language) so a timing-attack-aware attacker can't probe the signature byte by byte. When `COORD_WEBHOOK_SECRET` is unset, the delivery loop omits the header entirely; a receiver that requires a signature should fail-closed on the missing header rather than trust the payload.
+
+### Retry and exhaustion
+
+The delivery loop runs every `COORD_WEBHOOK_DELIVERY_INTERVAL_SEC` (default 5s) and POSTs each due `webhook_outbox` row. On HTTP `2xx`, the row is marked `delivered` and the loop moves on. On any other response (4xx, 5xx, transport error), the row's `retry_count` is incremented and the next attempt is scheduled at `now + COORD_WEBHOOK_RETRY_BACKOFF_SEC * 2 ** retry_count`. After `COORD_WEBHOOK_MAX_RETRIES` (default 5), the row is marked `exhausted` and skipped from then on. The dashboard's "webhook delivery (24h)" panel surfaces the per-event-type tally (delivered / failed / pending / exhausted) so an operator can spot a misconfigured or flapping receiver quickly.
+
+A 4xx from the receiver is treated the same as a 5xx for retry purposes -- the loop doesn't know whether the 4xx is "your payload is wrong forever" or "I just deployed and bounced the auth layer". If you intend a permanent rejection, return 2xx and drop the event server-side; the outbox is fire-and-forget once the receiver acks.
+
+### Filtering the event stream
+
+The default subscription is "every event". Set `COORD_WEBHOOK_EVENTS` to a comma-separated allowlist to dial down noise:
+
+```bash
+export COORD_WEBHOOK_EVENTS=auto-promote,auto-demote,queue_grant
+```
+
+Filtering happens at enqueue time inside `fire_webhook`, so excluded events never hit the outbox at all -- there's no retry pressure from a receiver that doesn't care about, say, `claim_granted`. Empty or unset means "all events"; this is the recommended starting point when you're still figuring out which events your receiver actually needs.
+
+Slack and GitHub PR adapters that turn these payloads into channel messages and PR comments are queued as v0.27.x follow-ups; until then, every receiver is a small custom integration.
+
 ## Suggested team norms
 
 - Claim before editing, not after.

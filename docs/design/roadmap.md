@@ -1,23 +1,26 @@
 # Coord roadmap
 
 Status: living document
-Last updated: 2026-06-03 (after v0.26.0)
+Last updated: 2026-06-03 (after v0.27.0)
 
-This is the post-v0.26 forward look. Items here are candidates, not commitments -- order and scope move as production telemetry and operator feedback arrive. Entries already shipped live in [CHANGELOG.md](../../CHANGELOG.md); see also [docs/design/sub-file-claims.md](./sub-file-claims.md) for the v0.14-v0.26 arc design.
+This is the post-v0.27 forward look. Items here are candidates, not commitments -- order and scope move as production telemetry and operator feedback arrive. Entries already shipped live in [CHANGELOG.md](../../CHANGELOG.md); see also [docs/design/sub-file-claims.md](./sub-file-claims.md) for the v0.14-v0.26 arc design.
 
 ## v0.27 -- Notifications and integrations
 
-The hotspot lifecycle is operationally complete (detect -> promote -> demote -> queue -> cancel) but consumers of those events are all *pulling* via dashboard polling or `/metrics/*` queries. v0.27 turns those into *pushable* events so external systems (Slack, PagerDuty, GitHub PR bots) can react in real time.
+The hotspot lifecycle is operationally complete (detect -> promote -> demote -> queue -> cancel) but consumers of those events were all *pulling* via dashboard polling or `/metrics/*` queries. v0.27 turns those into *pushable* events so external systems (Slack, PagerDuty, GitHub PR bots) can react in real time.
 
-Candidate items:
+Shipped in v0.27.0:
 
-- Webhook delivery for `auto-promote`, `auto-demote`, `auto-coexist`, `auto-narrow`, `claim_granted`, `queue_grant`, and `request_release` events. Configurable via `COORD_WEBHOOK_URL` + an HMAC-signed payload so the receiver can verify provenance.
-- Per-event-type subscription filter (default subscribes to all; operators dial down noise via `COORD_WEBHOOK_EVENTS=auto-promote,queue_grant`).
+- Webhook delivery for `auto-promote`, `auto-promote-subtree`, `auto-demote`, `auto-coexist`, `auto-narrow`, `claim_granted`, `queue_grant`, and `queue_cancel` events. Configured via `COORD_WEBHOOK_URL` + an HMAC-SHA256-signed payload (`X-Coord-Signature` header) so the receiver can verify provenance against `COORD_WEBHOOK_SECRET`.
+- Per-event-type subscription filter via `COORD_WEBHOOK_EVENTS` (comma-separated allowlist; empty or unset means "all").
+- Outbox table for retry-on-failure (`webhook_outbox`, schema v13) with exponential backoff capped at `COORD_WEBHOOK_MAX_RETRIES` (default 5), so a transient receiver outage does not lose events; rows that exhaust their retry budget land in the `exhausted` state and are visible in the dashboard's "webhook delivery (24h)" panel.
+- Five new db helpers (`enqueue_webhook`, `list_pending_webhooks`, `mark_webhook_delivered`, `mark_webhook_failed`, `webhook_delivery_stats`) and a background delivery loop wired into `main.py`'s lifespan, gated on `COORD_WEBHOOK_URL`.
+
+Follow-ups deferred to v0.27.x (or rolled into v0.28's external-integrations theme):
+
 - A first-party Slack adapter that turns the webhook payloads into a single channel message stream. Optional bot mode that responds to `/coord pending` and `/coord queue` slash commands.
 - GitHub PR comment integration: when a pre-push hook 409s, the next push that does succeed includes a comment on the PR description listing the files that bounced and which engineer held them. Closes the "why did my PR sit unmerged" feedback gap.
-- Outbox table for webhook delivery retry: failed webhook POSTs land in a `webhook_outbox` row with exponential-backoff retry so a transient Slack outage does not lose events.
-
-Risk: webhook delivery is async and external, which complicates the test surface. Will need a fake HTTP receiver fixture in `tests/`.
+- Outbox retry CLI: `coord outbox retry --exhausted` and `coord outbox stats` so an operator can drive the retry rotation by hand after fixing a receiver, without poking at SQLite directly.
 
 ## v0.28 -- Multi-namespace coordination
 
@@ -72,7 +75,7 @@ Items worth tracking but not yet sized:
 - **Auto-cleanup of dead engineer IDs**: when an engineer has had no `claim_files` or `list_claims` call for N days, surface a "stale engineer" warning in the dashboard and offer a one-click cleanup that releases their lingering claims. Catches abandoned worktrees.
 - **Postgres-only optimisations** (post-Postgres-backend): NOTIFY-driven queue grant (zero poll latency), partitioned conflict_log for repos with >1M attempts per month, read-replica routing for the dashboard.
 
-## Done in the v0.13 -> v0.26 arc (for context)
+## Done in the v0.13 -> v0.27 arc (for context)
 
 This roadmap supersedes the older "candidate" markers in the v0.14 sub-file claims design doc. Everything below is shipped and lives in [CHANGELOG.md](../../CHANGELOG.md) for the full detail:
 
@@ -91,3 +94,4 @@ This roadmap supersedes the older "candidate" markers in the v0.14 sub-file clai
 | v0.24.0 | cross-process FIFO queue backend |
 | v0.25.0 | permanent shared-file pin + queue priority hints |
 | v0.26.0 | subtree auto-promote + priority age boost + queue cancellation |
+| v0.27.0 | webhook outbox + HMAC delivery + dashboard panel |

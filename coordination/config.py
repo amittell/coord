@@ -65,6 +65,22 @@ class Settings(BaseSettings):
     # entries. Set to 0 to disable the boost (strict declared
     # priority ordering, the v0.25 behaviour).
     queue_age_boost_seconds: int = 60
+    # v0.27 webhook delivery. When ``webhook_url`` is set, the
+    # conflict pipeline writes every emitted event (auto-coexist,
+    # auto-narrow, auto-promote, auto-demote, claim_granted,
+    # queue_grant, request_release, queue_cancel) to the
+    # webhook_outbox table; a background delivery loop POSTs each
+    # row with an ``X-Coord-Signature`` HMAC header. Empty URL
+    # disables the feature. ``webhook_events`` is a comma-separated
+    # filter (empty = all event types). ``webhook_secret`` is the
+    # HMAC key. ``webhook_max_retries`` caps the exponential-backoff
+    # retry chain before a row is marked exhausted.
+    webhook_url: str = ""
+    webhook_secret: str = ""
+    webhook_events: str = ""
+    webhook_max_retries: int = 5
+    webhook_retry_backoff_sec: int = 60
+    webhook_delivery_interval_sec: int = 5
 
     @property
     def auth_mode(self) -> str:

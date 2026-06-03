@@ -269,6 +269,21 @@ and wakes its in-process long-poll. coord-mcp gets a
 cancel_queue_request(queue_id, engineer=) tool. Useful when an
 agent decides to abandon a wait early.
 
+### Webhook notifications (v0.27)
+
+Set COORD_WEBHOOK_URL to the target receiver and the conflict
+pipeline starts POSTing every emitted event (auto-coexist,
+auto-narrow, auto-promote, auto-demote, queue_grant, queue_cancel,
+claim_granted) with an HMAC-SHA256 signature header
+(X-Coord-Signature) verifiable against COORD_WEBHOOK_SECRET. A
+background delivery loop retries on failure with exponential
+backoff capped at COORD_WEBHOOK_MAX_RETRIES (default 5). The
+dashboard's "webhook delivery (24h)" panel surfaces per-event-type
+delivery counts so the operator can see whether the receiver is
+healthy. Filter the event stream with COORD_WEBHOOK_EVENTS
+(comma-separated allowlist; empty = all). Slack and GitHub PR
+adapters are queued for v0.27.x follow-ups.
+
 ## Local Assets
 
 - `.env.example`: environment variable template
@@ -316,6 +331,12 @@ Start with `docs/integrations/claude-code.md` if your team is primarily on Claud
 | `COORD_AUTO_DEMOTE_INTERVAL_SEC` | Auto-demote sweep cadence (v0.23) for coord-managed `shared_files` entries. Set to `0` to disable the sweep. Default: `3600` |
 | `COORD_AUTO_DEMOTE_WINDOW_DAYS` | Auto-demote window (v0.23): coord-managed `shared_files` entries whose rolling hotspot count stays below `COORD_AUTO_PROMOTE_THRESHOLD` for this many days are removed. Default: `14` |
 | `COORD_QUEUE_AGE_BOOST_SECONDS` | Queue age boost (v0.26): a waiting FIFO queue entry whose age exceeds this is treated as one priority level higher for pop ordering. Set to `0` to disable (strict declared-priority order, the v0.25 behaviour). Default: `60` |
+| `COORD_WEBHOOK_URL` | Webhook receiver (v0.27): when set, every emitted event (auto-coexist, auto-narrow, auto-promote, auto-demote, claim_granted, queue_grant, queue_cancel) is enqueued in `webhook_outbox` and POSTed to this URL with an HMAC signature header. Default: unset (webhook delivery disabled). |
+| `COORD_WEBHOOK_SECRET` | Webhook signing secret (v0.27): HMAC-SHA256 key used to sign the JSON payload. The `X-Coord-Signature` header on every delivery is verifiable against this value. Default: unset (no signature header). |
+| `COORD_WEBHOOK_EVENTS` | Webhook event allowlist (v0.27): comma-separated list of event types to deliver (e.g. `auto-promote,queue_grant`). Empty or unset means "all events". Default: unset |
+| `COORD_WEBHOOK_MAX_RETRIES` | Webhook retry cap (v0.27): the delivery loop retries failed POSTs with exponential backoff and marks the outbox row exhausted after this many attempts. Default: `5` |
+| `COORD_WEBHOOK_RETRY_BACKOFF_SEC` | Webhook retry base delay (v0.27): exponential backoff base in seconds; next retry runs at `backoff * 2**retry_count`. Default: `60` |
+| `COORD_WEBHOOK_DELIVERY_INTERVAL_SEC` | Webhook delivery loop interval (v0.27): how often the background loop scans `webhook_outbox` for due rows. Default: `5` |
 | `COORD_DISABLE_BACKGROUND_CLEANUP` | Set truthy to skip the in-process claim expiration sweep (useful for tests or external schedulers). Default: unset |
 | `COORD_DISABLE_INSTANCE_LOCK` | Set truthy to bypass the advisory `<db>.lock` flock (useful on NFS-backed shared volumes where flock is unreliable). Default: unset |
 | `COORD_LS_FILES_CACHE_TTL_SEC` | TTL for the in-process `git ls-files` cache used during overlap checks. Default: `10` |

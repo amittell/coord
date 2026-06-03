@@ -141,7 +141,7 @@ CREATE INDEX IF NOT EXISTS idx_claims_engineer ON claims (engineer);
 """
 
 
-CURRENT_SCHEMA_VERSION = 12
+CURRENT_SCHEMA_VERSION = 13
 
 # Migration registry: list of (version, upgrade_sql) tuples applied in order.
 # Entry for version N is the SQL that upgrades a DB from version N-1 to N.
@@ -386,6 +386,40 @@ MIGRATIONS: list[tuple[int, str]] = [
         "DEFAULT 'normal';\n"
         "CREATE INDEX idx_claim_queue_blocking_priority "
         "ON claim_queue (blocking_claim_id, state, priority, position);",
+    ),
+    # v13: webhook delivery outbox. The conflict pipeline emits
+    # events (auto-coexist, auto-narrow, auto-promote, auto-demote,
+    # claim_granted, queue_grant, request_release, queue_cancel)
+    # into this table; a background delivery loop POSTs each row
+    # to ``COORD_WEBHOOK_URL`` with an ``X-Coord-Signature`` HMAC
+    # header and retries with exponential backoff until success or
+    # exhaustion. Persisting first means a transient receiver
+    # outage never loses events; the loop catches up on next run.
+    #
+    # ``status`` lifecycle: pending -> delivered | failed | exhausted.
+    # ``hmac_signature`` is computed at emit time so the receiver
+    # can verify provenance even after the row sits in the outbox
+    # through process restarts.
+    (
+        13,
+        "CREATE TABLE webhook_outbox (\n"
+        "    id TEXT PRIMARY KEY,\n"
+        "    url TEXT NOT NULL,\n"
+        "    event_type TEXT NOT NULL,\n"
+        "    payload_json TEXT NOT NULL,\n"
+        "    hmac_signature TEXT NOT NULL,\n"
+        "    status TEXT NOT NULL DEFAULT 'pending',\n"
+        "    retry_count INTEGER NOT NULL DEFAULT 0,\n"
+        "    last_attempt_at TEXT,\n"
+        "    last_error TEXT,\n"
+        "    next_attempt_at TEXT NOT NULL,\n"
+        "    created_at TEXT NOT NULL,\n"
+        "    delivered_at TEXT\n"
+        ");\n"
+        "CREATE INDEX idx_webhook_outbox_pending "
+        "ON webhook_outbox (status, next_attempt_at);\n"
+        "CREATE INDEX idx_webhook_outbox_event_type "
+        "ON webhook_outbox (event_type, created_at);",
     ),
 ]
 
@@ -1201,6 +1235,139 @@ class Database:
             )
             rows = await cur.fetchall()
             return [dict(r) for r in rows]
+
+    async def enqueue_webhook(
+        self,
+        *,
+        url: str,
+        event_type: str,
+        payload_json: str,
+        hmac_signature: str,
+        next_attempt_at: str | None = None,
+    ) -> str:
+        """v0.27: insert a row into ``webhook_outbox`` for the
+        background delivery loop to POST. Returns the new row id.
+
+        ``next_attempt_at`` defaults to now -- the loop picks it up
+        on its next tick. Callers don't need to know the retry
+        schedule; mark_webhook_failed advances it.
+        """
+        await self.init()
+        new_id = str(uuid4())
+        now_iso = _utcnow()
+        next_iso = next_attempt_at or now_iso
+        async with aiosqlite.connect(self.path) as conn:
+            await _configure_sqlite(conn)
+            await conn.execute(
+                "INSERT INTO webhook_outbox "
+                "(id, url, event_type, payload_json, hmac_signature, "
+                " status, retry_count, next_attempt_at, created_at) "
+                "VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?)",
+                (new_id, url, event_type, payload_json,
+                 hmac_signature, next_iso, now_iso),
+            )
+            await conn.commit()
+        return new_id
+
+    async def list_pending_webhooks(
+        self,
+        *,
+        now_iso: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """v0.27: return outbox rows whose ``status`` is pending or
+        failed AND whose ``next_attempt_at`` has elapsed. Ordered by
+        next_attempt_at ASC so the oldest-due rows are tried first.
+        """
+        await self.init()
+        ts = now_iso or _utcnow()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                "SELECT * FROM webhook_outbox "
+                "WHERE status IN ('pending', 'failed') "
+                "AND datetime(next_attempt_at) <= datetime(?) "
+                "ORDER BY datetime(next_attempt_at) ASC LIMIT ?",
+                (ts, limit),
+            )
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+    async def mark_webhook_delivered(self, outbox_id: str) -> None:
+        """v0.27: finalise an outbox row that the delivery loop
+        successfully POSTed. delivered_at is stamped; status flips."""
+        await self.init()
+        now_iso = _utcnow()
+        async with aiosqlite.connect(self.path) as conn:
+            await _configure_sqlite(conn)
+            await conn.execute(
+                "UPDATE webhook_outbox SET status = 'delivered', "
+                "delivered_at = ?, last_attempt_at = ? WHERE id = ?",
+                (now_iso, now_iso, outbox_id),
+            )
+            await conn.commit()
+
+    async def mark_webhook_failed(
+        self,
+        outbox_id: str,
+        *,
+        last_error: str,
+        next_attempt_at: str,
+        exhausted: bool = False,
+    ) -> None:
+        """v0.27: record a failed delivery attempt. Advances retry_count,
+        stamps last_error and last_attempt_at, sets next_attempt_at to
+        the backoff-computed timestamp. When ``exhausted`` is True the
+        status flips to 'exhausted' instead of 'failed' so the loop
+        stops considering it."""
+        await self.init()
+        now_iso = _utcnow()
+        new_status = "exhausted" if exhausted else "failed"
+        async with aiosqlite.connect(self.path) as conn:
+            await _configure_sqlite(conn)
+            await conn.execute(
+                "UPDATE webhook_outbox SET status = ?, "
+                "retry_count = retry_count + 1, last_error = ?, "
+                "last_attempt_at = ?, next_attempt_at = ? WHERE id = ?",
+                (new_status, last_error[:500], now_iso,
+                 next_attempt_at, outbox_id),
+            )
+            await conn.commit()
+
+    async def webhook_delivery_stats(
+        self,
+        *,
+        window_hours: int = 24,
+        now: datetime | None = None,
+    ) -> dict[str, dict[str, int]]:
+        """v0.27: per-event-type delivery counts for the dashboard.
+        Returns ``{event_type: {delivered: N, failed: M, pending: K,
+        exhausted: J}}``. Rolling window keyed off ``created_at``."""
+        await self.init()
+        now = now or datetime.now(UTC)
+        cutoff = (now - timedelta(hours=window_hours)).replace(microsecond=0)
+        cutoff_iso = cutoff.isoformat().replace("+00:00", "Z")
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                "SELECT event_type, status, COUNT(*) AS n "
+                "FROM webhook_outbox "
+                "WHERE datetime(created_at) >= datetime(?) "
+                "GROUP BY event_type, status",
+                (cutoff_iso,),
+            )
+            rows = await cur.fetchall()
+        out: dict[str, dict[str, int]] = {}
+        for r in rows:
+            et = str(r["event_type"])
+            st = str(r["status"])
+            out.setdefault(et, {
+                "delivered": 0, "failed": 0,
+                "pending": 0, "exhausted": 0,
+            })[st] = int(r["n"] or 0)
+        return out
 
     async def list_queued_with_holder(
         self,

@@ -81,10 +81,26 @@ async def lifespan(app: FastAPI):
                 logger.exception("Failed to run auto-demote sweep")
             await asyncio.sleep(settings.auto_demote_interval_sec)
 
+    async def webhook_delivery_loop() -> None:
+        """v0.27 background delivery: every
+        ``settings.webhook_delivery_interval_sec`` seconds, drain the
+        webhook outbox. Exceptions are logged and swallowed so a single
+        bad tick never tears the loop down. The loop is only started
+        when ``COORD_WEBHOOK_URL`` is configured so deployments that
+        don't use webhooks pay no scheduler overhead."""
+        while True:
+            try:
+                await get_service().deliver_pending_webhooks()
+            except Exception:  # pragma: no cover - background failures are logged
+                logger.exception("webhook_delivery_loop: tick failed")
+            await asyncio.sleep(settings.webhook_delivery_interval_sec)
+
     task = asyncio.create_task(cleanup_loop())
     tasks: list[asyncio.Task] = [task]
     if settings.auto_demote_interval_sec > 0:
         tasks.append(asyncio.create_task(auto_demote_loop()))
+    if settings.webhook_url:
+        tasks.append(asyncio.create_task(webhook_delivery_loop()))
     yield
     for t in tasks:
         t.cancel()

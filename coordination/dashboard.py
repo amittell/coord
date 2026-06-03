@@ -704,6 +704,34 @@ tbody tr td.empty {
   font-size: 10.5px;
   letter-spacing: 0.02em;
 }
+
+/* v0.27 webhook delivery panel */
+.webhooks .wbrow {
+  display: grid;
+  grid-template-columns: 24ch repeat(5, 1fr);
+  gap: calc(var(--grid) * 2);
+  align-items: baseline;
+  padding: calc(var(--grid)) 0;
+  border-bottom: 1px dashed var(--hairline);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.webhooks .wbrow.wbhead {
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: lowercase;
+}
+.webhooks .wbrow:last-child { border-bottom: none; }
+.webhooks .wbevent { color: var(--phosphor); }
+.webhooks .wbcell {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.webhooks .wbcell.muted { color: var(--muted-2); }
+.webhooks .wbcell.wbfailed { color: var(--red); }
+.webhooks .wbcell.wbpending { color: var(--amber); }
+.webhooks .wbcell.wbexhausted { color: var(--red); }
 """
 
 
@@ -734,6 +762,7 @@ async def render_dashboard() -> str:
     auto_resolution_series = await svc.db.daily_auto_resolutions(days=30)
     hotspot_rows = await svc.db.hotspot_files(days=30, min_attempts=5, limit=10)
     queued_rows = await svc.db.list_queued_with_holder(state="waiting", limit=100)
+    webhook_stats = await svc.db.webhook_delivery_stats(window_hours=24)
 
     claims_by_id: dict[str, dict[str, Any]] = {
         str(c["id"]): c for c in recent if c.get("id")
@@ -1221,6 +1250,48 @@ async def render_dashboard() -> str:
         '</section>'
     )
 
+    # v0.27: webhook delivery panel. Surface per-event-type delivery
+    # health for the last 24h so an operator can spot a stuck endpoint
+    # at a glance. Zero counts render muted so non-zero ones (especially
+    # failed / exhausted) catch the eye. Data: webhook_delivery_stats.
+    def _wbcell(value: int, extra: str = "") -> str:
+        cls = "wbcell" + (f" {extra}" if extra else "") + (" muted" if value == 0 else "")
+        return f'<div class="{cls}">{value}</div>'
+
+    if webhook_stats:
+        wb_lines: list[str] = [
+            '<div class="wbrow wbhead"><div>event_type</div>'
+            '<div class="wbcell">delivered</div><div class="wbcell">failed</div>'
+            '<div class="wbcell">pending</div><div class="wbcell">exhausted</div>'
+            '<div class="wbcell">total</div></div>'
+        ]
+        for event_type in sorted(webhook_stats):
+            wc = webhook_stats[event_type]
+            wb_d, wb_f, wb_p, wb_x = (
+                int(wc.get(k, 0) or 0)
+                for k in ("delivered", "failed", "pending", "exhausted")
+            )
+            wb_lines.append(
+                '<div class="wbrow">'
+                f'<div class="wbevent">{_esc(event_type)}</div>'
+                f'{_wbcell(wb_d)}{_wbcell(wb_f, "wbfailed")}'
+                f'{_wbcell(wb_p, "wbpending")}{_wbcell(wb_x, "wbexhausted")}'
+                f'{_wbcell(wb_d + wb_f + wb_p + wb_x)}'
+                '</div>'
+            )
+        webhook_body = "".join(wb_lines)
+    else:
+        webhook_body = (
+            '<div class="empty" style="padding:calc(var(--grid) * 2)">'
+            'no webhook events in the last 24h</div>'
+        )
+    webhooks_html = (
+        '<section class="panel"><header><h2>webhook delivery (24h)</h2>'
+        f'<span class="meta">{len(webhook_stats)} event types</span></header>'
+        '<div class="webhooks" style="padding:calc(var(--grid) * 2)">'
+        + webhook_body + '</div></section>'
+    )
+
     auto_resolutions_html = (
         '<section class="panel">'
         '<header><h2>auto-resolutions (24h)</h2>'
@@ -1288,6 +1359,8 @@ async def render_dashboard() -> str:
     {hotspots_html}
 
     {queue_html}
+
+    {webhooks_html}
 
     <div class="row split-7-5">
       <section class="panel">

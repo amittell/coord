@@ -1170,3 +1170,82 @@ async def test_dashboard_pending_queue_empty_state(
     'no queued claims (good!)' placeholder."""
     html_out = await render_dashboard()
     assert "no queued claims" in html_out.lower()
+
+
+# ---------------------------------------------------------------------------
+# v0.27: webhook delivery panel
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dashboard_renders_webhook_delivery_panel(
+    svc: CoordinationService,
+) -> None:
+    """v0.27: a "webhook delivery (24h)" panel surfaces per-event-type
+    delivery counts (delivered / failed / pending / exhausted). Each
+    event_type renders as a row; non-zero counts pop against muted
+    zeros so an operator spots stuck endpoints at a glance."""
+    oid_promote = await svc.db.enqueue_webhook(
+        url="https://example.test/wh",
+        event_type="auto-promote",
+        payload_json="{}",
+        hmac_signature="sig1",
+    )
+    oid_grant = await svc.db.enqueue_webhook(
+        url="https://example.test/wh",
+        event_type="queue_grant",
+        payload_json="{}",
+        hmac_signature="sig2",
+    )
+    await svc.db.enqueue_webhook(
+        url="https://example.test/wh",
+        event_type="auto-demote",
+        payload_json="{}",
+        hmac_signature="sig3",
+    )
+
+    # Flip the first to delivered, the second to failed; third remains
+    # pending. Gives us one of each status (plus zero-exhausted) for
+    # the panel to render.
+    await svc.db.mark_webhook_delivered(oid_promote)
+    await svc.db.mark_webhook_failed(
+        oid_grant,
+        last_error="boom",
+        next_attempt_at="2099-01-01T00:00:00Z",
+    )
+
+    html_out = await render_dashboard()
+
+    # Panel header is present.
+    assert "webhook delivery (24h)" in html_out.lower()
+
+    # Slice the panel: anchor on the <h2> so the CSS comment cannot
+    # match. The next panel after webhooks is "repositories".
+    start = html_out.lower().index("<h2>webhook delivery (24h)</h2>")
+    end = html_out.lower().index("repositories", start)
+    panel = html_out[start:end]
+
+    # All three event types appear as rows.
+    assert "auto-promote" in panel
+    assert "queue_grant" in panel
+    assert "auto-demote" in panel
+
+    # delivered=1 row (auto-promote): the row contains the event name
+    # and a >1< delivered cell. Easiest check: locate the row and
+    # confirm the per-status counts are present in the panel.
+    assert ">1</div>" in panel  # at least one non-zero status cell
+
+    # The header label tokens are visible.
+    for label in ("delivered", "failed", "pending", "exhausted"):
+        assert label in panel.lower()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_webhook_panel_empty_state(
+    svc: CoordinationService,
+) -> None:
+    """With no outbox rows, the panel still renders with a placeholder
+    rather than disappearing."""
+    html_out = await render_dashboard()
+    assert "webhook delivery (24h)" in html_out.lower()
+    assert "no webhook events" in html_out.lower()

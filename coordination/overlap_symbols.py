@@ -378,6 +378,7 @@ async def record_auto_resolution(
     requester_claim_id: str,
     overlapping_paths: tuple[str, ...],
     overlapping_symbols: tuple[tuple[str, tuple[str, ...]], ...],
+    service: Any = None,
 ) -> None:
     """Persist a server-side auto-resolution: wire coexist partners and
     append a single audit row to ``request_events``.
@@ -396,6 +397,13 @@ async def record_auto_resolution(
       exists. The check uses ``actor_session_id`` only to short-circuit;
       ``actor_engineer`` and ``actor_session_id`` remain NULL because
       this is a server action with no human actor.
+
+    v0.27: when ``service`` is non-None (a CoordinationService), also
+    emits an ``auto-coexist`` or ``auto-narrow`` webhook with the same
+    detail dict that landed in the audit row. The parameter is typed
+    ``Any`` to avoid a circular import between this module and
+    :mod:`coordination.service`; callers that don't want webhook
+    emission simply omit it.
     """
     if kind not in (OverlapKind.AUTO_COEXIST, OverlapKind.AUTO_NARROW):
         raise ValueError(
@@ -436,6 +444,8 @@ async def record_auto_resolution(
         actor_session_id=None,
         detail=detail,
     )
+    if service is not None:
+        await service.fire_webhook(event_type, detail)
 
 
 async def _auto_resolution_event_exists(

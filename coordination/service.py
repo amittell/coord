@@ -658,6 +658,7 @@ class CoordinationService:
                     requester_claim_id=requester_cid,
                     overlapping_paths=result.overlapping_paths,
                     overlapping_symbols=result.overlapping_symbols,
+                    service=self,
                 )
 
         # Count one tick per successfully inserted claim. We look back at
@@ -666,6 +667,22 @@ class CoordinationService:
         for _cid, _ctype, _pattern, sev, _exp in ids:
             if _cid in created:
                 metrics.claims_created_total.inc(severity=sev)
+        # v0.27: emit a single ``claim_granted`` webhook for the whole
+        # batch so external receivers see one event per
+        # ``POST /claims`` call instead of one per claim row. The detail
+        # carries the full list of created ids plus the caller identity
+        # so downstream subscribers can correlate against their own
+        # state without re-querying the API.
+        if created:
+            await self.fire_webhook(
+                "claim_granted",
+                {
+                    "claim_ids": list(created),
+                    "engineer": body.engineer,
+                    "repo": body.repo,
+                    "session_id": body.session_id,
+                },
+            )
         return CreateClaimsResponse(
             claim_ids=created,
             conflicts=[],
@@ -800,20 +817,22 @@ class CoordinationService:
             if after == before:
                 # Already present; idempotent no-op, no audit.
                 continue
+            subtree_detail = {
+                "pattern": subtree_glob,
+                "source_count": len(source_leaves),
+                "source_patterns": source_leaves,
+                "threshold": threshold,
+                "window_days": window,
+                "subtree": True,
+            }
             await self.db.record_request_event(
                 event_type="auto-promote",
                 request_id=None,
                 actor_engineer=None,
                 actor_session_id=None,
-                detail={
-                    "pattern": subtree_glob,
-                    "source_count": len(source_leaves),
-                    "source_patterns": source_leaves,
-                    "threshold": threshold,
-                    "window_days": window,
-                    "subtree": True,
-                },
+                detail=subtree_detail,
             )
+            await self.fire_webhook("auto-promote", subtree_detail)
 
         for pattern in leaf_promotions:
             before = await self.db.get_ownership_yaml() or ""
@@ -836,18 +855,20 @@ class CoordinationService:
             if after == before:
                 # Already in the rule set; idempotent no-op, no audit.
                 continue
+            leaf_detail = {
+                "pattern": pattern,
+                "threshold": threshold,
+                "window_days": window,
+                "subtree": False,
+            }
             await self.db.record_request_event(
                 event_type="auto-promote",
                 request_id=None,
                 actor_engineer=None,
                 actor_session_id=None,
-                detail={
-                    "pattern": pattern,
-                    "threshold": threshold,
-                    "window_days": window,
-                    "subtree": False,
-                },
+                detail=leaf_detail,
             )
+            await self.fire_webhook("auto-promote", leaf_detail)
 
     async def _finalise_v14_scope(
         self,
@@ -1215,6 +1236,11 @@ class CoordinationService:
         None so the caller surfaces the legacy 409 + the cancelled
         marker.
         """
+        # Snapshot the row before cancellation so the v0.27 webhook
+        # detail can carry the requester and pattern even after the
+        # state flip. ``get_queue_entry`` returns None for a missing
+        # row, which lines up with the False return below.
+        pre_row = await self.db.get_queue_entry(queue_id)
         cancelled = await self.db.cancel_queue_entry(
             queue_id, requester_engineer=engineer
         )
@@ -1222,6 +1248,22 @@ class CoordinationService:
             _notify_waiter(
                 queue_id,
                 {"granted_claim_id": None, "cancelled": True},
+            )
+            await self.fire_webhook(
+                "queue_cancel",
+                {
+                    "queue_id": str(queue_id),
+                    "requester_engineer": (
+                        pre_row.get("requester_engineer")
+                        if pre_row is not None
+                        else None
+                    ),
+                    "pattern": (
+                        pre_row.get("pattern")
+                        if pre_row is not None
+                        else None
+                    ),
+                },
             )
         return cancelled
 
@@ -1389,6 +1431,21 @@ class CoordinationService:
                 _notify_waiter(
                     entry["id"], {"granted_claim_id": granted_cid}
                 )
+                # v0.27: emit a ``queue_grant`` webhook so subscribers
+                # know a queued requester was auto-promoted into a real
+                # claim. Detail mirrors the queue-row fields the
+                # dashboard already surfaces.
+                await self.fire_webhook(
+                    "queue_grant",
+                    {
+                        "queue_id": str(entry["id"]),
+                        "granted_claim_id": granted_cid,
+                        "requester_engineer": entry.get(
+                            "requester_engineer"
+                        ),
+                        "pattern": entry.get("pattern"),
+                    },
+                )
             else:
                 await self.db.mark_queue_expired(entry["id"])
                 _notify_waiter(entry["id"], {"granted_claim_id": None})
@@ -1441,6 +1498,203 @@ class CoordinationService:
     async def extend_claim(self, claim_id: str, body_engineer: str, ttl_hours: int) -> bool:
         new_exp = _expires_at(ttl_hours)
         return await self.db.extend_claim(claim_id, body_engineer, new_exp)
+
+    async def fire_webhook(
+        self,
+        event_type: str,
+        detail: dict[str, Any],
+    ) -> str | None:
+        """v0.27: emit an event into the webhook delivery outbox.
+
+        No-op when COORD_WEBHOOK_URL is unset. Filters against
+        COORD_WEBHOOK_EVENTS when that is non-empty (comma-separated
+        event-type allowlist). Computes HMAC-SHA256 over the JSON
+        payload at emit time using COORD_WEBHOOK_SECRET so the
+        receiver can verify provenance even after the row sits in
+        the outbox through a process restart. Returns the new
+        outbox row id, or None when skipped.
+
+        The actual HTTP POST happens in the background delivery
+        loop (v0.27 agent A); this method is fire-and-forget from
+        the caller's perspective.
+        """
+        url = (self.settings.webhook_url or "").strip()
+        if not url:
+            return None
+        events_filter = (self.settings.webhook_events or "").strip()
+        if events_filter:
+            allowed = {
+                tok.strip()
+                for tok in events_filter.split(",")
+                if tok.strip()
+            }
+            if event_type not in allowed:
+                return None
+        import hashlib
+        import hmac
+        import json as _json
+
+        payload = {
+            "event_type": event_type,
+            "timestamp": datetime.now(UTC)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "detail": detail,
+        }
+        payload_json = _json.dumps(payload, sort_keys=True)
+        secret = (self.settings.webhook_secret or "").encode("utf-8")
+        signature = (
+            hmac.new(secret, payload_json.encode("utf-8"), hashlib.sha256)
+            .hexdigest()
+            if secret
+            else ""
+        )
+        try:
+            return await self.db.enqueue_webhook(
+                url=url,
+                event_type=event_type,
+                payload_json=payload_json,
+                hmac_signature=signature,
+            )
+        except Exception:  # noqa: BLE001 - best-effort emit
+            logger.exception(
+                "fire_webhook: failed to enqueue %s outbox row",
+                event_type,
+            )
+            return None
+
+    async def deliver_pending_webhooks(self) -> dict[str, int]:
+        """v0.27: process the webhook outbox.
+
+        POSTs every due row to its target URL with the
+        ``X-Coord-Signature`` HMAC header carried in the row. On a 2xx
+        response the row is marked delivered; on any non-2xx response
+        or transport-level exception the row is marked failed and the
+        next attempt scheduled at ``now + backoff * 2**retry_count``
+        seconds (the exponent is capped at ``webhook_max_retries`` to
+        prevent overflow). Once ``retry_count + 1`` reaches
+        ``settings.webhook_max_retries`` the row is marked exhausted
+        instead of failed so the loop stops considering it.
+
+        Per-row exception handling means one bad receiver does not
+        break the batch -- each row is committed (delivered, failed,
+        or exhausted) independently. Returns the
+        ``{delivered, failed, exhausted}`` counters for the loop's
+        log line.
+        """
+        import httpx
+
+        counts = {"delivered": 0, "failed": 0, "exhausted": 0}
+        try:
+            rows = await self.db.list_pending_webhooks()
+        except Exception:  # noqa: BLE001 - best-effort background sweep
+            logger.exception("deliver_pending_webhooks: list query failed")
+            return counts
+        if not rows:
+            return counts
+
+        max_retries = max(int(self.settings.webhook_max_retries), 1)
+        backoff = max(int(self.settings.webhook_retry_backoff_sec), 1)
+        # Cap the exponent at max_retries so backoff * 2**retry_count
+        # cannot overflow even if a row's retry_count drifted past the
+        # max (e.g. a config change shrank the cap).
+        exponent_cap = max_retries
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            for row in rows:
+                outbox_id = str(row["id"])
+                try:
+                    response = await client.post(
+                        row["url"],
+                        content=row["payload_json"],
+                        headers={
+                            "Content-Type": "application/json",
+                            "X-Coord-Signature": row["hmac_signature"],
+                            "X-Coord-Event-Type": row["event_type"],
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001 - per-row isolation
+                    error = f"{type(exc).__name__}: {exc}"
+                    await self._record_webhook_failure(
+                        row=row,
+                        error=error,
+                        backoff=backoff,
+                        max_retries=max_retries,
+                        exponent_cap=exponent_cap,
+                        counts=counts,
+                    )
+                    continue
+
+                if 200 <= response.status_code < 300:
+                    try:
+                        await self.db.mark_webhook_delivered(outbox_id)
+                        counts["delivered"] += 1
+                    except Exception:  # noqa: BLE001 - audit best-effort
+                        logger.exception(
+                            "deliver_pending_webhooks: mark_delivered "
+                            "failed for %s",
+                            outbox_id,
+                        )
+                    continue
+
+                error = f"HTTP {response.status_code}"
+                await self._record_webhook_failure(
+                    row=row,
+                    error=error,
+                    backoff=backoff,
+                    max_retries=max_retries,
+                    exponent_cap=exponent_cap,
+                    counts=counts,
+                )
+
+        return counts
+
+    async def _record_webhook_failure(
+        self,
+        *,
+        row: dict[str, Any],
+        error: str,
+        backoff: int,
+        max_retries: int,
+        exponent_cap: int,
+        counts: dict[str, int],
+    ) -> None:
+        """Helper for deliver_pending_webhooks: compute the next-attempt
+        timestamp, decide exhausted vs failed, and mark the row. Counter
+        bookkeeping happens here too so the call site stays compact.
+        Per-row exception handling: a failure to write the failure row
+        is logged but never propagates, otherwise one bad row would
+        stall the rest of the batch."""
+
+        outbox_id = str(row["id"])
+        current_retries = int(row.get("retry_count") or 0)
+        # exponent_cap keeps backoff * 2**n bounded; current_retries can
+        # legitimately equal max_retries - 1 going into the final attempt.
+        exponent = min(current_retries, exponent_cap)
+        delay_sec = backoff * (2 ** exponent)
+        next_dt = datetime.now(UTC) + timedelta(seconds=delay_sec)
+        next_attempt_at = (
+            next_dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        )
+        exhausted = current_retries + 1 >= max_retries
+        try:
+            await self.db.mark_webhook_failed(
+                outbox_id,
+                last_error=error,
+                next_attempt_at=next_attempt_at,
+                exhausted=exhausted,
+            )
+        except Exception:  # noqa: BLE001 - audit best-effort
+            logger.exception(
+                "deliver_pending_webhooks: mark_failed failed for %s",
+                outbox_id,
+            )
+            return
+        if exhausted:
+            counts["exhausted"] += 1
+        else:
+            counts["failed"] += 1
 
     async def set_ownership_yaml(self, yaml_text: str) -> None:
         await self.db.set_ownership_yaml(yaml_text)
@@ -1593,18 +1847,20 @@ class CoordinationService:
                 # so we don't spam events on every sweep.
                 continue
             patched = next_patched
+            demote_detail = {
+                "pattern": pattern,
+                "count_in_window": count_in_window,
+                "threshold": threshold,
+                "window_days": window_days,
+            }
             await self.db.record_request_event(
                 event_type="auto-demote",
                 request_id=None,
                 actor_engineer=None,
                 actor_session_id=None,
-                detail={
-                    "pattern": pattern,
-                    "count_in_window": count_in_window,
-                    "threshold": threshold,
-                    "window_days": window_days,
-                },
+                detail=demote_detail,
             )
+            await self.fire_webhook("auto-demote", demote_detail)
             removed += 1
 
         if patched != current:

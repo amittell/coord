@@ -3276,3 +3276,289 @@ async def test_long_poll_wakes_on_cancellation(
         f"long-poll did not wake promptly on cancellation; "
         f"elapsed={elapsed:.2f}s"
     )
+
+
+# ---------------------------------------------------------------------------
+# v0.27: webhook event emission
+# ---------------------------------------------------------------------------
+
+
+async def _outbox_rows(db_path: str, event_type: str | None = None) -> list[dict[str, Any]]:
+    """Return outbox rows directly via aiosqlite.
+
+    The delivery loop is not running in these tests; we are exercising
+    the emission path only (fire_webhook -> enqueue_webhook), so reading
+    the table directly is the most precise observation point.
+    """
+    import aiosqlite
+
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        if event_type is None:
+            cur = await conn.execute(
+                "SELECT * FROM webhook_outbox ORDER BY created_at ASC"
+            )
+        else:
+            cur = await conn.execute(
+                "SELECT * FROM webhook_outbox WHERE event_type = ? "
+                "ORDER BY created_at ASC",
+                (event_type,),
+            )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+@pytest.fixture()
+async def client_webhook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncClient:
+    """Variant of ``client`` with webhook emission enabled.
+
+    URL is a fake endpoint; the delivery loop is not started, so the
+    outbox rows stay pending. Tests inspect the outbox table directly.
+    """
+    db_path = tmp_path / "db.sqlite"
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "test-token")
+    monkeypatch.setenv("COORD_DATABASE_PATH", str(db_path))
+    monkeypatch.setenv("COORD_DISABLE_BACKGROUND_CLEANUP", "1")
+    monkeypatch.setenv("COORD_DISABLE_INSTANCE_LOCK", "1")
+    monkeypatch.delenv("COORD_REPO_ROOT", raising=False)
+    monkeypatch.setenv("COORD_WEBHOOK_URL", "http://fake")
+    monkeypatch.setenv("COORD_WEBHOOK_SECRET", "test-secret")
+
+    from coordination import deps
+
+    deps.get_service.cache_clear()
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        ac.db_path = str(db_path)  # type: ignore[attr-defined]
+        yield ac
+
+    deps.get_service.cache_clear()
+
+
+@pytest.fixture()
+async def client_webhook_auto_promote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncClient:
+    """Webhook-enabled variant with hard auto-promote at threshold=2 so
+    the second 409 on a path trips an ``auto-promote`` event."""
+    db_path = tmp_path / "db.sqlite"
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "test-token")
+    monkeypatch.setenv("COORD_DATABASE_PATH", str(db_path))
+    monkeypatch.setenv("COORD_DISABLE_BACKGROUND_CLEANUP", "1")
+    monkeypatch.setenv("COORD_DISABLE_INSTANCE_LOCK", "1")
+    monkeypatch.delenv("COORD_REPO_ROOT", raising=False)
+    monkeypatch.setenv("COORD_WEBHOOK_URL", "http://fake")
+    monkeypatch.setenv("COORD_WEBHOOK_SECRET", "test-secret")
+    monkeypatch.setenv("COORD_AUTO_PROMOTE_THRESHOLD", "2")
+    monkeypatch.setenv("COORD_AUTO_PROMOTE_WINDOW_DAYS", "7")
+    # Disable subtree promotion so the leaf-promotion path fires
+    # deterministically on a single-file hotspot.
+    monkeypatch.setenv("COORD_AUTO_PROMOTE_SUBTREE_MIN_FILES", "0")
+
+    from coordination import deps
+
+    deps.get_service.cache_clear()
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        ac.db_path = str(db_path)  # type: ignore[attr-defined]
+        yield ac
+
+    deps.get_service.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_create_claims_emits_claim_granted(
+    client_webhook: AsyncClient,
+) -> None:
+    """A successful POST /claims writes one ``claim_granted`` row to
+    the outbox carrying the created claim id, the engineer, the repo,
+    and the session id."""
+    import json as _json
+
+    body = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "session_id": "sess-1",
+        "claims": [{"type": "file", "pattern": "src/v27a.ts"}],
+    }
+    r = await client_webhook.post("/claims", headers=_AUTH, json=body)
+    assert r.status_code == 200, r.text
+    claim_ids = r.json()["claim_ids"]
+    assert claim_ids
+
+    rows = await _outbox_rows(
+        client_webhook.db_path,  # type: ignore[attr-defined]
+        event_type="claim_granted",
+    )
+    assert len(rows) == 1, rows
+    row = rows[0]
+    assert row["status"] == "pending"
+    assert row["hmac_signature"], "HMAC must be computed at emit time"
+    payload = _json.loads(row["payload_json"])
+    assert payload["event_type"] == "claim_granted"
+    detail = payload["detail"]
+    assert detail["engineer"] == "alice"
+    assert detail["repo"] == "amittell/coord"
+    assert detail["session_id"] == "sess-1"
+    assert detail["claim_ids"] == claim_ids
+
+
+@pytest.mark.asyncio
+async def test_auto_promote_emits_webhook(
+    client_webhook_auto_promote: AsyncClient,
+) -> None:
+    """Two distinct attempters bouncing on the same path with
+    threshold=2 trips an ``auto-promote`` event and a matching outbox
+    row appears."""
+    import json as _json
+
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/v27b.ts"}],
+    }
+    rh = await client_webhook_auto_promote.post(
+        "/claims", headers=_AUTH, json=holder
+    )
+    assert rh.status_code == 200, rh.text
+
+    for engineer in ("bob", "carol"):
+        rr = await client_webhook_auto_promote.post(
+            "/claims",
+            headers=_AUTH,
+            json={
+                "engineer": engineer,
+                "repo": "amittell/coord",
+                "claims": [{"type": "file", "pattern": "src/v27b.ts"}],
+            },
+        )
+        # Both attempts 409 (claim_ids=[]) -- they're the trigger.
+        assert rr.json().get("claim_ids") == [], rr.text
+
+    rows = await _outbox_rows(
+        client_webhook_auto_promote.db_path,  # type: ignore[attr-defined]
+        event_type="auto-promote",
+    )
+    assert rows, "auto-promote webhook must have fired"
+    payload = _json.loads(rows[0]["payload_json"])
+    assert payload["event_type"] == "auto-promote"
+    detail = payload["detail"]
+    assert detail["pattern"] == "src/v27b.ts"
+    assert detail["threshold"] == 2
+    assert detail["subtree"] is False
+
+
+@pytest.mark.asyncio
+async def test_queue_grant_emits_webhook(
+    client_webhook: AsyncClient,
+) -> None:
+    """Hold + queue + release fires a ``queue_grant`` outbox row when
+    the FIFO drain auto-grants the queued requester."""
+    import asyncio as _asyncio
+    import json as _json
+
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/v27c.ts"}],
+    }
+    rh = await client_webhook.post("/claims", headers=_AUTH, json=holder)
+    assert rh.status_code == 200, rh.text
+    holder_claim_id = rh.json()["claim_ids"][0]
+
+    async def queued_request() -> dict:
+        body = {
+            "engineer": "bob",
+            "repo": "amittell/coord",
+            "claims": [{"type": "file", "pattern": "src/v27c.ts"}],
+            "wait_seconds": 5,
+        }
+        return (
+            await client_webhook.post("/claims", headers=_AUTH, json=body)
+        ).json()
+
+    waiter = _asyncio.create_task(queued_request())
+    await _wait_for_queue_id(client_webhook, "bob")
+
+    # Release the holder. The drain re-runs create_claims for the queued
+    # requester, which both grants and itself emits a claim_granted
+    # webhook -- but the queue_grant emission is what this test asserts.
+    rr = await client_webhook.post(
+        "/claims/release",
+        headers=_AUTH,
+        json={"engineer": "alice", "claim_ids": [holder_claim_id]},
+    )
+    assert rr.status_code == 200, rr.text
+
+    result = await _asyncio.wait_for(waiter, timeout=3.0)
+    assert result.get("claim_ids"), result
+
+    rows = await _outbox_rows(
+        client_webhook.db_path,  # type: ignore[attr-defined]
+        event_type="queue_grant",
+    )
+    assert len(rows) == 1, rows
+    payload = _json.loads(rows[0]["payload_json"])
+    assert payload["event_type"] == "queue_grant"
+    detail = payload["detail"]
+    assert detail["requester_engineer"] == "bob"
+    assert detail["pattern"] == "src/v27c.ts"
+    assert detail["granted_claim_id"] == result["claim_ids"][0]
+    assert detail["queue_id"]
+
+
+@pytest.mark.asyncio
+async def test_queue_cancel_emits_webhook(
+    client_webhook: AsyncClient,
+) -> None:
+    """Enqueue + DELETE /requests/{queue_id} fires a ``queue_cancel``
+    outbox row carrying the cancelled requester and pattern."""
+    import asyncio as _asyncio
+    import json as _json
+
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/v27d.ts"}],
+    }
+    rh = await client_webhook.post("/claims", headers=_AUTH, json=holder)
+    assert rh.status_code == 200, rh.text
+
+    async def queued_request() -> dict:
+        body = {
+            "engineer": "bob",
+            "repo": "amittell/coord",
+            "claims": [{"type": "file", "pattern": "src/v27d.ts"}],
+            "wait_seconds": 5,
+        }
+        return (
+            await client_webhook.post("/claims", headers=_AUTH, json=body)
+        ).json()
+
+    waiter = _asyncio.create_task(queued_request())
+    queue_id = await _wait_for_queue_id(client_webhook, "bob")
+
+    rc = await client_webhook.delete(
+        f"/requests/{queue_id}?engineer=bob", headers=_AUTH
+    )
+    assert rc.status_code == 200, rc.text
+    assert rc.json()["cancelled"] is True
+
+    # Drain the waiter so the task doesn't leak across tests.
+    await _asyncio.wait_for(waiter, timeout=3.0)
+
+    rows = await _outbox_rows(
+        client_webhook.db_path,  # type: ignore[attr-defined]
+        event_type="queue_cancel",
+    )
+    assert len(rows) == 1, rows
+    payload = _json.loads(rows[0]["payload_json"])
+    assert payload["event_type"] == "queue_cancel"
+    detail = payload["detail"]
+    assert detail["requester_engineer"] == "bob"
+    assert detail["pattern"] == "src/v27d.ts"
+    assert detail["queue_id"] == queue_id

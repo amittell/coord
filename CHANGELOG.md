@@ -9,6 +9,38 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.27.0] - 2026-06-03
+
+### Added
+
+- Webhook notification primitive. Set COORD_WEBHOOK_URL to a
+  receiver endpoint and the conflict pipeline writes every emitted
+  event (auto-coexist, auto-narrow, auto-promote,
+  auto-promote-subtree, auto-demote, claim_granted, queue_grant,
+  queue_cancel) to a new webhook_outbox table (schema v13). A
+  background delivery loop POSTs each row with an HMAC-SHA256
+  signature header (X-Coord-Signature) computed using
+  COORD_WEBHOOK_SECRET. Retries with exponential backoff capped
+  at COORD_WEBHOOK_MAX_RETRIES (default 5), then marks the row
+  exhausted. Filter the event stream with COORD_WEBHOOK_EVENTS.
+- New settings: webhook_url, webhook_secret, webhook_events,
+  webhook_max_retries, webhook_retry_backoff_sec,
+  webhook_delivery_interval_sec.
+- Service.fire_webhook(event_type, detail) helper called at every
+  event-emission site. Service.deliver_pending_webhooks runs the
+  delivery loop. Five db helpers: enqueue_webhook,
+  list_pending_webhooks, mark_webhook_delivered,
+  mark_webhook_failed, webhook_delivery_stats.
+- Dashboard "webhook delivery (24h)" panel showing per-event-type
+  delivery counts (delivered / failed / pending / exhausted).
+- 10+ new tests covering signature correctness, retry behaviour,
+  exhaustion, filter, event-site emission, and dashboard render.
+
+### Roadmap
+
+- Slack adapter, GitHub PR comments, and an outbox retry CLI are
+  queued as v0.27.x follow-ups.
+
 ## [0.26.0] - 2026-06-03
 
 ### Added

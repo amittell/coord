@@ -502,6 +502,62 @@ Auto-resolution / auto-promote audit (v0.14+, extended v0.22, v0.23, v0.26): ser
 }
 ```
 
+## Outbound webhooks (v0.27.0+)
+
+v0.27 adds an opt-in outbound delivery channel for events that previously lived only in the dashboard, the `/metrics/*` endpoints, and `GET /requests/{id}/events`. There is no new HTTP endpoint to *call* on coord itself -- webhooks travel in the other direction: coord POSTs each emitted event to the URL configured in `COORD_WEBHOOK_URL`. This section documents the contract the receiver must implement.
+
+### Trigger and event types
+
+Every event that lands in the `request_events` audit table also goes through `Service.fire_webhook(event_type, detail)`, which filters by `COORD_WEBHOOK_EVENTS` and enqueues a row in `webhook_outbox`. A background delivery loop drains the outbox. The event-emission sites covered in v0.27:
+
+- `claim_granted` -- a `POST /claims` succeeded.
+- `auto-coexist` (v0.14) -- two symbol claims on the same file with disjoint symbol sets were both granted.
+- `auto-narrow` (v0.14) -- a symbol claim was granted alongside a narrowable file claim.
+- `auto-promote` (v0.22) -- a hot file was promoted into `owners.yaml` as a `shared_file`.
+- `auto-promote-subtree` (v0.26) -- a directory ancestor was promoted as a subtree glob (`src/auth/**`) instead of N leaf entries.
+- `auto-demote` (v0.23) -- a coord-managed `shared_file` entry was removed because the rolling hotspot count dropped.
+- `queue_grant` (v0.21) -- a queued `claim_files(wait_seconds=...)` waiter was auto-granted when the blocking holder released.
+- `queue_cancel` (v0.26) -- a `DELETE /requests/{queue_id}` cancelled a waiting queue entry.
+
+`COORD_WEBHOOK_EVENTS` is a comma-separated allowlist; empty or unset means "deliver every event". A receiver that subscribes to a subset never sees enqueue or retry pressure for the unwanted events.
+
+### Request shape
+
+Each delivery is `POST <COORD_WEBHOOK_URL>` with `Content-Type: application/json` and the following body:
+
+```json
+{
+  "event_type": "auto-promote",
+  "timestamp": "2026-06-03T14:22:00Z",
+  "detail": {
+    "pattern": "src/auth/login.ts",
+    "threshold": 5,
+    "window_days": 7
+  }
+}
+```
+
+`event_type` repeats the value in the `X-Coord-Event-Type` header. `timestamp` is the UTC instant the event was emitted (the same value stored in `request_events.created_at`). `detail` is the event-type-specific JSON blob, byte-identical to the `detail` column on the matching `request_events` row. A receiver that already parses the audit log can reuse the same handler.
+
+### Headers
+
+Two headers travel with every delivery:
+
+- `X-Coord-Event-Type` -- the event type. Lets a receiver filter without parsing the body.
+- `X-Coord-Signature` -- hex-encoded HMAC-SHA256 of the raw request body, computed with `COORD_WEBHOOK_SECRET`. Omitted when the secret is unset. Verify with a constant-time comparison (`hmac.compare_digest` in Python, `crypto.timingSafeEqual` in Node) before trusting any field. A receiver that requires a signature should fail-closed on the missing header rather than trust an unsigned payload.
+
+### Delivery semantics
+
+The delivery loop runs every `COORD_WEBHOOK_DELIVERY_INTERVAL_SEC` (default `5`) and POSTs each due row in `webhook_outbox`. On HTTP `2xx`, the row is marked `delivered` and removed from the retry rotation. On any other response (4xx, 5xx, network error), the row's `retry_count` is incremented and the next attempt is scheduled at `now + COORD_WEBHOOK_RETRY_BACKOFF_SEC * 2 ** retry_count` (default backoff base `60s`, capped at `COORD_WEBHOOK_MAX_RETRIES = 5` attempts). After the retry cap, the row is marked `exhausted` and is no longer retried. The dashboard's "webhook delivery (24h)" panel groups counts by event type so a flapping receiver is visible at a glance.
+
+Coord does not distinguish "you rejected the payload" (4xx) from "you crashed" (5xx) for retry purposes. If you want to drop an event permanently from the retry rotation, return a `2xx` and discard server-side.
+
+### Schema
+
+The outbox table (schema v13) carries `id`, `url`, `event_type`, `payload_json`, `hmac_signature`, `status` (`pending | delivered | failed | exhausted`), `retry_count`, `last_attempt_at`, `last_error`, `next_attempt_at`, `created_at`, and `delivered_at`. Two indexes back the delivery loop: `(status, next_attempt_at)` for the "what's due now" scan and `(event_type, created_at)` for the dashboard rollup.
+
+The audit row in `request_events` is written unconditionally regardless of whether `COORD_WEBHOOK_URL` is set -- the outbox is purely additive. Disabling webhooks does not lose any event; it just stops pushing them.
+
 ## `POST /config/ownership`
 
 Upload ownership YAML.
