@@ -12,4 +12,6 @@ Use these guides in roughly this order:
 Reference material:
 
 - `api-reference.md`
+- `design/sub-file-claims.md` (v0.14-v0.26 arc design)
+- [./design/roadmap.md](./design/roadmap.md) (v0.27+ candidates and future bucket)
 - `../templates/README.md`

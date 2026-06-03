@@ -1,11 +1,31 @@
 ## Coordination protocol (mandatory)
 
-This repo uses a shared coordination service to prevent multi-agent / multi-engineer file collisions.
+Multi-agent file coordination via the `coord` MCP server. Required calls every session:
 
-Use the `coord` MCP tools:
+1. `list_claims` at task start.
+2. `claim_files` before editing.
+3. `release_claims` (or `release_session` to drop everything this MCP session holds, v0.6+) when done.
 
-1. `list_claims` then `claim_files` at task start.
-2. If conflicts are returned: stop and ask the user.
-3. `release_claims` when done.
+If `claim_files` returns conflicts, stop and ask the user. No edits outside claimed scope; no opportunistic refactors; shared config edits only with explicit user approval.
 
-Hard rules: no edits outside claimed scope; no opportunistic refactors; shared config edits only with explicit user approval.
+### Sub-file (symbol-level) claims (v0.14+)
+
+When two agents need different parts of the same file, claim symbols instead of whole files. Pass `symbols={"src/auth/login.ts": ["handleLogin"]}` to `claim_files` so the claim scopes to just that function. Two agents on disjoint symbols of the same file auto-coexist with no 409.
+
+- `Foo::handleA` (v0.16): method-level notation. Sibling methods of the same class auto-coexist; the bare class blocks all of its methods.
+- `Outer::Inner::method` (v0.17): recursive nesting works to any depth.
+- Server-side validation (v0.17): when `COORD_REPO_ROOT` is set, the server rejects symbols that do not exist in the file with a hint listing what is parseable. The MCP wrapper pre-validates locally before POST so typos fail fast; disable with `COORD_DISABLE_CLIENT_VALIDATION=1`.
+
+### Queueing instead of bouncing (v0.21+)
+
+When a hot file is contested and your work is blocking the team, pass `wait_seconds=60` to `claim_files`. The request joins a FIFO queue behind the blocking holder; on release the next queued requester is auto-granted. Pair with `urgency='low' | 'normal' | 'high' | 'blocking'` (v0.25) to jump ahead of lower-priority waiters; long-waiting entries age-boost one level after `COORD_QUEUE_AGE_BOOST_SECONDS` (v0.26). Abandon a wait early via `cancel_queue_request(queue_id, engineer=...)` (v0.26). Inspect your own queue rows via `my_requests(queued=True)` (v0.22).
+
+### Asking the holder directly (v0.6+ / v0.11+ decisions)
+
+If queueing will not work either:
+- `request_release` files an explicit ask against the holder's claim. The holder's TTL shortens; their decision lands back in your `my_requests` view.
+- `respond_to_request` decisions (v0.11+): `approved` (release whole claim), `denied` (keep it), `narrowed` (close the claim, open a tighter one -- pass `narrowed_pattern`), `coexist` (let the requester have a sibling claim on the same scope -- pass `coexist_pattern`). `coexist` is cooperative not enforced; agents on the same file still handle imports and module-level state themselves.
+
+### Operator visibility
+
+Poll `pending_requests` between operations to see who is blocked on your scope and respond via `respond_to_request`. The dashboard surfaces hotspot files, an auto-resolution heatmap, and a pending-queue panel for ambient awareness.

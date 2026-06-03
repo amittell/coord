@@ -24,6 +24,7 @@ The stack is intentionally simple:
 - `docs/integrations/claude-code.md`: Claude Code-first integration
 - `docs/integrations/codex-cli.md`: Codex CLI integration
 - Cursor users: see `templates/.cursor/mcp.json.example` and the Cursor rule under `templates/.cursor/rules/`
+- [`docs/design/roadmap.md`](./docs/design/roadmap.md): v0.27-v0.30 candidates and future bucket
 - `CHANGELOG.md`: notable changes between versions
 
 ## Quickstart
@@ -122,7 +123,7 @@ curl -X POST http://127.0.0.1:8080/claims \
 
 ### How the template + secret split works at runtime
 
-`coord-mcp` is spawned by the editor/CLI with whatever env the tracked MCP registration provides — usually the placeholder values `set-me`, `example-org/example-repo`, and `http://127.0.0.1:8080`. At startup the wrapper walks up from its working directory (like git looking for `.git/`) until it finds `.coordination/local.env`, then for each `COORD_*` allowlisted key:
+`coord-mcp` is spawned by the editor/CLI with whatever env the tracked MCP registration provides -- usually the placeholder values `set-me`, `example-org/example-repo`, and `http://127.0.0.1:8080`. At startup the wrapper walks up from its working directory (like git looking for `.git/`) until it finds `.coordination/local.env`, then for each `COORD_*` allowlisted key:
 
 - if the variable is currently unset, **or** holds one of the documented placeholders, the wrapper overrides it from `local.env`;
 - if the variable already holds a real value (a shell export, or an inline env block in `.mcp.json` with a real token), the explicit value wins.
@@ -309,6 +310,12 @@ Start with `docs/integrations/claude-code.md` if your team is primarily on Claud
 | `COORD_SHARED_TTL_HOURS` | TTL for shared-file claims. Default: `2` |
 | `COORD_IDLE_TIMEOUT_SEC` | Session-tagged claims auto-release if the holder has been silent for this many seconds (added in v0.6.0). Set to `0` to disable idle expiration cluster-wide. Default: `1800` |
 | `COORD_REQUEST_TTL_SHORT_SEC` | When a release request is filed, the holder's claim TTL is clamped to `min(remaining, this)` (added in v0.9.0). Forces a near-term decision so a non-responsive holder can't sit on the scope. Default: `300` |
+| `COORD_AUTO_PROMOTE_THRESHOLD` | Hard auto-promote (v0.22): when a file's blocked-claim attempts cross this threshold within `COORD_AUTO_PROMOTE_WINDOW_DAYS`, the conflict pipeline writes a `shared_files` rule into `owners.yaml`. Default: `0` (disabled). |
+| `COORD_AUTO_PROMOTE_WINDOW_DAYS` | Rolling window (days) used by hard auto-promote when counting blocked-claim attempts (v0.22). Default: `7` |
+| `COORD_AUTO_PROMOTE_SUBTREE_MIN_FILES` | Subtree auto-promote (v0.26): when this many auto-promoted files share a directory ancestor, coord writes a single subtree glob (e.g. `src/auth/**`) instead of N leaf entries. Set to `0` to disable subtree-level promotion. Default: `3` |
+| `COORD_AUTO_DEMOTE_INTERVAL_SEC` | Auto-demote sweep cadence (v0.23) for coord-managed `shared_files` entries. Set to `0` to disable the sweep. Default: `3600` |
+| `COORD_AUTO_DEMOTE_WINDOW_DAYS` | Auto-demote window (v0.23): coord-managed `shared_files` entries whose rolling hotspot count stays below `COORD_AUTO_PROMOTE_THRESHOLD` for this many days are removed. Default: `14` |
+| `COORD_QUEUE_AGE_BOOST_SECONDS` | Queue age boost (v0.26): a waiting FIFO queue entry whose age exceeds this is treated as one priority level higher for pop ordering. Set to `0` to disable (strict declared-priority order, the v0.25 behaviour). Default: `60` |
 | `COORD_DISABLE_BACKGROUND_CLEANUP` | Set truthy to skip the in-process claim expiration sweep (useful for tests or external schedulers). Default: unset |
 | `COORD_DISABLE_INSTANCE_LOCK` | Set truthy to bypass the advisory `<db>.lock` flock (useful on NFS-backed shared volumes where flock is unreliable). Default: unset |
 | `COORD_LS_FILES_CACHE_TTL_SEC` | TTL for the in-process `git ls-files` cache used during overlap checks. Default: `10` |
@@ -325,6 +332,7 @@ Start with `docs/integrations/claude-code.md` if your team is primarily on Claud
 | `COORD_REPO_ID` | Repo identifier (e.g. `example-org/example-app`) attached to every claim from this repo (added in v0.3.0). Set automatically by `coord init` from `git remote get-url origin`. |
 | `COORD_SESSION_ID` | Pin a stable session id across coord-mcp restarts (added in v0.5.0). Otherwise coord-mcp generates a fresh 16-char hex id at startup. |
 | `COORD_NO_UPDATE_CHECK` | Set truthy to silence the once-per-24h "update available" stderr line emitted by every `coord` CLI command. Default: unset |
+| `COORD_DISABLE_CLIENT_VALIDATION` | Set to `1` to bypass the MCP wrapper's local symbol pre-validation (v0.17). The server-side validator still runs when `COORD_REPO_ROOT` is set. Default: unset |
 
 ## Development
 

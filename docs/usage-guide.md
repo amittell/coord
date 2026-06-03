@@ -32,7 +32,7 @@ Risky:
 
 Why this matters: claims from the same `engineer` are intentionally ignored during conflict checks. If you reuse one ID for multiple simultaneous workers, those workers will not block each other.
 
-From v0.5.0 onward, `coord-mcp` also generates a per-process `session_id` and tags every claim with it. The conflict check additionally self-excludes any active claim sharing your session_id, regardless of engineer name. This handles the common case of one Codex/Claude session spawning multiple subagents under different engineer names — they all share the same `session_id` and so don't false-conflict against each other. Different sessions stay adversarial.
+From v0.5.0 onward, `coord-mcp` also generates a per-process `session_id` and tags every claim with it. The conflict check additionally self-excludes any active claim sharing your session_id, regardless of engineer name. This handles the common case of one Codex/Claude session spawning multiple subagents under different engineer names -- they all share the same `session_id` and so don't false-conflict against each other. Different sessions stay adversarial.
 
 ## Repo identifiers (v0.3.0+)
 
@@ -339,7 +339,7 @@ curl -X POST "http://127.0.0.1:8080/sessions/<session-id>/release" \
   -H "Authorization: Bearer $COORD_AUTH_TOKEN"
 ```
 
-Useful at end-of-work — `coord-mcp`'s `release_session` tool wraps this so the agent doesn't have to track every subagent's claim ids.
+Useful at end-of-work -- `coord-mcp`'s `release_session` tool wraps this so the agent doesn't have to track every subagent's claim ids.
 
 ## Release requests (v0.9.0+)
 

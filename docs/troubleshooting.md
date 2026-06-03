@@ -153,13 +153,13 @@ Most common causes (all closed in v0.7.x):
 2. The hook chain delegates to `.coordination/hooks/pre-push` and that file is missing → "partial install" state. v0.7.1+ doctor adds an explicit `.coordination/hooks/pre-push exists` check; fix with `coord upgrade` (or `coord init --force` if `config.toml` is also missing).
 3. An outer wrapper hook backgrounded the coord call (e.g. `"$@" &`), severing stdin → coord can't see git's ref-update stream. v0.7.2+ refuses loudly when stdin is redirected but empty. Wire the outer hook to forward stdin: cache `cat > $TMPFILE` once at the top, then `bash $COORD_HOOK "$@" < $TMPFILE`.
 
-Run `coord doctor` — the v0.7.1+ `.coordination/hooks/pre-push exists` check catches the most common partial-install variant.
+Run `coord doctor` -- the v0.7.1+ `.coordination/hooks/pre-push exists` check catches the most common partial-install variant.
 
 ## `git stash -u` keeps wiping `.coordination/` files
 
 Symptom: every few hours `.coordination/config.toml`, `owners.yaml`, and `hooks/pre-push` disappear, but `local.env` survives.
 
-Cause (closed in v0.8.1): pre-v0.8.1 the managed `.gitignore` rule was just `.coordination/local.env` — only `local.env` was ignored. The other files were untracked-but-not-ignored, so `git stash -u` (`--include-untracked`) swept them up. A stash conflict / drop / partial-pop then lost them; only `local.env` survived because it was actually ignored.
+Cause (closed in v0.8.1): pre-v0.8.1 the managed `.gitignore` rule was just `.coordination/local.env` -- only `local.env` was ignored. The other files were untracked-but-not-ignored, so `git stash -u` (`--include-untracked`) swept them up. A stash conflict / drop / partial-pop then lost them; only `local.env` survived because it was actually ignored.
 
 Fix: run `coord upgrade` to migrate the `.gitignore` block to `/.coordination/` (the wider rule). v0.8.1+ ignores the entire directory; nothing under it is ever stashed.
 

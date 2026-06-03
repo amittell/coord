@@ -1,19 +1,19 @@
 # Sub-file (symbol-level) claims
 
-Status: proposal, targeting v0.14.0
+Status: shipped (v0.14 initial, extended through v0.26)
 Author: Alex Mittell
-Date: 2026-06-02
+Date: 2026-06-02 (original proposal); last refreshed 2026-06-03
 
 ## Motivation
 
-Coord today scopes claims by file path or glob. With small teams (2-3 agents) this is workable; the v0.11 `narrowed` / `coexist` decisions cover the occasional hot file by letting a holder voluntarily concede some scope. With larger fleets (10+ agents on one repo) the model breaks: a handful of files (`router.ts`, `package-lock.json`, the schema index, the app shell) are touched by every active claim, and every agent eventually serialises on them. The current escape hatches are reactive — invoked after a `409`, not as the default behaviour.
+Coord today scopes claims by file path or glob. With small teams (2-3 agents) this is workable; the v0.11 `narrowed` / `coexist` decisions cover the occasional hot file by letting a holder voluntarily concede some scope. With larger fleets (10+ agents on one repo) the model breaks: a handful of files (`router.ts`, `package-lock.json`, the schema index, the app shell) are touched by every active claim, and every agent eventually serialises on them. The current escape hatches are reactive -- invoked after a `409`, not as the default behaviour.
 
 The bottleneck is grain size. Two agents editing different functions in `auth.ts` have no real conflict, but coord can only see "both want auth.ts" and forces them to dance. Moving the unit of coordination one level down (function or class instead of file) eliminates the false conflicts without giving up the safety properties of coord's existing model.
 
 Non-goals for v1:
 - Arbitrary byte-range claims. Symbols are the atomic unit; sub-symbol locking is not in scope.
-- Methods inside a class. A claim on a class covers all of its methods. v2 can decompose.
-- Languages other than TypeScript. Parser interface is language-agnostic so Python/Go drop in later, but only TS ships in v0.14.
+- Methods inside a class. A claim on a class covers all of its methods. v2 can decompose. **Shipped in v0.16** -- individually claimable via `Parent::child` notation.
+- Languages other than TypeScript. Parser interface is language-agnostic so Python/Go drop in later, but only TS ships in v0.14. **Shipped in v0.15** -- Python + Go parsers landed alongside TS.
 - Sub-file dashboard panels. Audit surface is text-only for v1; dashboard work follows in v0.14.1.
 
 ## Data model
@@ -75,7 +75,7 @@ Overlap uses a two-level prefix-matching rule for symbol-vs-symbol comparisons o
 
 `'function' | 'class' | 'interface' | 'type' | 'const' | 'enum' | 'unknown'`
 
-Producer is the parser (see "Parser strategy"). The value is informational — overlap is computed on `(file_path, symbol_name)` only. Kind exists for the dashboard and audit log; future versions may use it for namespace separation (e.g. allow a `function foo` and `type Foo` claim to coexist).
+Producer is the parser (see "Parser strategy"). The value is informational -- overlap is computed on `(file_path, symbol_name)` only. Kind exists for the dashboard and audit log; future versions may use it for namespace separation (e.g. allow a `function foo` and `type Foo` claim to coexist).
 
 ### Claim-shape examples
 
@@ -111,7 +111,7 @@ Expanded: the `symbols` list applies to **every** file matched by `pattern`. If 
 
 ## Overlap algorithm
 
-`compute_overlap` (heuristic and repo-rooted modes) keeps its current contract — given two patterns, return the path set intersection — but the conflict pipeline gains a post-filter step. Pseudocode:
+`compute_overlap` (heuristic and repo-rooted modes) keeps its current contract -- given two patterns, return the path set intersection -- but the conflict pipeline gains a post-filter step. Pseudocode:
 
 ```
 def is_overlap(holder_claim, requester_claim) -> OverlapResult:
@@ -150,7 +150,7 @@ def is_overlap(holder_claim, requester_claim) -> OverlapResult:
         return PARTIAL_GRANT(requester_path_minus_held_symbols)
 ```
 
-`AUTO_COEXIST` and `AUTO_NARROW` are server-side automatic decisions logged to `request_events` as new event types (`auto-coexist`, `auto-narrow`) but skip the `requests` flow entirely — there is no human-in-the-loop request to file because the resolution is mechanical and free of policy ambiguity. Audit trail is preserved; latency is one round-trip lower.
+`AUTO_COEXIST` and `AUTO_NARROW` are server-side automatic decisions logged to `request_events` as new event types (`auto-coexist`, `auto-narrow`) but skip the `requests` flow entirely -- there is no human-in-the-loop request to file because the resolution is mechanical and free of policy ambiguity. Audit trail is preserved; latency is one round-trip lower.
 
 ### Worked example
 
@@ -372,8 +372,12 @@ Each implementation chunk lands with tests in the existing pytest harness:
 
 - `tests/test_db_migration.py`: v7→v8 round-trip, backfill values, new index presence, rollback safety.
 - `tests/test_symbol_parser.py`: TS fixtures covering function, class, interface, type, const-as-arrow, default export, generics, decorators. Tree-sitter + regex both tested via parametrise.
-- `tests/test_overlap_symbols.py`: full overlap matrix — file/file, file/symbol (narrowable + non-narrowable), symbol/file, symbol/symbol (disjoint + overlapping), with multi-file patterns.
+- `tests/test_overlap_symbols.py`: full overlap matrix -- file/file, file/symbol (narrowable + non-narrowable), symbol/file, symbol/symbol (disjoint + overlapping), with multi-file patterns.
 - `tests/test_api.py` additions: POST /claims accepts `symbols`, returns `symbol_overlap` in conflicts, auto-coexist returns 201 with `coexists_with`, auto-narrow updates holder's `coexists_with`.
 - `tests/test_mcp_server.py` additions: `claim_files(symbols=...)` propagates correctly via httpx MockTransport.
 
 Target: +60-80 tests, ~95% line coverage on new code.
+
+## See also
+
+- [./roadmap.md](./roadmap.md) -- the post-v0.26 forward look (v0.27+ candidates and future bucket). The v0.14-v0.26 arc described above is the shipped predecessor; new sub-file work plans land there.

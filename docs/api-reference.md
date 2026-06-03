@@ -178,8 +178,8 @@ Query params:
 
 - one or more `pattern=...`
 - `engineer=<id>`
-- `repo=<id>` (v0.4.0+) — restrict the check to claims with the same `repo` value. Without this, the service-wide pool is checked, which can false-positive across unrelated repos.
-- `session_id=<id>` (v0.6.0+, may be repeated as of v0.10.0) — additionally self-exclude any active claim sharing one of these session_ids. The pre-push hook reads every line of `.coordination/sessions.live` and forwards them all so an agent's own subagent claims under different engineer names don't false-positive on its own push. Each id also acts as an activity ping for that session's held claims.
+- `repo=<id>` (v0.4.0+) -- restrict the check to claims with the same `repo` value. Without this, the service-wide pool is checked, which can false-positive across unrelated repos.
+- `session_id=<id>` (v0.6.0+, may be repeated as of v0.10.0) -- additionally self-exclude any active claim sharing one of these session_ids. The pre-push hook reads every line of `.coordination/sessions.live` and forwards them all so an agent's own subagent claims under different engineer names don't false-positive on its own push. Each id also acts as an activity ping for that session's held claims.
 
 Example:
 
@@ -329,14 +329,14 @@ The operator stays in the loop -- v0.21 never auto-promotes on its own; the endp
 
 The merged inbox a holder polls. Returns two kinds of rows distinguished by `kind`:
 
-- `kind: "request"` — first-class release requests filed against claims this session holds (v0.9+). The holder's next action is to `respond_to_request` (approve / deny). Pending requests carry `urgency`, `requested_pattern`, `requester_engineer`, `requester_session_id`.
-- `kind: "auto-conflict"` — read-only conflict-log entries logged automatically every time a `claim_files` got 409'd against one of this session's claims (v0.6).
+- `kind: "request"` -- first-class release requests filed against claims this session holds (v0.9+). The holder's next action is to `respond_to_request` (approve / deny). Pending requests carry `urgency`, `requested_pattern`, `requester_engineer`, `requester_session_id`.
+- `kind: "auto-conflict"` -- read-only conflict-log entries logged automatically every time a `claim_files` got 409'd against one of this session's claims (v0.6).
 
 The first time per holder session that a first-class request appears in this feed, a `notified` audit event is recorded against the request so the operator can prove the holder saw it.
 
 ## `POST /sessions/{session_id}/release` (v0.5.0+)
 
-Bulk-release every active claim with the given `session_id`. Used by `coord-mcp`'s `release_session` tool at end-of-work — releases claims made by every subagent under that session in one call, regardless of the engineer name they used.
+Bulk-release every active claim with the given `session_id`. Used by `coord-mcp`'s `release_session` tool at end-of-work -- releases claims made by every subagent under that session in one call, regardless of the engineer name they used.
 
 ```bash
 curl -X POST "http://127.0.0.1:8080/sessions/sess-deadbeef/release" \
@@ -373,7 +373,7 @@ Extend an active claim owned by an engineer.
 
 File a release request against an active claim. Filing shortens the holder's claim TTL to `min(remaining, COORD_REQUEST_TTL_SHORT_SEC)` (default 300s) so the claim is forced to a near-term decision: the holder either responds (approve / deny) via `POST /requests/{id}/respond` or the shortened TTL fires and the claim auto-releases.
 
-By default, the server long-polls for the holder's decision: `wait_seconds=60` (override 0–600).
+By default, the server long-polls for the holder's decision: `wait_seconds=60` (override 0..600).
 
 Body:
 
