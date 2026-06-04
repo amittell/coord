@@ -1,12 +1,12 @@
 # Multi-Agent Team Coordination
 
-[![PyPI](https://img.shields.io/pypi/v/multi-agent-coordination.svg)](https://pypi.org/project/multi-agent-coordination/)
-[![Python versions](https://img.shields.io/pypi/pyversions/multi-agent-coordination.svg)](https://pypi.org/project/multi-agent-coordination/)
+[![PyPI](https://img.shields.io/pypi/v/coord.svg)](https://pypi.org/project/coord/)
+[![Python versions](https://img.shields.io/pypi/pyversions/coord.svg)](https://pypi.org/project/coord/)
 [![CI](https://github.com/amittell/coord/actions/workflows/ci.yml/badge.svg)](https://github.com/amittell/coord/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
 [![Container image](https://img.shields.io/badge/ghcr.io-coord-blue)](https://github.com/amittell/coord/pkgs/container/coord)
 
-`multi-agent-coordination` is a small coordination layer for teams running multiple agent sessions against the same codebase. It gives Claude Code, Codex CLI, and Cursor a shared source of truth for active file/module claims so agents can check, claim, extend, and release work before they step on each other.
+`coord` is a small coordination layer for teams running multiple agent sessions against the same codebase. It gives Claude Code, Codex CLI, and Cursor a shared source of truth for active file/module claims so agents can check, claim, extend, and release work before they step on each other.
 
 **This repo IS the coordination service.** You run one instance of it (locally during development, or as a container in whatever infra your team already uses) and point your application repos at it with `coord init`. The application repos you coordinate live elsewhere.
 

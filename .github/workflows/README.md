@@ -218,7 +218,7 @@ account access):
    publisher" (the form is at
    `https://pypi.org/manage/account/publishing/`).
 3. Fill in:
-   - PyPI Project Name: `multi-agent-coordination`
+   - PyPI Project Name: `coord`
    - Owner: `amittell`
    - Repository name: `coord`
    - Workflow name: `release.yml`

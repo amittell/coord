@@ -202,7 +202,7 @@ jobs:
   # PyPI token at publish time. Requires a pending publisher registered
   # at https://pypi.org/manage/account/publishing/ before the first
   # publish succeeds; bootstrap via:
-  #   project name = multi-agent-coordination
+  #   project name = coord
   #   owner        = amittell
   #   repo         = coord
   #   workflow     = release.yml
@@ -216,7 +216,7 @@ jobs:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     environment:
       name: pypi
-      url: https://pypi.org/p/multi-agent-coordination
+      url: https://pypi.org/p/coord
     permissions:
       id-token: write       # required for OIDC trusted publishing
       contents: read        # required for checkout
