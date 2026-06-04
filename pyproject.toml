@@ -48,7 +48,7 @@ symbols = [
     "tree-sitter>=0.24.0",
     "tree-sitter-typescript>=0.23.2",
     "tree-sitter-python>=0.23.0",
-    "tree-sitter-go>=0.23.0",
+    "tree-sitter-go>=0.25.0",
 ]
 dev = [
     "pytest>=9.0.3",
@@ -58,7 +58,7 @@ dev = [
     "tree-sitter>=0.24.0",
     "tree-sitter-typescript>=0.23.2",
     "tree-sitter-python>=0.23.0",
-    "tree-sitter-go>=0.23.0",
+    "tree-sitter-go>=0.25.0",
 ]
 
 [project.scripts]
