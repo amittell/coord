@@ -1,7 +1,7 @@
 # Multi-Agent Team Coordination
 
-[![PyPI](https://img.shields.io/pypi/v/coord.svg)](https://pypi.org/project/coord/)
-[![Python versions](https://img.shields.io/pypi/pyversions/coord.svg)](https://pypi.org/project/coord/)
+[![PyPI](https://img.shields.io/pypi/v/coord-mcp-server.svg)](https://pypi.org/project/coord-mcp-server/)
+[![Python versions](https://img.shields.io/pypi/pyversions/coord-mcp-server.svg)](https://pypi.org/project/coord-mcp-server/)
 [![CI](https://github.com/amittell/coord/actions/workflows/ci.yml/badge.svg)](https://github.com/amittell/coord/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
 [![Container image](https://img.shields.io/badge/ghcr.io-coord-blue)](https://github.com/amittell/coord/pkgs/container/coord)

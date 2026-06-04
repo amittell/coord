@@ -1,5 +1,5 @@
 [project]
-name = "coord"
+name = "coord-mcp-server"
 version = "0.27.1"
 description = "Coordination service for multi-engineer agent teams (HTTP API + MCP + dashboard)"
 readme = "README.md"
