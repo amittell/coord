@@ -9,6 +9,21 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.27.2] - 2026-06-04
+
+### Fixed
+
+- Missing runtime dependency on ``packaging``. ``cli_doctor`` and
+  ``cli_update_notice`` import ``from packaging.version`` for SemVer
+  parsing, but the package was not declared in
+  ``[project.dependencies]``. Fresh ``pip install coord-mcp-server``
+  installs hit ``ModuleNotFoundError: No module named 'packaging'``
+  on the first ``coord`` invocation. The dev venv masked this because
+  ``pip`` itself pulls in ``packaging`` transitively, but a clean
+  user install does not. Added ``packaging>=23.0`` to the runtime
+  dependency list. Surfaced by the first successful v0.27.1 PyPI
+  publish and a clean-venv install smoke test.
+
 ## [0.27.1] - 2026-06-03
 
 ### Added
