@@ -45,7 +45,7 @@ dependencies = [
 
 [project.optional-dependencies]
 symbols = [
-    "tree-sitter>=0.24.0",
+    "tree-sitter>=0.25.2",
     "tree-sitter-typescript>=0.23.2",
     "tree-sitter-python>=0.23.0",
     "tree-sitter-go>=0.23.0",
@@ -55,7 +55,7 @@ dev = [
     "pytest-asyncio>=1.4.0",
     "ruff>=0.15.15",
     "mypy>=2.1.0",
-    "tree-sitter>=0.24.0",
+    "tree-sitter>=0.25.2",
     "tree-sitter-typescript>=0.23.2",
     "tree-sitter-python>=0.23.0",
     "tree-sitter-go>=0.23.0",
