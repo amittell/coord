@@ -162,6 +162,17 @@ class CoordinationService:
     db: Database
     settings: Settings
 
+    async def count_queued_for(self, engineer: str) -> int:
+        """v0.28: return how many waiting queue rows the given engineer
+        currently owns. Drives the ``X-Coord-Queue-Depth`` backpressure
+        header so clients can self-regulate without an extra round trip
+        to ``/requests?queued=true``.
+        """
+        rows = await self.db.list_queued_with_holder(
+            engineer=engineer, state="waiting"
+        )
+        return len(rows)
+
     async def _rules(self) -> list[PathRule]:
         raw = await self.db.get_ownership_yaml()
         if not raw:
@@ -1411,6 +1422,8 @@ class CoordinationService:
             entry = await self.db.pop_next_waiting_queue_entry(
                 released_claim_id,
                 age_boost_seconds=self.settings.queue_age_boost_seconds,
+                fairness_interval=self.settings.queue_fairness_interval,
+                priority_decay_sec=self.settings.queue_priority_decay_sec,
             )
             if entry is None:
                 return

@@ -1,9 +1,22 @@
 # Coord roadmap
 
 Status: living document
-Last updated: 2026-06-03 (after v0.27.0)
+Last updated: 2026-06-05 (after v0.28.0)
 
-This is the post-v0.27 forward look. Items here are candidates, not commitments -- order and scope move as production telemetry and operator feedback arrive. Entries already shipped live in [CHANGELOG.md](../../CHANGELOG.md); see also [docs/design/sub-file-claims.md](./sub-file-claims.md) for the v0.14-v0.26 arc design.
+This is the post-v0.28 forward look. Items here are candidates, not commitments -- order and scope move as production telemetry and operator feedback arrive. Entries already shipped live in [CHANGELOG.md](../../CHANGELOG.md); see also [docs/design/sub-file-claims.md](./sub-file-claims.md) for the v0.14-v0.26 arc design.
+
+## v0.28.0 (shipped) -- Queue QoS + housekeeping
+
+v0.28 was originally sized for "multi-namespace coordination" (the v0.28 section below). That body of work was deferred to a later release pending actual multi-tenant demand. Instead v0.28.0 pulls in four low-hanging items from the v0.29 queue QoS bucket and the future bucket's "auto-cleanup of dead engineer IDs" entry, all of which fit in a no-schema-migration release.
+
+Shipped in v0.28.0:
+
+- Backpressure header on every authenticated response. ``X-Coord-Queue-Depth: N`` is attached when the request carries an engineer signal (``X-Coord-Engineer`` header or ``engineer`` query param). N is that engineer's currently-queued waiting-claim count. Lets clients self-regulate without an extra round trip. Toggle via ``COORD_BACKPRESSURE_HEADER`` (default on).
+- Queue fairness pass on ``db.pop_next_waiting_queue_entry``. Every ``COORD_QUEUE_FAIRNESS_INTERVAL``-th call (default 10) bypasses the priority CASE entirely and pops by raw FIFO position. Anti-starvation guarantee for low/normal-priority waiters under a steady stream of high/blocking traffic. Set to 0 to disable.
+- Priority decay -- counterpart to the v0.26 age boost. A waiting entry's effective priority drops one level per ``COORD_QUEUE_PRIORITY_DECAY_SEC`` seconds (default 300; floor at ``low``). Prevents a misclassified urgent request from monopolising the queue head indefinitely. Set to 0 to disable.
+- Stale engineer housekeeping. New ``coord engineers stale [--release]`` CLI subcommand + dashboard panel surface engineers whose most-recent activity is older than ``COORD_STALE_ENGINEER_DAYS`` (default 7). ``--release`` drops their lingering active claims. Solves the "abandoned worktree leaves dangling claims" issue.
+
+No schema migration; all four are config + behavioural additions. Multi-namespace coordination (the original v0.28 plan) is deferred to v0.29 or v0.30 depending on which ships first when demand surfaces -- the design notes below stand.
 
 ## v0.27 -- Notifications and integrations
 
@@ -22,9 +35,9 @@ Follow-ups deferred to v0.27.x (or rolled into v0.28's external-integrations the
 - GitHub PR comment integration: when a pre-push hook 409s, the next push that does succeed includes a comment on the PR description listing the files that bounced and which engineer held them. Closes the "why did my PR sit unmerged" feedback gap.
 - Outbox retry CLI: `coord outbox retry --exhausted` and `coord outbox stats` so an operator can drive the retry rotation by hand after fixing a receiver, without poking at SQLite directly.
 
-## v0.28 -- Multi-namespace coordination
+## Multi-namespace coordination (deferred from v0.28)
 
-Today coord is single-tenant per instance: one ownership YAML, one claim table, one queue. v0.28 scales to multi-repo and multi-team usage without forcing a separate coord instance per topology.
+Today coord is single-tenant per instance: one ownership YAML, one claim table, one queue. This body of work scales to multi-repo and multi-team usage without forcing a separate coord instance per topology. Originally sized for v0.28, deferred to v0.29 or v0.30 (whichever ships first) pending actual multi-tenant demand surfacing in production telemetry.
 
 Candidate items:
 
@@ -35,17 +48,14 @@ Candidate items:
 
 Risk: namespace design has lots of decisions (URL shape, tenant isolation level, billing surface) that will pull engineering time. May benefit from a separate design doc (`docs/design/multi-namespace.md`) before implementation.
 
-## v0.29 -- Queue quality of service
+## v0.29 -- Queue quality of service (continued)
 
-v0.21-v0.26 covered priority, age boost, and cancellation, but production traffic at scale will surface starvation, monopoly, and backpressure issues the current model does not address.
+v0.21-v0.28 covered priority, age boost, cancellation, fairness, decay, and the backpressure header. v0.29 picks up the remaining queue-QoS items that need either schema or behavioural changes too disruptive to fit in the v0.28 no-migration release.
 
 Candidate items:
 
-- Priority decay (counterpart to age boost): a `blocking` claim that has been queued for `COORD_QUEUE_PRIORITY_DECAY_SEC` (default 300) drops to `high`, then `normal` after another decay window. Prevents a misclassified urgent request from monopolising the head of the queue forever.
 - Per-engineer rate limiting: an engineer cannot have more than N active claims or more than M queued requests at once (`COORD_MAX_CLAIMS_PER_ENGINEER`, `COORD_MAX_QUEUED_PER_ENGINEER`). Returns 429 with a `Retry-After` header.
 - Per-repo claim quotas mirroring the v0.4 max-claim-ratio but at the queue layer: a repo whose queue is > N deep refuses new wait_seconds requests with a "service degraded" hint, surfacing pushback at the API instead of letting waiters pile up.
-- Backpressure signals on every response: `X-Coord-Queue-Depth` header counts the requester's current queue position so the client can decide whether to wait or escalate.
-- Fairness pass on `pop_next_waiting_queue_entry`: every Nth pop ignores priority and pops by raw FIFO to guarantee `low`-priority waiters eventually win.
 
 Risk: rate-limiting interacts with the v0.5 session_id self-exclusion and the v0.10 multi-session activity ping in ways that need careful testing. Coord must not 429 an agent's own subagents.
 
@@ -72,10 +82,9 @@ Items worth tracking but not yet sized:
 - **Conflict-prediction ML**: feed the conflict_log + claim history into a small model that predicts which pending claims are likely to 409. Surface in the dashboard so an operator can proactively split a module before the storm hits.
 - **Activity replay / debug mode**: a `coord replay` CLI that re-runs every claim and decision from a captured timeline. Useful for reproducing tricky race conditions and validating proposed conflict-engine changes against historical traffic.
 - **Operator approval workflow** (alternative to v0.22 hard auto-promote): instead of writing immediately, the conflict pipeline files a `pending_promotion` row that the operator approves via the dashboard. Bridges the gap between v0.21 fully-soft and v0.22 fully-automatic.
-- **Auto-cleanup of dead engineer IDs**: when an engineer has had no `claim_files` or `list_claims` call for N days, surface a "stale engineer" warning in the dashboard and offer a one-click cleanup that releases their lingering claims. Catches abandoned worktrees.
 - **Postgres-only optimisations** (post-Postgres-backend): NOTIFY-driven queue grant (zero poll latency), partitioned conflict_log for repos with >1M attempts per month, read-replica routing for the dashboard.
 
-## Done in the v0.13 -> v0.27 arc (for context)
+## Done in the v0.13 -> v0.28 arc (for context)
 
 This roadmap supersedes the older "candidate" markers in the v0.14 sub-file claims design doc. Everything below is shipped and lives in [CHANGELOG.md](../../CHANGELOG.md) for the full detail:
 
@@ -95,3 +104,4 @@ This roadmap supersedes the older "candidate" markers in the v0.14 sub-file clai
 | v0.25.0 | permanent shared-file pin + queue priority hints |
 | v0.26.0 | subtree auto-promote + priority age boost + queue cancellation |
 | v0.27.0 | webhook outbox + HMAC delivery + dashboard panel |
+| v0.28.0 | backpressure header + queue fairness + priority decay + stale engineer cleanup |

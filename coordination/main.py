@@ -151,6 +151,72 @@ async def _count_http_requests(request: Request, call_next):
     return response
 
 
+def _engineer_from_request(request: Request) -> str | None:
+    """Extract the caller's engineer identity from request signals so the
+    v0.28 backpressure middleware can attribute queue depth correctly.
+
+    Tries (in order):
+
+    1. ``X-Coord-Engineer`` request header -- the explicit declaration
+       the coord-mcp wrapper will send once it is updated.
+    2. ``engineer`` query string param -- already used by
+       ``/conflicts``, ``/claims``, ``/requests``, etc.
+
+    The JSON-body fallback (``engineer`` field on POST /claims and
+    POST /requests) is intentionally deferred: ASGI middlewares run
+    before the route, and consuming ``request.body()`` here would
+    detach the bytes from the downstream Pydantic parser. Header +
+    query covers the vast majority of real call paths today; the
+    wrapper can ship the explicit ``X-Coord-Engineer`` header in a
+    follow-up so body parsing is never needed.
+    """
+    explicit = request.headers.get("x-coord-engineer")
+    if explicit:
+        stripped = explicit.strip()
+        if stripped:
+            return stripped
+    qp = request.query_params.get("engineer")
+    if qp:
+        stripped = qp.strip()
+        if stripped:
+            return stripped
+    return None
+
+
+@app.middleware("http")
+async def _backpressure_middleware(request: Request, call_next):
+    """v0.28: stamp ``X-Coord-Queue-Depth`` on responses when the caller's
+    engineer can be identified, so clients self-regulate without a
+    follow-up ``GET /requests?queued=true``.
+
+    Best-effort by design:
+
+    * Skipped entirely when ``settings.backpressure_header`` is False
+      (operators on receivers that strip unknown headers).
+    * Skipped when no engineer signal is present (anonymous health
+      checks, /metrics scrapes, etc.).
+    * Counting errors are swallowed so a transient DB issue never
+      poisons the underlying response -- the header just goes missing
+      for that one request.
+    """
+    response = await call_next(request)
+    settings = get_settings()
+    if not settings.backpressure_header:
+        return response
+    engineer = _engineer_from_request(request)
+    if not engineer:
+        return response
+    try:
+        depth = await get_service().count_queued_for(engineer)
+        response.headers["X-Coord-Queue-Depth"] = str(depth)
+    except Exception:  # pragma: no cover - best-effort header
+        logger.debug(
+            "backpressure_middleware: queue depth lookup failed",
+            exc_info=True,
+        )
+    return response
+
+
 @app.middleware("http")
 async def _access_log_middleware(request: Request, call_next):
     """Emit one structured access-log record per HTTP request.

@@ -81,6 +81,37 @@ class Settings(BaseSettings):
     webhook_max_retries: int = 5
     webhook_retry_backoff_sec: int = 60
     webhook_delivery_interval_sec: int = 5
+    # v0.28 queue ordering refinements (queue QoS, low-hanging from the
+    # roadmap v0.29 section pulled forward).
+    #
+    # ``queue_fairness_interval``: every Nth call to
+    # pop_next_waiting_queue_entry ignores priority entirely and pops
+    # by raw FIFO position. Guarantees low/normal-priority waiters
+    # eventually win against a steady stream of high/blocking entries
+    # that age boost (v0.26) and priority decay (this version) might
+    # otherwise let monopolise. Set to 0 to disable (strict
+    # priority-then-position ordering preserved).
+    queue_fairness_interval: int = 10
+    # ``queue_priority_decay_sec``: a waiting entry's effective
+    # priority drops one level per this many seconds in the queue
+    # (blocking -> high -> normal -> low, with low as the floor).
+    # Counterpart to v0.26 age boost: prevents a misclassified urgent
+    # request from sitting at the head of the queue indefinitely. Set
+    # to 0 to disable decay (v0.26 boost + v0.25 declared priority
+    # remain in force).
+    queue_priority_decay_sec: int = 300
+    # ``backpressure_header``: when True, every response includes an
+    # ``X-Coord-Queue-Depth`` header counting how many of the caller's
+    # claims are currently queued waiting. Lets clients self-regulate
+    # without an extra round trip to ``/requests?queued=true``. Set
+    # to False to disable for receivers that strip unknown headers.
+    backpressure_header: bool = True
+    # ``stale_engineer_days``: an engineer whose most recent
+    # last_activity is older than this many days surfaces in the
+    # ``coord engineers stale`` CLI and the dashboard's stale-engineer
+    # panel. ``--release`` on the CLI drops their lingering claims.
+    # Set to 0 to disable the housekeeping surface.
+    stale_engineer_days: int = 7
 
     @property
     def auth_mode(self) -> str:

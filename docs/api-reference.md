@@ -6,6 +6,34 @@ All authenticated endpoints require a bearer token. In the examples below we ass
 Authorization: Bearer <COORD_AUTH_TOKEN>
 ```
 
+## Response headers
+
+### `X-Coord-Queue-Depth` (v0.28.0+)
+
+Every authenticated response includes ``X-Coord-Queue-Depth: N`` when the request carries an engineer signal -- either the ``X-Coord-Engineer`` request header or an ``engineer`` query parameter. ``N`` is the count of that engineer's currently-queued ``claim_queue`` rows in the ``waiting`` state (the same set surfaced by ``GET /requests?queued=true&requester_engineer=...``). Clients can read this header to self-regulate (back off, escalate, or abandon a wait) without a second round trip.
+
+The header is omitted on:
+
+- responses to requests that do not carry an engineer signal (`/health`, `/readyz`, operator-style listing calls without an `engineer=` query param);
+- responses from a service where `COORD_BACKPRESSURE_HEADER` is set falsy (default is `true`, header enabled).
+
+Example:
+
+```bash
+curl -i "http://127.0.0.1:8080/claims?engineer=alex/claude/main" \
+  -H "Authorization: Bearer $COORD_AUTH_TOKEN" \
+  -H "X-Coord-Engineer: alex/claude/main"
+```
+
+```
+HTTP/1.1 200 OK
+content-type: application/json
+x-coord-queue-depth: 2
+...
+```
+
+A value of ``0`` means the engineer has no queued waiters; the header is still emitted to make the "no backpressure" signal explicit.
+
 ## `GET /health`
 
 Unauthenticated liveness probe.

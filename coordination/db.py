@@ -143,6 +143,27 @@ CREATE INDEX IF NOT EXISTS idx_claims_engineer ON claims (engineer);
 
 CURRENT_SCHEMA_VERSION = 13
 
+
+# v0.28 fairness pass: per-blocking-claim counter that
+# pop_next_waiting_queue_entry increments on every call. When
+# (counter % fairness_interval) == 0 the pop bypasses the priority
+# CASE and orders by raw FIFO position so low/normal-priority
+# waiters eventually win. Keyed on blocking_claim_id so unrelated
+# queues don't interfere with each other's fairness rotations.
+# Per-process state: a restart resets the counters, which is fine
+# because the fairness guarantee is statistical, not absolute.
+_FAIRNESS_COUNTERS: dict[str, int] = {}
+
+
+def _next_fairness_count(blocking_claim_id: str) -> int:
+    """Increment + return the per-blocking-claim fairness counter.
+    Internal helper for pop_next_waiting_queue_entry; exposed at module
+    level so tests can reset state via _FAIRNESS_COUNTERS.clear()."""
+
+    n = _FAIRNESS_COUNTERS.get(blocking_claim_id, 0) + 1
+    _FAIRNESS_COUNTERS[blocking_claim_id] = n
+    return n
+
 # Migration registry: list of (version, upgrade_sql) tuples applied in order.
 # Entry for version N is the SQL that upgrades a DB from version N-1 to N.
 # Version 1 creates the initial core schema; future versions append here.
@@ -1057,6 +1078,8 @@ class Database:
         blocking_claim_id: str,
         *,
         age_boost_seconds: int = 0,
+        fairness_interval: int = 0,
+        priority_decay_sec: int = 0,
     ) -> dict[str, Any] | None:
         """Return the head-of-queue waiting entry for ``blocking_claim_id``,
         marking it as ``in_progress`` so a concurrent release-drain on the
@@ -1069,44 +1092,106 @@ class Database:
         many seconds. Prevents low/normal-priority waiters from starving
         under a steady stream of high/blocking entries. ``0`` disables
         the boost (strict declared-priority ordering, the v0.25 behaviour).
+
+        v0.28: ``fairness_interval`` triggers a fairness pop on every Nth
+        call (per blocking_claim_id) that ignores priority entirely and
+        orders by raw FIFO position ASC. Guarantees low/normal-priority
+        waiters eventually win even when high/blocking entries arrive
+        steadily. ``0`` disables the fairness override and the per-process
+        counter is not advanced -- preserving v0.25--v0.27 behaviour
+        byte-identically.
+
+        v0.28: ``priority_decay_sec`` subtracts one rank level per
+        ``priority_decay_sec`` seconds in queue (blocking->high->normal
+        ->low, floored at 'low'=1). Counterpart to age boost: prevents a
+        misclassified urgent request from monopolising the head of the
+        queue indefinitely. ``0`` disables decay and the priority-rank
+        computation matches v0.27 exactly.
         """
         await self.init()
         boost_threshold = max(0, int(age_boost_seconds))
+        fairness_n = max(0, int(fairness_interval))
+        decay_sec = max(0, int(priority_decay_sec))
+        # v0.28: only advance the fairness counter when the feature is
+        # enabled. With ``fairness_interval == 0`` we MUST NOT touch
+        # _FAIRNESS_COUNTERS -- otherwise toggling the setting between
+        # calls would shift the modulo phase and the v0.27 byte-identical
+        # invariant would break for callers that disable fairness.
+        fairness_pop = False
+        if fairness_n > 0:
+            count = _next_fairness_count(blocking_claim_id)
+            fairness_pop = (count % fairness_n) == 0
         async with aiosqlite.connect(self.path) as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             await conn.execute("BEGIN IMMEDIATE")
-            # v0.25: order by priority DESC (blocking > high > normal >
-            # low) before position ASC so urgent waiters jump ahead of
-            # earlier-but-lower-priority entries. SQLite has no ENUM, so
-            # we map the priority string to an integer ordinal via CASE.
-            #
-            # v0.26: when ``age_boost_seconds`` > 0, add +1 to the rank of
-            # any entry whose age (now - enqueued_at) exceeds the threshold,
-            # so an old normal waiter floats to an effective 'high' rank
-            # and breaks the tie via position ASC. The age expression uses
-            # ``strftime('%s', ...)`` for an integer epoch comparison; if
-            # enqueued_at is malformed the inner strftime returns NULL
-            # and the COALESCE keeps the age at 0 (no boost), so the v0.25
-            # behaviour is preserved on bad data.
-            cur = await conn.execute(
-                "SELECT *, ("
-                "CASE priority "
-                "WHEN 'blocking' THEN 4 "
-                "WHEN 'high' THEN 3 "
-                "WHEN 'normal' THEN 2 "
-                "WHEN 'low' THEN 1 "
-                "ELSE 2 END"
-                " + CASE WHEN ? > 0 AND COALESCE("
-                "CAST(strftime('%s','now') AS INTEGER) - "
-                "CAST(strftime('%s', enqueued_at) AS INTEGER), 0) > ? "
-                "THEN 1 ELSE 0 END"
-                ") AS _prio_rank "
-                "FROM claim_queue "
-                "WHERE blocking_claim_id = ? AND state = 'waiting' "
-                "ORDER BY _prio_rank DESC, position ASC LIMIT 1",
-                (boost_threshold, boost_threshold, blocking_claim_id),
-            )
+            if fairness_pop:
+                # v0.28 fairness override: bypass the priority CASE
+                # entirely and pop the oldest waiting entry (lowest
+                # position). This is the starvation safety valve so
+                # low/normal-priority waiters eventually win.
+                cur = await conn.execute(
+                    "SELECT * FROM claim_queue "
+                    "WHERE blocking_claim_id = ? AND state = 'waiting' "
+                    "ORDER BY position ASC LIMIT 1",
+                    (blocking_claim_id,),
+                )
+            else:
+                # v0.25: order by priority DESC (blocking > high > normal
+                # > low) before position ASC so urgent waiters jump ahead
+                # of earlier-but-lower-priority entries. SQLite has no
+                # ENUM, so we map the priority string to an integer
+                # ordinal via CASE.
+                #
+                # v0.26: when ``age_boost_seconds`` > 0, add +1 to the
+                # rank of any entry whose age (now - enqueued_at) exceeds
+                # the threshold, so an old normal waiter floats to an
+                # effective 'high' rank and breaks the tie via position
+                # ASC. The age expression uses ``strftime('%s', ...)``
+                # for an integer epoch comparison; if enqueued_at is
+                # malformed the inner strftime returns NULL and the
+                # COALESCE keeps the age at 0 (no boost), so the v0.25
+                # behaviour is preserved on bad data.
+                #
+                # v0.28: when ``priority_decay_sec`` > 0, subtract one
+                # rank level per ``decay_sec`` seconds in the queue. The
+                # MAX(0, ...) inside the inner CAST clamps the integer
+                # division to be non-negative on malformed timestamps;
+                # the outer MAX(_prio_rank, 1) at ORDER BY time floors
+                # the effective rank at 'low'=1 so a very old entry
+                # still pops in declared FIFO order against equally
+                # low-floored peers.
+                cur = await conn.execute(
+                    "SELECT *, ("
+                    "CASE priority "
+                    "WHEN 'blocking' THEN 4 "
+                    "WHEN 'high' THEN 3 "
+                    "WHEN 'normal' THEN 2 "
+                    "WHEN 'low' THEN 1 "
+                    "ELSE 2 END"
+                    " + CASE WHEN ? > 0 AND COALESCE("
+                    "CAST(strftime('%s','now') AS INTEGER) - "
+                    "CAST(strftime('%s', enqueued_at) AS INTEGER), 0) > ? "
+                    "THEN 1 ELSE 0 END"
+                    " - CASE WHEN ? > 0 "
+                    "THEN CAST(MAX(0, COALESCE("
+                    "CAST(strftime('%s','now') AS INTEGER) - "
+                    "CAST(strftime('%s', enqueued_at) AS INTEGER), 0)) / ? "
+                    "AS INTEGER) "
+                    "ELSE 0 END"
+                    ") AS _prio_rank "
+                    "FROM claim_queue "
+                    "WHERE blocking_claim_id = ? AND state = 'waiting' "
+                    "ORDER BY (CASE WHEN _prio_rank < 1 THEN 1 "
+                    "ELSE _prio_rank END) DESC, position ASC LIMIT 1",
+                    (
+                        boost_threshold,
+                        boost_threshold,
+                        decay_sec,
+                        decay_sec if decay_sec > 0 else 1,
+                        blocking_claim_id,
+                    ),
+                )
             row = await cur.fetchone()
             if row is None:
                 await conn.commit()
@@ -1980,6 +2065,79 @@ class Database:
                     "engineers_24h": int(r["engineers_in_window"] or 0),
                     "active_claims": int(r["active_claims"] or 0),
                     "auto_resolutions_24h": auto_counts,
+                }
+            )
+        return out
+
+    async def list_stale_engineers(
+        self,
+        *,
+        days: int,
+        now: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """v0.28: return engineers whose most-recent active-claim
+        ``last_activity`` is older than ``days`` days ago. Useful for
+        housekeeping abandoned worktrees that never released their
+        claims.
+
+        Returns one row per engineer:
+        ``{engineer, last_activity, active_claim_count, repos: [...]}``.
+
+        Engineers with zero active claims are not included (their
+        last_activity has nothing to bound). ``last_activity IS NULL``
+        rows (pre-v0.6 claims without session tagging) are also
+        excluded because the idle-expiration path does not track them
+        either -- including them would surface every legacy claim as
+        "stale" forever.
+
+        Ordering: oldest activity first so the most-abandoned
+        engineers float to the top of the dashboard panel and CLI
+        output.
+        """
+        if days <= 0:
+            return []
+        await self.init()
+        now = now or datetime.now(UTC)
+        cutoff = (now - timedelta(days=days)).replace(microsecond=0)
+        cutoff_iso = cutoff.isoformat().replace("+00:00", "Z")
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                """
+                SELECT
+                    engineer,
+                    MAX(last_activity) AS last_activity,
+                    COUNT(*) AS active_claim_count,
+                    GROUP_CONCAT(DISTINCT repo) AS repos
+                FROM claims
+                WHERE released_at IS NULL
+                  AND last_activity IS NOT NULL
+                GROUP BY engineer
+                HAVING datetime(MAX(last_activity)) < datetime(?)
+                ORDER BY datetime(MAX(last_activity)) ASC, engineer ASC
+                """,
+                (cutoff_iso,),
+            )
+            rows = await cur.fetchall()
+            await conn.commit()
+
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            # GROUP_CONCAT returns NULL if every row in the group has a
+            # NULL repo; treat that case as an empty list rather than
+            # leaking a literal "None" string into the output.
+            repos_raw = r["repos"]
+            if repos_raw:
+                repos = sorted({s for s in str(repos_raw).split(",") if s})
+            else:
+                repos = []
+            out.append(
+                {
+                    "engineer": str(r["engineer"]),
+                    "last_activity": str(r["last_activity"]),
+                    "active_claim_count": int(r["active_claim_count"] or 0),
+                    "repos": repos,
                 }
             )
         return out

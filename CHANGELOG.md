@@ -9,6 +9,42 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.28.0] - 2026-06-05
+
+### Added
+
+- Backpressure response header. Every authenticated response
+  includes ``X-Coord-Queue-Depth: N`` when the request carries an
+  engineer signal (X-Coord-Engineer header or ``engineer`` query
+  param). N counts that engineer's currently-queued waiting
+  claims. Toggle via COORD_BACKPRESSURE_HEADER.
+- Queue fairness pass. Every COORD_QUEUE_FAIRNESS_INTERVAL-th
+  call (default 10) to ``db.pop_next_waiting_queue_entry``
+  bypasses the priority CASE and pops by raw FIFO position.
+  Anti-starvation guarantee for low/normal-priority waiters.
+  Set to 0 to disable.
+- Priority decay. Counterpart to the v0.26 age boost. A waiting
+  entry's effective priority drops one level per
+  COORD_QUEUE_PRIORITY_DECAY_SEC seconds (blocking -> high ->
+  normal -> low, floor at low). Prevents misclassified urgent
+  requests from monopolising the queue head. Default 300;
+  set to 0 to disable.
+- Stale engineer housekeeping. New ``coord engineers stale
+  [--release]`` subcommand surfaces engineers whose most-recent
+  activity is older than COORD_STALE_ENGINEER_DAYS (default 7).
+  ``--release`` drops their lingering active claims. Dashboard
+  panel shows the same data. db.list_stale_engineers helper.
+- ~15 new tests covering the four features.
+
+### Changed
+
+- v0.28 originally targeted multi-namespace coordination
+  (per-repo ownership rules, cross-repo blocks, per-team views,
+  multi-tenant tokens; see docs/design/multi-namespace.md). That
+  work is deferred to a later release pending actual multi-tenant
+  demand. v0.28.0 pulls in four low-hanging queue QoS +
+  housekeeping items from v0.29 + the future bucket instead.
+
 ## [0.27.2] - 2026-06-04
 
 ### Fixed

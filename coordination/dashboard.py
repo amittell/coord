@@ -705,6 +705,29 @@ tbody tr td.empty {
   letter-spacing: 0.02em;
 }
 
+/* v0.28 stale engineers panel */
+.stale .serow {
+  display: grid;
+  grid-template-columns: 24ch 1fr 6ch;
+  gap: calc(var(--grid) * 2);
+  align-items: baseline;
+  padding: calc(var(--grid)) 0;
+  border-bottom: 1px dashed var(--hairline);
+  font-size: 11px;
+}
+.stale .serow:last-child { border-bottom: none; }
+.stale .sename a {
+  color: var(--phosphor);
+  text-decoration: none;
+}
+.stale .sename a:hover { text-decoration: underline; }
+.stale .seage { color: var(--amber); }
+.stale .secount {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--fg-bright);
+}
+
 /* v0.27 webhook delivery panel */
 .webhooks .wbrow {
   display: grid;
@@ -763,6 +786,13 @@ async def render_dashboard() -> str:
     hotspot_rows = await svc.db.hotspot_files(days=30, min_attempts=5, limit=10)
     queued_rows = await svc.db.list_queued_with_holder(state="waiting", limit=100)
     webhook_stats = await svc.db.webhook_delivery_stats(window_hours=24)
+    stale_engineer_days = svc.settings.stale_engineer_days
+    if stale_engineer_days > 0:
+        stale_engineers = await svc.db.list_stale_engineers(
+            days=stale_engineer_days, now=now
+        )
+    else:
+        stale_engineers = []
 
     claims_by_id: dict[str, dict[str, Any]] = {
         str(c["id"]): c for c in recent if c.get("id")
@@ -1250,6 +1280,54 @@ async def render_dashboard() -> str:
         '</section>'
     )
 
+    # v0.28: stale engineers panel. Surface engineers whose most
+    # recent last_activity exceeds the configured threshold so an
+    # operator can spot abandoned worktrees that never released their
+    # claims. Empty state is "good!" because zero stale engineers is
+    # the steady state we want. Source: Database.list_stale_engineers.
+    if stale_engineer_days <= 0:
+        stale_body = (
+            '<div class="empty" style="padding:calc(var(--grid) * 2)">'
+            'stale-engineer housekeeping disabled '
+            '(stale_engineer_days = 0)</div>'
+        )
+    elif stale_engineers:
+        stale_lines: list[str] = []
+        for se in stale_engineers:
+            engineer = str(se.get("engineer") or "?")
+            age = _ago(se.get("last_activity"), now)
+            count = int(se.get("active_claim_count") or 0)
+            # Link the engineer name to ?engineer=NAME so the operator
+            # can drill into the existing activity surface that already
+            # honours the query parameter.
+            link = (
+                f'<a class="seengineer" href="?engineer={_esc(engineer)}">'
+                f'{_esc(engineer)}</a>'
+            )
+            stale_lines.append(
+                '<div class="serow">'
+                f'<div class="sename">{link}</div>'
+                f'<div class="seage">{_esc(age)}</div>'
+                f'<div class="secount">{count}</div>'
+                '</div>'
+            )
+        stale_body = "".join(stale_lines)
+    else:
+        stale_body = (
+            '<div class="empty" style="padding:calc(var(--grid) * 2)">'
+            'no stale engineers (good!)</div>'
+        )
+    stale_html = (
+        '<section class="panel">'
+        '<header><h2>stale engineers</h2>'
+        f'<span class="meta">threshold {stale_engineer_days}d · '
+        f'{len(stale_engineers)} listed</span></header>'
+        '<div class="stale" style="padding:calc(var(--grid) * 2)">'
+        + stale_body +
+        '</div>'
+        '</section>'
+    )
+
     # v0.27: webhook delivery panel. Surface per-event-type delivery
     # health for the last 24h so an operator can spot a stuck endpoint
     # at a glance. Zero counts render muted so non-zero ones (especially
@@ -1359,6 +1437,8 @@ async def render_dashboard() -> str:
     {hotspots_html}
 
     {queue_html}
+
+    {stale_html}
 
     {webhooks_html}
 

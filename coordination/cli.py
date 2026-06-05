@@ -4,6 +4,7 @@ import argparse
 
 from coordination import BANNER, __version__
 from coordination.cli_doctor import run_doctor
+from coordination.cli_engineers import add_engineers_subparser
 from coordination.cli_init import run_init
 from coordination.cli_ops import run_claims, run_release, run_status, run_stop
 from coordination.cli_outbox import add_outbox_subparser
@@ -30,6 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  coord claims      List active claims\n"
             "  coord release     Release a claim by id\n"
             "  coord outbox      Inspect / retry / purge the webhook outbox\n"
+            "  coord engineers   Per-engineer housekeeping (list / release stale engineers)\n"
             "\n"
             "Advanced entry points:\n"
             "  coord-api         Raw uvicorn runner for the FastAPI app (coordination.main:app)\n"
@@ -221,6 +223,7 @@ def build_parser() -> argparse.ArgumentParser:
     release.set_defaults(func=run_release)
 
     add_outbox_subparser(sub)
+    add_engineers_subparser(sub)
 
     internal = sub.add_parser("_serve")
     internal.set_defaults(func=lambda _: _run_internal_server())

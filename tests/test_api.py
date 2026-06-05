@@ -3061,6 +3061,427 @@ async def test_age_boost_disabled_when_setting_zero(
 
 
 # ---------------------------------------------------------------------------
+# v0.28: queue ordering
+#
+# Two refinements stacked on top of the v0.25 priority CASE and v0.26 age
+# boost: a fairness override that periodically ignores priority and pops by
+# raw FIFO position, and a priority decay rule that drops effective priority
+# one level per ``priority_decay_sec`` seconds in queue. Both live in the
+# same SQL CASE in pop_next_waiting_queue_entry; tests exercise them via the
+# Database API directly so we don't have to wait through real release-drain
+# loops. Each test in this section uses the ``_reset_fairness_counters``
+# fixture to clear the module-level _FAIRNESS_COUNTERS dict so the modulo
+# phase doesn't leak between tests.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def _reset_fairness_counters() -> None:
+    """Clear the per-process fairness counter dictionary so each test
+    starts from count=0. Without this the modulo phase leaks between
+    tests via the module-level _FAIRNESS_COUNTERS dict and ordering
+    assertions become order-dependent.
+    """
+    from coordination import db as _db_mod
+
+    _db_mod._FAIRNESS_COUNTERS.clear()
+    yield
+    _db_mod._FAIRNESS_COUNTERS.clear()
+
+
+@pytest.mark.asyncio
+async def test_fairness_interval_pops_in_position_order_every_nth_time(
+    client: AsyncClient,
+    _reset_fairness_counters: None,
+) -> None:
+    """Seed three waiters at the same holder: two low-priority then one
+    blocking. With fairness_interval=2 the first pop (count=1) honours
+    priority and the blocking waiter wins; the second pop (count=2, the
+    fairness pop) bypasses priority and the oldest remaining low waiter
+    (position=1) wins.
+    """
+    from coordination import deps
+
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/v28_fair.ts"}],
+    }
+    rh = await client.post("/claims", headers=_AUTH, json=holder)
+    assert rh.status_code == 200, rh.text
+    holder_cid = rh.json()["claim_ids"][0]
+
+    db = deps.get_service().db
+
+    low1 = await db.enqueue_claim_request(
+        blocking_claim_id=holder_cid,
+        requester_engineer="low_first",
+        requester_session_id="low1-sess",
+        requester_branch=None,
+        requester_description=None,
+        repo="amittell/coord",
+        claim_type="file",
+        pattern="src/v28_fair.ts",
+        symbols=None,
+        narrowable=None,
+        ttl_hours=None,
+        wait_seconds=120,
+        priority="low",
+    )
+    low2 = await db.enqueue_claim_request(
+        blocking_claim_id=holder_cid,
+        requester_engineer="low_second",
+        requester_session_id="low2-sess",
+        requester_branch=None,
+        requester_description=None,
+        repo="amittell/coord",
+        claim_type="file",
+        pattern="src/v28_fair.ts",
+        symbols=None,
+        narrowable=None,
+        ttl_hours=None,
+        wait_seconds=120,
+        priority="low",
+    )
+    blocking = await db.enqueue_claim_request(
+        blocking_claim_id=holder_cid,
+        requester_engineer="blocker",
+        requester_session_id="blocker-sess",
+        requester_branch=None,
+        requester_description=None,
+        repo="amittell/coord",
+        claim_type="file",
+        pattern="src/v28_fair.ts",
+        symbols=None,
+        narrowable=None,
+        ttl_hours=None,
+        wait_seconds=120,
+        priority="blocking",
+    )
+    assert low1["position"] == 1
+    assert low2["position"] == 2
+    assert blocking["position"] == 3
+
+    # Pop 1: count=1, 1 % 2 != 0, priority CASE wins -> blocking.
+    pop1 = await db.pop_next_waiting_queue_entry(
+        holder_cid,
+        fairness_interval=2,
+    )
+    assert pop1 is not None
+    assert pop1["requester_engineer"] == "blocker", (
+        "first pop (count=1) honours priority; blocking must win; "
+        f"got {pop1['requester_engineer']!r}"
+    )
+
+    # Pop 2: count=2, 2 % 2 == 0, fairness override -> oldest position.
+    # blocking was already removed by pop1, so position 1 (low_first)
+    # is the oldest remaining waiter.
+    pop2 = await db.pop_next_waiting_queue_entry(
+        holder_cid,
+        fairness_interval=2,
+    )
+    assert pop2 is not None
+    assert pop2["requester_engineer"] == "low_first", (
+        "second pop (count=2, fairness pop) ignores priority and picks "
+        f"position ASC; got {pop2['requester_engineer']!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fairness_disabled_when_setting_zero(
+    client: AsyncClient,
+    _reset_fairness_counters: None,
+) -> None:
+    """With fairness_interval=0 the override never fires: even 10
+    consecutive pops honour priority. Seed one blocking waiter and one
+    low waiter; the blocking pops on the first call, the low waiter
+    pops on the second, and the eight remaining calls return None.
+    Critically, the per-process counter must not be touched -- otherwise
+    toggling fairness on later would inherit a leaked modulo phase.
+    """
+    from coordination import deps
+    from coordination import db as _db_mod
+
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/v28_fair_off.ts"}],
+    }
+    rh = await client.post("/claims", headers=_AUTH, json=holder)
+    assert rh.status_code == 200, rh.text
+    holder_cid = rh.json()["claim_ids"][0]
+
+    db = deps.get_service().db
+
+    # Enqueue low first (position 1) then blocking (position 2). With
+    # fairness=0 the priority CASE wins and blocking pops first; with
+    # any fairness pop the low would jump ahead. We assert blocking
+    # always wins until removed.
+    await db.enqueue_claim_request(
+        blocking_claim_id=holder_cid,
+        requester_engineer="low_waiter",
+        requester_session_id="low-sess",
+        requester_branch=None,
+        requester_description=None,
+        repo="amittell/coord",
+        claim_type="file",
+        pattern="src/v28_fair_off.ts",
+        symbols=None,
+        narrowable=None,
+        ttl_hours=None,
+        wait_seconds=120,
+        priority="low",
+    )
+    await db.enqueue_claim_request(
+        blocking_claim_id=holder_cid,
+        requester_engineer="blocker",
+        requester_session_id="blocker-sess",
+        requester_branch=None,
+        requester_description=None,
+        repo="amittell/coord",
+        claim_type="file",
+        pattern="src/v28_fair_off.ts",
+        symbols=None,
+        narrowable=None,
+        ttl_hours=None,
+        wait_seconds=120,
+        priority="blocking",
+    )
+
+    pop1 = await db.pop_next_waiting_queue_entry(
+        holder_cid, fairness_interval=0
+    )
+    assert pop1 is not None
+    assert pop1["requester_engineer"] == "blocker"
+
+    # Next call: queue has only the low waiter left. Priority CASE
+    # ranks low=1 and there's no fairness override to second-guess it,
+    # so the low waiter pops and the subsequent eight calls return None.
+    pop2 = await db.pop_next_waiting_queue_entry(
+        holder_cid, fairness_interval=0
+    )
+    assert pop2 is not None
+    assert pop2["requester_engineer"] == "low_waiter"
+    for _ in range(8):
+        assert (
+            await db.pop_next_waiting_queue_entry(
+                holder_cid, fairness_interval=0
+            )
+            is None
+        )
+
+    # Critical byte-identical-behaviour check: the per-blocking-claim
+    # fairness counter must not have been touched when fairness=0.
+    assert holder_cid not in _db_mod._FAIRNESS_COUNTERS, (
+        "fairness_interval=0 must not advance the counter; found "
+        f"{_db_mod._FAIRNESS_COUNTERS.get(holder_cid)!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_priority_decay_drops_blocking_to_high_after_decay_window(
+    client: AsyncClient,
+    _reset_fairness_counters: None,
+) -> None:
+    """Seed an old blocking waiter backdated past two decay windows plus
+    a fresh high waiter. Decay subtracts 2 from the old blocking
+    (effective rank = 4 - 2 = 2), so fresh high (rank = 3) wins by
+    declared priority. We use two windows rather than one to avoid the
+    rank-tie + position tiebreak case (the old blocking enqueued first
+    at position=1 would otherwise win on a tie). The decay-disabled
+    counterpart test asserts the inverse.
+    """
+    from coordination import deps
+
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/v28_decay.ts"}],
+    }
+    rh = await client.post("/claims", headers=_AUTH, json=holder)
+    assert rh.status_code == 200, rh.text
+    holder_cid = rh.json()["claim_ids"][0]
+
+    db = deps.get_service().db
+    decay_sec = 300
+
+    old_blocking = await db.enqueue_claim_request(
+        blocking_claim_id=holder_cid,
+        requester_engineer="old_blocker",
+        requester_session_id="ob-sess",
+        requester_branch=None,
+        requester_description=None,
+        repo="amittell/coord",
+        claim_type="file",
+        pattern="src/v28_decay.ts",
+        symbols=None,
+        narrowable=None,
+        ttl_hours=None,
+        wait_seconds=120,
+        priority="blocking",
+    )
+    await db.enqueue_claim_request(
+        blocking_claim_id=holder_cid,
+        requester_engineer="fresh_high",
+        requester_session_id="fh-sess",
+        requester_branch=None,
+        requester_description=None,
+        repo="amittell/coord",
+        claim_type="file",
+        pattern="src/v28_decay.ts",
+        symbols=None,
+        narrowable=None,
+        ttl_hours=None,
+        wait_seconds=120,
+        priority="high",
+    )
+
+    # Backdate the old blocking by 2 decay windows + 1s so effective
+    # rank = 4 - 2 = 2 < high's rank of 3. Age boost stays disabled so
+    # decay alone decides the outcome.
+    await _backdate_queue_entry(
+        db, old_blocking["id"], seconds_ago=2 * decay_sec + 1
+    )
+
+    popped = await db.pop_next_waiting_queue_entry(
+        holder_cid,
+        age_boost_seconds=0,
+        fairness_interval=0,
+        priority_decay_sec=decay_sec,
+    )
+    assert popped is not None
+    assert popped["requester_engineer"] == "fresh_high", (
+        "decay drops old blocking (4 - 2 = 2) below fresh high (3); "
+        f"fresh high must win; got {popped['requester_engineer']!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_priority_decay_floors_at_low(
+    client: AsyncClient,
+    _reset_fairness_counters: None,
+) -> None:
+    """An extreme decay (10x the window) on a normal entry would push
+    raw effective rank to 2 - 10 = -8. The ORDER BY clamp floors it at
+    'low'=1 so the entry still has a valid ordinal and still pops when
+    no other waiters compete. Verifies the clamp + that decay never
+    blocks eventual delivery.
+    """
+    from coordination import deps
+
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/v28_decay_floor.ts"}],
+    }
+    rh = await client.post("/claims", headers=_AUTH, json=holder)
+    assert rh.status_code == 200, rh.text
+    holder_cid = rh.json()["claim_ids"][0]
+
+    db = deps.get_service().db
+    decay_sec = 300
+
+    aged_normal = await db.enqueue_claim_request(
+        blocking_claim_id=holder_cid,
+        requester_engineer="ancient_normal",
+        requester_session_id="an-sess",
+        requester_branch=None,
+        requester_description=None,
+        repo="amittell/coord",
+        claim_type="file",
+        pattern="src/v28_decay_floor.ts",
+        symbols=None,
+        narrowable=None,
+        ttl_hours=None,
+        wait_seconds=120,
+        priority="normal",
+    )
+    await _backdate_queue_entry(
+        db, aged_normal["id"], seconds_ago=10 * decay_sec
+    )
+
+    popped = await db.pop_next_waiting_queue_entry(
+        holder_cid,
+        age_boost_seconds=0,
+        fairness_interval=0,
+        priority_decay_sec=decay_sec,
+    )
+    assert popped is not None
+    assert popped["requester_engineer"] == "ancient_normal", (
+        "an ancient normal entry must still pop when it is the only "
+        f"waiter; got {popped['requester_engineer']!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_decay_disabled_when_setting_zero(
+    client: AsyncClient,
+    _reset_fairness_counters: None,
+) -> None:
+    """With priority_decay_sec=0 the decay CASE short-circuits to 0 and
+    declared priority alone (plus the v0.26 boost, here disabled) drives
+    ordering. An ancient blocking entry stays blocking and beats a fresh
+    high entry no matter how far back it was enqueued.
+    """
+    from coordination import deps
+
+    holder = {
+        "engineer": "alice",
+        "repo": "amittell/coord",
+        "claims": [{"type": "file", "pattern": "src/v28_decay_off.ts"}],
+    }
+    rh = await client.post("/claims", headers=_AUTH, json=holder)
+    assert rh.status_code == 200, rh.text
+    holder_cid = rh.json()["claim_ids"][0]
+
+    db = deps.get_service().db
+
+    old_blocking = await db.enqueue_claim_request(
+        blocking_claim_id=holder_cid,
+        requester_engineer="ancient_blocker",
+        requester_session_id="ab-sess",
+        requester_branch=None,
+        requester_description=None,
+        repo="amittell/coord",
+        claim_type="file",
+        pattern="src/v28_decay_off.ts",
+        symbols=None,
+        narrowable=None,
+        ttl_hours=None,
+        wait_seconds=120,
+        priority="blocking",
+    )
+    await db.enqueue_claim_request(
+        blocking_claim_id=holder_cid,
+        requester_engineer="fresh_high",
+        requester_session_id="fh-sess",
+        requester_branch=None,
+        requester_description=None,
+        repo="amittell/coord",
+        claim_type="file",
+        pattern="src/v28_decay_off.ts",
+        symbols=None,
+        narrowable=None,
+        ttl_hours=None,
+        wait_seconds=120,
+        priority="high",
+    )
+    await _backdate_queue_entry(db, old_blocking["id"], seconds_ago=3600)
+
+    popped = await db.pop_next_waiting_queue_entry(
+        holder_cid,
+        age_boost_seconds=0,
+        fairness_interval=0,
+        priority_decay_sec=0,
+    )
+    assert popped is not None
+    assert popped["requester_engineer"] == "ancient_blocker", (
+        "decay disabled: blocking (rank=4) must beat fresh high (rank=3) "
+        f"regardless of age; got {popped['requester_engineer']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # v0.26: queue cancellation
 # ---------------------------------------------------------------------------
 
@@ -3562,3 +3983,121 @@ async def test_queue_cancel_emits_webhook(
     assert detail["requester_engineer"] == "bob"
     assert detail["pattern"] == "src/v27d.ts"
     assert detail["queue_id"] == queue_id
+
+
+# ---------------------------------------------------------------------------
+# v0.28: backpressure header
+# ---------------------------------------------------------------------------
+
+
+async def _seed_two_queued_for_bob(client: AsyncClient) -> None:
+    """Set up the shared backpressure-header fixture: alice holds two
+    distinct claims, bob has one waiting queue entry behind each. The
+    middleware should report a queue depth of 2 whenever bob is the
+    identified caller."""
+    from coordination import deps
+
+    db = deps.get_service().db
+
+    for idx, pattern in enumerate(("src/v28a.ts", "src/v28b.ts")):
+        holder = {
+            "engineer": "alice",
+            "repo": "amittell/coord",
+            "claims": [{"type": "file", "pattern": pattern}],
+        }
+        rh = await client.post("/claims", headers=_AUTH, json=holder)
+        assert rh.status_code == 200, rh.text
+        holder_cid = rh.json()["claim_ids"][0]
+
+        await db.enqueue_claim_request(
+            blocking_claim_id=holder_cid,
+            requester_engineer="bob",
+            requester_session_id=f"bob-sess-{idx}",
+            requester_branch=None,
+            requester_description=None,
+            repo="amittell/coord",
+            claim_type="file",
+            pattern=pattern,
+            symbols=None,
+            narrowable=None,
+            ttl_hours=None,
+            wait_seconds=120,
+        )
+
+
+@pytest.mark.asyncio
+async def test_backpressure_header_present_with_engineer_in_query(
+    client: AsyncClient,
+) -> None:
+    """The middleware stamps ``X-Coord-Queue-Depth`` on responses when
+    the caller's engineer arrives as the standard ``engineer`` query
+    parameter, counting that engineer's waiting queue rows."""
+    await _seed_two_queued_for_bob(client)
+
+    r = await client.get("/claims?engineer=bob", headers=_AUTH)
+    assert r.status_code == 200, r.text
+    assert r.headers.get("X-Coord-Queue-Depth") == "2"
+
+
+@pytest.mark.asyncio
+async def test_backpressure_header_uses_x_coord_engineer_header(
+    client: AsyncClient,
+) -> None:
+    """``X-Coord-Engineer`` is the explicit declaration channel for
+    coord-mcp wrappers; it must work even when the query string is
+    silent on the engineer identity."""
+    await _seed_two_queued_for_bob(client)
+
+    headers = dict(_AUTH)
+    headers["X-Coord-Engineer"] = "bob"
+    r = await client.get("/claims", headers=headers)
+    assert r.status_code == 200, r.text
+    assert r.headers.get("X-Coord-Queue-Depth") == "2"
+
+
+@pytest.mark.asyncio
+async def test_backpressure_header_omitted_without_engineer_signal(
+    client: AsyncClient,
+) -> None:
+    """Anonymous calls (no header, no query) get no header at all -- the
+    middleware has nothing to attribute the depth to."""
+    await _seed_two_queued_for_bob(client)
+
+    r = await client.get("/claims", headers=_AUTH)
+    assert r.status_code == 200, r.text
+    assert "X-Coord-Queue-Depth" not in r.headers
+
+
+@pytest.mark.asyncio
+async def test_backpressure_header_disabled_via_setting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With ``COORD_BACKPRESSURE_HEADER=false`` the middleware is a
+    no-op even when an engineer signal is present."""
+    db_path = tmp_path / "db.sqlite"
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "test-token")
+    monkeypatch.setenv("COORD_DATABASE_PATH", str(db_path))
+    monkeypatch.setenv("COORD_DISABLE_BACKGROUND_CLEANUP", "1")
+    monkeypatch.setenv("COORD_DISABLE_INSTANCE_LOCK", "1")
+    monkeypatch.delenv("COORD_REPO_ROOT", raising=False)
+    monkeypatch.setenv("COORD_BACKPRESSURE_HEADER", "false")
+
+    from coordination import deps
+
+    deps.get_service.cache_clear()
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        await _seed_two_queued_for_bob(ac)
+
+        r = await ac.get("/claims?engineer=bob", headers=_AUTH)
+        assert r.status_code == 200, r.text
+        assert "X-Coord-Queue-Depth" not in r.headers
+
+        headers = dict(_AUTH)
+        headers["X-Coord-Engineer"] = "bob"
+        r2 = await ac.get("/claims", headers=headers)
+        assert r2.status_code == 200, r2.text
+        assert "X-Coord-Queue-Depth" not in r2.headers
+
+    deps.get_service.cache_clear()

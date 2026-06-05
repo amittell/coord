@@ -1249,3 +1249,77 @@ async def test_dashboard_webhook_panel_empty_state(
     html_out = await render_dashboard()
     assert "webhook delivery (24h)" in html_out.lower()
     assert "no webhook events" in html_out.lower()
+
+
+# ---------------------------------------------------------------------------
+# v0.28: stale engineers panel
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dashboard_renders_stale_engineers_panel(
+    svc: CoordinationService,
+) -> None:
+    """v0.28: a "stale engineers" panel surfaces engineers whose most
+    recent ``last_activity`` is older than ``stale_engineer_days``. The
+    panel shows the engineer name, an age relative-time, and the
+    active claim count so an operator can spot abandoned worktrees at
+    a glance.
+
+    We disable the idle-expiry sweep for this test by pinning
+    ``idle_timeout_sec = 0`` on the service. Without that, the seed
+    claim's 15-day-old last_activity would trip the idle path inside
+    ``list_claims`` -- the dashboard calls that on its way in -- and
+    the row would be released before ``list_stale_engineers`` saw it.
+    """
+    import aiosqlite
+
+    svc.settings = svc.settings.model_copy(update={"idle_timeout_sec": 0})
+
+    # Seed one stale engineer (15 days old) and one fresh engineer.
+    # We backdate last_activity directly on the row so the test isn't
+    # at the mercy of insert_claims_batch stamping "now".
+    stale_exp = _iso(datetime.now(UTC) + timedelta(days=14))
+    fresh_exp = _iso(datetime.now(UTC) + timedelta(days=14))
+    await svc.db.insert_claims_batch(
+        engineer="stale-engineer",
+        branch=None,
+        description=None,
+        items=[("stale-1", "file", "src/x.py", "soft", stale_exp)],
+        repo="demo",
+        session_id="session-stale",
+    )
+    await svc.db.insert_claims_batch(
+        engineer="fresh-engineer",
+        branch=None,
+        description=None,
+        items=[("fresh-1", "file", "src/y.py", "soft", fresh_exp)],
+        repo="demo",
+        session_id="session-fresh",
+    )
+    backdated = _iso(datetime.now(UTC) - timedelta(days=15))
+    async with aiosqlite.connect(svc.db.path) as conn:
+        await conn.execute(
+            "UPDATE claims SET last_activity = ? WHERE id = ?",
+            (backdated, "stale-1"),
+        )
+        await conn.commit()
+
+    html_out = await render_dashboard()
+
+    # Panel header is present.
+    assert "<h2>stale engineers</h2>" in html_out.lower()
+
+    # Slice the panel for tighter assertions. The panel after stale is
+    # webhooks (start of the per-event-type rows). Anchor on the
+    # rendered <h2> so the CSS comment can't match.
+    start = html_out.lower().index("<h2>stale engineers</h2>")
+    end = html_out.lower().index("<h2>webhook delivery", start)
+    panel = html_out[start:end]
+
+    assert "stale-engineer" in panel
+    # Fresh engineer must NOT appear in the panel slice.
+    assert "fresh-engineer" not in panel
+    # Active claim count surfaces as a numeric cell.
+    assert ">1<" in panel
+

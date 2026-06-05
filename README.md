@@ -30,7 +30,7 @@ The stack is intentionally simple:
 - `docs/integrations/claude-code.md`: Claude Code-first integration
 - `docs/integrations/codex-cli.md`: Codex CLI integration
 - Cursor users: see `templates/.cursor/mcp.json.example` and the Cursor rule under `templates/.cursor/rules/`
-- [`docs/design/roadmap.md`](./docs/design/roadmap.md): v0.27-v0.30 candidates and future bucket
+- [`docs/design/roadmap.md`](./docs/design/roadmap.md): v0.28-v0.30 candidates and future bucket
 - `CHANGELOG.md`: notable changes between versions
 
 ## Quickstart
@@ -290,6 +290,38 @@ healthy. Filter the event stream with COORD_WEBHOOK_EVENTS
 (comma-separated allowlist; empty = all). Slack and GitHub PR
 adapters are queued for v0.27.x follow-ups.
 
+### Backpressure header (v0.28)
+
+Every authenticated response includes ``X-Coord-Queue-Depth: N``
+when the request carries an engineer signal (``X-Coord-Engineer``
+header or ``engineer`` query param). N is the count of that
+engineer's currently-queued waiting claims. Lets clients
+self-regulate without an extra round trip to ``/requests?queued=true``.
+Set COORD_BACKPRESSURE_HEADER=false to disable.
+
+### Queue fairness pass (v0.28)
+
+Every COORD_QUEUE_FAIRNESS_INTERVAL-th call (default 10) to the
+queue pop bypasses priority entirely and pops by raw FIFO position.
+Guarantees low/normal-priority waiters eventually win against a
+steady stream of high/blocking entries. Set to 0 to disable
+(strict priority ordering preserved).
+
+### Priority decay (v0.28)
+
+A waiting entry's effective priority drops one level per
+COORD_QUEUE_PRIORITY_DECAY_SEC seconds in the queue (blocking ->
+high -> normal -> low, floor at low). Counterpart to the v0.26 age
+boost. Prevents misclassified urgent requests from monopolising
+the queue head. Default 300; 0 disables.
+
+### Stale engineer cleanup (v0.28)
+
+``coord engineers stale [--release]`` surfaces engineers whose
+most-recent activity is older than COORD_STALE_ENGINEER_DAYS
+(default 7). ``--release`` drops their lingering claims. Dashboard
+panel shows the same data. Solves abandoned-worktree housekeeping.
+
 ## Local Assets
 
 - `.env.example`: environment variable template
@@ -343,6 +375,10 @@ Start with `docs/integrations/claude-code.md` if your team is primarily on Claud
 | `COORD_WEBHOOK_MAX_RETRIES` | Webhook retry cap (v0.27): the delivery loop retries failed POSTs with exponential backoff and marks the outbox row exhausted after this many attempts. Default: `5` |
 | `COORD_WEBHOOK_RETRY_BACKOFF_SEC` | Webhook retry base delay (v0.27): exponential backoff base in seconds; next retry runs at `backoff * 2**retry_count`. Default: `60` |
 | `COORD_WEBHOOK_DELIVERY_INTERVAL_SEC` | Webhook delivery loop interval (v0.27): how often the background loop scans `webhook_outbox` for due rows. Default: `5` |
+| `COORD_BACKPRESSURE_HEADER` | Backpressure response header (v0.28): when truthy, every authenticated response includes `X-Coord-Queue-Depth: N` if the request carries an engineer signal (`X-Coord-Engineer` header or `engineer` query param). N is that engineer's currently-queued waiting claim count. Set to `false` to disable. Default: `true` |
+| `COORD_QUEUE_FAIRNESS_INTERVAL` | Queue fairness pass (v0.28): every Nth call to `db.pop_next_waiting_queue_entry` bypasses the priority CASE and pops by raw FIFO position, guaranteeing low/normal-priority waiters eventually win against a steady stream of high/blocking entries. Set to `0` to disable (strict priority ordering preserved). Default: `10` |
+| `COORD_QUEUE_PRIORITY_DECAY_SEC` | Queue priority decay (v0.28): counterpart to the v0.26 age boost. A waiting entry's effective priority drops one level per this many seconds in the queue (`blocking` -> `high` -> `normal` -> `low`, floor at `low`). Prevents a misclassified urgent request from monopolising the queue head. Set to `0` to disable. Default: `300` |
+| `COORD_STALE_ENGINEER_DAYS` | Stale engineer threshold (v0.28): `coord engineers stale` (and the dashboard panel) flags engineers whose most-recent claim activity is older than this many days. `--release` drops their lingering active claims. Default: `7` |
 | `COORD_DISABLE_BACKGROUND_CLEANUP` | Set truthy to skip the in-process claim expiration sweep (useful for tests or external schedulers). Default: unset |
 | `COORD_DISABLE_INSTANCE_LOCK` | Set truthy to bypass the advisory `<db>.lock` flock (useful on NFS-backed shared volumes where flock is unreliable). Default: unset |
 | `COORD_LS_FILES_CACHE_TTL_SEC` | TTL for the in-process `git ls-files` cache used during overlap checks. Default: `10` |

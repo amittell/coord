@@ -437,6 +437,45 @@ Filtering happens at enqueue time inside `fire_webhook`, so excluded events neve
 
 Slack and GitHub PR adapters that turn these payloads into channel messages and PR comments are queued as v0.27.x follow-ups; until then, every receiver is a small custom integration.
 
+## Queue QoS and housekeeping (v0.28+)
+
+v0.28 layers four small features on top of the v0.25 priority + v0.26 age boost queue model. Each is a config + behavioural addition with no schema migration, so upgrading is a drop-in restart.
+
+### Backpressure header
+
+Every authenticated response includes ``X-Coord-Queue-Depth: N`` when the request carries an engineer signal (the ``X-Coord-Engineer`` header or an ``engineer`` query param). N is the count of that engineer's currently-queued waiting claims, so a client can self-regulate without an extra round trip to ``/requests?queued=true``. Set ``COORD_BACKPRESSURE_HEADER=false`` to disable; default is on.
+
+Verify with curl:
+
+```bash
+curl -i "http://127.0.0.1:8080/claims?engineer=alex/claude/main" \
+  -H "Authorization: Bearer $COORD_AUTH_TOKEN" \
+  -H "X-Coord-Engineer: alex/claude/main" | grep -i 'X-Coord-Queue-Depth'
+```
+
+The header is suppressed on responses to requests that do not carry an engineer signal so unauthenticated probes (``/health``, ``/readyz``) and operator-style calls without an engineer query param are not annotated.
+
+### Queue fairness pass
+
+``db.pop_next_waiting_queue_entry`` keeps an in-memory per-blocking-claim counter. Every ``COORD_QUEUE_FAIRNESS_INTERVAL``-th call (default 10) bypasses the priority CASE entirely and pops by raw FIFO position. This guarantees that a low or normal waiter eventually wins against a steady stream of high or blocking entries that would otherwise indefinitely starve it. Set to ``0`` to disable and restore strict priority ordering (the v0.25-v0.27 behaviour).
+
+### Priority decay
+
+Counterpart to the v0.26 age boost. A waiting entry's *effective* priority drops one level per ``COORD_QUEUE_PRIORITY_DECAY_SEC`` seconds in the queue (``blocking`` -> ``high`` -> ``normal`` -> ``low``, floor at ``low``). Default ``300``; ``0`` disables. Prevents a misclassified urgent request from monopolising the queue head: a ``blocking`` waiter that has been sitting for ten minutes ends up at ``normal`` rank and stops blocking newer high-priority traffic. Combined with the v0.26 age boost (which lifts long-waiting low/normal entries) and the fairness pass (which periodically ignores priority entirely), the queue self-regulates without operator intervention.
+
+### Stale engineer cleanup
+
+The dashboard surfaces a "stale engineers" panel listing engineers whose most-recent claim activity is older than ``COORD_STALE_ENGINEER_DAYS`` (default 7). The same data is available via CLI:
+
+```bash
+coord engineers stale              # human-readable list
+coord engineers stale --json       # machine-readable
+coord engineers stale --days 14    # custom threshold
+coord engineers stale --release --yes  # drop their lingering active claims
+```
+
+Solves the "abandoned worktree leaves dangling claims" housekeeping issue. ``--release`` is opt-in and requires ``--yes`` to avoid accidental drops; without it the CLI is read-only.
+
 ## Suggested team norms
 
 - Claim before editing, not after.
