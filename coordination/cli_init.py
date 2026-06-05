@@ -173,9 +173,27 @@ def _write_local_env(
     path.write_text(body, encoding="utf-8")
 
 
-def _update_mcp_json(
-    path: Path, service_url: str, token: str, repo_id: str | None = None
-) -> None:
+# Placeholder values written into every tracked MCP template
+# (.mcp.json, .codex/config.toml, .cursor/mcp.json). The MCP wrapper
+# at startup walks up from its working directory to find
+# .coordination/local.env (gitignored) and overrides these
+# placeholders with the real values it carries. Keeping the tracked
+# templates at placeholders is what makes them safe to commit
+# publicly; tests/test_deploy_overlay.py is the leak guard that
+# enforces this. coordination/mcp_server.py:_load_local_env contains
+# the matching override logic.
+PLACEHOLDER_API_URL = "http://127.0.0.1:8080"
+PLACEHOLDER_AUTH_TOKEN = "set-me"
+PLACEHOLDER_REPO_ID = "example-org/example-repo"
+
+
+def _update_mcp_json(path: Path) -> None:
+    """Write or refresh the tracked .mcp.json template (also used for
+    .cursor/mcp.json). Always emits the documented placeholder values;
+    the real service URL, bearer token, and repo identifier flow
+    exclusively through .coordination/local.env, which the MCP
+    wrapper resolves at startup. See PLACEHOLDER_* constants above
+    for the reasoning."""
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         try:
@@ -185,34 +203,26 @@ def _update_mcp_json(
     else:
         data = {}
     servers = data.setdefault("mcpServers", {})
-    env: dict[str, str] = {
-        "COORD_API_URL": service_url,
-        "COORD_AUTH_TOKEN": token,
-    }
-    if repo_id:
-        env["COORD_REPO_ID"] = repo_id
     servers["coord"] = {
         "command": "coord-mcp",
         "args": [],
-        "env": env,
+        "env": {
+            "COORD_API_URL": PLACEHOLDER_API_URL,
+            "COORD_AUTH_TOKEN": PLACEHOLDER_AUTH_TOKEN,
+            "COORD_REPO_ID": PLACEHOLDER_REPO_ID,
+        },
     }
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
-def _update_codex_config(
-    path: Path,
-    service_url: str | None = None,
-    token: str = "",
-    repo_id: str | None = None,
-) -> None:
-    """Write Codex's MCP server entry for coord, including an inline env
-    block. Codex spawns ``coord-mcp`` without sourcing ``.coordination/local.env``,
-    so without an explicit ``[mcp_servers.coord.env]`` block the child
-    inherits whatever the user's shell happened to have, falls back to
-    ``http://127.0.0.1:8080``, and surfaces "All connection attempts
-    failed" to the operator. Embedding the env in the TOML makes the
-    config self-contained, matching how ``.mcp.json`` works for Claude.
-    """
+def _update_codex_config(path: Path) -> None:
+    """Write Codex's MCP server entry for coord with the documented
+    placeholder env block. Codex spawns ``coord-mcp`` without sourcing
+    ``.coordination/local.env`` directly, so the wrapper itself loads
+    that file on startup and overrides the placeholders below with
+    the real values. The tracked file must NEVER carry real config;
+    the leak guard in tests/test_deploy_overlay.py is the regression
+    check (mirrors the .mcp.json contract)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     parts = [
         "[mcp_servers.coord]\n",
@@ -221,29 +231,11 @@ def _update_codex_config(
         "enabled = true\n",
         "required = false\n",
         "tool_timeout_sec = 30\n",
+        "\n[mcp_servers.coord.env]\n",
+        f'COORD_API_URL = "{PLACEHOLDER_API_URL}"\n',
+        f'COORD_AUTH_TOKEN = "{PLACEHOLDER_AUTH_TOKEN}"\n',
+        f'COORD_REPO_ID = "{PLACEHOLDER_REPO_ID}"\n',
     ]
-    # Only emit the env table when we actually have at least one value to
-    # set; legacy callers that don't pass service_url get the bare server
-    # entry (and an explanatory comment) so behaviour is unchanged for
-    # them.
-    if service_url or token or repo_id:
-        parts.append("\n[mcp_servers.coord.env]\n")
-        if service_url:
-            parts.append(f'COORD_API_URL = "{service_url}"\n')
-        # Always emit the token line so the user can see where to slot
-        # the real value in if they leave it blank during init.
-        parts.append(f'COORD_AUTH_TOKEN = "{token}"\n')
-        if repo_id:
-            parts.append(f'COORD_REPO_ID = "{repo_id}"\n')
-    else:
-        parts.extend(
-            [
-                "\n",
-                "# Set in your shell or .coordination/local.env:\n",
-                '#   export COORD_API_URL="https://YOUR_COORD_SERVICE.example"\n',
-                '#   export COORD_AUTH_TOKEN="..."\n',
-            ]
-        )
     path.write_text("".join(parts), encoding="utf-8")
 
 
@@ -377,13 +369,12 @@ def run_init(args) -> int:
     _write_local_env(repo_root, mode, service_url, repo_id=repo_id)
     written.append(".coordination/local.env")
 
-    # Pick the COORD_AUTH_TOKEN line specifically rather than the first line,
-    # which after this change is COORD_API_URL.
-    token = ""
-    for line in (repo_root / ".coordination" / "local.env").read_text(encoding="utf-8").splitlines():
-        if line.startswith("COORD_AUTH_TOKEN="):
-            token = line.split("=", 1)[1].strip()
-            break
+    # NOTE: we deliberately do NOT pass service_url / token / repo_id to the
+    # tracked-template writers below. Those files (.mcp.json,
+    # .codex/config.toml, .cursor/mcp.json) live in version control and must
+    # never carry the real bearer token or hostname; the MCP wrapper resolves
+    # both from .coordination/local.env (gitignored) at startup. See
+    # PLACEHOLDER_* constants above and tests/test_deploy_overlay.py.
 
     if not args.no_owners:
         owners_path = repo_root / ".coordination" / "owners.yaml"
@@ -393,24 +384,15 @@ def run_init(args) -> int:
             written.append(".coordination/owners.yaml")
 
     if tool == "claude":
-        _update_mcp_json(
-            repo_root / ".mcp.json", service_url, token, repo_id=repo_id
-        )
+        _update_mcp_json(repo_root / ".mcp.json")
         ensure_managed_block(repo_root / "CLAUDE.md", CLAUDE_SNIPPET)
         written.extend([".mcp.json", "CLAUDE.md (managed block)"])
     elif tool == "codex":
-        _update_codex_config(
-            repo_root / ".codex" / "config.toml",
-            service_url=service_url,
-            token=token,
-            repo_id=repo_id,
-        )
+        _update_codex_config(repo_root / ".codex" / "config.toml")
         ensure_managed_block(repo_root / "AGENTS.md", AGENTS_SNIPPET)
         written.extend([".codex/config.toml", "AGENTS.md (managed block)"])
     else:
-        _update_mcp_json(
-            repo_root / ".cursor" / "mcp.json", service_url, token, repo_id=repo_id
-        )
+        _update_mcp_json(repo_root / ".cursor" / "mcp.json")
         ensure_managed_block(repo_root / ".cursor" / "rules" / "coordination.mdc", CURSOR_RULE)
         written.extend([".cursor/mcp.json", ".cursor/rules/coordination.mdc"])
 

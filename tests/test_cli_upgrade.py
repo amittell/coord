@@ -112,6 +112,19 @@ def test_upgrade_refreshes_url_in_local_env(tmp_path: Path) -> None:
 
 
 def test_upgrade_refreshes_mcp_json_env_block(tmp_path: Path) -> None:
+    """``coord upgrade`` rewrites the tracked .mcp.json template with
+    the documented placeholder env block, leaving any foreign
+    ``mcpServers`` entries untouched. The real bearer token and
+    service URL live exclusively in .coordination/local.env, which
+    the MCP wrapper resolves at startup. See
+    coordination/cli_init.py:PLACEHOLDER_* for the constants and
+    tests/test_deploy_overlay.py for the public-fork leak guard."""
+    from coordination.cli_init import (
+        PLACEHOLDER_API_URL,
+        PLACEHOLDER_AUTH_TOKEN,
+        PLACEHOLDER_REPO_ID,
+    )
+
     _seed_initialised_repo(
         tmp_path,
         tool="claude",
@@ -128,10 +141,67 @@ def test_upgrade_refreshes_mcp_json_env_block(tmp_path: Path) -> None:
     }, indent=2) + "\n", encoding="utf-8")
     cli_upgrade.run_upgrade(_make_args(tmp_path))
     data = json.loads(mcp.read_text(encoding="utf-8"))
-    assert data["mcpServers"]["coord"]["env"]["COORD_API_URL"] == "http://coord.new.example"
-    assert data["mcpServers"]["coord"]["env"]["COORD_AUTH_TOKEN"] == "t-123"
+    env = data["mcpServers"]["coord"]["env"]
+    assert env["COORD_API_URL"] == PLACEHOLDER_API_URL
+    assert env["COORD_AUTH_TOKEN"] == PLACEHOLDER_AUTH_TOKEN
+    assert env["COORD_REPO_ID"] == PLACEHOLDER_REPO_ID
     # Foreign server entries must be left alone.
     assert data["mcpServers"]["other"]["command"] == "other-mcp"
+
+
+def test_upgrade_never_writes_real_token_into_tracked_mcp_json(tmp_path: Path) -> None:
+    """Regression for the v0.28.1/v0.28.2 leak: upgrade used to read the
+    real bearer token out of local.env and write it straight into the
+    tracked .mcp.json template, which then tripped the
+    test_deploy_overlay.py placeholder guard on the next CI run. Even
+    when local.env carries a real 64-hex-char token, the tracked
+    template must end up with the documented `set-me` placeholder."""
+    real_token = "a" * 64  # shape-matches the COORD_AUTH_TOKEN format
+    _seed_initialised_repo(
+        tmp_path,
+        tool="claude",
+        service_url="https://prod-coord.example.com",
+        token=real_token,
+    )
+
+    cli_upgrade.run_upgrade(_make_args(tmp_path))
+
+    # The tracked template must have placeholders, never the real values.
+    mcp = json.loads((tmp_path / ".mcp.json").read_text(encoding="utf-8"))
+    env = mcp["mcpServers"]["coord"]["env"]
+    assert env["COORD_AUTH_TOKEN"] == "set-me", env
+    assert env["COORD_API_URL"] == "http://127.0.0.1:8080", env
+    assert real_token not in (tmp_path / ".mcp.json").read_text(encoding="utf-8")
+
+    # ...but local.env must still carry the real token + URL so the
+    # MCP wrapper can override the placeholders at startup.
+    local_env = (tmp_path / ".coordination" / "local.env").read_text(encoding="utf-8")
+    assert f"COORD_AUTH_TOKEN={real_token}" in local_env
+    assert "COORD_API_URL=https://prod-coord.example.com" in local_env
+
+
+def test_upgrade_never_writes_real_token_into_codex_config(tmp_path: Path) -> None:
+    """Same regression as above, but for the Codex-flavoured tracked
+    template (.codex/config.toml)."""
+    real_token = "b" * 64
+    _seed_initialised_repo(
+        tmp_path,
+        tool="codex",
+        service_url="https://prod-coord.example.com",
+        token=real_token,
+    )
+
+    cli_upgrade.run_upgrade(_make_args(tmp_path))
+
+    cfg = (tmp_path / ".codex" / "config.toml").read_text(encoding="utf-8")
+    assert 'COORD_AUTH_TOKEN = "set-me"' in cfg
+    assert 'COORD_API_URL = "http://127.0.0.1:8080"' in cfg
+    assert real_token not in cfg
+    assert "prod-coord.example.com" not in cfg
+
+    local_env = (tmp_path / ".coordination" / "local.env").read_text(encoding="utf-8")
+    assert f"COORD_AUTH_TOKEN={real_token}" in local_env
+    assert "COORD_API_URL=https://prod-coord.example.com" in local_env
 
 
 def test_upgrade_preserves_claude_md_content_outside_managed_block(tmp_path: Path) -> None:
@@ -200,7 +270,9 @@ def test_upgrade_codex_writes_env_block_so_mcp_can_reach_service(
     """Regression: codex spawns coord-mcp without sourcing .coordination/local.env,
     so the MCP child has no COORD_API_URL and silently dials 127.0.0.1:8080 with
     "All connection attempts failed". The codex MCP config MUST embed an [env]
-    block, the same way Claude's .mcp.json does."""
+    block, the same way Claude's .mcp.json does. As of the v0.28.3 hotfix the
+    embedded block carries the documented placeholder values; the MCP wrapper
+    resolves them against ``.coordination/local.env`` at startup."""
     _seed_initialised_repo(
         tmp_path, tool="codex", service_url="http://coord.example.lan",
         token="prod-token-xyz",
@@ -208,8 +280,10 @@ def test_upgrade_codex_writes_env_block_so_mcp_can_reach_service(
     cli_upgrade.run_upgrade(_make_args(tmp_path))
     codex_cfg = (tmp_path / ".codex" / "config.toml").read_text(encoding="utf-8")
     assert "[mcp_servers.coord.env]" in codex_cfg
-    assert 'COORD_API_URL = "http://coord.example.lan"' in codex_cfg
-    assert 'COORD_AUTH_TOKEN = "prod-token-xyz"' in codex_cfg
+    assert 'COORD_API_URL = "http://127.0.0.1:8080"' in codex_cfg
+    assert 'COORD_AUTH_TOKEN = "set-me"' in codex_cfg
+    assert "prod-token-xyz" not in codex_cfg
+    assert "coord.example.lan" not in codex_cfg
 
 
 def test_upgrade_refreshes_all_tool_configs_present_on_disk(
@@ -257,20 +331,32 @@ def test_upgrade_refreshes_all_tool_configs_present_on_disk(
 
     cli_upgrade.run_upgrade(_make_args(tmp_path))
 
-    # Codex side stays correct.
+    # Both tool configs now hold the documented placeholder env block.
+    # The real URL and token live exclusively in .coordination/local.env
+    # which the MCP wrapper resolves at startup. The stale strings from
+    # the pre-existing claude artefact must be gone -- not replaced by
+    # the real token (that would leak it back into a tracked file).
     codex_cfg = (tmp_path / ".codex" / "config.toml").read_text(encoding="utf-8")
-    assert 'COORD_API_URL = "http://coord.fresh.lan"' in codex_cfg
-    assert 'COORD_AUTH_TOKEN = "rotated-token-123"' in codex_cfg
+    assert 'COORD_API_URL = "http://127.0.0.1:8080"' in codex_cfg
+    assert 'COORD_AUTH_TOKEN = "set-me"' in codex_cfg
+    assert "rotated-token-123" not in codex_cfg
 
-    # Claude side ALSO refreshes even though config.toml says tool=codex.
     mcp_data = json.loads(mcp.read_text(encoding="utf-8"))
     env = mcp_data["mcpServers"]["coord"]["env"]
-    assert env["COORD_API_URL"] == "http://coord.fresh.lan"
-    assert env["COORD_AUTH_TOKEN"] == "rotated-token-123"
+    assert env["COORD_API_URL"] == "http://127.0.0.1:8080"
+    assert env["COORD_AUTH_TOKEN"] == "set-me"
+    assert "stale-token" not in mcp.read_text(encoding="utf-8")
+    assert "rotated-token-123" not in mcp.read_text(encoding="utf-8")
 
     # CLAUDE.md managed block was rewritten too (no stale content).
     assert "stale" not in (tmp_path / "CLAUDE.md").read_text(encoding="utf-8")
     assert "Coordination protocol" in (tmp_path / "CLAUDE.md").read_text(encoding="utf-8")
+
+    # And the real, rotated token must still flow into local.env so the
+    # MCP wrapper can resolve the placeholder at startup.
+    local_env = (tmp_path / ".coordination" / "local.env").read_text(encoding="utf-8")
+    assert "COORD_AUTH_TOKEN=rotated-token-123" in local_env
+    assert "COORD_API_URL=http://coord.fresh.lan" in local_env
 
 
 def test_upgrade_does_not_create_tool_configs_that_were_never_initialised(
@@ -296,19 +382,23 @@ def test_upgrade_does_not_create_tool_configs_that_were_never_initialised(
     )
 
 
-def test_upgrade_codex_embeds_repo_id_when_known(tmp_path: Path) -> None:
-    """When the repo has a detectable origin, codex's env block should also
-    carry COORD_REPO_ID so per-repo claim tagging works without the user
-    manually sourcing local.env."""
+def test_upgrade_codex_embeds_placeholder_repo_id(tmp_path: Path) -> None:
+    """The codex env block carries a placeholder COORD_REPO_ID so the
+    MCP wrapper has a key to override at startup from local.env. The
+    real repo_id is detected at init time and written into local.env;
+    the tracked template must NEVER carry the real value (which would
+    leak the customer/organisation identifier into a public fork)."""
     _seed_initialised_repo(tmp_path, tool="codex")
-    # Add a fake origin so _detect_repo_id resolves.
+    # Add a real-looking origin so _detect_repo_id resolves; the real
+    # repo_id must NOT end up in the tracked template.
     subprocess.run(
         ["git", "remote", "add", "origin", "git@github.com:example-org/widgets.git"],
         cwd=tmp_path, check=True,
     )
     cli_upgrade.run_upgrade(_make_args(tmp_path))
     codex_cfg = (tmp_path / ".codex" / "config.toml").read_text(encoding="utf-8")
-    assert 'COORD_REPO_ID = "example-org/widgets"' in codex_cfg
+    assert 'COORD_REPO_ID = "example-org/example-repo"' in codex_cfg
+    assert "widgets" not in codex_cfg
 
 
 def test_upgrade_skips_owners_yaml_even_if_force_flag_unused(tmp_path: Path) -> None:

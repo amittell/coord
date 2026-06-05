@@ -9,6 +9,59 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.28.3] - 2026-06-05
+
+### Security
+
+- ``coord init`` and ``coord upgrade`` no longer write the real service
+  URL, bearer token, or repo identifier into the tracked MCP
+  templates (``.mcp.json``, ``.codex/config.toml``, ``.cursor/mcp.json``).
+  Pre-fix, an ``upgrade`` against a remote-mode config would leak the
+  64-hex-char ``COORD_AUTH_TOKEN`` from ``.coordination/local.env``
+  back into the public-safe template, which would have committed a
+  real credential the next time someone ran ``git add .``. The leak
+  was caught at working-tree time by ``tests/test_deploy_overlay.py``
+  and never landed on main, but the regression existed since
+  before v0.14.
+  Tracked templates now always carry the documented placeholders
+  (``http://127.0.0.1:8080``, ``set-me``, ``example-org/example-repo``);
+  the MCP wrapper's ``_load_local_env`` resolves them at startup
+  against the gitignored ``.coordination/local.env``, which continues
+  to hold the real values. Two new regression tests pin the contract:
+  ``test_upgrade_never_writes_real_token_into_tracked_mcp_json`` and
+  ``test_upgrade_never_writes_real_token_into_codex_config``.
+
+### Fixed
+
+- ``coord doctor``'s ``.mcp.json / .codex/config.toml / .cursor/mcp.json
+  token matches local.env`` check now treats the documented
+  ``set-me`` placeholder as a match. The check was reporting FAIL
+  whenever the tracked template held the correct placeholder
+  (because the MCP wrapper resolves it from local.env at startup --
+  the wrapper does this on every spawn). False alarm removed.
+
+### Added
+
+- ``docs/deployment.md`` now has a "Transport security (TLS)" section
+  covering five operator-pickable patterns: plaintext (default),
+  Cloudflare Tunnel + Universal SSL, Let's Encrypt + cert-manager
+  with DNS-01 challenge, self-signed CA with cert distribution, and
+  the dual-access hybrid (Cloudflare for off-LAN access plus LAN-direct
+  HTTP for local agents). Each option carries threat-model coverage,
+  step-by-step setup, pros/cons, and a decision tree at the bottom.
+
+### Changed
+
+- ``coordination.cli_init._update_mcp_json`` and
+  ``coordination.cli_init._update_codex_config`` are now zero-argument
+  helpers (except ``path``); the previous ``service_url``, ``token``,
+  and ``repo_id`` parameters were exactly the leak vector. Internal-only
+  signature change; no public API affected.
+- New module constants ``PLACEHOLDER_API_URL``,
+  ``PLACEHOLDER_AUTH_TOKEN``, ``PLACEHOLDER_REPO_ID`` in
+  ``coordination.cli_init`` make the placeholder values discoverable
+  to test code and future surfaces.
+
 ## [0.28.2] - 2026-06-05
 
 ### Fixed

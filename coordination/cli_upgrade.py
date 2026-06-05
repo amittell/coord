@@ -102,28 +102,31 @@ def run_upgrade(args) -> int:
     # accidentally deleted .mcp.json / .codex/config.toml etc and runs
     # coord upgrade to put it back. Without this fallback, upgrade would
     # silently no-op when given a half-erased repo.
+    # The tracked-template writers below intentionally do NOT receive the
+    # real service_url or token; they always emit placeholder values that
+    # the MCP wrapper resolves against .coordination/local.env at startup.
+    # Writing the real token here would commit a credential to the repo
+    # if .mcp.json is tracked, which it is by design (it's the public-safe
+    # template). See coordination/cli_init.py:PLACEHOLDER_* and
+    # tests/test_deploy_overlay.py for the leak guard. The unused `token`
+    # and `repo_id` locals in this function are still required by
+    # _rewrite_local_env above so the real config keeps flowing into
+    # the gitignored local.env file.
     mcp_json = repo_root / ".mcp.json"
     if mcp_json.exists() or config.tool == "claude":
-        _update_mcp_json(mcp_json, config.service_url, token, repo_id=repo_id)
+        _update_mcp_json(mcp_json)
         ensure_managed_block(repo_root / "CLAUDE.md", CLAUDE_SNIPPET)
         written.extend([".mcp.json", "CLAUDE.md (managed block)"])
 
     codex_cfg = repo_root / ".codex" / "config.toml"
     if codex_cfg.exists() or config.tool == "codex":
-        _update_codex_config(
-            codex_cfg,
-            service_url=config.service_url,
-            token=token,
-            repo_id=repo_id,
-        )
+        _update_codex_config(codex_cfg)
         ensure_managed_block(repo_root / "AGENTS.md", AGENTS_SNIPPET)
         written.extend([".codex/config.toml", "AGENTS.md (managed block)"])
 
     cursor_cfg = repo_root / ".cursor" / "mcp.json"
     if cursor_cfg.exists() or config.tool == "cursor":
-        _update_mcp_json(
-            cursor_cfg, config.service_url, token, repo_id=repo_id
-        )
+        _update_mcp_json(cursor_cfg)
         ensure_managed_block(
             repo_root / ".cursor" / "rules" / "coordination.mdc", CURSOR_RULE
         )

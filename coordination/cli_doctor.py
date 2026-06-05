@@ -363,12 +363,20 @@ def _check_token_consistency(
 ) -> list[CheckResult]:
     """Surface drift between ``.coordination/local.env``'s
     ``COORD_AUTH_TOKEN`` and the copy embedded in each tool's MCP
-    config. The hook reads local.env directly, but Claude/Codex/Cursor
-    spawn the MCP child with the env baked into their tool config -- if
-    the user rotates the token in local.env without running
-    ``coord upgrade``, the MCP child silently authenticates with the
-    old key. The fix is always ``coord upgrade``.
+    config. The placeholder ``set-me`` counts as a match because the
+    MCP wrapper's ``_load_local_env`` (see coordination/mcp_server.py)
+    auto-resolves it from ``.coordination/local.env`` at startup; that
+    is the documented, public-fork-safe configuration. A literal but
+    non-placeholder mismatch usually means the user rotated the token
+    in local.env without running ``coord upgrade``, leaving the MCP
+    child authenticating with the old key. The fix is always
+    ``coord upgrade``.
     """
+    # Avoid a top-level import cycle: cli_doctor is imported by cli.py,
+    # which also pulls in cli_init for argparse wiring. The constants we
+    # need are defined in cli_init at module load time.
+    from coordination.cli_init import PLACEHOLDER_AUTH_TOKEN
+
     out: list[CheckResult] = []
     upgrade_hint = (
         "Run 'coord upgrade' so the embedded token matches the one in "
@@ -397,7 +405,7 @@ def _check_token_consistency(
         embedded = extractor(path)
         if embedded is None:
             continue
-        if embedded == token:
+        if embedded == PLACEHOLDER_AUTH_TOKEN or embedded == token:
             out.append(CheckResult(label, True))
         else:
             out.append(CheckResult(label, False, "embedded token differs", upgrade_hint))
