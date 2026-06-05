@@ -9,6 +9,30 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.28.2] - 2026-06-05
+
+### Fixed
+
+- ``coordination.__version__`` is now sourced from
+  ``importlib.metadata.version("coord-mcp-server")`` instead of being
+  hand-maintained alongside ``pyproject.toml``. v0.28.1 shipped with
+  the two out of sync (``__version__ = "0.28.0"`` baked into the
+  v0.28.1 container image) so ``/readyz`` reported the wrong version
+  after the bump-manifest job rolled out. With this change there is
+  one source of truth at runtime, and the v0.28.2 image reports
+  ``0.28.2`` correctly through ``/readyz``, the ``coord --version``
+  banner, the dashboard footer, ``coord doctor``, and the update
+  notice banner.
+
+### Added
+
+- ``tests/test_version_consistency.py`` pins the three-way contract:
+  ``coordination.__version__`` == ``importlib.metadata`` metadata ==
+  ``pyproject.toml`` ``[project].version``. CI fails fast on the next
+  release pipeline if any pair drifts again. The third assertion
+  guards that the value is a clean PEP 440 string so the workflow's
+  ``Version()`` parse cannot break either.
+
 ## [0.28.1] - 2026-06-05
 
 ### Added
