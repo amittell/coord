@@ -11,7 +11,30 @@ metadata:
 spec:
   ingressClassName: traefik
   rules:
+    # LAN-direct path. Resolved by the on-LAN DNS (Firewalla at .1) to one
+    # of the cluster node IPs; Traefik host-matches and routes to the coord
+    # Service. Plaintext on the LAN; see docs/deployment.md "Transport
+    # security (TLS)" Option 5 for the threat-model discussion.
     - host: coord.kebabrack.lan
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: coord
+                port:
+                  number: 8080
+    # Off-LAN path. Cloudflare Tunnel terminates Universal SSL at the edge
+    # and tunnels traffic back to traefik.kube-system.svc.cluster.local:80;
+    # Traefik host-matches this rule and lands on the same coord Service.
+    # The cloudflared ingress mapping itself lives in amittell/kebabrack-lab
+    # k8s/80-cloudflared-config.yaml, and the public DNS CNAME
+    # coord.mittell.ai -> <tunnel-uuid>.cfargotunnel.com is set via
+    # `cloudflared tunnel route dns`. End users switch
+    # COORD_API_URL between the two hostnames per location (Pattern A
+    # in docs/deployment.md).
+    - host: coord.mittell.ai
       http:
         paths:
           - path: /
