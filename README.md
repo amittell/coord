@@ -33,47 +33,181 @@ The stack is intentionally simple:
 - [`docs/design/roadmap.md`](./docs/design/roadmap.md): v0.28-v0.30 candidates and future bucket
 - `CHANGELOG.md`: notable changes between versions
 
-## Quickstart
+## Install
 
-From inside a checkout of this repository:
+Three supported install paths. Pick the one that matches how you intend to use coord.
+
+| Goal | Path |
+|------|------|
+| Run the `coord` CLI plus MCP wrapper on a developer laptop | Option 1 (pipx) or Option 2 (pip) |
+| Self-host the coordination server in a container | Option 3 (Docker) |
+| Hack on coord itself | See [Development](#development) below |
+
+### Option 1: pipx (recommended)
+
+`pipx` installs coord into an isolated environment and exposes the `coord`, `coord-mcp`, and `coord-api` commands on your `$PATH` without touching the system Python. Cleanest path on macOS, Linux, and WSL.
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
-coord start --background
+# install pipx itself if you do not already have it
+python3 -m pip install --user pipx
+python3 -m pipx ensurepath
+# (open a new shell so PATH picks up the change)
+
+# install coord
+pipx install coord-mcp-server
+
+# optional: enable symbol-level claims (TypeScript, Python, Go parsers)
+pipx inject coord-mcp-server 'coord-mcp-server[symbols]'
 ```
 
-`coord start` prints the API URL, dashboard URL, and an `export COORD_AUTH_TOKEN=...` line you can paste into your shell.
+### Option 2: pip in a venv
 
-Useful URLs:
+If you do not want pipx, install into a dedicated virtual environment:
 
-- API base: `http://127.0.0.1:8080`
-- readiness: `http://127.0.0.1:8080/readyz`
-- dashboard: `http://127.0.0.1:8080/dashboard`
+```bash
+python3 -m venv ~/.venvs/coord
+source ~/.venvs/coord/bin/activate
+pip install --upgrade pip
+pip install 'coord-mcp-server[symbols]'   # drop [symbols] if you do not need tree-sitter parsers
+```
 
-Then, inside the repo you want to coordinate:
+Pin to a specific release for reproducible installs:
+
+```bash
+pip install 'coord-mcp-server==0.28.2'
+```
+
+### Option 3: Docker (self-hosted server)
+
+For a server shared by a team, run the published container. Pinning to a tag (instead of `:latest`) means you control when the cluster picks up a new version.
+
+```bash
+docker volume create coord-data
+docker run -d \
+  --name coord \
+  -e COORD_AUTH_TOKEN="$(openssl rand -hex 32)" \
+  -p 8080:8080 \
+  -v coord-data:/data \
+  ghcr.io/amittell/coord:v0.28.2
+```
+
+The image is multi-arch (linux/amd64 + linux/arm64), keyless-signed with cosign, and ships SBOM + SLSA provenance attestations. Kubernetes manifests live under `deploy/k8s/` and `docs/deployment.md` has the full operator notes.
+
+### Verify the install
+
+```bash
+coord --version
+# coord 0.28.2
+
+curl -fsS http://127.0.0.1:8080/readyz
+# {"status":"ready","version":"0.28.2",...}
+```
+
+The CLI surface is intentionally small:
+
+- `coord start`: boot a local coordination service with sane defaults
+- `coord init`: wire the current application repo for Claude Code, Codex CLI, or Cursor
+- `coord upgrade`: refresh the protocol snippets `coord init` wrote into the application repo
+- `coord doctor`: verify the repo wiring and service connectivity
+
+`coord-api` and `coord-mcp` are the lower-level entry points that `coord start` and the MCP clients launch under the hood; keep them in mind for advanced or custom setups.
+
+## Quickstart
+
+After installing, get the service running and wire your first application repo.
+
+1. **Start the coordination service.** Skip this step if you point at a shared team server.
+
+   ```bash
+   coord start --background
+   ```
+
+   `coord start` prints the API URL, the dashboard URL, and an `export COORD_AUTH_TOKEN=...` line. Paste that export into your shell.
+
+2. **Confirm the service is healthy.**
+
+   ```bash
+   curl -fsS http://127.0.0.1:8080/readyz   # JSON: {"status":"ready",...}
+   open http://127.0.0.1:8080/dashboard     # macOS
+   xdg-open http://127.0.0.1:8080/dashboard # Linux
+   ```
+
+3. **Wire your application repo** (the codebase your agents work in, NOT this repo).
+
+   ```bash
+   cd /path/to/your-app
+   coord init --tool claude --mode local --yes   # or --tool codex / --tool cursor
+   coord doctor                                  # all-green expected
+   ```
+
+   `coord init` writes the tracked MCP template plus a gitignored `.coordination/` directory carrying the real bearer token. The relevant CLAUDE.md / AGENTS.md / .cursor/rules block is added inside managed `coord:begin .. coord:end` markers so future `coord upgrade` runs can refresh it cleanly without touching your own content.
+
+4. **Start coordinating.** Your agents now have `claim_files`, `list_claims`, `release_claims`, and the rest of the MCP tool surface available. See `docs/usage-guide.md` for the day-to-day workflow.
+
+## Upgrade
+
+Upgrade has two halves: the **coord package** (CLI plus server) and the **in-repo protocol snippets** that `coord init` previously wrote into each application repo.
+
+### Step 1: upgrade the package
+
+Match the path you used to install:
+
+```bash
+# pipx
+pipx upgrade coord-mcp-server
+
+# pip (inside the same venv you installed into)
+pip install --upgrade coord-mcp-server
+
+# docker (self-hosted server)
+docker pull ghcr.io/amittell/coord:v0.28.2
+docker rm -f coord
+docker run -d --name coord \
+  -e COORD_AUTH_TOKEN="$EXISTING_TOKEN" \
+  -p 8080:8080 \
+  -v coord-data:/data \
+  ghcr.io/amittell/coord:v0.28.2
+```
+
+When you point at a shared team server, the server operator owns the container upgrade. End users only need to upgrade their local CLI plus MCP wrapper to match.
+
+### Step 2: refresh the in-repo protocol snippets
+
+The CLAUDE.md, AGENTS.md, and `.cursor/rules` text written by `coord init` reflects the protocol features available at the time it was generated. After upgrading the package, refresh those blocks in every application repo:
 
 ```bash
 cd /path/to/your-app
-coord init --tool claude --mode local --yes
-coord doctor
+coord upgrade        # rewrites only the managed coord:begin..coord:end blocks
+coord doctor         # confirms the new wiring is healthy
 ```
 
-Advanced MCP note:
+`coord upgrade` is idempotent and only touches its own managed blocks. Anything outside the `coord:begin .. coord:end` markers is preserved verbatim.
+
+### Step 3: verify
 
 ```bash
-export COORD_API_URL=http://127.0.0.1:8080
-coord-mcp
+coord --version
+# coord 0.28.2
+
+curl -fsS http://127.0.0.1:8080/readyz | python3 -m json.tool
+#   "version": "0.28.2"
 ```
 
-`coord` is the main product surface:
+If your CLI and the running server disagree on version, the dashboard footer and the once-per-24h CLI update notice will both flag it. Set `COORD_NO_UPDATE_CHECK=1` if you are intentionally pinned to an older release.
 
-- `coord start`: boot a local coordination service with sane defaults
-- `coord init`: wire the current repo for Claude Code, Codex CLI, or Cursor
-- `coord doctor`: verify the repo wiring and service connectivity
+### Optional: pin to a specific version
 
-`coord-api` and `coord-mcp` still exist for advanced use and compatibility.
+For reproducible installs across a team:
+
+```bash
+pipx install 'coord-mcp-server==0.28.2'
+# or
+pip install 'coord-mcp-server==0.28.2'
+# or, in a Dockerfile / Kubernetes manifest:
+#   image: ghcr.io/amittell/coord:v0.28.2
+```
+
+The full release history lives on PyPI (<https://pypi.org/project/coord-mcp-server/#history>) and as GitHub releases (<https://github.com/amittell/coord/releases>). `CHANGELOG.md` has the per-version notes.
 
 ## First API Call
 
@@ -399,8 +533,12 @@ Start with `docs/integrations/claude-code.md` if your team is primarily on Claud
 
 ## Development
 
+For contributing to coord itself (not just using it). End users should follow the [Install](#install) section above; this path builds from a source checkout with the dev extras.
+
 ```bash
-make install       # create .venv and install dev deps
+git clone https://github.com/amittell/coord.git
+cd coord
+make install       # create .venv and install dev deps (editable install)
 make check         # ruff + mypy + pytest (~30s)     - run before pushing
 make verify        # check + docker-smoke (~2min)    - full local CI equivalent
 make test-fast     # pytest without integration tests - fast inner loop
@@ -416,14 +554,16 @@ chmod +x .git/hooks/pre-push
 
 Bypass a specific push with `git push --no-verify` (docs-only changes, etc.).
 
-## Docker
+## Docker (build from source)
+
+Distinct from the published image used in [Install Option 3](#option-3-docker-self-hosted-server) above. This builds the image locally from the current checkout, which is what you want when iterating on the container itself.
 
 ```bash
-docker build -t coordination .
+docker build -t coord:dev .
 docker run \
-  -e COORD_AUTH_TOKEN=secret \
+  -e COORD_AUTH_TOKEN="$(openssl rand -hex 32)" \
   -p 8080:8080 \
-  coordination
+  coord:dev
 ```
 
 ## License
