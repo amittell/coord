@@ -255,3 +255,102 @@ jobs:
           # Skip-existing handles re-runs of an already-published version
           # gracefully.
           skip-existing: true
+
+  # After a real tag push, rewrite deploy/k8s/prod/deployment.yaml so the
+  # kebabrack live overlay picks up the image we just built. Without this
+  # job the manifest drifts behind every release and ArgoCD keeps pinning
+  # the cluster to whatever version a human last hand-edited. See
+  # docs/design/roadmap.md "v0.28.1" for the original gap (a 14-version
+  # drift between v0.13.0 and v0.28.0).
+  #
+  # Skipped on workflow_dispatch: manual rebuilds and release candidates
+  # should never silently flip production.
+  bump-manifest:
+    name: Bump prod deployment manifest
+    runs-on: ubuntu-latest
+    needs: publish-image
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - name: Check out main
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          # Land the bump on main, not on the tag ref. The tag is
+          # immutable; what ArgoCD watches is the moving main branch.
+          ref: main
+          fetch-depth: 0
+          # Default GITHUB_TOKEN has contents:write at the workflow level,
+          # which lets a subsequent `git push origin HEAD:main` succeed.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Rewrite image pin in deploy/k8s/prod/deployment.yaml
+        env:
+          IMAGE: ${{ needs.publish-image.outputs.image-name }}
+          VERSION: ${{ needs.publish-image.outputs.version-tag }}
+          DIGEST: ${{ needs.publish-image.outputs.image-digest }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          manifest = pathlib.Path("deploy/k8s/prod/deployment.yaml")
+          image = os.environ["IMAGE"]
+          version = os.environ["VERSION"]
+          digest = os.environ["DIGEST"]
+          if not (image and version and digest):
+              raise SystemExit(
+                  f"missing required input: IMAGE={image!r} VERSION={version!r} "
+                  f"DIGEST={digest!r}"
+              )
+
+          target = f"{image}:{version}@{digest}"
+          text = manifest.read_text(encoding="utf-8")
+          # The pinned reference lives on the first `image:` line in the
+          # Deployment spec; match its leading indent and value.
+          pattern = re.compile(r"^(\s*image:\s+)\S+(\s*)$", re.MULTILINE)
+          new_text, count = pattern.subn(rf"\g<1>{target}\g<2>", text, count=1)
+          if count != 1:
+              raise SystemExit(
+                  f"no image: line matched in {manifest}; cannot auto-bump"
+              )
+          if new_text == text:
+              print(f"manifest already pins {target}; nothing to do")
+              raise SystemExit(0)
+          manifest.write_text(new_text, encoding="utf-8")
+          print(f"updated {manifest} -> {target}")
+          PY
+
+      - name: Commit and push
+        env:
+          VERSION: ${{ needs.publish-image.outputs.version-tag }}
+          DIGEST: ${{ needs.publish-image.outputs.image-digest }}
+        run: |
+          # Identity matches the GitHub Actions bot so the commit shows
+          # up cleanly in repo history.
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          if git diff --quiet -- deploy/k8s/prod/deployment.yaml; then
+            echo "deploy/k8s/prod/deployment.yaml unchanged after rewrite; skipping commit"
+            exit 0
+          fi
+
+          git add deploy/k8s/prod/deployment.yaml
+          # `[skip ci]` in the commit message is a GitHub Actions
+          # convention: any workflow triggered by this push is skipped.
+          # release.yml only triggers on tag pushes, so it would not
+          # recurse anyway, but ci.yml would otherwise run a full test
+          # matrix on a one-line manifest change. ArgoCD watches git
+          # directly and reconciles regardless of CI status.
+          git commit \
+            -m "ops: bump prod deployment to ${VERSION}" \
+            -m "Automated by .github/workflows/release.yml after the publish-image job for ${VERSION} succeeded. Image digest: ${DIGEST}." \
+            -m "[skip ci]"
+
+          # Rebase against any commits that landed on main while the
+          # release was building, then push. Failure here surfaces to
+          # the operator instead of silently leaving the manifest behind.
+          git pull --rebase origin main
+          git push origin HEAD:main

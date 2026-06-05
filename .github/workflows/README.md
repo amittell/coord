@@ -57,6 +57,27 @@ Jobs:
   PyPI via OIDC trusted publishing (no API token stored in repo
   secrets). Bootstrap requires a one-time pending-publisher
   registration on PyPI; see "PyPI trusted publishing" below.
+- `bump-manifest` - on real tag pushes only (gated on the same
+  condition as `publish-pypi`), rewrites
+  `deploy/k8s/prod/deployment.yaml` to pin the image tag + digest
+  that `publish-image` just published, then commits and pushes the
+  result back to `main`. The commit message ends with `[skip ci]`
+  so the manifest bump does not retrigger the CI matrix; ArgoCD
+  watches `main` directly and reconciles regardless. Inputs
+  (image name, version tag, digest) flow through `env:` blocks
+  rather than `${{ ... }}` interpolation inside `run:`, eliminating
+  the workflow-injection surface. Job permission: `contents: write`.
+
+  Edge cases the job handles cleanly:
+  - Manifest already at the target digest: detected via `git diff
+    --quiet`; the job exits without a commit.
+  - Concurrent push to `main` while the release was building: the
+    job runs `git pull --rebase origin main` before pushing.
+  - Manual rebuild via `workflow_dispatch`: skipped via the same
+    `if: github.event_name == 'push' && startsWith(github.ref,
+    'refs/tags/')` guard used by `publish-pypi`. Manual rebuilds
+    of an old tag or release candidates do not silently flip
+    production.
 
 Tag behaviour:
 

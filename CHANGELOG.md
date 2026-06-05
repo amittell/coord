@@ -9,6 +9,33 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.28.1] - 2026-06-05
+
+### Added
+
+- ``bump-manifest`` job in ``.github/workflows/release.yml``. Runs
+  after ``publish-image`` succeeds on real tag pushes and rewrites
+  ``deploy/k8s/prod/deployment.yaml`` so the kebabrack live overlay
+  picks up the image digest just published. Skipped on
+  ``workflow_dispatch`` (manual rebuilds + release candidates
+  should not silently flip production). Commit message includes
+  ``[skip ci]`` so the manifest bump does not retrigger the full
+  CI matrix; ArgoCD watches git directly and reconciles regardless.
+
+### Fixed
+
+- ``deploy/k8s/prod/deployment.yaml`` had been pinned at v0.13.0
+  since that release. The kebabrack live overlay drifted 14
+  versions behind because the release workflow built and pushed
+  the GHCR image but never updated the manifest. The companion
+  ops commit catches the live cluster up to v0.28.0; the new
+  bump-manifest job prevents the drift from recurring.
+
+### Changed
+
+- ``.gitignore`` excludes ``uv.lock`` (development artifact when
+  contributors run ``uv venv`` instead of ``python -m venv``).
+
 ## [0.28.0] - 2026-06-05
 
 ### Added
