@@ -112,6 +112,22 @@ class Settings(BaseSettings):
     # panel. ``--release`` on the CLI drops their lingering claims.
     # Set to 0 to disable the housekeeping surface.
     stale_engineer_days: int = 7
+    # v0.29 per-engineer bearer tokens. When True, the legacy shared
+    # ``COORD_AUTH_TOKEN`` no longer authenticates -- the only
+    # accepted bearers are rows in the ``engineer_tokens`` table
+    # (managed by ``coord tokens create / list / revoke``). This is
+    # the migration kill switch: flip it on once every client repo
+    # has switched to its own per-engineer token. Default False so
+    # existing deployments keep working unchanged on upgrade.
+    require_per_engineer_token: bool = False
+    # v0.29 dashboard cookie session. The dashboard login form sets
+    # an HTTP-only cookie with the engineer's bearer token so the
+    # browser doesn't have to keep retyping it. Lifetime is bounded
+    # by this many seconds; default 8h matches a working day. Set
+    # to 0 to disable the cookie session entirely (browsers will
+    # have to send Authorization: Bearer ... on every request,
+    # which curl can do but real browsers cannot).
+    dashboard_session_lifetime_sec: int = 28800
 
     @property
     def auth_mode(self) -> str:
