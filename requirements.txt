@@ -35,7 +35,7 @@ python-dotenv==1.2.2
 python-multipart==0.0.32
 PyYAML==6.0.3
 referencing==0.37.0
-rpds-py==0.30.0
+rpds-py==2026.5.1
 sse-starlette==3.4.4
 starlette==1.2.1
 typing-inspection==0.4.2
