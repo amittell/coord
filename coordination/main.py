@@ -398,8 +398,273 @@ async def meta() -> dict[str, str | bool]:
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard(_: None = Depends(require_auth)) -> str:
-    return await render_dashboard()
+async def dashboard(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """v0.29: gracefully render the login form for unauthenticated
+    browsers instead of returning the raw JSON 401 the rest of the
+    API uses. The auth path is exactly the same require_auth uses
+    (per-engineer token, then shared, then COORD_REQUIRE flag); a
+    failure surfaces as the login form, not a 401.
+    """
+    settings = get_settings()
+    token = _extract_bearer(authorization, request)
+    if not token:
+        return _login_page_response()
+
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    service = get_service()
+    if await service.db.lookup_engineer_token(token_hash) is not None:
+        # Best-effort touch; never let it gate the page render.
+        try:
+            await service.db.touch_engineer_token(token_hash)
+        except Exception:  # noqa: BLE001
+            pass
+        return HTMLResponse(await render_dashboard())
+    if not settings.require_per_engineer_token and settings.auth_token:
+        if hmac.compare_digest(token, settings.auth_token):
+            return HTMLResponse(await render_dashboard())
+
+    # Stale or wrong token: render login form with an error banner so
+    # the user can paste a fresh token without poking at curl.
+    metrics.auth_failures_total.inc()
+    return _login_page_response(error="Invalid or expired token. Paste a fresh one.")
+
+
+@app.get("/dashboard/login", response_class=HTMLResponse)
+async def dashboard_login_form(request: Request) -> Response:
+    """Always serves the login page (even if the user is already
+    authenticated) -- this is the bookmark target for ``log out then
+    log back in as someone else``. Logging in a fresh time
+    overwrites the existing cookie."""
+    return _login_page_response()
+
+
+@app.post("/dashboard/login", response_class=HTMLResponse)
+async def dashboard_login_submit(request: Request) -> Response:
+    """Validate the submitted token and set the session cookie.
+
+    The form submits ``application/x-www-form-urlencoded`` with one
+    field, ``token``. Validation flows through the same per-engineer
+    -> shared -> COORD_REQUIRE pipeline as ``require_auth`` so the
+    semantics stay identical between header-bearer and cookie-bearer
+    paths. On success we set ``coord_session`` and 303 to the
+    dashboard; on failure we re-render the login form with an
+    error banner."""
+    settings = get_settings()
+    form = await request.form()
+    raw = form.get("token") or ""
+    # form.get can return UploadFile when a multipart field is bound to
+    # a file input. The login form posts urlencoded text, so we only
+    # accept strings -- silently rejecting an upload prevents a curl
+    # user from uploading a binary blob that pretends to be a token.
+    if not isinstance(raw, str):
+        return _login_page_response(error="Invalid token submission.")
+    token = raw.strip()
+    if not token:
+        return _login_page_response(error="Token is required.")
+
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    service = get_service()
+    valid = False
+    if await service.db.lookup_engineer_token(token_hash) is not None:
+        valid = True
+    elif (
+        not settings.require_per_engineer_token
+        and settings.auth_token
+        and hmac.compare_digest(token, settings.auth_token)
+    ):
+        valid = True
+
+    if not valid:
+        metrics.auth_failures_total.inc()
+        return _login_page_response(error="Invalid token.")
+
+    response = Response(status_code=303)
+    response.headers["Location"] = "/dashboard"
+    # Cookie security:
+    # * httponly=True  -- no JS in the dashboard can exfiltrate it
+    # * samesite=lax   -- SameSite=Strict would log the user out on
+    #                     every external link; Lax lets top-level
+    #                     navigation carry the cookie while still
+    #                     blocking cross-site POSTs (the actual CSRF
+    #                     surface). Matches GitHub/GitLab dashboards.
+    # * secure         -- mirror the request's scheme. Production is
+    #                     served over https through Cloudflare, so
+    #                     this resolves to True there; local dev over
+    #                     http://127.0.0.1 stays usable because we
+    #                     do not force Secure on plaintext requests.
+    response.set_cookie(
+        DASHBOARD_SESSION_COOKIE,
+        value=token,
+        max_age=settings.dashboard_session_lifetime_sec,
+        httponly=True,
+        samesite="lax",
+        secure=request.url.scheme == "https",
+        path="/",
+    )
+    return response
+
+
+@app.post("/dashboard/logout", response_class=HTMLResponse)
+async def dashboard_logout(request: Request) -> Response:
+    """Clear the session cookie and bounce back to the login form.
+
+    Always returns 303 so a browser refresh after logout doesn't
+    re-submit a POST. The cookie is cleared regardless of whether
+    one was set, so a user who lost their session can hit
+    /dashboard/logout to force-clean cookies before the next login.
+    """
+    response = Response(status_code=303)
+    response.headers["Location"] = "/dashboard/login"
+    response.delete_cookie(DASHBOARD_SESSION_COOKIE, path="/")
+    return response
+
+
+_LOGIN_HTML = """\
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>coord -- log in</title>
+  <style>
+    :root {{
+      color-scheme: light dark;
+      --bg: #0f1115;
+      --fg: #e6e7eb;
+      --muted: #9aa0a6;
+      --border: #2a2f37;
+      --accent: #6ea8ff;
+      --error: #ff7676;
+    }}
+    @media (prefers-color-scheme: light) {{
+      :root {{
+        --bg: #fafbfc;
+        --fg: #1a1d22;
+        --muted: #586069;
+        --border: #d0d7de;
+        --accent: #0969da;
+        --error: #cf222e;
+      }}
+    }}
+    html, body {{
+      margin: 0; padding: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font: 14px/1.5 system-ui, -apple-system, sans-serif;
+      min-height: 100vh;
+    }}
+    main {{
+      max-width: 28rem;
+      margin: 5rem auto;
+      padding: 2rem;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }}
+    h1 {{
+      margin: 0 0 0.25rem 0;
+      font-size: 1.25rem;
+      font-weight: 600;
+    }}
+    p.subtitle {{
+      margin: 0 0 1.5rem 0;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }}
+    label {{
+      display: block;
+      margin-bottom: 0.5rem;
+      font-weight: 500;
+    }}
+    input[type=password] {{
+      box-sizing: border-box;
+      width: 100%;
+      padding: 0.5rem 0.75rem;
+      font: inherit;
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      background: var(--bg);
+      color: var(--fg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+    }}
+    input[type=password]:focus {{
+      outline: 2px solid var(--accent);
+      outline-offset: -1px;
+    }}
+    button {{
+      margin-top: 1rem;
+      padding: 0.5rem 1rem;
+      font: inherit;
+      font-weight: 600;
+      background: var(--accent);
+      color: white;
+      border: 0;
+      border-radius: 6px;
+      cursor: pointer;
+    }}
+    button:hover {{ filter: brightness(1.1); }}
+    .error {{
+      margin: 0 0 1rem 0;
+      padding: 0.5rem 0.75rem;
+      border: 1px solid var(--error);
+      border-radius: 6px;
+      color: var(--error);
+      font-size: 0.85rem;
+    }}
+    .help {{
+      margin-top: 1rem;
+      color: var(--muted);
+      font-size: 0.8rem;
+    }}
+    code {{
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 0.85em;
+      background: rgba(127, 127, 127, 0.15);
+      padding: 0.05rem 0.3rem;
+      border-radius: 4px;
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>coord</h1>
+    <p class="subtitle">paste your bearer token to continue</p>
+    {error_html}
+    <form method="POST" action="/dashboard/login" autocomplete="off">
+      <label for="token">bearer token</label>
+      <input id="token" type="password" name="token" required autofocus
+             placeholder="coordt_..." spellcheck="false">
+      <button type="submit">log in</button>
+    </form>
+    <p class="help">
+      Generate a per-engineer token on the server with
+      <code>coord tokens create &lt;engineer&gt;</code>.
+      The legacy shared <code>COORD_AUTH_TOKEN</code> still works
+      unless the operator has set
+      <code>COORD_REQUIRE_PER_ENGINEER_TOKEN=true</code>.
+    </p>
+  </main>
+</body>
+</html>
+"""
+
+
+def _login_page_response(*, error: str | None = None) -> HTMLResponse:
+    """Render the login form. Status is always 200 so browsers do
+    not display a default-style error page; the auth failure path
+    surfaces via the inline error banner instead."""
+    error_html = ""
+    if error:
+        # Escape '<', '>', '&' so an attacker-controlled error string
+        # (none today, but the helper is here so the next refactor
+        # cannot regress) cannot inject markup.
+        safe = (
+            error.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        )
+        error_html = f'<p class="error">{safe}</p>'
+    return HTMLResponse(_LOGIN_HTML.format(error_html=error_html))
 
 
 @app.post("/claims")
