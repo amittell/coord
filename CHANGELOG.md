@@ -9,6 +9,78 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.29.0] - 2026-06-06
+
+First minor version bump since v0.28.0. Brings per-engineer
+bearer tokens to retire the single shared ``COORD_AUTH_TOKEN``,
+plus a real login form on ``/dashboard`` that replaces the JSON
+401 browsers used to see. The shared token still works by
+default; flip ``COORD_REQUIRE_PER_ENGINEER_TOKEN=true`` to reject
+it cluster-wide once every engineer has been migrated.
+
+### Added
+
+- Schema migration v14: ``engineer_tokens`` table. Tokens are
+  stored as ``sha256(raw_token)`` only; the raw value is returned
+  exactly once at creation time. Columns: ``id`` (UUID),
+  ``engineer``, ``token_sha256`` (unique index), optional
+  ``description``, ``created_at``, ``revoked_at``,
+  ``last_used_at``. Unique index on the hash gives the auth path
+  O(1) lookups.
+- Five new ``Database`` methods covering the lifecycle:
+  ``create_engineer_token``, ``lookup_engineer_token``,
+  ``touch_engineer_token``, ``list_engineer_tokens``,
+  ``revoke_engineer_token``.
+- ``coord tokens create / list / revoke`` CLI. Tokens are
+  prefixed ``coordt_`` for grep-ability in CI logs and clipboard
+  scanners. ``list`` is metadata-only; the raw token is never
+  recoverable after creation. ``revoke`` is idempotent.
+- ``Settings.require_per_engineer_token`` (env:
+  ``COORD_REQUIRE_PER_ENGINEER_TOKEN``). False by default;
+  switching to True is the migration kill switch -- after that
+  point only rows in ``engineer_tokens`` authenticate.
+- ``Settings.dashboard_session_lifetime_sec`` (env:
+  ``COORD_DASHBOARD_SESSION_LIFETIME_SEC``). Default 28800 (8h).
+- Dashboard login UI: ``GET /dashboard`` renders an HTML login
+  form when no auth is present (instead of returning JSON 401).
+  ``POST /dashboard/login`` validates the token and sets a
+  ``coord_session`` cookie (HTTPOnly, SameSite=Lax, Secure when
+  the request itself is over HTTPS, ``max_age =
+  COORD_DASHBOARD_SESSION_LIFETIME_SEC``). ``POST
+  /dashboard/logout`` clears the cookie and 303s back to the
+  login form.
+- 32 new tests across four files cover the contracts:
+  ``test_engineer_tokens.py`` (db layer), ``test_cli_tokens.py``
+  (CLI), ``test_auth_per_engineer.py`` (HTTP auth),
+  ``test_dashboard_login.py`` (browser login flow).
+
+### Changed
+
+- ``require_auth`` middleware now resolves the bearer from
+  either the ``Authorization`` header or the ``coord_session``
+  cookie; the header always wins so an operator debugging with
+  curl can override a stale browser cookie. The lookup tries
+  per-engineer tokens first, then falls back to the shared
+  ``COORD_AUTH_TOKEN`` unless
+  ``COORD_REQUIRE_PER_ENGINEER_TOKEN`` is set.
+- Successful per-engineer auth attaches ``request.state.engineer``
+  to the request so downstream handlers can read the
+  authenticated engineer without re-deriving it. ``auth_kind`` is
+  also attached (``per_engineer`` or ``shared``).
+
+### Security
+
+- ``last_used_at`` is bumped opportunistically on successful
+  per-engineer auth so operators can spot stale tokens via
+  ``coord tokens list`` and revoke them. The touch path swallows
+  exceptions to keep transient lock contention from blocking
+  request auth.
+- A revoked token's row stays in the table so ``coord tokens
+  list --include-revoked`` answers ``which tokens did this
+  engineer ever hold, when were they revoked?``. The matching
+  ``lookup_engineer_token`` query filters out revoked rows so
+  the bearer stops authenticating on the next request.
+
 ## [0.28.4] - 2026-06-06
 
 Rollup release of post-v0.28.3 dependency updates and a CI flake

@@ -1,0 +1,205 @@
+"""Tests for the v0.29 dashboard login form + cookie session.
+
+The browser path is what was missing pre-v0.29: hitting
+``/dashboard`` without auth used to return the raw JSON
+``{"detail":"Missing bearer token"}``. Now it returns an HTML
+login page, the form posts to ``/dashboard/login``, and a
+successful submission sets the ``coord_session`` cookie which the
+auth path treats identically to ``Authorization: Bearer ...``.
+
+These tests pin the behaviour real browsers depend on:
+
+1. GET /dashboard unauthenticated -> HTML login page (HTTP 200).
+2. POST /dashboard/login with a valid token -> 303 + Set-Cookie.
+3. POST /dashboard/login with an invalid token -> login page +
+   inline error banner; no cookie set.
+4. GET /dashboard with a valid cookie -> dashboard HTML.
+5. GET /dashboard with a stale cookie -> login page with the
+   stale-token error message.
+6. POST /dashboard/logout -> 303 to login form + cleared cookie.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+
+import pytest
+from httpx import ASGITransport, AsyncClient
+
+from coordination.main import app
+
+
+def _sha256(t: str) -> str:
+    return hashlib.sha256(t.encode("utf-8")).hexdigest()
+
+
+@pytest.fixture()
+async def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncClient:
+    db_path = tmp_path / "db.sqlite"
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "shared-test-token")
+    monkeypatch.setenv("COORD_DATABASE_PATH", str(db_path))
+    monkeypatch.setenv("COORD_DISABLE_BACKGROUND_CLEANUP", "1")
+    monkeypatch.setenv("COORD_DISABLE_INSTANCE_LOCK", "1")
+    monkeypatch.delenv("COORD_REPO_ROOT", raising=False)
+
+    from coordination import deps
+
+    deps.get_service.cache_clear()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
+
+
+async def test_dashboard_unauth_serves_login_form(client: AsyncClient) -> None:
+    """Pre-v0.29 the dashboard returned the raw JSON 401. Browsers
+    just saw the text ``{"detail":"Missing bearer token"}``. The fix
+    is an HTML login page on HTTP 200 with the form."""
+    r = await client.get("/dashboard")
+    assert r.status_code == 200
+    assert "text/html" in r.headers["content-type"]
+    assert "<form" in r.text
+    assert "/dashboard/login" in r.text
+    assert 'name="token"' in r.text
+    # No JSON 401 leaked into the body.
+    assert "Missing bearer token" not in r.text
+
+
+async def test_login_post_with_valid_token_sets_cookie(
+    client: AsyncClient,
+) -> None:
+    """A successful login returns 303 (PRG pattern) with the session
+    cookie set. The cookie value is the raw token; the auth path
+    resolves it through the same per-engineer / shared / require
+    flag pipeline as a header-bearer."""
+    from coordination.deps import get_service
+
+    svc = get_service()
+    raw = "coordt_" + "a" * 64
+    await svc.db.create_engineer_token(
+        "alex/claude/main", _sha256(raw), description="laptop"
+    )
+
+    r = await client.post(
+        "/dashboard/login",
+        data={"token": raw},
+        follow_redirects=False,
+    )
+    assert r.status_code == 303
+    assert r.headers["location"] == "/dashboard"
+    set_cookie = r.headers.get("set-cookie", "")
+    assert "coord_session=" in set_cookie
+    assert "HttpOnly" in set_cookie
+    assert "SameSite=lax" in set_cookie
+
+
+async def test_login_post_with_shared_token_works_by_default(
+    client: AsyncClient,
+) -> None:
+    """Back-compat: the existing shared COORD_AUTH_TOKEN still logs
+    in via the form by default. Flipping
+    COORD_REQUIRE_PER_ENGINEER_TOKEN=true is the only way to make
+    the shared token stop working at this layer too."""
+    r = await client.post(
+        "/dashboard/login",
+        data={"token": "shared-test-token"},
+        follow_redirects=False,
+    )
+    assert r.status_code == 303
+
+
+async def test_login_post_with_bad_token_renders_error_banner(
+    client: AsyncClient,
+) -> None:
+    r = await client.post(
+        "/dashboard/login",
+        data={"token": "not-a-real-token"},
+        follow_redirects=False,
+    )
+    assert r.status_code == 200
+    assert "<form" in r.text
+    assert "Invalid token" in r.text
+    assert "coord_session=" not in r.headers.get("set-cookie", "")
+
+
+async def test_login_post_with_empty_token_renders_required_error(
+    client: AsyncClient,
+) -> None:
+    r = await client.post(
+        "/dashboard/login",
+        data={"token": ""},
+        follow_redirects=False,
+    )
+    assert r.status_code == 200
+    assert "Token is required" in r.text
+
+
+async def test_dashboard_with_valid_session_cookie_renders(
+    client: AsyncClient,
+) -> None:
+    """The browser carries the session cookie on every dashboard
+    request. The dashboard treats it identically to a header
+    bearer and renders the real HTML."""
+    from coordination.deps import get_service
+
+    svc = get_service()
+    raw = "coordt_" + "b" * 64
+    await svc.db.create_engineer_token(
+        "alex/claude/main", _sha256(raw)
+    )
+
+    r = await client.get(
+        "/dashboard", cookies={"coord_session": raw}
+    )
+    assert r.status_code == 200
+    # The login form HTML carries `<form method="POST" action="/dashboard/login"`;
+    # the real dashboard does not. So presence of the real dashboard
+    # markers is the cleanest discriminator.
+    assert "action=\"/dashboard/login\"" not in r.text
+
+
+async def test_dashboard_with_stale_cookie_shows_error_banner(
+    client: AsyncClient,
+) -> None:
+    """An old cookie -- e.g. after the token was revoked or rotated --
+    must surface as the friendly stale-token banner, NOT as a JSON
+    401. Otherwise the user just sees an opaque error page."""
+    r = await client.get(
+        "/dashboard", cookies={"coord_session": "stale-revoked"}
+    )
+    assert r.status_code == 200
+    assert "<form" in r.text
+    assert "Invalid or expired token" in r.text
+
+
+async def test_logout_clears_cookie_and_redirects(
+    client: AsyncClient,
+) -> None:
+    r = await client.post(
+        "/dashboard/logout",
+        cookies={"coord_session": "anything"},
+        follow_redirects=False,
+    )
+    assert r.status_code == 303
+    assert r.headers["location"] == "/dashboard/login"
+    set_cookie = r.headers.get("set-cookie", "")
+    # delete_cookie issues an empty-value Set-Cookie with a past expiry.
+    assert "coord_session=" in set_cookie
+    assert "Max-Age=0" in set_cookie or "expires" in set_cookie.lower()
+
+
+async def test_login_form_does_not_leak_token_back_into_html(
+    client: AsyncClient,
+) -> None:
+    """Defense-in-depth: even on a bad-token submission, the
+    rejected value must NOT be reflected back into the HTML
+    response (that would be a stored XSS risk if the inline error
+    message ever interpolated the raw input)."""
+    payload = "fake-token-1234"
+    r = await client.post(
+        "/dashboard/login",
+        data={"token": payload},
+        follow_redirects=False,
+    )
+    assert r.status_code == 200
+    assert payload not in r.text
