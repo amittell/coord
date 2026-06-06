@@ -9,6 +9,58 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.28.4] - 2026-06-06
+
+Rollup release of post-v0.28.3 dependency updates and a CI flake
+fix. No code-level behaviour change; the runtime version moves so
+the production image picks up the new transitive deps and the
+manifest auto-bumper deploys them.
+
+### Fixed
+
+- Three FIFO queue ordering tests in ``tests/test_api.py``
+  (``test_queue_grants_in_fifo_order_on_release``,
+  ``test_queue_priority_blocking_jumps_ahead``,
+  ``test_queue_priority_default_normal_preserves_fifo``) used
+  ``await asyncio.sleep(0.05)`` to enforce enqueue ordering
+  before the holder release fired. The 50ms delay was reliable on
+  Linux/macOS but race-flaky on Windows's coarser scheduler --
+  CI on main had been red since v0.28.1. Switched to the existing
+  ``_wait_for_queue_id`` helper that polls
+  ``GET /requests?queued=true`` until each row is observable,
+  which removes the timing dependency.
+- ``requirements.txt`` had inconsistent ``pydantic==2.13.4`` and
+  ``pydantic_core==2.47.0`` pins after PR #17's group bump.
+  pydantic 2.13.4 strictly requires pydantic_core==2.46.4;
+  reverting the core pin makes the docker build smoke step
+  resolve cleanly again.
+
+### Changed (dependency bumps, runtime)
+
+- cryptography 47.0.0 -> 48.0.0 (PR #20)
+- rpds-py 0.30.0 -> 2026.5.1 (PR #19)
+- fastapi 0.136.0 -> 0.136.3
+- uvicorn 0.45.0 -> 0.49.0
+- pydantic 2.13.3 -> 2.13.4
+- pydantic-settings 2.14.0 -> 2.14.1
+- mcp 1.27.0 -> 1.27.2
+- pathspec 1.0.4 -> 1.1.1
+- certifi 2026.2.25 -> 2026.5.20
+- click 8.3.2 -> 8.4.1
+- httptools 0.7.1 -> 0.8.0
+- idna 3.11 -> 3.18
+- pyjwt 2.12.1 -> 2.13.0
+- python-multipart 0.0.26 -> 0.0.32
+- sse-starlette 3.3.4 -> 3.4.4
+- starlette 1.0.0 -> 1.2.1
+- watchfiles 1.1.1 -> 1.2.0
+
+### Changed (dev / CI)
+
+- tree-sitter dev extra: ``>=0.24.0`` -> ``>=0.25.2`` (PR #21)
+- Two GitHub Actions SHAs bumped via the actions-minor-and-patch
+  group (PR #16): ``actions/checkout`` v6.0.2 -> v6.0.3, etc.
+
 ## [0.28.3] - 2026-06-05
 
 ### Security
