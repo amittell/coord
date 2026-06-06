@@ -141,7 +141,7 @@ CREATE INDEX IF NOT EXISTS idx_claims_engineer ON claims (engineer);
 """
 
 
-CURRENT_SCHEMA_VERSION = 13
+CURRENT_SCHEMA_VERSION = 14
 
 
 # v0.28 fairness pass: per-blocking-claim counter that
@@ -441,6 +441,40 @@ MIGRATIONS: list[tuple[int, str]] = [
         "ON webhook_outbox (status, next_attempt_at);\n"
         "CREATE INDEX idx_webhook_outbox_event_type "
         "ON webhook_outbox (event_type, created_at);",
+    ),
+    # v14: per-engineer bearer tokens. Replaces the single shared
+    # ``COORD_AUTH_TOKEN`` for everyday agent work; the shared token
+    # stays valid by default for backwards compat and is only
+    # rejected when the operator sets
+    # ``COORD_REQUIRE_PER_ENGINEER_TOKEN=true``.
+    #
+    # Tokens are stored as ``sha256(raw_token)`` only -- the raw
+    # string is returned exactly once at creation time and never
+    # again, matching every modern PAT system. ``revoked_at`` is
+    # nullable; a non-NULL value means the token no longer
+    # authenticates. ``last_used_at`` is bumped opportunistically on
+    # successful auth so operators can spot stale tokens via
+    # ``coord tokens list``.
+    #
+    # The unique index on ``token_sha256`` is what makes the auth
+    # path O(1): the request hashes the incoming bearer once and
+    # does a single index lookup to resolve it to an engineer.
+    (
+        14,
+        "CREATE TABLE engineer_tokens (\n"
+        "    id TEXT PRIMARY KEY,\n"
+        "    engineer TEXT NOT NULL,\n"
+        "    token_sha256 TEXT NOT NULL UNIQUE,\n"
+        "    description TEXT,\n"
+        "    created_at TEXT NOT NULL,\n"
+        "    revoked_at TEXT,\n"
+        "    last_used_at TEXT\n"
+        ");\n"
+        "CREATE INDEX idx_engineer_tokens_engineer "
+        "ON engineer_tokens (engineer);\n"
+        "CREATE INDEX idx_engineer_tokens_active "
+        "ON engineer_tokens (revoked_at) "
+        "WHERE revoked_at IS NULL;",
     ),
 ]
 
@@ -1453,6 +1487,131 @@ class Database:
                 "pending": 0, "exhausted": 0,
             })[st] = int(r["n"] or 0)
         return out
+
+    async def create_engineer_token(
+        self,
+        engineer: str,
+        token_sha256: str,
+        *,
+        description: str | None = None,
+        now: datetime | None = None,
+    ) -> str:
+        """v0.29: insert a per-engineer bearer token row. The caller is
+        responsible for hashing the raw token (sha256 hex digest) and
+        for safely returning the raw value to the user exactly once --
+        this method never sees the raw token. Returns the new row's id.
+        """
+        await self.init()
+        token_id = str(uuid4())
+        ts = (now or datetime.now(UTC)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        async with aiosqlite.connect(self.path) as conn:
+            await _configure_sqlite(conn)
+            await conn.execute(
+                "INSERT INTO engineer_tokens "
+                "(id, engineer, token_sha256, description, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (token_id, engineer, token_sha256, description, ts),
+            )
+            await conn.commit()
+        return token_id
+
+    async def lookup_engineer_token(
+        self, token_sha256: str
+    ) -> dict[str, Any] | None:
+        """v0.29: O(1) lookup on the unique index. Returns the row dict
+        if a matching, non-revoked token exists; None otherwise. The
+        caller is expected to bump ``last_used_at`` separately via
+        ``touch_engineer_token`` after a successful auth -- splitting
+        the two keeps the hot read path off the write contention."""
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                "SELECT id, engineer, description, created_at, last_used_at "
+                "FROM engineer_tokens "
+                "WHERE token_sha256 = ? AND revoked_at IS NULL",
+                (token_sha256,),
+            )
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def touch_engineer_token(
+        self,
+        token_sha256: str,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        """v0.29: bump ``last_used_at`` after a successful auth. Best
+        effort: a failure here must NOT cause the request itself to
+        401, so callers should swallow exceptions. Skipped silently
+        when no row matches."""
+        await self.init()
+        ts = (now or datetime.now(UTC)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        async with aiosqlite.connect(self.path) as conn:
+            await _configure_sqlite(conn)
+            await conn.execute(
+                "UPDATE engineer_tokens SET last_used_at = ? "
+                "WHERE token_sha256 = ? AND revoked_at IS NULL",
+                (ts, token_sha256),
+            )
+            await conn.commit()
+
+    async def list_engineer_tokens(
+        self,
+        *,
+        engineer: str | None = None,
+        include_revoked: bool = False,
+    ) -> list[dict[str, Any]]:
+        """v0.29: list token metadata for ``coord tokens list`` and the
+        dashboard. The raw token and its hash are never returned --
+        callers see id, engineer, description, created_at, revoked_at,
+        last_used_at. Sorted newest first."""
+        await self.init()
+        sql = (
+            "SELECT id, engineer, description, created_at, "
+            "revoked_at, last_used_at FROM engineer_tokens"
+        )
+        clauses: list[str] = []
+        params: list[Any] = []
+        if engineer:
+            clauses.append("engineer = ?")
+            params.append(engineer)
+        if not include_revoked:
+            clauses.append("revoked_at IS NULL")
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at DESC"
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(sql, params)
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def revoke_engineer_token(
+        self,
+        token_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        """v0.29: idempotent revocation. Returns True if a previously
+        live token was newly revoked; False if the id does not exist or
+        the token was already revoked. The row is preserved (not
+        deleted) so audit queries against ``engineer_tokens`` keep their
+        historical shape -- a revoked token simply never matches in
+        ``lookup_engineer_token``."""
+        await self.init()
+        ts = (now or datetime.now(UTC)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        async with aiosqlite.connect(self.path) as conn:
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                "UPDATE engineer_tokens SET revoked_at = ? "
+                "WHERE id = ? AND revoked_at IS NULL",
+                (ts, token_id),
+            )
+            await conn.commit()
+            return cur.rowcount > 0
 
     async def list_queued_with_holder(
         self,

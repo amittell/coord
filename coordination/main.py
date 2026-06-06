@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import json
 import logging
@@ -252,7 +253,26 @@ async def _access_log_middleware(request: Request, call_next):
     return response
 
 
-def require_auth(authorization: str | None = Header(default=None)) -> None:
+async def require_auth(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> None:
+    """v0.29: two-tier bearer auth.
+
+    Per-engineer tokens (the new, recommended path) live in the
+    ``engineer_tokens`` table as sha256 hashes. The shared
+    ``COORD_AUTH_TOKEN`` is still accepted by default for
+    back-compat -- existing clients keep working untouched on
+    upgrade -- and is fully rejected once the operator flips
+    ``COORD_REQUIRE_PER_ENGINEER_TOKEN=true``.
+
+    The dashboard cookie also feeds this path: when the browser
+    has a ``coord_session`` cookie set by ``/dashboard/login``, we
+    treat its value as a bearer token, which means the same
+    per-engineer / shared-token lookup applies to browser and
+    headless clients uniformly. That keeps the security model
+    flat -- there is no separate "session token" type to audit.
+    """
     settings = get_settings()
     if not settings.auth_token:
         if settings.allow_insecure_no_auth:
@@ -264,13 +284,76 @@ def require_auth(authorization: str | None = Header(default=None)) -> None:
                 "COORD_ALLOW_INSECURE_NO_AUTH=true"
             ),
         )
-    if not authorization or not authorization.startswith("Bearer "):
+
+    token = _extract_bearer(authorization, request)
+    if not token:
         metrics.auth_failures_total.inc()
         raise HTTPException(status_code=401, detail="Missing bearer token")
-    token = authorization.removeprefix("Bearer ").strip()
-    if not hmac.compare_digest(token, settings.auth_token):
+
+    # Try per-engineer first: a leaked per-engineer token surfaces
+    # in ``coord tokens list`` and can be revoked individually,
+    # which is the whole point of having them.
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    service = get_service()
+    engineer_row = await service.db.lookup_engineer_token(token_hash)
+    if engineer_row is not None:
+        # Best-effort touch. The auth path must never 401 because
+        # the update failed (e.g. transient lock contention), so a
+        # broad except is correct here.
+        try:
+            await service.db.touch_engineer_token(token_hash)
+        except Exception:  # noqa: BLE001 - intentional swallow
+            pass
+        request.state.engineer = engineer_row["engineer"]
+        request.state.auth_kind = "per_engineer"
+        return
+
+    if settings.require_per_engineer_token:
         metrics.auth_failures_total.inc()
-        raise HTTPException(status_code=401, detail="Invalid bearer token")
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "Per-engineer token required "
+                "(COORD_REQUIRE_PER_ENGINEER_TOKEN=true). "
+                "Run 'coord tokens create <engineer>' on the server "
+                "and paste the new token into .coordination/local.env."
+            ),
+        )
+
+    # Legacy shared-token fallback.
+    if hmac.compare_digest(token, settings.auth_token):
+        request.state.auth_kind = "shared"
+        return
+
+    metrics.auth_failures_total.inc()
+    raise HTTPException(status_code=401, detail="Invalid bearer token")
+
+
+# Cookie set by ``/dashboard/login``. HTTP-only so JS in any
+# extension/widget can't read it; SameSite=Lax so a cross-site GET
+# doesn't accidentally carry it; Secure because the login page
+# refuses to set it over plaintext (the operator who bypasses the
+# secure check is opting in).
+DASHBOARD_SESSION_COOKIE = "coord_session"
+
+
+def _extract_bearer(
+    authorization: str | None, request: Request
+) -> str | None:
+    """Resolve the bearer token from either the ``Authorization``
+    header (the standard headless path) or the ``coord_session``
+    cookie set by the dashboard login (the browser path). The
+    explicit header always wins so an operator can override a
+    stale cookie by retrying with curl.
+    """
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.removeprefix("Bearer ").strip()
+        if token:
+            return token
+    cookie = request.cookies.get(DASHBOARD_SESSION_COOKIE)
+    if cookie:
+        return cookie.strip()
+    return None
 
 
 @app.get("/health", response_class=PlainTextResponse)
