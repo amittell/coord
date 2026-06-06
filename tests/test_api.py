@@ -1609,11 +1609,17 @@ async def test_queue_grants_in_fifo_order_on_release(
         }
         return (await client.post("/claims", headers=_AUTH, json=body)).json()
 
-    # Fire bob first; brief sleep guarantees bob enqueues before carol.
+    # Fire bob first, then carol. The previous implementation used
+    # `await asyncio.sleep(0.05)` between create_task calls to give the
+    # event loop time to enqueue each request, but that timing was
+    # reliable only on Linux/macOS; on Windows's coarser scheduler the
+    # holder release could fire before bob's POST had actually entered
+    # the queue, draining nothing and timing both waiters out. Polling
+    # for the observable queue row removes the race entirely.
     bob_task = _asyncio.create_task(queued_request("bob"))
-    await _asyncio.sleep(0.05)
+    await _wait_for_queue_id(client, "bob")
     carol_task = _asyncio.create_task(queued_request("carol"))
-    await _asyncio.sleep(0.05)
+    await _wait_for_queue_id(client, "carol")
 
     # Release the holder; bob (head of FIFO) should be auto-granted.
     rel = await client.post(
@@ -2662,13 +2668,15 @@ async def test_queue_priority_blocking_jumps_ahead(
 
     # Enqueue in FIFO order bob, carol, dan. With strict FIFO bob would
     # win; with priority dan (blocking) jumps to the head, carol (high)
-    # second, bob (normal) last.
+    # second, bob (normal) last. Each `_wait_for_queue_id` replaces a
+    # 50ms sleep that was Windows-flaky -- see the long comment in
+    # test_queue_grants_in_fifo_order_on_release for the failure mode.
     bob_task = _asyncio.create_task(queued_request("bob", None))
-    await _asyncio.sleep(0.05)
+    await _wait_for_queue_id(client, "bob")
     carol_task = _asyncio.create_task(queued_request("carol", "high"))
-    await _asyncio.sleep(0.05)
+    await _wait_for_queue_id(client, "carol")
     dan_task = _asyncio.create_task(queued_request("dan", "blocking"))
-    await _asyncio.sleep(0.05)
+    await _wait_for_queue_id(client, "dan")
 
     # Release the holder; the drain pops by priority DESC.
     rel = await client.post(
@@ -2731,10 +2739,13 @@ async def test_queue_priority_default_normal_preserves_fifo(
         }
         return (await client.post("/claims", headers=_AUTH, json=body)).json()
 
+    # Each `_wait_for_queue_id` replaces a 50ms sleep that was
+    # Windows-flaky: the holder release could fire before bob's POST
+    # had observably entered the queue, draining nothing.
     bob_task = _asyncio.create_task(queued_request("bob"))
-    await _asyncio.sleep(0.05)
+    await _wait_for_queue_id(client, "bob")
     carol_task = _asyncio.create_task(queued_request("carol"))
-    await _asyncio.sleep(0.05)
+    await _wait_for_queue_id(client, "carol")
 
     rel = await client.post(
         "/claims/release",
