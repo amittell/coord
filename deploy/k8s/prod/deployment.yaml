@@ -43,6 +43,14 @@ spec:
               value: "8080"
             - name: COORD_DATABASE_PATH
               value: /data/coordination.db
+            # v0.29: reject the shared COORD_AUTH_TOKEN once every
+            # engineer has been migrated to a per-engineer token
+            # (via `coord tokens create` against this same db). The
+            # shared token still lives in the coord-auth Secret for
+            # backwards compat but is ignored by the auth middleware
+            # when this flag is set.
+            - name: COORD_REQUIRE_PER_ENGINEER_TOKEN
+              value: "true"
           envFrom:
             - secretRef:
                 name: coord-auth
