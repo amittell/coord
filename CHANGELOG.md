@@ -9,6 +9,30 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.29.1] - 2026-06-08
+
+### Fixed
+
+- ``packaging`` is declared as a runtime dep in ``pyproject.toml``
+  (since v0.27.2) but was never added to ``requirements.txt``.
+  The Dockerfile builds the image by ``pip install -r
+  requirements.txt`` and then ``pip install --no-deps .``, so the
+  pyproject runtime deps are deliberately ignored -- the image
+  was relying on ``packaging`` being pulled in transitively by
+  some other runtime dep. PR #17's bumps (v0.28.4) broke that
+  transitive chain, but the consequence only surfaced when the
+  v0.29.0 image actually tried to import ``coordination.cli_doctor``
+  (which imports ``packaging.version``) and crashed at module
+  load. ``coord --version``, ``coord tokens ...``, ``coord
+  doctor`` all failed in the production pod with
+  ``ModuleNotFoundError: No module named 'packaging'``.
+
+  Fix: pin ``packaging==26.2`` in ``requirements.txt``. The
+  runtime server (``coord-api``) was unaffected (it never
+  imports ``packaging``), which is why ``/readyz`` kept returning
+  HTTP 200 the whole time; the bug only blocked operator-facing
+  CLI work inside the pod.
+
 ## [0.29.0] - 2026-06-06
 
 First minor version bump since v0.28.0. Brings per-engineer
