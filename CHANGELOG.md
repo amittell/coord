@@ -9,6 +9,29 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.29.2] - 2026-06-09
+
+### Security
+
+- ``coord_session`` cookie set by ``POST /dashboard/login`` now
+  honours the ``X-Forwarded-Proto`` header when deciding the
+  ``Secure`` attribute. Pre-fix the code only checked
+  ``request.url.scheme``, which always reads ``http`` behind a
+  TLS-terminating proxy (Cloudflare's edge, Traefik's edge, an
+  AWS ALB, etc.). The cookie was being set without ``Secure`` in
+  production, which meant the browser was technically willing to
+  send it over plain HTTP. No exploit path today because
+  ``coord.mittell.ai`` is HTTPS-only at the Cloudflare edge, but
+  the missing flag was a defense-in-depth miss that this release
+  closes.
+
+  A new helper ``_request_uses_https`` checks both the immediate
+  transport and the first hop of ``X-Forwarded-Proto``. Three new
+  regression tests cover the contract: header present sets
+  Secure, header absent keeps it off (so local dev over
+  ``http://127.0.0.1`` stays functional), and comma-separated
+  proxy chains use the first hop.
+
 ## [0.29.1] - 2026-06-08
 
 ### Fixed

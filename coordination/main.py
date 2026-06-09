@@ -490,21 +490,48 @@ async def dashboard_login_submit(request: Request) -> Response:
     #                     navigation carry the cookie while still
     #                     blocking cross-site POSTs (the actual CSRF
     #                     surface). Matches GitHub/GitLab dashboards.
-    # * secure         -- mirror the request's scheme. Production is
-    #                     served over https through Cloudflare, so
-    #                     this resolves to True there; local dev over
-    #                     http://127.0.0.1 stays usable because we
-    #                     do not force Secure on plaintext requests.
+    # * secure         -- ``_request_uses_https`` honours
+    #                     ``X-Forwarded-Proto`` so requests fronted by
+    #                     Cloudflare or Traefik (which terminate TLS
+    #                     and tunnel HTTP to the origin) still set the
+    #                     Secure flag. Plain dev over
+    #                     ``http://127.0.0.1`` stays usable because no
+    #                     proxy injects the header.
     response.set_cookie(
         DASHBOARD_SESSION_COOKIE,
         value=token,
         max_age=settings.dashboard_session_lifetime_sec,
         httponly=True,
         samesite="lax",
-        secure=request.url.scheme == "https",
+        secure=_request_uses_https(request),
         path="/",
     )
     return response
+
+
+def _request_uses_https(request: Request) -> bool:
+    """Decide whether the request reached us over TLS.
+
+    ``request.url.scheme`` only sees the immediate transport, so a
+    deployment fronted by Cloudflare or Traefik (which terminate TLS
+    at the edge and tunnel HTTP to the origin) would always read as
+    ``http`` even when the client connected over HTTPS. Trust the
+    standard ``X-Forwarded-Proto`` header when it is present so the
+    Secure cookie flag still gets set behind those proxies.
+
+    Only the first hop is checked; downstream proxies that append
+    another value (``X-Forwarded-Proto: https, http``) are treated
+    as HTTPS when the first hop was. This matches the convention in
+    every reverse-proxy implementation we've seen and is what
+    Cloudflare specifically writes.
+    """
+    if request.url.scheme == "https":
+        return True
+    forwarded = request.headers.get("x-forwarded-proto", "")
+    if not forwarded:
+        return False
+    first = forwarded.split(",")[0].strip().lower()
+    return first == "https"
 
 
 @app.post("/dashboard/logout", response_class=HTMLResponse)

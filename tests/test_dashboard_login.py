@@ -188,6 +188,68 @@ async def test_logout_clears_cookie_and_redirects(
     assert "Max-Age=0" in set_cookie or "expires" in set_cookie.lower()
 
 
+async def test_secure_cookie_flag_honours_x_forwarded_proto(
+    client: AsyncClient,
+) -> None:
+    """Behind Cloudflare or Traefik, TLS terminates at the edge and
+    the origin sees plain HTTP. Without trusting
+    ``X-Forwarded-Proto: https`` the Secure cookie flag would never
+    be set in production, which leaves the cookie willing to travel
+    over plaintext if a same-host plain-HTTP path ever existed. The
+    fix is to honour the header; this test pins both halves of the
+    contract -- header present, header absent.
+    """
+    from coordination.deps import get_service
+
+    svc = get_service()
+    raw = "coordt_" + "9" * 64
+    await svc.db.create_engineer_token(
+        "alex/claude/main", _sha256(raw)
+    )
+
+    # Behind a TLS-terminating proxy (Cloudflare's edge): Secure must
+    # be set even though the inner transport is HTTP.
+    proxied = await client.post(
+        "/dashboard/login",
+        data={"token": raw},
+        headers={"x-forwarded-proto": "https"},
+        follow_redirects=False,
+    )
+    assert proxied.status_code == 303
+    cookie = proxied.headers.get("set-cookie", "")
+    assert "coord_session=" in cookie
+    assert "Secure" in cookie, (
+        f"Secure flag should be set when X-Forwarded-Proto is https; "
+        f"got Set-Cookie: {cookie!r}"
+    )
+
+    # Plain dev (no proxy): no Secure flag, otherwise localhost over
+    # http would silently lose its session.
+    direct = await client.post(
+        "/dashboard/login",
+        data={"token": raw},
+        follow_redirects=False,
+    )
+    assert direct.status_code == 303
+    cookie = direct.headers.get("set-cookie", "")
+    assert "coord_session=" in cookie
+    assert "Secure" not in cookie, (
+        f"Secure flag must NOT be set on plain dev; "
+        f"got Set-Cookie: {cookie!r}"
+    )
+
+    # Comma-separated chains (a downstream proxy appended): the
+    # first hop is what matters per the X-Forwarded-Proto convention.
+    chained = await client.post(
+        "/dashboard/login",
+        data={"token": raw},
+        headers={"x-forwarded-proto": "https, http"},
+        follow_redirects=False,
+    )
+    assert chained.status_code == 303
+    assert "Secure" in chained.headers.get("set-cookie", "")
+
+
 async def test_login_form_does_not_leak_token_back_into_html(
     client: AsyncClient,
 ) -> None:
