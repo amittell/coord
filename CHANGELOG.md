@@ -9,6 +9,35 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.29.3] - 2026-06-09
+
+### Security
+
+- v0.29.2 added ``X-Forwarded-Proto`` awareness to the cookie
+  Secure flag, but real-world testing against the production
+  Cloudflare Tunnel + Traefik stack showed the header gets
+  rewritten to ``http`` at the Traefik hop (Traefik's default
+  ``forwardedHeaders.trustedIPs`` does not include the
+  cloudflared pod IP, so the proxy-injected header is stripped
+  for safety). The cookie was still shipping without ``Secure``.
+
+  Two new signals added to ``_request_uses_https`` so the Secure
+  flag fires in real proxy chains:
+
+  1. ``CF-Visitor: {"scheme":"https"}`` -- Cloudflare adds this
+     at the edge; cloudflared and Traefik pass arbitrary headers
+     through untouched, so this signal survives the chain
+     intact. Cloudflare guarantees its presence on every proxied
+     request.
+  2. ``COORD_DASHBOARD_COOKIE_FORCE_SECURE=true`` -- operator
+     escape hatch for stacks that strip both proxy headers, or
+     for any future proxy chain where the auto-detection still
+     misses.
+
+  Two new regression tests pin the CF-Visitor path (JSON happy
+  case + mangled-JSON soft fail) and the force-secure override.
+  Plus the v0.29.2 ``X-Forwarded-Proto`` test still passes.
+
 ## [0.29.2] - 2026-06-09
 
 ### Security

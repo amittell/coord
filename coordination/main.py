@@ -513,25 +513,54 @@ def _request_uses_https(request: Request) -> bool:
     """Decide whether the request reached us over TLS.
 
     ``request.url.scheme`` only sees the immediate transport, so a
-    deployment fronted by Cloudflare or Traefik (which terminate TLS
-    at the edge and tunnel HTTP to the origin) would always read as
-    ``http`` even when the client connected over HTTPS. Trust the
-    standard ``X-Forwarded-Proto`` header when it is present so the
-    Secure cookie flag still gets set behind those proxies.
+    deployment fronted by Cloudflare or Traefik (which terminate
+    TLS at the edge and tunnel HTTP to the origin) would always
+    read as ``http`` even when the client connected over HTTPS.
+    This helper checks four signals in priority order so the
+    Secure cookie flag still gets set behind real-world proxy
+    chains:
 
-    Only the first hop is checked; downstream proxies that append
-    another value (``X-Forwarded-Proto: https, http``) are treated
-    as HTTPS when the first hop was. This matches the convention in
-    every reverse-proxy implementation we've seen and is what
-    Cloudflare specifically writes.
+    1. ``request.url.scheme == "https"`` -- direct TLS to the
+       origin (uvicorn with ``--ssl-certfile``).
+    2. ``COORD_DASHBOARD_COOKIE_FORCE_SECURE=true`` -- operator
+       escape hatch for proxy stacks that strip the headers below.
+    3. ``X-Forwarded-Proto: https`` -- the standard header used by
+       most reverse proxies. Traefik silently rewrites this header
+       when the source IP is not in its trusted-IPs list, so it
+       often comes through as ``http`` even when the real client
+       transport was HTTPS.
+    4. ``CF-Visitor: {"scheme":"https"}`` -- Cloudflare adds this
+       at the edge and ``cloudflared`` preserves it into the
+       tunnel. Traefik does NOT rewrite arbitrary headers, so
+       this signal survives the cloudflared -> Traefik hop intact.
+       The Cloudflare docs guarantee its presence on all proxied
+       requests.
+
+    Only the first hop of each multi-value header is checked, per
+    the X-Forwarded-Proto convention.
     """
     if request.url.scheme == "https":
         return True
+
+    if get_settings().dashboard_cookie_force_secure:
+        return True
+
     forwarded = request.headers.get("x-forwarded-proto", "")
-    if not forwarded:
-        return False
-    first = forwarded.split(",")[0].strip().lower()
-    return first == "https"
+    if forwarded:
+        first = forwarded.split(",")[0].strip().lower()
+        if first == "https":
+            return True
+
+    cf_visitor = request.headers.get("cf-visitor", "")
+    if cf_visitor:
+        try:
+            parsed = json.loads(cf_visitor)
+        except (ValueError, TypeError):
+            parsed = {}
+        if isinstance(parsed, dict) and parsed.get("scheme") == "https":
+            return True
+
+    return False
 
 
 @app.post("/dashboard/logout", response_class=HTMLResponse)

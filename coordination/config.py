@@ -128,6 +128,16 @@ class Settings(BaseSettings):
     # have to send Authorization: Bearer ... on every request,
     # which curl can do but real browsers cannot).
     dashboard_session_lifetime_sec: int = 28800
+    # v0.29.3 ``dashboard_cookie_force_secure``: when True, the
+    # ``coord_session`` cookie is always written with the Secure
+    # attribute even if the request reaches the origin over HTTP.
+    # Use this when the origin sits behind a TLS-terminating proxy
+    # that does NOT inject ``X-Forwarded-Proto`` or ``CF-Visitor``
+    # in a form the auto-detection in ``_request_uses_https`` can
+    # see (or when those headers are stripped downstream). Default
+    # False; the auto-detection handles Cloudflare Tunnel + Traefik
+    # + nginx + ALB out of the box.
+    dashboard_cookie_force_secure: bool = False
 
     @property
     def auth_mode(self) -> str:

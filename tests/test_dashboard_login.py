@@ -250,6 +250,76 @@ async def test_secure_cookie_flag_honours_x_forwarded_proto(
     assert "Secure" in chained.headers.get("set-cookie", "")
 
 
+async def test_secure_cookie_flag_honours_cf_visitor(
+    client: AsyncClient,
+) -> None:
+    """Cloudflare adds ``CF-Visitor: {"scheme":"https"}`` at the
+    edge; cloudflared and Traefik pass it through untouched.
+    Honour it as a fallback to ``X-Forwarded-Proto`` (which Traefik
+    rewrites by default) so the Secure cookie flag still gets set
+    in real Cloudflare-Tunnel deployments."""
+    from coordination.deps import get_service
+
+    svc = get_service()
+    raw = "coordt_" + "8" * 64
+    await svc.db.create_engineer_token(
+        "alex/claude/main", _sha256(raw)
+    )
+
+    r = await client.post(
+        "/dashboard/login",
+        data={"token": raw},
+        headers={"cf-visitor": '{"scheme":"https"}'},
+        follow_redirects=False,
+    )
+    assert r.status_code == 303
+    cookie = r.headers.get("set-cookie", "")
+    assert "Secure" in cookie, (
+        f"CF-Visitor scheme=https must set Secure; got Set-Cookie: {cookie!r}"
+    )
+
+    # Mangled JSON in CF-Visitor must not crash auth -- we treat it
+    # as absent and fall through to the next signal.
+    r = await client.post(
+        "/dashboard/login",
+        data={"token": raw},
+        headers={"cf-visitor": "not-json"},
+        follow_redirects=False,
+    )
+    assert r.status_code == 303
+    assert "Secure" not in r.headers.get("set-cookie", "")
+
+
+async def test_dashboard_cookie_force_secure_operator_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The escape hatch for proxy stacks that strip both
+    X-Forwarded-Proto and CF-Visitor. Set
+    COORD_DASHBOARD_COOKIE_FORCE_SECURE=true and the Secure flag
+    is always written, regardless of headers."""
+    db_path = tmp_path / "db.sqlite"
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "shared-test-token")
+    monkeypatch.setenv("COORD_DATABASE_PATH", str(db_path))
+    monkeypatch.setenv("COORD_DISABLE_BACKGROUND_CLEANUP", "1")
+    monkeypatch.setenv("COORD_DISABLE_INSTANCE_LOCK", "1")
+    monkeypatch.setenv("COORD_DASHBOARD_COOKIE_FORCE_SECURE", "true")
+    monkeypatch.delenv("COORD_REPO_ROOT", raising=False)
+
+    from coordination import deps
+
+    deps.get_service.cache_clear()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        r = await ac.post(
+            "/dashboard/login",
+            data={"token": "shared-test-token"},
+            follow_redirects=False,
+        )
+        assert r.status_code == 303
+        assert "Secure" in r.headers.get("set-cookie", "")
+
+
 async def test_login_form_does_not_leak_token_back_into_html(
     client: AsyncClient,
 ) -> None:
