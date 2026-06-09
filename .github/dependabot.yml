@@ -14,6 +14,19 @@ updates:
         update-types:
           - "minor"
           - "patch"
+    ignore:
+      # pydantic-core ships independently of pydantic, but every
+      # pydantic release strictly pins a single pydantic-core
+      # version (e.g. pydantic 2.13.4 requires
+      # pydantic-core==2.46.4 exactly). Letting dependabot bump
+      # pydantic-core on its own produces an UNSAT lockfile that
+      # docker build smoke catches as `ResolutionImpossible`.
+      # Re-allow these bumps once pydantic releases 2.14+ with a
+      # newer core (then pydantic-core will move as part of the
+      # python-minor-and-patch group bump, not as a standalone PR).
+      # PR #22 (closed 2026-06-08) was the second time this issue
+      # bit; first was PR #17 -> v0.28.4 hotfix.
+      - dependency-name: "pydantic-core"
 
   # GitHub Actions used in .github/workflows/. Dependabot is allowed
   # to auto-update action SHAs here, which is the whole point of the
