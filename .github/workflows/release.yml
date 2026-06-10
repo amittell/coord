@@ -322,7 +322,7 @@ jobs:
           print(f"updated {manifest} -> {target}")
           PY
 
-      - name: Commit and push
+      - name: Commit, push, and retag at the deployment-ready commit
         env:
           VERSION: ${{ needs.publish-image.outputs.version-tag }}
           DIGEST: ${{ needs.publish-image.outputs.image-digest }}
@@ -340,10 +340,12 @@ jobs:
           git add deploy/k8s/prod/deployment.yaml
           # `[skip ci]` in the commit message is a GitHub Actions
           # convention: any workflow triggered by this push is skipped.
-          # release.yml only triggers on tag pushes, so it would not
-          # recurse anyway, but ci.yml would otherwise run a full test
-          # matrix on a one-line manifest change. ArgoCD watches git
-          # directly and reconciles regardless of CI status.
+          # release.yml only triggers on tag pushes (and the moved
+          # tag below is pushed by GITHUB_TOKEN, which GitHub
+          # documents as NOT triggering downstream workflows), but
+          # ci.yml would otherwise run a full test matrix on a
+          # one-line manifest change. ArgoCD watches git directly
+          # and reconciles regardless of CI status.
           git commit \
             -m "ops: bump prod deployment to ${VERSION}" \
             -m "Automated by .github/workflows/release.yml after the publish-image job for ${VERSION} succeeded. Image digest: ${DIGEST}." \
@@ -354,3 +356,43 @@ jobs:
           # the operator instead of silently leaving the manifest behind.
           git pull --rebase origin main
           git push origin HEAD:main
+
+          # Move the version tag forward to this new commit.
+          #
+          # When the maintainer pushes a tag locally, the tag points
+          # at the commit that bumped pyproject.toml + CHANGELOG --
+          # but the manifest in that commit still pins the PREVIOUS
+          # image. After this job runs, main carries a manifest pin
+          # to the new image. Without this retag, ``git describe HEAD``
+          # would keep resolving to the previous version tag (because
+          # the maintainer's tagged commit is on a now-orphan branch
+          # after the rebase above) and the tag's tree would describe
+          # an outdated deployment state.
+          #
+          # We move the tag forward to the bot's just-committed
+          # commit, which has:
+          #   1. the new pyproject + CHANGELOG (from the rebased
+          #      commit it sits on top of)
+          #   2. the manifest pinned to the freshly-published image
+          # That commit IS the deployment-ready snapshot, and is
+          # what ``git checkout vX.Y.Z`` should land on.
+          #
+          # Image artefacts (the cosigned image digest, the BuildKit
+          # + GitHub provenance attestations, the GitHub Release
+          # body, the PyPI wheel) are all keyed off the IMAGE digest,
+          # not the git ref -- moving the tag does not invalidate any
+          # of them. The GitHub Release page's "Tagged at" timestamp
+          # and commit link update to the new commit, which is the
+          # intended outcome.
+          #
+          # The force-push uses ``GITHUB_TOKEN`` (the workflow's
+          # default token), and GitHub guarantees pushes made by that
+          # token do not trigger workflows -- so the retag does not
+          # recursively re-run release.yml. See:
+          # https://docs.github.com/en/actions/security-guides/automatic-token-authentication
+          # ("When you use the repository's GITHUB_TOKEN ... events ...
+          # will not create a new workflow run.")
+          git tag -f -a "${VERSION}" \
+            -m "${VERSION} (deployment-ready commit; manifest pins ${DIGEST})" \
+            HEAD
+          git push origin "${VERSION}" --force

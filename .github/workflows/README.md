@@ -61,16 +61,35 @@ Jobs:
   condition as `publish-pypi`), rewrites
   `deploy/k8s/prod/deployment.yaml` to pin the image tag + digest
   that `publish-image` just published, then commits and pushes the
-  result back to `main`. The commit message ends with `[skip ci]`
-  so the manifest bump does not retrigger the CI matrix; ArgoCD
-  watches `main` directly and reconciles regardless. Inputs
-  (image name, version tag, digest) flow through `env:` blocks
-  rather than `${{ ... }}` interpolation inside `run:`, eliminating
-  the workflow-injection surface. Job permission: `contents: write`.
+  result back to `main`. Finally moves the version tag forward to
+  the just-committed snapshot so `git describe HEAD` resolves to
+  the current shipped version. The commit message ends with
+  `[skip ci]` so the manifest bump does not retrigger the CI
+  matrix; ArgoCD watches `main` directly and reconciles regardless.
+  Inputs (image name, version tag, digest) flow through `env:`
+  blocks rather than `${{ ... }}` interpolation inside `run:`,
+  eliminating the workflow-injection surface. Job permission:
+  `contents: write`.
+
+  Tag retag rationale: when the maintainer pushes `v0.X.Y`
+  locally, the tag points at a commit whose manifest still pins
+  the *previous* image. After the build succeeds and the manifest
+  gets bumped to the new digest, the tag is moved forward to that
+  new commit. This keeps the tag's tree consistent with what the
+  cluster actually runs, and means anyone who clones `vX.Y.Z`
+  gets the same deployment YAML ArgoCD is reconciling against.
+  Image artifacts (cosign signature, BuildKit + GitHub provenance
+  attestations, GitHub Release body, PyPI wheel) are keyed off
+  the image digest, not the git ref, so moving the tag does not
+  invalidate any of them. The force-push uses `GITHUB_TOKEN`,
+  which GitHub guarantees does not trigger downstream workflows
+  (`https://docs.github.com/en/actions/security-guides/automatic-token-authentication`),
+  so retag does not recursively re-run `release.yml`.
 
   Edge cases the job handles cleanly:
   - Manifest already at the target digest: detected via `git diff
-    --quiet`; the job exits without a commit.
+    --quiet`; the job exits without a commit AND without moving
+    the tag (the tag-move is conditional on a successful commit).
   - Concurrent push to `main` while the release was building: the
     job runs `git pull --rebase origin main` before pushing.
   - Manual rebuild via `workflow_dispatch`: skipped via the same
