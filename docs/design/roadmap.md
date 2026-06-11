@@ -1,9 +1,47 @@
 # Coord roadmap
 
 Status: living document
-Last updated: 2026-06-05 (after v0.28.0)
+Last updated: 2026-06-11 (after v0.29.3)
 
-This is the post-v0.28 forward look. Items here are candidates, not commitments -- order and scope move as production telemetry and operator feedback arrive. Entries already shipped live in [CHANGELOG.md](../../CHANGELOG.md); see also [docs/design/sub-file-claims.md](./sub-file-claims.md) for the v0.14-v0.26 arc design.
+This is the post-v0.29 forward look. Items here are candidates, not commitments -- order and scope move as production telemetry and operator feedback arrive. Entries already shipped live in [CHANGELOG.md](../../CHANGELOG.md); see also [docs/design/sub-file-claims.md](./sub-file-claims.md) for the v0.14-v0.26 arc design.
+
+## v0.29.0-0.29.3 (shipped) -- Per-engineer bearer tokens + dashboard login UI
+
+v0.29 was originally sized for queue rate limiting (the QoS continuation in the older v0.29 section, now renamed v0.30). That was deferred when operator demand surfaced for per-engineer bearer tokens to retire the single shared ``COORD_AUTH_TOKEN``, and for a real HTML login form on ``/dashboard`` instead of the JSON 401 browsers used to see. Rate limiting now becomes a natural follow-on (the engineer identity it needs is what per-engineer tokens give us at auth time) and moves to v0.30.
+
+Shipped in v0.29.0:
+
+- Schema migration v14: ``engineer_tokens`` table. Tokens stored as ``sha256(raw_token)`` only; raw value returned exactly once at creation. Columns: id (UUID), engineer, token_sha256 (unique index), description, created_at, revoked_at, last_used_at.
+- Five new Database methods cover the lifecycle: ``create_engineer_token``, ``lookup_engineer_token``, ``touch_engineer_token``, ``list_engineer_tokens``, ``revoke_engineer_token``.
+- ``coord tokens create / list / revoke`` CLI. Tokens prefixed ``coordt_`` for grep-ability. ``list`` is metadata-only; raw token is never recoverable after creation. ``revoke`` idempotent.
+- ``COORD_REQUIRE_PER_ENGINEER_TOKEN`` env flag. False by default (shared token still works for back-compat); switching True is the migration kill switch that rejects the shared token cluster-wide.
+- Dashboard login UI: ``GET /dashboard`` renders HTML login form when unauth (instead of JSON 401). ``POST /dashboard/login`` validates + sets ``coord_session`` cookie. ``POST /dashboard/logout`` clears it. Cookie is HTTPOnly, SameSite=Lax, Secure on HTTPS, lifetime ``COORD_DASHBOARD_SESSION_LIFETIME_SEC`` (default 8h).
+- 32 new tests across 4 files: ``test_engineer_tokens.py`` (db layer), ``test_cli_tokens.py`` (CLI), ``test_auth_per_engineer.py`` (HTTP auth), ``test_dashboard_login.py`` (browser login flow).
+
+Operational hardening shipped in v0.29.1-v0.29.3:
+
+- v0.29.1: ``packaging`` added to ``requirements.txt`` (was declared as a runtime dep in pyproject but never carried by ``requirements.txt`` -- transitive chain broke in PR #17's bump).
+- v0.29.2: cookie ``Secure`` flag now honours ``X-Forwarded-Proto`` so origins behind a TLS-terminating proxy (Cloudflare, Traefik, nginx, ALB) still mark the cookie Secure.
+- v0.29.3: cookie ``Secure`` also honours Cloudflare's ``CF-Visitor: {"scheme":"https"}`` because Traefik strips ``X-Forwarded-Proto`` from untrusted source IPs by default. Plus a ``COORD_DASHBOARD_COOKIE_FORCE_SECURE`` escape hatch for proxy chains that strip both headers.
+
+Operational follow-ups shipped alongside (not feature work):
+
+- Cloudflare Tunnel dual-access pattern: ``coord.mittell.ai`` (HTTPS via tunnel) for off-LAN, ``coord.kebabrack.lan`` (HTTP LAN-direct) for local work. Documented as Option 5 in ``docs/deployment.md``.
+- Full ``docs/deployment.md`` TLS section covering 5 patterns (plaintext, Cloudflare Tunnel, Let's Encrypt + cert-manager DNS-01, self-signed CA, dual-access).
+- ``.github/workflows/release.yml`` ``bump-manifest`` job now moves the version tag forward to the deployment-ready commit so ``git describe HEAD`` resolves to the current shipped version (was always one tag behind).
+- ``.github/dependabot.yml`` ignore rule for ``pydantic-core`` until pydantic itself ships a release that adopts it (pydantic 2.13.4 pins ``pydantic-core==2.46.4`` exactly).
+- Windows CI flake fix: three FIFO queue ordering tests in ``test_api.py`` were timing-flaky on Windows; replaced ``asyncio.sleep(0.05)`` with the existing ``_wait_for_queue_id`` poll helper.
+
+### v0.29.x candidate follow-ups
+
+The per-engineer token surface opened up several near-term enhancements:
+
+- **Token expiry**: ``engineer_tokens.expires_at`` column + ``coord tokens create --expires-in 30d`` flag. Auth path 401s on expired tokens with a hint to reissue. Same pattern as GitHub PATs.
+- **Token rotation with grace period**: a way to issue ``v2`` of a token before revoking ``v1``, with both valid during the rotation window. Useful for rotating tokens in tools that cache them.
+- **In-dashboard token management UI**: a logged-in engineer can view their own tokens, revoke them, and generate new ones from the dashboard. Today it is CLI-only on the server.
+- **Token activity log**: per-token request count + last-source-IP/UA. Surfaces in the dashboard so operators can spot "this token has not been used in a month" or "this token is being used from an unexpected location".
+- **CSRF tokens** for state-changing dashboard operations. ``SameSite=Lax`` already blocks cross-site POSTs, but a per-form CSRF token adds defense in depth against the SameSite=None opt-out future.
+- **SSO/OIDC integration**: an alternative to per-engineer tokens where dashboard auth proxies through an external identity provider (Google, GitHub, Okta) and tokens are minted automatically.
 
 ## v0.28.0 (shipped) -- Queue QoS + housekeeping
 
@@ -48,20 +86,20 @@ Candidate items:
 
 Risk: namespace design has lots of decisions (URL shape, tenant isolation level, billing surface) that will pull engineering time. May benefit from a separate design doc (`docs/design/multi-namespace.md`) before implementation.
 
-## v0.29 -- Queue quality of service (continued)
+## v0.30 -- Queue quality of service (continued)
 
-v0.21-v0.28 covered priority, age boost, cancellation, fairness, decay, and the backpressure header. v0.29 picks up the remaining queue-QoS items that need either schema or behavioural changes too disruptive to fit in the v0.28 no-migration release.
+v0.21-v0.28 covered priority, age boost, cancellation, fairness, decay, and the backpressure header. v0.30 (originally planned as v0.29 before per-engineer tokens jumped the queue) picks up the remaining queue-QoS items that need either schema or behavioural changes too disruptive to fit in the v0.28 no-migration release. The v0.29 per-engineer token work actually makes this easier: rate limiting now has a reliable per-engineer identity at auth time, not just a request-body engineer field that any holder of the shared token could lie about.
 
 Candidate items:
 
-- Per-engineer rate limiting: an engineer cannot have more than N active claims or more than M queued requests at once (`COORD_MAX_CLAIMS_PER_ENGINEER`, `COORD_MAX_QUEUED_PER_ENGINEER`). Returns 429 with a `Retry-After` header.
+- Per-engineer rate limiting: an engineer cannot have more than N active claims or more than M queued requests at once (`COORD_MAX_CLAIMS_PER_ENGINEER`, `COORD_MAX_QUEUED_PER_ENGINEER`). Returns 429 with a `Retry-After` header. With per-engineer tokens the limit key is the authenticated engineer (not the engineer field in the body), which closes the obvious bypass.
 - Per-repo claim quotas mirroring the v0.4 max-claim-ratio but at the queue layer: a repo whose queue is > N deep refuses new wait_seconds requests with a "service degraded" hint, surfacing pushback at the API instead of letting waiters pile up.
 
 Risk: rate-limiting interacts with the v0.5 session_id self-exclusion and the v0.10 multi-session activity ping in ways that need careful testing. Coord must not 429 an agent's own subagents.
 
-## v0.30 -- Language-server-aware claims
+## v0.31 -- Language-server-aware claims
 
-The v0.14-v0.17 symbol claims rely on tree-sitter for parsing, which extracts top-level structure but does not know about types, callsites, or refactor safety. v0.30 elevates the symbol claim from "lexical match on a name" to "semantic match on a definition".
+The v0.14-v0.17 symbol claims rely on tree-sitter for parsing, which extracts top-level structure but does not know about types, callsites, or refactor safety. v0.31 elevates the symbol claim from "lexical match on a name" to "semantic match on a definition".
 
 Candidate items:
 
@@ -84,7 +122,7 @@ Items worth tracking but not yet sized:
 - **Operator approval workflow** (alternative to v0.22 hard auto-promote): instead of writing immediately, the conflict pipeline files a `pending_promotion` row that the operator approves via the dashboard. Bridges the gap between v0.21 fully-soft and v0.22 fully-automatic.
 - **Postgres-only optimisations** (post-Postgres-backend): NOTIFY-driven queue grant (zero poll latency), partitioned conflict_log for repos with >1M attempts per month, read-replica routing for the dashboard.
 
-## Done in the v0.13 -> v0.28 arc (for context)
+## Done in the v0.13 -> v0.29 arc (for context)
 
 This roadmap supersedes the older "candidate" markers in the v0.14 sub-file claims design doc. Everything below is shipped and lives in [CHANGELOG.md](../../CHANGELOG.md) for the full detail:
 
@@ -105,3 +143,7 @@ This roadmap supersedes the older "candidate" markers in the v0.14 sub-file clai
 | v0.26.0 | subtree auto-promote + priority age boost + queue cancellation |
 | v0.27.0 | webhook outbox + HMAC delivery + dashboard panel |
 | v0.28.0 | backpressure header + queue fairness + priority decay + stale engineer cleanup |
+| v0.29.0 | per-engineer bearer tokens + dashboard login UI + cookie session |
+| v0.29.1 | hotfix: packaging dep in requirements.txt |
+| v0.29.2 | cookie Secure honours X-Forwarded-Proto |
+| v0.29.3 | cookie Secure also honours CF-Visitor (Traefik strips XFP) + force-secure escape hatch |
