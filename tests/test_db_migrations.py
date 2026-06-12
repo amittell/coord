@@ -620,3 +620,87 @@ async def test_v6_adds_coexists_with_to_claims(tmp_path: Path) -> None:
     )
     coex_row = next(r for r in rows if r[1] == "coexists_with")
     assert coex_row[3] == 0, "coexists_with must be nullable for backfill"
+
+
+async def test_v15_adds_token_lifecycle_columns(tmp_path: Path) -> None:
+    """v15 adds the token lifecycle columns to engineer_tokens. The
+    expiry/rotation columns must be nullable (NULL = legacy semantics:
+    no expiry, not rotated) and request_count must default to 0 so
+    pre-v15 rows read as never-counted rather than NULL."""
+    db_path = tmp_path / "v15_token_lifecycle.sqlite"
+    db = Database(db_path)
+    await db.init()
+
+    rows = await _fetch_all(db_path, "PRAGMA table_info(engineer_tokens)")
+    cols = {r[1] for r in rows}
+    for expected in (
+        "expires_at",
+        "rotated_from",
+        "rotation_grace_until",
+        "request_count",
+        "last_source_ip",
+        "last_user_agent",
+    ):
+        assert expected in cols, (
+            f"engineer_tokens missing {expected}; saw: {cols}"
+        )
+    for nullable in ("expires_at", "rotated_from", "rotation_grace_until"):
+        row = next(r for r in rows if r[1] == nullable)
+        assert row[3] == 0, f"{nullable} must be nullable for backfill"
+    count_row = next(r for r in rows if r[1] == "request_count")
+    assert count_row[4] == "0", "request_count must default to 0"
+
+
+async def test_v15_preserves_existing_token_rows(tmp_path: Path) -> None:
+    """A v14 database with live tokens upgrades to v15 with every row
+    intact and legacy semantics (no expiry, zero request count)."""
+    db_path = tmp_path / "v15_upgrade.sqlite"
+
+    # Build a genuine v14 database: replay the migration registry up
+    # to and including v14, stamp it, and insert a token row with the
+    # v14 column set only.
+    import aiosqlite
+
+    from coordination import db as db_module
+
+    async with aiosqlite.connect(db_path) as conn:
+        for version, sql in db_module.MIGRATIONS:
+            if version > 14:
+                break
+            for stmt in db_module._split_sql_statements(sql):
+                await conn.execute(stmt)
+        await conn.execute(db_module.SCHEMA_VERSION_TABLE_SQL)
+        await conn.execute(
+            "INSERT INTO schema_version (id, version) VALUES (1, 14)"
+        )
+        await conn.execute(
+            "INSERT INTO engineer_tokens "
+            "(id, engineer, token_sha256, description, created_at) "
+            "VALUES ('tok-1', 'alex/claude/main', 'deadbeef', 'laptop', "
+            "'2026-06-01T00:00:00Z')"
+        )
+        await conn.commit()
+
+    db = Database(db_path)
+    await db.init()
+
+    version_row = await _fetch_one(
+        db_path, "SELECT version FROM schema_version WHERE id = 1"
+    )
+    assert version_row[0] == db_module.CURRENT_SCHEMA_VERSION
+
+    row = await _fetch_one(
+        db_path,
+        "SELECT engineer, expires_at, rotated_from, rotation_grace_until, "
+        "request_count FROM engineer_tokens WHERE id = 'tok-1'",
+    )
+    assert row[0] == "alex/claude/main"
+    assert row[1] is None
+    assert row[2] is None
+    assert row[3] is None
+    assert row[4] == 0
+
+    # And the upgraded row still authenticates through the v15 code.
+    hit = await db.lookup_engineer_token("deadbeef")
+    assert hit is not None
+    assert hit["status"] == "ok"

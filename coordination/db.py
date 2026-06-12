@@ -141,7 +141,7 @@ CREATE INDEX IF NOT EXISTS idx_claims_engineer ON claims (engineer);
 """
 
 
-CURRENT_SCHEMA_VERSION = 14
+CURRENT_SCHEMA_VERSION = 15
 
 
 # v0.28 fairness pass: per-blocking-claim counter that
@@ -476,11 +476,48 @@ MIGRATIONS: list[tuple[int, str]] = [
         "ON engineer_tokens (revoked_at) "
         "WHERE revoked_at IS NULL;",
     ),
+    # v15: token lifecycle columns (v0.29.4). ``expires_at`` makes a
+    # token self-terminating (NULL = no expiry, matching legacy rows);
+    # ``rotated_from`` links a successor token back to the token it
+    # replaced so the rotation chain is walkable; a non-NULL
+    # ``rotation_grace_until`` on the OLD token marks it as replaced --
+    # it keeps authenticating until that instant so cached copies in
+    # long-lived tools survive the swap, then goes dark.
+    #
+    # ``request_count`` / ``last_source_ip`` / ``last_user_agent`` are
+    # last-state activity tracking bumped opportunistically on auth
+    # (same best-effort contract as ``last_used_at``): enough for the
+    # operator questions "is this token dead?" and "is this token
+    # being used from somewhere unexpected?" without a per-request
+    # history table contending with the auth hot path.
+    (
+        15,
+        "ALTER TABLE engineer_tokens ADD COLUMN expires_at TEXT;\n"
+        "ALTER TABLE engineer_tokens ADD COLUMN rotated_from TEXT;\n"
+        "ALTER TABLE engineer_tokens ADD COLUMN rotation_grace_until TEXT;\n"
+        "ALTER TABLE engineer_tokens ADD COLUMN request_count INTEGER NOT NULL DEFAULT 0;\n"
+        "ALTER TABLE engineer_tokens ADD COLUMN last_source_ip TEXT;\n"
+        "ALTER TABLE engineer_tokens ADD COLUMN last_user_agent TEXT;\n"
+        "CREATE INDEX idx_engineer_tokens_rotated_from "
+        "ON engineer_tokens (rotated_from);",
+    ),
 ]
 
 
 def _utcnow() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _ts_elapsed(ts: Any, ref: datetime) -> bool:
+    """True when ``ts`` is a non-empty timestamp at or before ``ref``.
+    Unparseable values count as elapsed -- fail closed, because a
+    corrupt expiry must not turn into an immortal token."""
+    if not ts:
+        return False
+    try:
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00")) <= ref
+    except ValueError:
+        return True
 
 
 # SQLite waits this long (ms) for a contended write lock before raising
@@ -1494,66 +1531,127 @@ class Database:
         token_sha256: str,
         *,
         description: str | None = None,
+        expires_at: datetime | None = None,
+        rotated_from: str | None = None,
         now: datetime | None = None,
     ) -> str:
         """v0.29: insert a per-engineer bearer token row. The caller is
         responsible for hashing the raw token (sha256 hex digest) and
         for safely returning the raw value to the user exactly once --
         this method never sees the raw token. Returns the new row's id.
+
+        v0.29.4: ``expires_at`` (None = never expires) and
+        ``rotated_from`` (id of the predecessor token when this row is
+        minted by a rotation) land in the v15 columns.
         """
         await self.init()
         token_id = str(uuid4())
         ts = (now or datetime.now(UTC)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        exp_ts = (
+            expires_at.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            if expires_at
+            else None
+        )
         async with aiosqlite.connect(self.path) as conn:
             await _configure_sqlite(conn)
             await conn.execute(
                 "INSERT INTO engineer_tokens "
-                "(id, engineer, token_sha256, description, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (token_id, engineer, token_sha256, description, ts),
+                "(id, engineer, token_sha256, description, created_at, "
+                "expires_at, rotated_from) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (token_id, engineer, token_sha256, description, ts, exp_ts, rotated_from),
             )
             await conn.commit()
         return token_id
 
-    async def lookup_engineer_token(
-        self, token_sha256: str
+    async def resolve_engineer_token(
+        self,
+        token_sha256: str,
+        *,
+        now: datetime | None = None,
     ) -> dict[str, Any] | None:
-        """v0.29: O(1) lookup on the unique index. Returns the row dict
-        if a matching, non-revoked token exists; None otherwise. The
-        caller is expected to bump ``last_used_at`` separately via
-        ``touch_engineer_token`` after a successful auth -- splitting
-        the two keeps the hot read path off the write contention."""
+        """v0.29.4: diagnostic lookup behind ``lookup_engineer_token``.
+        Returns None for missing or revoked tokens (indistinguishable
+        on purpose -- both mean "not a credential"). Otherwise returns
+        the row dict plus a computed ``status`` field: ``ok`` when the
+        token authenticates, ``expired`` when ``expires_at`` has
+        passed, or ``rotation_grace_elapsed`` when the token was
+        rotated away and its grace window has closed. The distinct
+        statuses let the auth layer emit actionable 401 hints without
+        weakening the valid-only contract of ``lookup_engineer_token``.
+        """
         await self.init()
         async with aiosqlite.connect(self.path) as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(
-                "SELECT id, engineer, description, created_at, last_used_at "
+                "SELECT id, engineer, description, created_at, last_used_at, "
+                "expires_at, rotated_from, rotation_grace_until, "
+                "request_count, last_source_ip, last_user_agent "
                 "FROM engineer_tokens "
                 "WHERE token_sha256 = ? AND revoked_at IS NULL",
                 (token_sha256,),
             )
             row = await cur.fetchone()
-        return dict(row) if row else None
+        if row is None:
+            return None
+        out = dict(row)
+        ref = now or datetime.now(UTC)
+        if _ts_elapsed(out.get("expires_at"), ref):
+            out["status"] = "expired"
+        elif _ts_elapsed(out.get("rotation_grace_until"), ref):
+            out["status"] = "rotation_grace_elapsed"
+        else:
+            out["status"] = "ok"
+        return out
+
+    async def lookup_engineer_token(
+        self, token_sha256: str
+    ) -> dict[str, Any] | None:
+        """v0.29: O(1) lookup on the unique index. Returns the row dict
+        only when the token currently authenticates (not revoked, not
+        expired, not past its rotation grace window); None otherwise.
+        Callers needing to know WHY a token stopped authenticating use
+        ``resolve_engineer_token``. The caller is expected to bump
+        ``last_used_at`` separately via ``touch_engineer_token`` after
+        a successful auth -- splitting the two keeps the hot read path
+        off the write contention."""
+        resolved = await self.resolve_engineer_token(token_sha256)
+        if resolved is None or resolved["status"] != "ok":
+            return None
+        return resolved
 
     async def touch_engineer_token(
         self,
         token_sha256: str,
         *,
+        source_ip: str | None = None,
+        user_agent: str | None = None,
         now: datetime | None = None,
     ) -> None:
         """v0.29: bump ``last_used_at`` after a successful auth. Best
         effort: a failure here must NOT cause the request itself to
         401, so callers should swallow exceptions. Skipped silently
-        when no row matches."""
+        when no row matches.
+
+        v0.29.4: also increments ``request_count`` and records the
+        last-seen source IP / user agent. Both are untrusted proxy
+        metadata, so they are truncated before storage; request_count
+        is approximate by design (touch failures are swallowed). A
+        request with no IP/UA keeps the previous last-seen values."""
         await self.init()
         ts = (now or datetime.now(UTC)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        ip = (source_ip or "")[:128] or None
+        ua = (user_agent or "")[:512] or None
         async with aiosqlite.connect(self.path) as conn:
             await _configure_sqlite(conn)
             await conn.execute(
-                "UPDATE engineer_tokens SET last_used_at = ? "
+                "UPDATE engineer_tokens SET last_used_at = ?, "
+                "request_count = COALESCE(request_count, 0) + 1, "
+                "last_source_ip = COALESCE(?, last_source_ip), "
+                "last_user_agent = COALESCE(?, last_user_agent) "
                 "WHERE token_sha256 = ? AND revoked_at IS NULL",
-                (ts, token_sha256),
+                (ts, ip, ua, token_sha256),
             )
             await conn.commit()
 
@@ -1570,7 +1668,9 @@ class Database:
         await self.init()
         sql = (
             "SELECT id, engineer, description, created_at, "
-            "revoked_at, last_used_at FROM engineer_tokens"
+            "revoked_at, last_used_at, expires_at, rotated_from, "
+            "rotation_grace_until, request_count, last_source_ip, "
+            "last_user_agent FROM engineer_tokens"
         )
         clauses: list[str] = []
         params: list[Any] = []
@@ -1612,6 +1712,95 @@ class Database:
             )
             await conn.commit()
             return cur.rowcount > 0
+
+    async def rotate_engineer_token(
+        self,
+        token_id: str,
+        new_token_sha256: str,
+        *,
+        grace_until: datetime,
+        expires_at: datetime | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """v0.29.4: atomically mint a successor token and put the old
+        token into its rotation grace window. Returns ``{"ok": True,
+        "new_token_id": ..., "engineer": ..., "description": ...,
+        "grace_until": ...}`` on success, or ``{"ok": False, "error":
+        <reason>}`` where reason is one of ``not_found`` / ``revoked``
+        / ``expired`` / ``already_rotated``.
+
+        Rules (deliberately strict so a rotation can never revive a
+        dead credential): revoked tokens cannot rotate; expired tokens
+        cannot rotate (mint a fresh token instead); a token that
+        already has a ``rotation_grace_until`` cannot rotate again --
+        that would either fork the chain or extend a window that
+        already closed. Rotate the current successor instead.
+
+        Insert-successor and set-old-grace happen in one BEGIN
+        IMMEDIATE transaction so the pair cannot partially apply."""
+        await self.init()
+        ref = now or datetime.now(UTC)
+        ts = ref.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        grace_ts = (
+            grace_until.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        )
+        exp_ts = (
+            expires_at.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            if expires_at
+            else None
+        )
+        new_id = str(uuid4())
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            await conn.execute("BEGIN IMMEDIATE")
+            cur = await conn.execute(
+                "SELECT id, engineer, description, revoked_at, "
+                "expires_at, rotation_grace_until "
+                "FROM engineer_tokens WHERE id = ?",
+                (token_id,),
+            )
+            old = await cur.fetchone()
+            if old is None:
+                await conn.rollback()
+                return {"ok": False, "error": "not_found"}
+            if old["revoked_at"] is not None:
+                await conn.rollback()
+                return {"ok": False, "error": "revoked"}
+            if _ts_elapsed(old["expires_at"], ref):
+                await conn.rollback()
+                return {"ok": False, "error": "expired"}
+            if old["rotation_grace_until"] is not None:
+                await conn.rollback()
+                return {"ok": False, "error": "already_rotated"}
+            await conn.execute(
+                "INSERT INTO engineer_tokens "
+                "(id, engineer, token_sha256, description, created_at, "
+                "expires_at, rotated_from) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    new_id,
+                    old["engineer"],
+                    new_token_sha256,
+                    old["description"],
+                    ts,
+                    exp_ts,
+                    old["id"],
+                ),
+            )
+            await conn.execute(
+                "UPDATE engineer_tokens SET rotation_grace_until = ? "
+                "WHERE id = ?",
+                (grace_ts, old["id"]),
+            )
+            await conn.commit()
+        return {
+            "ok": True,
+            "new_token_id": new_id,
+            "engineer": str(old["engineer"]),
+            "description": old["description"],
+            "grace_until": grace_ts,
+        }
 
     async def list_queued_with_holder(
         self,

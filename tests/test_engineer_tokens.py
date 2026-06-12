@@ -186,3 +186,252 @@ async def test_audit_row_survives_revocation(tmp_path: Path) -> None:
         datetime.fromisoformat(audit["revoked_at"].replace("Z", "+00:00"))
         - issued
     ) < timedelta(seconds=2)
+
+
+# --- v0.29.4: expiry ---
+
+
+async def test_expired_token_does_not_authenticate(tmp_path: Path) -> None:
+    """``expires_at`` in the past makes ``lookup_engineer_token``
+    return None, exactly like a revoked token. The valid-only lookup
+    contract is what the auth path leans on."""
+    db = Database(tmp_path / "tok.sqlite")
+    raw = "coordt_" + "i" * 64
+    past = datetime.now(UTC) - timedelta(hours=1)
+    await db.create_engineer_token(
+        "alex/claude/main", _sha256(raw), expires_at=past
+    )
+
+    assert await db.lookup_engineer_token(_sha256(raw)) is None
+
+    resolved = await db.resolve_engineer_token(_sha256(raw))
+    assert resolved is not None
+    assert resolved["status"] == "expired"
+
+
+async def test_future_expiry_still_authenticates(tmp_path: Path) -> None:
+    db = Database(tmp_path / "tok.sqlite")
+    raw = "coordt_" + "j" * 64
+    future = datetime.now(UTC) + timedelta(days=30)
+    await db.create_engineer_token(
+        "alex/claude/main", _sha256(raw), expires_at=future
+    )
+
+    hit = await db.lookup_engineer_token(_sha256(raw))
+    assert hit is not None
+    assert hit["status"] == "ok"
+    assert hit["expires_at"].endswith("Z")
+
+
+async def test_no_expiry_means_immortal(tmp_path: Path) -> None:
+    """Legacy rows (and tokens created without --expires-in) have
+    expires_at NULL and never expire."""
+    db = Database(tmp_path / "tok.sqlite")
+    raw = "coordt_" + "k" * 64
+    await db.create_engineer_token("alex/claude/main", _sha256(raw))
+
+    resolved = await db.resolve_engineer_token(_sha256(raw))
+    assert resolved is not None
+    assert resolved["status"] == "ok"
+    assert resolved["expires_at"] is None
+
+
+async def test_resolve_returns_none_for_revoked_and_missing(tmp_path: Path) -> None:
+    """Revoked and missing are indistinguishable through resolve: both
+    mean "not a credential" and must not leak metadata to whoever is
+    holding the dead token."""
+    db = Database(tmp_path / "tok.sqlite")
+    raw = "coordt_" + "l" * 64
+    tok = await db.create_engineer_token("alex/claude/main", _sha256(raw))
+    await db.revoke_engineer_token(tok)
+
+    assert await db.resolve_engineer_token(_sha256(raw)) is None
+    assert await db.resolve_engineer_token(_sha256("never-issued")) is None
+
+
+# --- v0.29.4: activity tracking ---
+
+
+async def test_touch_records_activity_metadata(tmp_path: Path) -> None:
+    db = Database(tmp_path / "tok.sqlite")
+    raw = "coordt_" + "m" * 64
+    await db.create_engineer_token("alex/claude/main", _sha256(raw))
+
+    await db.touch_engineer_token(
+        _sha256(raw), source_ip="203.0.113.7", user_agent="coord-mcp/0.29"
+    )
+    await db.touch_engineer_token(
+        _sha256(raw), source_ip="203.0.113.8", user_agent="coord-mcp/0.29"
+    )
+
+    row = await db.lookup_engineer_token(_sha256(raw))
+    assert row is not None
+    assert row["request_count"] == 2
+    assert row["last_source_ip"] == "203.0.113.8"
+
+    listed = await db.list_engineer_tokens()
+    assert listed[0]["last_user_agent"] == "coord-mcp/0.29"
+
+
+async def test_touch_without_metadata_keeps_last_seen(tmp_path: Path) -> None:
+    """A request that arrives without IP/UA (e.g. direct connection
+    with no proxy headers) must not blank out the last-seen values."""
+    db = Database(tmp_path / "tok.sqlite")
+    raw = "coordt_" + "n" * 64
+    await db.create_engineer_token("alex/claude/main", _sha256(raw))
+
+    await db.touch_engineer_token(
+        _sha256(raw), source_ip="203.0.113.7", user_agent="coord-mcp/0.29"
+    )
+    await db.touch_engineer_token(_sha256(raw))
+
+    row = await db.lookup_engineer_token(_sha256(raw))
+    assert row is not None
+    assert row["request_count"] == 2
+    assert row["last_source_ip"] == "203.0.113.7"
+
+
+async def test_touch_truncates_oversized_metadata(tmp_path: Path) -> None:
+    """IP and UA are untrusted proxy metadata; the db layer caps them
+    so a hostile client cannot bloat the table."""
+    db = Database(tmp_path / "tok.sqlite")
+    raw = "coordt_" + "o" * 64
+    await db.create_engineer_token("alex/claude/main", _sha256(raw))
+
+    await db.touch_engineer_token(
+        _sha256(raw), source_ip="x" * 1000, user_agent="y" * 5000
+    )
+
+    row = await db.lookup_engineer_token(_sha256(raw))
+    assert row is not None
+    assert len(row["last_source_ip"]) == 128
+    listed = await db.list_engineer_tokens()
+    assert len(listed[0]["last_user_agent"]) == 512
+
+
+# --- v0.29.4: rotation ---
+
+
+async def test_rotate_happy_path(tmp_path: Path) -> None:
+    """Rotation mints a successor (same engineer + description,
+    rotated_from links back) and puts the old token into a grace
+    window during which BOTH tokens authenticate."""
+    db = Database(tmp_path / "tok.sqlite")
+    old_raw = "coordt_" + "p" * 64
+    new_raw = "coordt_" + "q" * 64
+    old_id = await db.create_engineer_token(
+        "alex/claude/main", _sha256(old_raw), description="laptop"
+    )
+
+    grace = datetime.now(UTC) + timedelta(hours=24)
+    result = await db.rotate_engineer_token(
+        old_id, _sha256(new_raw), grace_until=grace
+    )
+    assert result["ok"] is True
+    assert result["engineer"] == "alex/claude/main"
+
+    new_row = await db.lookup_engineer_token(_sha256(new_raw))
+    assert new_row is not None
+    assert new_row["status"] == "ok"
+    assert new_row["rotated_from"] == old_id
+    assert new_row["description"] == "laptop"
+
+    # Old token still authenticates inside the grace window.
+    old_row = await db.lookup_engineer_token(_sha256(old_raw))
+    assert old_row is not None
+    assert old_row["status"] == "ok"
+
+
+async def test_rotated_token_dies_after_grace(tmp_path: Path) -> None:
+    db = Database(tmp_path / "tok.sqlite")
+    old_raw = "coordt_" + "r" * 64
+    new_raw = "coordt_" + "s" * 64
+    old_id = await db.create_engineer_token("alex/claude/main", _sha256(old_raw))
+
+    # Grace window already in the past: the old token is immediately dead.
+    grace = datetime.now(UTC) - timedelta(seconds=1)
+    result = await db.rotate_engineer_token(
+        old_id, _sha256(new_raw), grace_until=grace
+    )
+    assert result["ok"] is True
+
+    assert await db.lookup_engineer_token(_sha256(old_raw)) is None
+    resolved = await db.resolve_engineer_token(_sha256(old_raw))
+    assert resolved is not None
+    assert resolved["status"] == "rotation_grace_elapsed"
+
+    # The successor is unaffected.
+    assert await db.lookup_engineer_token(_sha256(new_raw)) is not None
+
+
+async def test_rotate_rejects_dead_or_already_rotated(tmp_path: Path) -> None:
+    """A rotation must never revive a dead credential: revoked,
+    expired, and already-rotated tokens all refuse to rotate with a
+    distinct error. Rotating the current successor is the supported
+    path (A -> B, then B -> C)."""
+    db = Database(tmp_path / "tok.sqlite")
+    grace = datetime.now(UTC) + timedelta(hours=1)
+
+    missing = await db.rotate_engineer_token(
+        "no-such-id", _sha256("w1"), grace_until=grace
+    )
+    assert missing == {"ok": False, "error": "not_found"}
+
+    revoked_id = await db.create_engineer_token("alex/a", _sha256("w2"))
+    await db.revoke_engineer_token(revoked_id)
+    revoked = await db.rotate_engineer_token(
+        revoked_id, _sha256("w3"), grace_until=grace
+    )
+    assert revoked == {"ok": False, "error": "revoked"}
+
+    expired_id = await db.create_engineer_token(
+        "alex/b", _sha256("w4"),
+        expires_at=datetime.now(UTC) - timedelta(hours=1),
+    )
+    expired = await db.rotate_engineer_token(
+        expired_id, _sha256("w5"), grace_until=grace
+    )
+    assert expired == {"ok": False, "error": "expired"}
+
+    chain_id = await db.create_engineer_token("alex/c", _sha256("w6"))
+    first = await db.rotate_engineer_token(
+        chain_id, _sha256("w7"), grace_until=grace
+    )
+    assert first["ok"] is True
+    again = await db.rotate_engineer_token(
+        chain_id, _sha256("w8"), grace_until=grace
+    )
+    assert again == {"ok": False, "error": "already_rotated"}
+
+    # Rotating the successor extends the chain.
+    succ = await db.rotate_engineer_token(
+        first["new_token_id"], _sha256("w9"), grace_until=grace
+    )
+    assert succ["ok"] is True
+
+
+async def test_rotate_is_atomic_on_insert_failure(tmp_path: Path) -> None:
+    """If the successor insert fails (duplicate hash), the old token
+    must come out untouched -- no half-applied rotation where the old
+    token has a grace window but no successor exists."""
+    import aiosqlite
+
+    import pytest
+
+    db = Database(tmp_path / "tok.sqlite")
+    raw_a = "coordt_" + "t" * 64
+    raw_b = "coordt_" + "u" * 64
+    await db.create_engineer_token("alex/a", _sha256(raw_a))
+    target_id = await db.create_engineer_token("alex/b", _sha256(raw_b))
+
+    grace = datetime.now(UTC) + timedelta(hours=1)
+    with pytest.raises(aiosqlite.IntegrityError):
+        # Successor hash collides with token A's hash.
+        await db.rotate_engineer_token(
+            target_id, _sha256(raw_a), grace_until=grace
+        )
+
+    row = await db.resolve_engineer_token(_sha256(raw_b))
+    assert row is not None
+    assert row["status"] == "ok"
+    assert row["rotation_grace_until"] is None
