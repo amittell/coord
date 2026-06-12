@@ -30,7 +30,7 @@ spec:
         - name: ghcr-pull
       containers:
         - name: coord
-          image: ghcr.io/amittell/coord:v0.29.4@sha256:b99ddf8dd2886dabb818705f15b7ac21ca7ecb2403bcb515e1c54f6fe06909e9
+          image: ghcr.io/amittell/coord:v0.29.5@sha256:9e663f6c5602bef579d7a4d8c2552f6b05b8a3447a629fa8816ac1048c0e84b4
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
