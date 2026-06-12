@@ -980,8 +980,39 @@ async def render_dashboard(
                             )
                             name += f" (lines {start_line}-{end_line}{marker})"
                         symbol_names.append(name)
+                # v0.31 wave 2: claims the rename auto-follow sweep
+                # touched get a small "renamed: old -> new" note so the
+                # operator can see the claim is tracking a moved symbol
+                # rather than the name it was created under. Same N+1
+                # caveat as the symbol fetch above; same justification.
+                rename_notes: list[str] = []
+                if claim_id:
+                    rename_rows = await svc.db.list_symbol_renames_for_claims(
+                        [str(claim_id)]
+                    )
+                    for rr in rename_rows:
+                        old_p = str(
+                            rr.get("old_symbol_path")
+                            or rr.get("old_symbol_name")
+                            or ""
+                        )
+                        new_p = str(
+                            rr.get("new_symbol_path")
+                            or rr.get("new_symbol_name")
+                            or ""
+                        )
+                        if old_p and new_p:
+                            rename_notes.append(
+                                f"renamed: {old_p} -> {new_p}"
+                            )
+                inner_lines: list[str] = []
                 if symbol_names:
-                    symbols_inline = ", ".join(_esc(n) for n in symbol_names)
+                    inner_lines.append(
+                        ", ".join(_esc(n) for n in symbol_names)
+                    )
+                inner_lines.extend(_esc(n) for n in rename_notes)
+                if inner_lines:
+                    symbols_inline = "<br>".join(inner_lines)
                     scope_cell = (
                         "<td>symbol"
                         f"<br><em class='symbols' style='font-size:11px;color:var(--muted)'>"

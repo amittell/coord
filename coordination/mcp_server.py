@@ -401,6 +401,92 @@ async def claim_files(
 
 
 @mcp.tool()
+async def claim_refactor(
+    engineer: str,
+    file: str,
+    symbol: str,
+    new_name: str | None = None,
+    wait_seconds: int | None = None,
+    description: str | None = None,
+    branch: str | None = None,
+    ttl_hours: int | None = None,
+    urgency: str | None = None,
+) -> dict[str, Any]:
+    """Reserve a symbol's definition plus every callsite before a refactor.
+
+    Use this instead of ``claim_files`` when you are about to rename or
+    change the signature of ``symbol`` (claim notation: ``'handler'``,
+    ``'Outer::method'``): the server asks its language server for every
+    reference and claims them all in one batch -- a symbol claim on the
+    tightest enclosing symbol of each callsite, a whole-file claim for
+    module-level callsites, and always the definition symbol itself.
+    Other agents then see your refactor coming instead of colliding
+    with it mid-rename.
+
+    ``new_name`` is informational: it seeds the claim description
+    ("refactor: rename X -> Y") so holders of overlapping scope know
+    what is changing. The server does not perform the rename.
+
+    ``wait_seconds`` / ``urgency`` behave exactly as on ``claim_files``
+    (v0.21 FIFO queue + v0.25 priority): the generated batch goes
+    through the normal conflict pipeline, so conflicts 409, queueing
+    queues, and rate limits 429.
+
+    Requires the server to run with COORD_LSP_ENABLED=true and a
+    healthy language server for the file's language; otherwise the
+    server answers 503 and this tool returns a structured
+    ``{"error": ..., "status": 503}`` result -- fall back to plain
+    ``claim_files`` on the files you know about.
+    """
+    body: dict[str, Any] = {
+        "engineer": engineer,
+        "file": file,
+        "symbol": symbol,
+    }
+    if new_name:
+        body["new_name"] = new_name
+    if description:
+        body["description"] = description
+    if branch:
+        body["branch"] = branch
+    if ttl_hours is not None:
+        body["ttl_hours"] = ttl_hours
+    # Mirror claim_files: only forward the queue knobs when they ask
+    # for queue behaviour, keeping the POST body minimal otherwise.
+    if wait_seconds is not None and wait_seconds > 0:
+        body["wait_seconds"] = wait_seconds
+    if urgency is not None:
+        body["urgency"] = urgency
+    repo_id = os.environ.get("COORD_REPO_ID", "").strip()
+    if repo_id:
+        body["repo"] = repo_id
+    body["session_id"] = _SESSION_ID
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.post(
+            f"{_base_url()}/claims/refactor",
+            json=body,
+            headers={**_headers(), "Content-Type": "application/json"},
+        )
+        if r.status_code == 503:
+            # LSP disabled or unavailable server-side. Structured, not
+            # an exception: the agent should degrade to claim_files,
+            # not crash its tool call.
+            payload = r.json()
+            return {"error": payload.get("detail"), "status": 503}
+        if r.status_code == 429:
+            payload = r.json()
+            return {
+                "error": payload.get("detail"),
+                "scope": payload.get("scope"),
+                "retry_after": payload.get("retry_after"),
+            }
+        if r.status_code in (400, 409):
+            return r.json()
+        r.raise_for_status()
+        return r.json()
+
+
+@mcp.tool()
 async def release_claims(claim_ids: list[str], engineer: str | None = None) -> dict[str, Any]:
     """Release claim IDs when work is finished."""
     async with httpx.AsyncClient(timeout=30.0) as client:

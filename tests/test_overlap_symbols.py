@@ -519,3 +519,112 @@ async def test_record_auto_resolution_rejects_other_kinds(db: Database) -> None:
             overlapping_paths=("a",),
             overlapping_symbols=(),
         )
+
+
+# ---------------------------------------------------------------------------
+# v0.31 wave 2: CALLSITE_OVERLAP (advisory) enum member + grouping helper
+# ---------------------------------------------------------------------------
+
+
+def test_overlap_kind_gains_callsite_overlap_without_disturbing_others() -> None:
+    """Cheap pin: the wave-2 member exists with its wire value and the
+    pre-existing kinds (and their values) are untouched."""
+    assert OverlapKind.CALLSITE_OVERLAP.value == "callsite_overlap"
+    assert {k.name: k.value for k in OverlapKind} == {
+        "NO_OVERLAP": "no_overlap",
+        "FILE_OVERLAP": "file_overlap",
+        "SYMBOL_OVERLAP": "symbol_overlap",
+        "AUTO_COEXIST": "auto_coexist",
+        "AUTO_NARROW": "auto_narrow",
+        "PARTIAL_GRANT": "partial_grant",
+        "CALLSITE_OVERLAP": "callsite_overlap",
+    }
+
+
+def _callsite_row(
+    *,
+    claim_id: str = "holder-1",
+    engineer: str = "alice",
+    pattern: str = "mod.py",
+    session_id: str | None = "sess-holder",
+    repo: str | None = None,
+    file_path: str = "caller.py",
+    line: int | None = 5,
+) -> dict[str, Any]:
+    """One raw row in the shape ``callsites_intersecting`` returns."""
+    return {
+        "claim_id": claim_id,
+        "engineer": engineer,
+        "pattern": pattern,
+        "session_id": session_id,
+        "repo": repo,
+        "file_path": file_path,
+        "line": line,
+        "character": 4,
+        "symbol_path": "handler",
+        "expires_at": _future(),
+    }
+
+
+def test_group_callsite_overlaps_filters_and_groups() -> None:
+    from coordination.overlap_symbols import group_callsite_overlaps
+
+    rows = [
+        # Kept: three rows for the same (holder claim, file) with a
+        # duplicate line that must dedupe and sort.
+        _callsite_row(line=7),
+        _callsite_row(line=5),
+        _callsite_row(line=5),
+        # Filtered: the requester's own engineer never warns itself.
+        _callsite_row(claim_id="own", engineer="bob"),
+        # Filtered: a holder sharing the requester's session is
+        # cooperative, not adversarial.
+        _callsite_row(claim_id="coop", session_id="sess-req"),
+        # Filtered: different repo bucket is invisible.
+        _callsite_row(claim_id="elsewhere", repo="other/repo"),
+        # Filtered: the requester's just-created claims are excluded.
+        _callsite_row(claim_id="just-created"),
+        # Filtered: a row with no line number cannot be rendered.
+        _callsite_row(line=None),
+    ]
+
+    out = group_callsite_overlaps(
+        rows,
+        requester_engineer="bob",
+        requester_session_id="sess-req",
+        requester_repo=None,
+        exclude_claim_ids={"just-created"},
+    )
+
+    assert len(out) == 1
+    overlap = out[0]
+    assert overlap.kind is OverlapKind.CALLSITE_OVERLAP
+    assert overlap.holder_claim_id == "holder-1"
+    assert overlap.holder_engineer == "alice"
+    assert overlap.holder_pattern == "mod.py"
+    assert overlap.file_path == "caller.py"
+    assert overlap.lines == (5, 7)
+
+
+def test_group_callsite_overlaps_groups_per_holder_claim_and_file() -> None:
+    from coordination.overlap_symbols import group_callsite_overlaps
+
+    rows = [
+        _callsite_row(claim_id="h1", file_path="a.py", line=1),
+        _callsite_row(claim_id="h1", file_path="b.py", line=2),
+        _callsite_row(claim_id="h2", file_path="a.py", line=3),
+    ]
+
+    out = group_callsite_overlaps(
+        rows,
+        requester_engineer="bob",
+        requester_session_id=None,
+        requester_repo=None,
+    )
+
+    # Sorted by (claim_id, file_path) for stable rendering.
+    assert [(o.holder_claim_id, o.file_path, o.lines) for o in out] == [
+        ("h1", "a.py", (1,)),
+        ("h1", "b.py", (2,)),
+        ("h2", "a.py", (3,)),
+    ]

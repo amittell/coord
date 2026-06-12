@@ -19,11 +19,13 @@ from coordination.overlap_symbols import (
     OverlapKind,
     check_overlap as check_symbol_overlap,
     format_symbol_path,
+    group_callsite_overlaps,
     record_auto_resolution,
 )
 from coordination.ownership import PathRule, parse_ownership_yaml, severity_for_pattern
 from coordination.schemas import (
     ClaimItem,
+    ClaimRefactorRequest,
     ConflictCheckResponse,
     ConflictEntry,
     ConflictingClaim,
@@ -64,6 +66,27 @@ class RateLimitExceeded(Exception):
         self.scope = scope
         self.detail = detail
         self.retry_after_sec = retry_after_sec
+
+
+class LspUnavailable(Exception):
+    """v0.31 wave 2: ``POST /claims/refactor`` needs a live language
+    server and there is none to be had -- LSP is disabled, no repo root
+    is configured, the file's language has no registered server, or the
+    pool could not answer (circuit open, spawn failure, timeout).
+
+    Unlike every other LSP touchpoint (which fails soft to parser
+    behaviour), refactor claims are MEANINGLESS without references, so
+    this is the one place an LSP outage becomes a real error. The API
+    layer maps it to HTTP 503.
+    """
+
+
+# v0.31 wave 2: hard ceiling on stored callsites per claim. References
+# results for a hot symbol can run into the thousands; the advisory
+# value of callsite N for large N is nil, and the table is consulted on
+# every grant, so we keep it bounded. Not operator-tunable on purpose:
+# this is a storage guardrail, not a policy knob.
+CALLSITE_CAP = 200
 
 
 def _expires_at(ttl_hours: int) -> str:
@@ -192,6 +215,62 @@ def _lsp_span_map(
     return spans
 
 
+def _tightest_enclosing_symbol(
+    flattened: list[dict[str, Any]] | None,
+    line: int,
+    character: int,
+) -> str | None:
+    """Find the tightest documentSymbol entry containing the position
+    ``(line, character)`` -- 1-based line, 0-based column, matching the
+    pool's normalised output -- and return its full ``Outer::leaf``
+    path, or ``None`` when no entry contains the position (module-level
+    code) or ``flattened`` itself is ``None`` (the server could not
+    describe the file).
+
+    Containment follows LSP Range semantics: the start position is
+    inclusive and the end position is EXCLUSIVE, so a position exactly
+    at ``(end_line, end_col)`` is outside the symbol (it is the first
+    position after the symbol's last character).
+
+    "Tightest" picks the smallest line span, breaking ties on nesting
+    depth (a method beats the class wrapping it when their spans
+    coincide on a one-line class)."""
+
+    if not flattened:
+        return None
+    best: tuple[int, int, str] | None = None
+    for entry in flattened:
+        try:
+            start_line = int(entry["start_line"])
+            start_col = int(entry["start_col"])
+            end_line = int(entry["end_line"])
+            end_col = int(entry["end_col"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        name = str(entry.get("name") or "")
+        if not name:
+            continue
+        if line < start_line or line > end_line:
+            continue
+        if line == start_line and character < start_col:
+            continue
+        # LSP range ends are exclusive: a position equal to the end
+        # is OUTSIDE (e.g. a callsite starting immediately after a
+        # symbol's closing brace on the same line is module-level,
+        # not inside that symbol).
+        if line == end_line and character >= end_col:
+            continue
+        parent = entry.get("parent_path")
+        parent = str(parent) if parent else None
+        full_path = format_symbol_path(parent, name)
+        depth = full_path.count("::")
+        size = end_line - start_line
+        key = (size, -depth, full_path)
+        if best is None or key < (best[0], best[1], best[2]):
+            best = (size, -depth, full_path)
+    return best[2] if best is not None else None
+
+
 # v0.21: FIFO queue waiters. Keyed on claim_queue.id. The release-path
 # drain sets the event and the granted_claim_id (or None for "give up
 # and surface the original 409"); the create_claims long-poll awaits the
@@ -256,6 +335,14 @@ class CoordinationService:
     # event loop serializes everything else. Held only across the
     # check+write pair -- never across the queue long-poll.
     _quota_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # v0.31 wave 2: strong references to in-flight callsite-enrichment
+    # tasks. asyncio.create_task only holds a weak reference, so a
+    # fire-and-forget task with no other referent can be garbage
+    # collected mid-flight; parking it here (and discarding on done)
+    # is the canonical anti-GC pattern. Tests also use this set to
+    # await enrichment deterministically:
+    # ``await asyncio.gather(*service._enrichment_tasks)``.
+    _enrichment_tasks: set[asyncio.Task[None]] = field(default_factory=set)
 
     async def count_queued_for(self, engineer: str) -> int:
         """v0.28: return how many waiting queue rows the given engineer
@@ -950,10 +1037,36 @@ class CoordinationService:
                     "session_id": body.session_id,
                 },
             )
+
+        # v0.31 wave 2: background callsite enrichment. For every
+        # symbol-scope claim that just landed, a fire-and-forget task
+        # asks the language server who calls each claimed symbol and
+        # records the answers in claim_symbol_callsites. Strictly
+        # advisory data, so the task never blocks (or fails) the grant
+        # response. Gated exactly like span persistence: LSP on and a
+        # repo root to resolve against.
+        if self.settings.lsp_enabled and self.settings.repo_root:
+            for cid in created:
+                created_item = item_for_cid.get(cid)
+                if created_item is not None and created_item.symbols:
+                    self._schedule_callsite_enrichment(cid)
+
+        # v0.31 wave 2: advisory CALLSITE_OVERLAP. The grant already
+        # happened; this only decorates the response with warnings when
+        # someone else's claimed symbol is called from inside the scope
+        # just granted. Riding on the existing ``warnings`` field is
+        # safe on a successful grant: main.py's warnings->400 mapping
+        # fires only when ``claim_ids`` is empty.
+        advisory_warnings: list[str] = []
+        if self.settings.lsp_enabled and created:
+            advisory_warnings = await self._callsite_advisories(
+                body=body, created=created, item_for_cid=item_for_cid
+            )
+
         return CreateClaimsResponse(
             claim_ids=created,
             conflicts=[],
-            warnings=zero_match_warnings,
+            warnings=zero_match_warnings + advisory_warnings,
             options=[],
         )
 
@@ -1278,6 +1391,617 @@ class CoordinationService:
             await conn.commit()
         if symbol_rows:
             await self.db.insert_claim_symbols(rows=symbol_rows)
+
+    # ------------------------------------------------------------------
+    # v0.31 wave 2: callsite enrichment + advisory CALLSITE_OVERLAP
+    # ------------------------------------------------------------------
+
+    def _schedule_callsite_enrichment(self, claim_id: str) -> None:
+        """Fire-and-forget a callsite-enrichment task for one claim.
+
+        The task is parked in ``self._enrichment_tasks`` (strong ref,
+        discarded on completion) so the event loop cannot garbage
+        collect it mid-flight and tests can await the set to make
+        enrichment deterministic.
+        """
+        task = asyncio.create_task(self._enrich_claim_callsites(claim_id))
+        self._enrichment_tasks.add(task)
+        task.add_done_callback(self._enrichment_tasks.discard)
+
+    async def _enrich_claim_callsites(self, claim_id: str) -> None:
+        """Ask the language server who calls each claimed symbol and
+        persist the answers (wholesale replace) into
+        ``claim_symbol_callsites``.
+
+        Advisory data with advisory guarantees: every failure -- LSP
+        down, circuit open, garbage result, even a DB hiccup -- is
+        swallowed at debug level and the claim simply has no (or stale)
+        callsite rows. We only write when at least one ``references``
+        call actually succeeded, so a total LSP outage cannot wipe
+        callsites a healthier earlier run recorded. Stored rows are
+        capped at :data:`CALLSITE_CAP` per claim.
+        """
+        try:
+            root = self.settings.repo_root
+            if not self.settings.lsp_enabled or not root:
+                return
+            symbol_rows = await self.db.get_claim_symbols(claim_id)
+            pool = get_lsp_pool(self.settings)
+            callsites: list[tuple[str, int, int | None, str | None]] = []
+            any_success = False
+            for row in symbol_rows:
+                start_line = row.get("start_line")
+                if start_line is None:
+                    # No persisted span, no definition position to ask
+                    # references at. Parser-miss / pre-v16 rows simply
+                    # do not enrich.
+                    continue
+                file_path = str(row["file_path"])
+                language = language_for_path(file_path)
+                if language is None:
+                    continue
+                refs = await pool.references(
+                    root,
+                    language,
+                    file_path,
+                    int(start_line),
+                    int(row.get("start_col") or 0),
+                )
+                if refs is None:
+                    continue
+                any_success = True
+                symbol_path = format_symbol_path(
+                    row.get("parent_symbol") or None,
+                    str(row["symbol_name"]),
+                )
+                for ref in refs:
+                    character = ref.get("character")
+                    callsites.append(
+                        (
+                            str(ref["file_path"]),
+                            int(ref["line"]),
+                            int(character) if character is not None else None,
+                            symbol_path,
+                        )
+                    )
+            if not any_success:
+                return
+            if len(callsites) > CALLSITE_CAP:
+                logger.info(
+                    "callsite enrichment: claim %s produced %d callsites; "
+                    "truncating to %d",
+                    claim_id,
+                    len(callsites),
+                    CALLSITE_CAP,
+                )
+                callsites = callsites[:CALLSITE_CAP]
+            await self.db.insert_claim_callsites(claim_id, callsites)
+        except Exception:  # noqa: BLE001 - enrichment is best-effort
+            logger.debug(
+                "callsite enrichment for claim %s failed; skipped",
+                claim_id,
+                exc_info=True,
+            )
+
+    async def _callsite_advisories(
+        self,
+        *,
+        body: CreateClaimsRequest,
+        created: list[str],
+        item_for_cid: dict[str, ClaimItem],
+    ) -> list[str]:
+        """Compute advisory CALLSITE_OVERLAP warnings for a batch that
+        was just granted.
+
+        For each created claim, the probe range is the whole file for
+        file-scope items and the persisted symbol spans for
+        symbol-scope items (span-less symbol rows contribute nothing --
+        without a range there is no "inside"). Holders are filtered by
+        the same adversary rules as the conflict pipeline (different
+        engineer, different session, same repo bucket) inside
+        :func:`group_callsite_overlaps`.
+
+        Each finding also lands as a ``callsite-advisory``
+        ``request_events`` audit row -- the same mechanism the
+        auto-coexist / auto-narrow resolutions use -- so the dashboard's
+        event stream sees it. Failures are swallowed: an advisory must
+        never break a grant that already happened.
+        """
+        advisories: list[str] = []
+        created_set = set(created)
+        try:
+            for cid in created:
+                item = item_for_cid.get(cid)
+                if item is None:
+                    continue
+                ranges: list[tuple[str, int, int]] = []
+                if item.symbols:
+                    for row in await self.db.get_claim_symbols(cid):
+                        if (
+                            row.get("start_line") is None
+                            or row.get("end_line") is None
+                        ):
+                            continue
+                        ranges.append(
+                            (
+                                str(row["file_path"]),
+                                int(row["start_line"]),
+                                int(row["end_line"]),
+                            )
+                        )
+                else:
+                    # Whole-file scope: every recorded line counts.
+                    ranges.append((item.pattern, 1, 1_000_000_000))
+                hit_rows: list[dict[str, Any]] = []
+                for file_path, lo, hi in ranges:
+                    hit_rows.extend(
+                        await self.db.callsites_intersecting(file_path, lo, hi)
+                    )
+                for overlap in group_callsite_overlaps(
+                    hit_rows,
+                    requester_engineer=body.engineer,
+                    requester_session_id=body.session_id,
+                    requester_repo=body.repo,
+                    exclude_claim_ids=created_set,
+                ):
+                    shown = ", ".join(str(n) for n in overlap.lines[:8])
+                    if len(overlap.lines) > 8:
+                        shown += f", +{len(overlap.lines) - 8} more"
+                    advisories.append(
+                        f"advisory: {overlap.holder_engineer} claim "
+                        f"{overlap.holder_claim_id} on "
+                        f"{overlap.holder_pattern!r} has "
+                        f"{len(overlap.lines)} recorded callsite(s) inside "
+                        f"{item.pattern!r} (lines {shown}); coordinate or "
+                        "expect semantic conflicts"
+                    )
+                    await self.db.record_request_event(
+                        "callsite-advisory",
+                        request_id=None,
+                        actor_engineer=None,
+                        actor_session_id=None,
+                        detail={
+                            "holder_claim_id": overlap.holder_claim_id,
+                            "requester_claim_id": cid,
+                            "file": overlap.file_path,
+                            "lines": list(overlap.lines),
+                        },
+                    )
+        except Exception:  # noqa: BLE001 - advisory must not break a grant
+            logger.debug(
+                "callsite advisory pass failed; grant unaffected",
+                exc_info=True,
+            )
+        return advisories
+
+    # ------------------------------------------------------------------
+    # v0.31 wave 2: rename auto-follow sweep
+    # ------------------------------------------------------------------
+
+    async def rename_sweep(self, *, max_claims: int = 20) -> int:
+        """Conservative rename auto-follow: detect claimed symbols that
+        were renamed on disk and update the claim rows to track them.
+
+        Per pass (the cleanup loop calls this on its cadence): up to
+        ``max_claims`` ACTIVE symbol-scope claims are inspected. For
+        each claimed symbol with a persisted span whose file still
+        exists under the repo root, extraction re-runs (parser always,
+        LSP refinement when the pool answers). Then:
+
+        - symbol still present (parser or LSP view): nothing to do.
+        - symbol vanished: candidate replacements are CURRENT symbols
+          with the same parent (and the same kind when the stored kind
+          is meaningful -- claim-time rows store ``'unknown'`` today,
+          which matches anything) whose span overlaps the STORED span
+          with a +/- 5 line tolerance. EXACTLY ONE candidate means we
+          follow the rename: :meth:`Database.update_claim_symbol_rename`
+          atomically rewrites the claim_symbols row, appends the audit
+          row, and (never today -- see below) would update
+          ``claims.pattern``. Zero or 2+ candidates means ambiguity,
+          and ambiguity means hands off (debug log only). The follow
+          is also skipped (debug log) when another active claim
+          already holds the new symbol path on the same file -- the
+          rewrite bypasses the conflict pipeline, so applying it would
+          silently create the same-symbol overlap that claim-time
+          enforcement rejects.
+
+        ``new_pattern`` is always ``None``: ``claims.pattern`` holds
+        the FILE pattern for symbol claims (the symbol path lives only
+        in ``claim_symbols`` rows -- see ``_finalise_v14_scope``), so a
+        symbol rename never changes the pattern. The plumbing exists in
+        the DB helper for any future pattern scheme that embeds symbol
+        paths.
+
+        Emits one ``symbol_renamed`` webhook per applied rename.
+        Returns the number of renames applied.
+        """
+        if not self.settings.lsp_enabled:
+            return 0
+        root = self.settings.repo_root
+        if not root or not root.is_dir():
+            return 0
+        root_resolved = root.resolve()
+        active = await self.db.list_active_claims_rows(exclude_engineer=None)
+        symbol_claims = [
+            r for r in active if r.get("scope_type") == "symbol"
+        ][:max_claims]
+        applied = 0
+        for claim in symbol_claims:
+            claim_id = str(claim["id"])
+            rows = await self.db.get_claim_symbols(claim_id)
+            by_file: dict[str, list[dict[str, Any]]] = {}
+            for row in rows:
+                if row.get("start_line") is None or row.get("end_line") is None:
+                    continue
+                by_file.setdefault(str(row["file_path"]), []).append(row)
+            for file_path, file_rows in by_file.items():
+                resolved = (root / file_path).resolve()
+                try:
+                    resolved.relative_to(root_resolved)
+                except ValueError:
+                    continue
+                if not resolved.is_file():
+                    # Deleted or moved file: a rename we cannot follow.
+                    continue
+                try:
+                    content = resolved.read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                except OSError:
+                    continue
+                parser_syms = extract_symbols(str(resolved), content)
+                if not parser_syms:
+                    # Unsupported extension or unparseable file: no
+                    # ground truth, no action.
+                    continue
+                current_paths: set[str] = set()
+                for sym in parser_syms:
+                    current_paths.add(
+                        format_symbol_path(sym.parent, sym.name)
+                    )
+                    parent = sym.parent
+                    while parent:
+                        current_paths.add(parent)
+                        parent = (
+                            parent.rsplit("::", 1)[0]
+                            if "::" in parent
+                            else None
+                        )
+                flattened: list[dict[str, Any]] | None = None
+                language = language_for_path(file_path)
+                if language is not None:
+                    pool = get_lsp_pool(self.settings)
+                    flattened = await pool.document_symbols(
+                        root, language, resolved
+                    )
+                lsp_spans: dict[str, tuple[int, int, int, int]] = {}
+                if flattened is not None:
+                    current_paths |= _lsp_symbol_path_set(flattened)
+                    lsp_spans = _lsp_span_map(flattened)
+                for row in file_rows:
+                    old_leaf = str(row["symbol_name"])
+                    parent_str = row.get("parent_symbol") or None
+                    old_path = format_symbol_path(parent_str, old_leaf)
+                    if old_path in current_paths:
+                        continue
+                    stored_start = int(row["start_line"])
+                    stored_end = int(row["end_line"])
+                    stored_kind = str(row.get("symbol_kind") or "unknown")
+                    candidates = [
+                        sym
+                        for sym in parser_syms
+                        if (sym.parent or None) == parent_str
+                        and (
+                            stored_kind in ("", "unknown")
+                            or sym.kind == stored_kind
+                        )
+                        and sym.start_line <= stored_end + 5
+                        and sym.end_line >= stored_start - 5
+                    ]
+                    if len(candidates) != 1:
+                        logger.debug(
+                            "rename sweep: claim %s symbol %r in %s "
+                            "vanished with %d candidates; leaving "
+                            "untouched",
+                            claim_id,
+                            old_path,
+                            file_path,
+                            len(candidates),
+                        )
+                        continue
+                    cand = candidates[0]
+                    new_path = format_symbol_path(cand.parent, cand.name)
+                    # The conflict pipeline never sees this rewrite (it
+                    # is a direct DB update, not a claim grant), so
+                    # guard against silently creating a second active
+                    # claim on the new path: if ANY other active
+                    # symbol-scope claim in the same repo bucket
+                    # already holds the new path on this file,
+                    # following the rename would manufacture exactly
+                    # the overlap that claim-time enforcement would
+                    # have 409'd. Ambiguity rule applies: doubt means
+                    # no action.
+                    existing_rows = await self.db.get_symbol_rows_on_file(
+                        file_path=file_path,
+                        repo=claim.get("repo"),
+                    )
+                    collision = any(
+                        str(r.get("id")) != claim_id
+                        and format_symbol_path(
+                            r.get("overlapping_parent_symbol") or None,
+                            str(r.get("overlapping_symbol")),
+                        )
+                        == new_path
+                        for r in existing_rows
+                    )
+                    if collision:
+                        logger.debug(
+                            "rename sweep: claim %s symbol %r in %s "
+                            "would follow to %r, but another active "
+                            "claim already holds that symbol; leaving "
+                            "untouched",
+                            claim_id,
+                            old_path,
+                            file_path,
+                            new_path,
+                        )
+                        continue
+                    lsp_hit = lsp_spans.get(new_path)
+                    if lsp_hit is not None:
+                        new_span: tuple[
+                            int, int | None, int, int | None
+                        ] = lsp_hit
+                        resolved_by = "lsp"
+                    else:
+                        new_span = (
+                            cand.start_line,
+                            None,
+                            cand.end_line,
+                            None,
+                        )
+                        resolved_by = "parser"
+                    updated = await self.db.update_claim_symbol_rename(
+                        claim_id,
+                        file_path=file_path,
+                        old_symbol_name=old_leaf,
+                        new_symbol_name=cand.name,
+                        new_start_line=new_span[0],
+                        new_start_col=new_span[1],
+                        new_end_line=new_span[2],
+                        new_end_col=new_span[3],
+                        resolved_by=resolved_by,
+                        new_pattern=None,
+                    )
+                    if not updated:
+                        continue
+                    applied += 1
+                    logger.info(
+                        "rename sweep: claim %s followed %r -> %r in %s "
+                        "(%s)",
+                        claim_id,
+                        old_path,
+                        new_path,
+                        file_path,
+                        resolved_by,
+                    )
+                    await self.fire_webhook(
+                        "symbol_renamed",
+                        {
+                            "claim_id": claim_id,
+                            "file": file_path,
+                            "old": old_path,
+                            "new": new_path,
+                            "engineer": claim.get("engineer"),
+                        },
+                    )
+        return applied
+
+    # ------------------------------------------------------------------
+    # v0.31 wave 2: refactor claims (symbol + every callsite, one shot)
+    # ------------------------------------------------------------------
+
+    async def create_refactor_claims(
+        self, body: ClaimRefactorRequest
+    ) -> CreateClaimsResponse:
+        """Expand a (file, symbol) refactor intent into a normal
+        ``create_claims`` batch covering the definition and every
+        reference the language server can see.
+
+        Hard LSP requirement: refactor claims exist to reserve
+        callsites, and only ``textDocument/references`` knows where
+        those are. The DEFINITION span tolerates a parser fallback
+        (the parser can find a declaration the server formats oddly),
+        but a failed documentSymbol or references call raises
+        :class:`LspUnavailable` -> HTTP 503. No silent degradation
+        into a single-file claim that pretends to cover a refactor.
+
+        Expansion rules:
+
+        - every reference whose tightest enclosing symbol resolves gets
+          a symbol claim on that path in its file;
+        - references at module level (or in files the server cannot
+          describe) get a whole-file claim on their file;
+        - the definition symbol claim is ALWAYS included, unless its
+          file is already covered by a whole-file claim from a
+          module-level reference in the same file;
+        - patterns dedupe; references resolving outside the repo root
+          are skipped (claims are repo-relative patterns and cannot
+          address foreign paths).
+
+        The generated batch is capped at ``settings.max_claim_files``
+        (the existing per-pattern guardrail doubles as the natural
+        batch ceiling here). Conflicts, queueing (``wait_seconds``),
+        and rate limits all apply unchanged because the batch goes
+        through the normal :meth:`create_claims` pipeline.
+        """
+        root = self.settings.repo_root
+        if not self.settings.lsp_enabled or not root or not root.is_dir():
+            raise LspUnavailable(
+                "refactor claims require COORD_LSP_ENABLED=true and a "
+                "configured COORD_REPO_ROOT"
+            )
+        language = language_for_path(body.file)
+        if language is None:
+            raise LspUnavailable(
+                f"no language server is registered for {body.file!r} "
+                "(supported: .py, .ts/.tsx/.js/.jsx, .go)"
+            )
+        pool = get_lsp_pool(self.settings)
+        flattened = await pool.document_symbols(root, language, body.file)
+        if flattened is None:
+            raise LspUnavailable(
+                f"the language server could not answer documentSymbol for "
+                f"{body.file!r} (server missing, circuit open, or timeout)"
+            )
+
+        # Definition span: LSP first, parser fallback for the
+        # DEFINITION only. References below have no fallback.
+        def_spans = _lsp_span_map(flattened)
+        def_hit = def_spans.get(body.symbol)
+        def_line: int | None = None
+        def_col = 0
+        if def_hit is not None:
+            def_line, def_col = def_hit[0], def_hit[1]
+        else:
+            resolved = (root / body.file).resolve()
+            if resolved.is_file():
+                try:
+                    content = resolved.read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                except OSError:
+                    content = ""
+                for sym in extract_symbols(str(resolved), content):
+                    if format_symbol_path(sym.parent, sym.name) == body.symbol:
+                        def_line, def_col = sym.start_line, 0
+                        break
+        if def_line is None:
+            return CreateClaimsResponse(
+                claim_ids=[],
+                conflicts=[],
+                warnings=[
+                    f"Unknown symbol {body.symbol!r} in {body.file!r}: "
+                    "neither the language server nor the parser can find "
+                    "its definition"
+                ],
+                options=["narrow_claim"],
+            )
+
+        refs = await pool.references(
+            root, language, body.file, def_line, def_col
+        )
+        if refs is None:
+            raise LspUnavailable(
+                f"the language server could not answer references for "
+                f"{body.symbol!r} in {body.file!r}"
+            )
+
+        # Per-reference enclosing-symbol resolution, one documentSymbol
+        # call per distinct reference file (cached).
+        doc_symbols_by_file: dict[str, list[dict[str, Any]] | None] = {
+            body.file: flattened
+        }
+        file_scope: set[str] = set()
+        symbol_scope: dict[str, set[str]] = {body.file: {body.symbol}}
+        for ref in refs:
+            ref_file = str(ref["file_path"])
+            if Path(ref_file).is_absolute():
+                # Outside the repo root: claims are repo-relative
+                # patterns and cannot reserve foreign paths.
+                logger.debug(
+                    "refactor claims: skipping out-of-repo reference %s",
+                    ref_file,
+                )
+                continue
+            if ref_file not in doc_symbols_by_file:
+                ref_language = language_for_path(ref_file)
+                doc_symbols_by_file[ref_file] = (
+                    await pool.document_symbols(root, ref_language, ref_file)
+                    if ref_language is not None
+                    else None
+                )
+            enclosing = _tightest_enclosing_symbol(
+                doc_symbols_by_file[ref_file],
+                int(ref["line"]),
+                int(ref.get("character") or 0),
+            )
+            if enclosing is None:
+                file_scope.add(ref_file)
+            else:
+                symbol_scope.setdefault(ref_file, set()).add(enclosing)
+        # A whole-file claim swallows any symbol claims on the same
+        # file (including the definition claim when a module-level
+        # reference lives next to the definition).
+        for f in file_scope:
+            symbol_scope.pop(f, None)
+
+        claims: list[ClaimItem] = [
+            ClaimItem(type="file", pattern=f) for f in sorted(file_scope)
+        ] + [
+            ClaimItem(type="file", pattern=f, symbols=sorted(syms))
+            for f, syms in sorted(symbol_scope.items())
+        ]
+        cap = self.settings.max_claim_files
+        if len(claims) > cap:
+            return CreateClaimsResponse(
+                claim_ids=[],
+                conflicts=[],
+                warnings=[
+                    f"refactor on {body.symbol!r} would generate "
+                    f"{len(claims)} claims; max is {cap} "
+                    "(COORD_MAX_CLAIM_FILES). Narrow the refactor or "
+                    "raise the limit."
+                ],
+                options=["narrow_claim", "escalate"],
+            )
+
+        if body.description:
+            description = body.description
+        elif body.new_name:
+            description = f"refactor: rename {body.symbol} -> {body.new_name}"
+        else:
+            description = f"refactor: {body.symbol}"
+
+        result = await self.create_claims(
+            CreateClaimsRequest(
+                engineer=body.engineer,
+                branch=body.branch,
+                description=description,
+                claims=claims,
+                ttl_hours=body.ttl_hours,
+                repo=body.repo,
+                session_id=body.session_id,
+                wait_seconds=body.wait_seconds,
+                urgency=body.urgency,
+            )
+        )
+        # Partial-coverage guard. The v0.21 queue enqueues only the
+        # single conflicted item, so a wait_seconds grant that arrives
+        # via the drain covers ONE pattern of this machine-generated
+        # batch -- and unlike a hand-built batch, the caller never saw
+        # the expanded pattern list, so a silently partial reservation
+        # would read as a fully reserved refactor. Decorate the grant
+        # rather than redesigning queue semantics: name what was NOT
+        # reserved so the agent can claim the remainder explicitly.
+        if result.claim_ids and len(result.claim_ids) < len(claims):
+            granted_rows = await self.db.list_active_claims_rows()
+            granted_patterns = {
+                str(r["pattern"])
+                for r in granted_rows
+                if str(r["id"]) in set(result.claim_ids)
+            }
+            dropped = [
+                c.pattern for c in claims if c.pattern not in granted_patterns
+            ]
+            if dropped:
+                result.warnings.append(
+                    f"refactor reservation is PARTIAL: the queue grant "
+                    f"covered {len(result.claim_ids)} of {len(claims)} "
+                    f"generated claims. Not reserved: {sorted(dropped)}. "
+                    "Claim these before editing them, or re-run "
+                    "claim_refactor."
+                )
+        return result
 
     async def list_claims(
         self,

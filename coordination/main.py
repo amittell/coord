@@ -32,8 +32,9 @@ from coordination.deps import get_service
 from coordination.tokens import generate_raw_token, sha256_token
 from coordination.logging import ACCESS_LOGGER_NAME, configure_logging, request_id_var
 from coordination.ownership import parse_ownership_yaml
-from coordination.service import RateLimitExceeded
+from coordination.service import LspUnavailable, RateLimitExceeded
 from coordination.schemas import (
+    ClaimRefactorRequest,
     CreateClaimsRequest,
     ExtendClaimRequest,
     FileRequestRequest,
@@ -75,8 +76,21 @@ async def lifespan(app: FastAPI):
     await get_service().db.init()
     metrics.set_build_info(__version__)
 
+    async def _shutdown_lsp_pool() -> None:
+        # v0.31: language servers are child processes of this one; reap
+        # them on every teardown path so a restart never strands pylsp
+        # or gopls children. shutdown_all never raises and is a no-op
+        # when nothing was spawned (the default, lsp_enabled=false).
+        if settings.lsp_enabled:
+            from coordination.lsp import get_lsp_pool
+
+            await get_lsp_pool(settings).shutdown_all()
+
     if os.environ.get("COORD_DISABLE_BACKGROUND_CLEANUP", "").lower() in {"1", "true", "yes"}:
-        yield
+        try:
+            yield
+        finally:
+            await _shutdown_lsp_pool()
         return
 
     async def cleanup_loop() -> None:
@@ -87,6 +101,28 @@ async def lifespan(app: FastAPI):
                 )
             except Exception:  # pragma: no cover - background cleanup failures are logged
                 logger.exception("Failed to expire stale claims")
+            # v0.31 wave 2: rename auto-follow sweep piggybacks on the
+            # cleanup cadence rather than running its own task -- one
+            # background heartbeat, two cheap jobs. Gated on
+            # lsp_enabled so the default-off posture stays a true
+            # no-op; the sweep itself is bounded (max 20 claims per
+            # pass) and never raises past this guard.
+            if settings.lsp_enabled:
+                try:
+                    await get_service().rename_sweep()
+                except Exception:  # pragma: no cover - background failures are logged
+                    logger.exception("Failed to run rename auto-follow sweep")
+                # Reap language servers idle past
+                # lsp_idle_shutdown_sec -- this loop is the only
+                # production caller, so without it the reaper would be
+                # dead code and every spawned server would live for
+                # the process lifetime.
+                try:
+                    from coordination.lsp import get_lsp_pool
+
+                    await get_lsp_pool(settings).shutdown_idle()
+                except Exception:  # pragma: no cover - background failures are logged
+                    logger.exception("Failed to reap idle LSP servers")
             await asyncio.sleep(settings.cleanup_interval_sec)
 
     async def auto_demote_loop() -> None:
@@ -123,14 +159,17 @@ async def lifespan(app: FastAPI):
         tasks.append(asyncio.create_task(auto_demote_loop()))
     if settings.webhook_url:
         tasks.append(asyncio.create_task(webhook_delivery_loop()))
-    yield
-    for t in tasks:
-        t.cancel()
-    for t in tasks:
-        try:
-            await t
-        except asyncio.CancelledError:
-            pass
+    try:
+        yield
+    finally:
+        for t in tasks:
+            t.cancel()
+        for t in tasks:
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+        await _shutdown_lsp_pool()
 
 
 app = FastAPI(title="Multi-Agent Coordination", version=__version__, lifespan=lifespan)
@@ -1581,6 +1620,49 @@ async def create_claims(body: CreateClaimsRequest, _: None = Depends(require_aut
     try:
         result = await get_service().create_claims(body)
     except RateLimitExceeded as exc:
+        return JSONResponse(
+            status_code=429,
+            content={
+                "detail": exc.detail,
+                "scope": exc.scope,
+                "retry_after": exc.retry_after_sec,
+            },
+            headers={"Retry-After": str(exc.retry_after_sec)},
+        )
+    payload = jsonable_encoder(result)
+    if result.conflicts:
+        return JSONResponse(status_code=409, content=payload)
+    if not result.claim_ids and result.warnings:
+        return JSONResponse(status_code=400, content=payload)
+    return JSONResponse(status_code=200, content=payload)
+
+
+@app.post("/claims/refactor")
+async def claim_refactor(
+    body: ClaimRefactorRequest, _: None = Depends(require_auth)
+) -> JSONResponse:
+    """v0.31 wave 2: reserve a symbol's definition plus every callsite
+    the language server can see, as one normal claims batch. Response
+    shapes are byte-compatible with POST /claims (200 / 400 / 409 /
+    429); the only new shape is 503 when no language server can answer,
+    because refactor claims are meaningless without references."""
+    try:
+        result = await get_service().create_refactor_claims(body)
+    except LspUnavailable as exc:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": (
+                    f"{exc}. LSP integration is disabled or unavailable "
+                    "(COORD_LSP_ENABLED); refactor claims need a live "
+                    "language server."
+                )
+            },
+        )
+    except RateLimitExceeded as exc:
+        # Same 429 contract as POST /claims: the generated batch goes
+        # through the normal create_claims pipeline, so the same quota
+        # raises can surface here.
         return JSONResponse(
             status_code=429,
             content={

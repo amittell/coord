@@ -10,6 +10,16 @@ variables the test sets before spawning:
   ``textDocument/documentSymbol`` result (hierarchical DocumentSymbol
   shape, flat SymbolInformation shape, or deliberate garbage for
   failure-path tests). Defaults to an empty list.
+- ``FAKE_LSP_SYMBOLS_BY_FILE_JSON`` (wave 2): JSON object mapping a
+  file BASENAME to the documentSymbol payload for that file. Lets one
+  server process answer differently per file -- the refactor-claim
+  tests need the definition file and each reference file to report
+  their own symbols. A request whose URI basename is not in the map
+  falls back to ``FAKE_LSP_SYMBOLS_JSON``.
+- ``FAKE_LSP_REFERENCES_JSON`` (wave 2): the raw JSON payload returned
+  as the ``textDocument/references`` result (``Location[]`` shape:
+  ``uri`` + ``range``, or deliberate garbage). Defaults to an empty
+  list.
 - ``FAKE_LSP_DELAY_SEC``: float seconds to sleep before sending each
   response -- set it above the client timeout for timeout tests.
 - ``FAKE_LSP_DIE_AFTER``: integer; the process exits abruptly (no
@@ -64,6 +74,10 @@ def main() -> int:
     stdout = sys.stdout.buffer
 
     symbols = json.loads(os.environ.get("FAKE_LSP_SYMBOLS_JSON", "[]"))
+    symbols_by_file = json.loads(
+        os.environ.get("FAKE_LSP_SYMBOLS_BY_FILE_JSON", "{}") or "{}"
+    )
+    references = json.loads(os.environ.get("FAKE_LSP_REFERENCES_JSON", "[]"))
     delay = float(os.environ.get("FAKE_LSP_DELAY_SEC", "0") or "0")
     die_after_raw = os.environ.get("FAKE_LSP_DIE_AFTER", "")
     die_after = int(die_after_raw) if die_after_raw else None
@@ -90,6 +104,17 @@ def main() -> int:
             result = {"capabilities": {}}
         elif method == "textDocument/documentSymbol":
             result = symbols
+            if isinstance(symbols_by_file, dict) and symbols_by_file:
+                uri = (
+                    message.get("params", {})
+                    .get("textDocument", {})
+                    .get("uri", "")
+                )
+                basename = uri.rsplit("/", 1)[-1]
+                if basename in symbols_by_file:
+                    result = symbols_by_file[basename]
+        elif method == "textDocument/references":
+            result = references
         else:
             # shutdown and anything else we do not model: null result
             # keeps the client's request/response bookkeeping happy.

@@ -43,6 +43,14 @@ class OverlapKind(str, Enum):
       whole file; caller decides whether to surface this as a 409, a
       narrowed grant, or a coexistence offer. This module just labels
       the case.
+    - ``CALLSITE_OVERLAP`` (v0.31 wave 2): purely advisory. The
+      requester's scope contains lines a holder's claimed symbol is
+      called from (per the language server's recorded references).
+      Never routed to a 409 and never queued -- the grant proceeds and
+      the service attaches a warning so the requester knows a semantic
+      (not textual) conflict is possible. :func:`check_overlap` never
+      returns this kind; the service computes it post-grant via
+      :func:`group_callsite_overlaps`.
     """
 
     NO_OVERLAP = "no_overlap"
@@ -51,6 +59,7 @@ class OverlapKind(str, Enum):
     AUTO_COEXIST = "auto_coexist"
     AUTO_NARROW = "auto_narrow"
     PARTIAL_GRANT = "partial_grant"
+    CALLSITE_OVERLAP = "callsite_overlap"
 
 
 @dataclass(frozen=True)
@@ -368,6 +377,92 @@ def _symbols_tuple_from_requester(
         if syms:
             out.append((f, syms))
     return tuple(out)
+
+
+@dataclass(frozen=True)
+class CallsiteOverlap:
+    """One advisory CALLSITE_OVERLAP finding (v0.31 wave 2).
+
+    ``lines`` are the recorded callsite line numbers (1-based, sorted,
+    de-duplicated) inside the requester's scope on ``file_path``. The
+    service renders these into the advisory warning string; nothing
+    here participates in grant routing.
+    """
+
+    kind: OverlapKind
+    holder_claim_id: str
+    holder_engineer: str
+    holder_pattern: str
+    file_path: str
+    lines: tuple[int, ...]
+
+
+def group_callsite_overlaps(
+    rows: list[dict[str, Any]],
+    *,
+    requester_engineer: str,
+    requester_session_id: str | None,
+    requester_repo: str | None,
+    exclude_claim_ids: set[str] | frozenset[str] = frozenset(),
+) -> list[CallsiteOverlap]:
+    """Classify raw ``callsites_intersecting`` rows into advisory
+    :class:`CallsiteOverlap` findings.
+
+    Pure function (no I/O) so the filtering rules are unit-testable in
+    isolation. Mirrors the conflict pipeline's adversary definition:
+
+    - the requester's own engineer never warns against itself;
+    - a holder claim sharing the requester's session_id is cooperative
+      (parent dispatcher + subagents), not adversarial;
+    - holders from a different repo bucket are invisible, exactly like
+      the v0.4 repo-scoped conflict check (NULL repo is its own legacy
+      bucket);
+    - ``exclude_claim_ids`` drops the requester's just-created claims,
+      which would otherwise self-report once their own enrichment runs.
+
+    Output is grouped per (holder claim, file) and sorted for stable
+    rendering.
+    """
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        claim_id = str(row.get("claim_id") or "")
+        if not claim_id or claim_id in exclude_claim_ids:
+            continue
+        if str(row.get("engineer") or "") == requester_engineer:
+            continue
+        if (
+            requester_session_id
+            and row.get("session_id") == requester_session_id
+        ):
+            continue
+        if row.get("repo") != requester_repo:
+            continue
+        line = row.get("line")
+        if line is None:
+            continue
+        key = (claim_id, str(row.get("file_path") or ""))
+        slot = grouped.setdefault(
+            key,
+            {
+                "engineer": str(row.get("engineer") or ""),
+                "pattern": str(row.get("pattern") or ""),
+                "lines": set(),
+            },
+        )
+        slot["lines"].add(int(line))
+    out: list[CallsiteOverlap] = []
+    for (claim_id, file_path), slot in sorted(grouped.items()):
+        out.append(
+            CallsiteOverlap(
+                kind=OverlapKind.CALLSITE_OVERLAP,
+                holder_claim_id=claim_id,
+                holder_engineer=slot["engineer"],
+                holder_pattern=slot["pattern"],
+                file_path=file_path,
+                lines=tuple(sorted(slot["lines"])),
+            )
+        )
+    return out
 
 
 async def record_auto_resolution(

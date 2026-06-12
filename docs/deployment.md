@@ -103,6 +103,22 @@ Use it when the container can see a checkout of the application repo on disk. Co
 
 If none of those fit your setup, leave `COORD_REPO_ROOT` unset. The service falls back to pathspec-only matching, which is less accurate but still usable for teams that write narrow claims.
 
+## LSP integration (v0.31+)
+
+With `COORD_REPO_ROOT` set, symbol claims can additionally be resolved through real language servers instead of tree-sitter approximation. Off by default:
+
+```bash
+COORD_LSP_ENABLED=true
+# Server commands (defaults shown); the binaries must be on PATH in the container:
+COORD_LSP_COMMAND_PYTHON=pylsp
+COORD_LSP_COMMAND_TYPESCRIPT="typescript-language-server --stdio"
+COORD_LSP_COMMAND_GO=gopls
+```
+
+What it buys: claim-time definition spans come from the language server (`resolved_by: lsp` in the dashboard), symbol validation accepts constructs tree-sitter misses, claimed symbols record their callsites so overlapping work on callers surfaces as an advisory, renamed symbols auto-follow when the rename is unambiguous, and `POST /claims/refactor` (MCP tool `claim_refactor`) reserves a symbol plus every callsite in one shot.
+
+Operational shape: language servers run as child processes of coord (one per language), lazily spawned, reaped after `COORD_LSP_IDLE_SHUTDOWN_SEC` (default 300) idle, requests bounded by `COORD_LSP_REQUEST_TIMEOUT_SEC` (default 5). A misbehaving or missing server trips a circuit breaker (`COORD_LSP_CIRCUIT_FAILURE_THRESHOLD` / `COORD_LSP_CIRCUIT_COOLDOWN_SEC`) and coord falls back to tree-sitter silently -- LSP can never make claim creation fail. The stock container image does not bundle language servers; either extend the image or run coord where the binaries exist.
+
 ## Backups
 
 The SQLite file at `COORD_DATABASE_PATH` plus its `*-wal` and `*-shm` siblings together make up the live state. For a consistent snapshot:

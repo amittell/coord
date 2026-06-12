@@ -1,7 +1,7 @@
 # Coord roadmap
 
 Status: living document
-Last updated: 2026-06-12 (after v0.30.0)
+Last updated: 2026-06-12 (after v0.31.0)
 
 This is the post-v0.29 forward look. Items here are candidates, not commitments -- order and scope move as production telemetry and operator feedback arrive. Entries already shipped live in [CHANGELOG.md](../../CHANGELOG.md); see also [docs/design/sub-file-claims.md](./sub-file-claims.md) for the v0.14-v0.26 arc design.
 
@@ -99,19 +99,17 @@ Shipped: ``COORD_MAX_CLAIMS_PER_ENGINEER`` (active-claim cap, 429 + computed ``R
 
 Design deviation from the original sketch, on purpose: limits key on the request-body engineer (the identity claims are stored under -- in production one per-engineer token fronts 20+ worktree agents with distinct body engineers, so token-keyed caps would lump them into one bucket). The authenticated-token ceiling that closes the spoof bypass needs a migration adding token attribution to claim rows; deferred until that migration carries its weight.
 
-## v0.31 -- Language-server-aware claims
+## v0.31.0 (shipped) -- Language-server-aware claims
 
-The v0.14-v0.17 symbol claims rely on tree-sitter for parsing, which extracts top-level structure but does not know about types, callsites, or refactor safety. v0.31 elevates the symbol claim from "lexical match on a name" to "semantic match on a definition".
+The v0.14-v0.17 symbol claims rely on tree-sitter for parsing, which extracts structure but does not know about types, callsites, or refactor safety. v0.31.0 elevates the symbol claim from "lexical match on a name" toward "semantic match on a definition", flag-gated behind ``COORD_LSP_ENABLED`` (default off; tree-sitter behavior is byte-identical when off).
 
-Candidate items:
+Shipped (schema migration v16):
 
-- LSP integration via `pylsp`, `typescript-language-server`, `gopls`: when the server has access to the application repo (`COORD_REPO_ROOT` set), it spawns an LSP and asks for the canonical definition span. The claim covers the byte range the LSP reports, not the tree-sitter approximation.
-- Symbol rename detection: when a tracked symbol gets renamed (`handleLogin` -> `handleAuth`), the active claim auto-follows by querying the LSP's rename refactor preview. Today the claim becomes a phantom; v0.30 makes it self-updating.
-- Callsite-aware overlap: claiming `handleLogin` also reserves every callsite of `handleLogin`. Two agents both modifying callers of `handleLogin` would be flagged for a `coexist` decision.
-- Cross-file refactor claims: `claim_refactor("rename src/auth/handleLogin -> handleAuth")` reserves the symbol and every callsite across the repo in one shot.
-- Symbol-aware diff display in the dashboard: when an active symbol claim exists, render the symbol's source range with line numbers so the operator can see exactly what is locked.
-
-Risk: LSP integration is heavyweight (spawning + warming up a language server on every conflict check is unworkable). Will need a persistent LSP-bridge process model, probably as a sidecar to the coord service.
+- **LSP integration**: in-process async client pool (one ``pylsp``/``typescript-language-server``/``gopls`` child per language+repo root, JSON-RPC/stdio, idle reaping, per-server circuit breaker). Claim-time definition spans upgrade to LSP ranges (``resolved_by: lsp``); validation accepts LSP-confirmed symbols the parser missed, never the reverse. The "persistent sidecar" of the original risk note became this pool -- no separate binary.
+- **Definition spans persisted always**: parser spans land in ``claim_symbols`` whenever ``COORD_REPO_ROOT`` is set, LSP or not; the dashboard renders ``file.py::sym (lines 10-42)``.
+- **Callsite-aware overlap (advisory)**: granted symbol claims record callsites via a post-grant background enrichment pass; later claims by other engineers covering those callsites still grant but carry an advisory warning. Advisory rather than the originally-sketched hard ``coexist`` flag because callsite data goes stale and references depend on indexing state.
+- **Symbol rename auto-follow**: a bounded background sweep follows unambiguous renames (same kind, same parent, span overlap, exactly one candidate) atomically across claim_symbols, the claim pattern, an audit row, a ``symbol_renamed`` webhook, and a dashboard note. The roadmap's "query the LSP rename refactor preview" was reinterpreted: that API works pre-apply, not post-hoc, so detection is span-anchored heuristics with a hard ambiguity stop.
+- **Cross-file refactor claims**: ``POST /claims/refactor`` / MCP ``claim_refactor`` reserve the definition plus every callsite's enclosing symbol as one normal claims batch (conflicts/queue/rate limits unchanged; 503 without a live language server).
 
 ## Future bucket (no version assigned)
 
@@ -153,3 +151,4 @@ This roadmap supersedes the older "candidate" markers in the v0.14 sub-file clai
 | v0.29.5 | dashboard token management panel + CSRF double-submit cookie + login Origin guard |
 | v0.29.6 | OIDC SSO: code+PKCE flow, SSO logins mint short-lived per-engineer tokens |
 | v0.30.0 | per-engineer claim/queue caps + per-repo queue admission control (429 + Retry-After) |
+| v0.31.0 | LSP-aware symbol claims: spans, callsite advisories, rename auto-follow, claim_refactor (schema v16) |

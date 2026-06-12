@@ -88,6 +88,64 @@ class CreateClaimsRequest(BaseModel):
     )
 
 
+class ClaimRefactorRequest(BaseModel):
+    """v0.31 wave 2: ``POST /claims/refactor``.
+
+    Asks the server to reserve a symbol's definition plus every
+    callsite the language server can see, in one shot. The server
+    resolves the definition span, runs ``textDocument/references``, and
+    expands the result into a normal ``create_claims`` batch: a symbol
+    claim on the tightest enclosing symbol of each reference, a file
+    claim for references with no enclosing symbol, and always the
+    definition symbol claim itself. Requires a live LSP
+    (``COORD_LSP_ENABLED`` + ``COORD_REPO_ROOT``); otherwise the
+    endpoint answers 503.
+    """
+
+    engineer: str
+    file: str = Field(
+        ...,
+        description="Repo-root-relative path of the file defining the symbol.",
+    )
+    symbol: str = Field(
+        ...,
+        description=(
+            "Canonical symbol path being refactored, in claim notation "
+            "('handler', 'Outer::method', 'A::B::leaf')."
+        ),
+    )
+    new_name: str | None = Field(
+        default=None,
+        description=(
+            "Intended post-refactor name. Informational: it seeds the "
+            "default description so other agents see what is coming. "
+            "The server does not perform the rename."
+        ),
+    )
+    wait_seconds: int | None = Field(
+        default=None,
+        ge=0,
+        le=600,
+        description=(
+            "Forwarded to the underlying create_claims call: when the "
+            "generated batch would 409, queue behind the blocking "
+            "holder for up to this many seconds (v0.21 semantics)."
+        ),
+    )
+    repo: str | None = None
+    session_id: str | None = None
+    branch: str | None = None
+    description: str | None = Field(
+        default=None,
+        description=(
+            "Optional override; defaults to 'refactor: rename <symbol> "
+            "-> <new_name>' (or 'refactor: <symbol>' without new_name)."
+        ),
+    )
+    ttl_hours: int | None = None
+    urgency: str | None = None
+
+
 class ConflictingClaim(BaseModel):
     id: str
     engineer: str

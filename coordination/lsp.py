@@ -1,10 +1,11 @@
-"""Async LSP client pool for span-accurate symbol claims (v0.31, wave 1).
+"""Async LSP client pool for span-accurate symbol claims (v0.31).
 
 The coordination server talks to real language servers (pylsp,
 typescript-language-server, gopls) over the standard JSON-RPC-over-stdio
-LSP transport to answer exactly one question in wave 1: "where does this
-symbol live in this file right now?" (``textDocument/documentSymbol``).
-Wave 2 will add references and rename tracking on top of the same pool.
+LSP transport. Wave 1 answers "where does this symbol live in this file
+right now?" (``textDocument/documentSymbol``); wave 2 adds "who calls
+it?" (``textDocument/references``) on the same pool, feeding the
+callsite-enrichment and refactor-claim machinery in the service layer.
 
 Design posture, in order of importance:
 
@@ -44,6 +45,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 from coordination.config import Settings
 
@@ -202,6 +204,70 @@ def _flatten_into(
 
 
 # ---------------------------------------------------------------------------
+# references normalisation
+# ---------------------------------------------------------------------------
+
+
+def _uri_to_path(uri: str) -> Path:
+    """Convert a ``file://`` URI to a local Path. Raises ``ValueError``
+    for any other scheme -- a reference into an unsaved buffer or a
+    virtual document is something we cannot claim, and the caller
+    treats the raise as protocol garbage."""
+
+    parts = urlsplit(uri)
+    if parts.scheme != "file":
+        raise ValueError(f"non-file URI in references result: {uri!r}")
+    return Path(unquote(parts.path))
+
+
+def _normalize_references(raw: Any, repo_root: Path) -> list[dict[str, Any]] | None:
+    """Normalise a ``textDocument/references`` result to callsite dicts.
+
+    The wire shape is ``Location[]`` (``uri`` + ``range``) or ``null``
+    when the server found nothing. Each location becomes::
+
+        {file_path, line, character}
+
+    where ``file_path`` is repo-root-relative (posix separators) when
+    the URI lands under ``repo_root`` and absolute otherwise, ``line``
+    is converted to 1-based here at the boundary (mirroring the
+    documentSymbol convention) and ``character`` stays 0-based exactly
+    as the server reported it.
+
+    Returns ``None`` for any shape that is not a well-formed location
+    list -- garbage is a failure, not an empty result. A ``null``
+    result is a legitimate "no references" answer and maps to ``[]``.
+    """
+
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        return None
+    root_resolved = Path(repo_root).resolve()
+    out: list[dict[str, Any]] = []
+    try:
+        for item in raw:
+            if not isinstance(item, dict):
+                raise TypeError("references entry is not an object")
+            path = _uri_to_path(str(item["uri"])).resolve()
+            try:
+                rendered = path.relative_to(root_resolved).as_posix()
+            except ValueError:
+                rendered = str(path)
+            start = item["range"]["start"]
+            out.append(
+                {
+                    "file_path": rendered,
+                    "line": int(start["line"]) + 1,
+                    "character": int(start["character"]),
+                }
+            )
+    except (KeyError, TypeError, ValueError):
+        return None
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Single client: one language server subprocess
 # ---------------------------------------------------------------------------
 
@@ -231,7 +297,14 @@ class LspClient:
         self.last_used = time.monotonic()
         self._next_id = 0
         self._lock = asyncio.Lock()
-        self._opened_uris: set[str] = set()
+        # uri -> (st_mtime_ns, st_size) at the moment we last sent the
+        # file's content. Per the LSP contract a server owns the text of
+        # an open document and never re-reads disk, so an open-once set
+        # would serve stale content for the whole client lifetime --
+        # silently defeating the rename sweep (the symbol would still
+        # "exist" in the server's stale copy). Re-open on signature
+        # change instead.
+        self._opened: dict[str, tuple[int, int]] = {}
         self._stderr_task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
@@ -349,34 +422,83 @@ class LspClient:
             # and stale responses from a previous timed-out request are
             # dropped on the floor.
 
-    async def document_symbols(self, file_path: Path) -> Any:
-        """Raw ``textDocument/documentSymbol`` result for ``file_path``.
+    async def _ensure_open(self, file_path: Path) -> str:
+        """Send ``textDocument/didOpen`` with the on-disk content and
+        return the file's URI, re-opening when the file changed on disk
+        since we last sent it. didOpen is technically optional for
+        documentSymbol in some servers but pylsp requires the document,
+        and the open-with-disk-content dance works for all three
+        supported servers.
 
-        Sends ``textDocument/didOpen`` with the on-disk content before
-        the first documentSymbol for a given file in this client's
-        lifetime. didOpen is technically optional for some servers, but
-        pylsp wants the document registered, and the open-with-disk-
-        content dance works for all three supported servers.
-        """
+        Freshness is tracked per URI as (mtime_ns, size): on change we
+        send didClose followed by a fresh didOpen, which every sync
+        mode accepts (unlike full-text didChange, which gopls's
+        incremental sync does not guarantee). The stat runs BEFORE the
+        read so a write racing the read causes a harmless re-open on
+        the next call rather than a missed update."""
 
-        uri = file_path.resolve().as_uri()
-        if uri not in self._opened_uris:
-            text = file_path.read_text(encoding="utf-8", errors="replace")
+        resolved = file_path.resolve()
+        uri = resolved.as_uri()
+        st = resolved.stat()
+        sig = (st.st_mtime_ns, st.st_size)
+        prev = self._opened.get(uri)
+        if prev == sig:
+            return uri
+        if prev is not None:
             await self.notify(
-                "textDocument/didOpen",
-                {
-                    "textDocument": {
-                        "uri": uri,
-                        "languageId": self.language,
-                        "version": 1,
-                        "text": text,
-                    }
-                },
+                "textDocument/didClose", {"textDocument": {"uri": uri}}
             )
-            self._opened_uris.add(uri)
+        text = resolved.read_text(encoding="utf-8", errors="replace")
+        await self.notify(
+            "textDocument/didOpen",
+            {
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": self.language,
+                    "version": 1,
+                    "text": text,
+                }
+            },
+        )
+        self._opened[uri] = sig
+        return uri
+
+    async def document_symbols(self, file_path: Path) -> Any:
+        """Raw ``textDocument/documentSymbol`` result for ``file_path``."""
+
+        uri = await self._ensure_open(file_path)
         result = await self.request(
             "textDocument/documentSymbol",
             {"textDocument": {"uri": uri}},
+        )
+        self.last_used = time.monotonic()
+        return result
+
+    async def references(
+        self, file_path: Path, line_1based: int, character: int
+    ) -> Any:
+        """Raw ``textDocument/references`` result for the position
+        ``(line_1based, character)`` in ``file_path``.
+
+        The position converts back to LSP's 0-based lines here, at the
+        same boundary that converted them to 1-based on the way out, so
+        a documentSymbol span can be fed straight back in.
+        ``includeDeclaration`` is False: the caller already holds the
+        definition (it is the claimed symbol itself) and only wants the
+        callsites.
+        """
+
+        uri = await self._ensure_open(file_path)
+        result = await self.request(
+            "textDocument/references",
+            {
+                "textDocument": {"uri": uri},
+                "position": {
+                    "line": max(0, int(line_1based) - 1),
+                    "character": int(character),
+                },
+                "context": {"includeDeclaration": False},
+            },
         )
         self.last_used = time.monotonic()
         return result
@@ -475,16 +597,18 @@ class LspClientPool:
             "go": self.settings.lsp_command_go,
         }.get(language)
 
-    async def document_symbols(
+    async def _prepare_call(
         self,
         repo_root: Path,
         language: str,
         file_path: str | Path,
-    ) -> list[dict[str, Any]] | None:
-        """Flattened documentSymbol entries for ``file_path``, or
-        ``None`` on any failure (circuit open, spawn failure, timeout,
-        crash, protocol garbage). Relative paths resolve against
-        ``repo_root``."""
+    ) -> tuple[tuple[str, str], _Circuit, LspClient, Path] | None:
+        """Shared front half of every pool request: circuit check,
+        command lookup, file resolution, get-or-spawn. Returns the
+        ``(key, circuit, client, resolved_path)`` tuple on success and
+        ``None`` on any failure -- spawn failures are recorded against
+        the circuit here so callers only own their request's failure
+        handling."""
 
         key = (language, str(Path(repo_root).resolve()))
         circuit = self._circuits.setdefault(key, _Circuit())
@@ -522,6 +646,23 @@ class LspClientPool:
             # counts like any other request failure.
             self._record_failure(key, circuit, exc=exc, open_now=False)
             return None
+        return key, circuit, client, resolved
+
+    async def document_symbols(
+        self,
+        repo_root: Path,
+        language: str,
+        file_path: str | Path,
+    ) -> list[dict[str, Any]] | None:
+        """Flattened documentSymbol entries for ``file_path``, or
+        ``None`` on any failure (circuit open, spawn failure, timeout,
+        crash, protocol garbage). Relative paths resolve against
+        ``repo_root``."""
+
+        prepared = await self._prepare_call(repo_root, language, file_path)
+        if prepared is None:
+            return None
+        key, circuit, client, resolved = prepared
 
         try:
             raw = await client.document_symbols(resolved)
@@ -543,6 +684,48 @@ class LspClientPool:
             return None
         circuit.consecutive_failures = 0
         return flattened
+
+    async def references(
+        self,
+        repo_root: Path,
+        language: str,
+        file_path: str | Path,
+        line_1based: int,
+        col_0based: int,
+    ) -> list[dict[str, Any]] | None:
+        """Normalised ``textDocument/references`` entries for the
+        position ``(line_1based, col_0based)`` in ``file_path``, or
+        ``None`` on any failure -- exactly the same circuit / discard
+        semantics as :meth:`document_symbols`. Each entry is
+        ``{file_path, line, character}`` with ``file_path`` rendered
+        repo-root-relative when the location lands under ``repo_root``
+        and absolute otherwise (see :func:`_normalize_references`)."""
+
+        prepared = await self._prepare_call(repo_root, language, file_path)
+        if prepared is None:
+            return None
+        key, circuit, client, resolved = prepared
+
+        try:
+            raw = await client.references(resolved, line_1based, col_0based)
+        except Exception as exc:  # noqa: BLE001
+            # The stream state is unknown after any failure; discard
+            # the client wholesale rather than resynchronising.
+            await self._discard_client(key)
+            self._record_failure(key, circuit, exc=exc, open_now=False)
+            return None
+
+        normalized = _normalize_references(raw, Path(repo_root))
+        if normalized is None:
+            self._record_failure(
+                key,
+                circuit,
+                exc=ValueError("unrecognised references result shape"),
+                open_now=False,
+            )
+            return None
+        circuit.consecutive_failures = 0
+        return normalized
 
     async def _get_or_spawn(
         self, key: tuple[str, str], command: str, repo_root: Path

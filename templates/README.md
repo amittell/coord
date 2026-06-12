@@ -17,6 +17,7 @@ For step-by-step rollout guidance, see `../docs/getting-started.md` plus the too
 | `.coordination/hooks/pre-push` | Git pre-push check against `/conflicts` |
 | `github-coordination-semantic.yml` | Copy to `.github/workflows/coordination-semantic.yml` (PR + merge-group CI template) |
 | `MERGE_QUEUE.md` | Notes for merge queue + stacked PR workflow |
+| `skills/coordinating-file-claims/` | Agent Skill (SKILL.md, agentskills.io format) teaching any skill-capable agent to install, configure, and use coord. Copy the directory into `.agents/skills/` (Codex), `.claude/skills/` (Claude Code), or `.cursor/skills/` (Cursor) |
 
 ## Set environment variables
 

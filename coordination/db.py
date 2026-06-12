@@ -958,6 +958,328 @@ class Database:
             rows = await cur.fetchall()
             return [dict(r) for r in rows]
 
+    async def insert_claim_callsites(
+        self,
+        claim_id: str,
+        callsites: list[tuple[str, int, int | None, str | None]],
+        *,
+        now: str | None = None,
+    ) -> int:
+        """v0.31 wave 2: persist the language server's reference list
+        for a claim. Each tuple is ``(file_path, line, character,
+        symbol_path)`` -- ``line`` 1-based, ``character`` 0-based or
+        ``None`` for servers that report line-only locations,
+        ``symbol_path`` the claimed symbol the reference points at.
+
+        Enrichment replaces wholesale: there is no unique index on the
+        table that INSERT OR IGNORE could lean on, so the claim's
+        existing rows are DELETEd and the new set inserted inside one
+        BEGIN IMMEDIATE transaction. A re-enrichment therefore never
+        accretes duplicates and a crash mid-call never leaves a mixed
+        old/new set behind. Returns the number of rows inserted.
+        """
+        await self.init()
+        created_at = now or _utcnow()
+        async with aiosqlite.connect(self.path) as conn:
+            await _configure_sqlite(conn)
+            await conn.execute("BEGIN IMMEDIATE")
+            await conn.execute(
+                "DELETE FROM claim_symbol_callsites WHERE claim_id = ?",
+                (claim_id,),
+            )
+            if callsites:
+                await conn.executemany(
+                    """
+                    INSERT INTO claim_symbol_callsites
+                        (id, claim_id, file_path, line, character,
+                         symbol_path, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            str(uuid4()),
+                            claim_id,
+                            file_path,
+                            line,
+                            character,
+                            symbol_path,
+                            created_at,
+                        )
+                        for file_path, line, character, symbol_path in callsites
+                    ],
+                )
+            await conn.commit()
+        return len(callsites)
+
+    async def list_callsites_for_claims(
+        self, claim_ids: list[str]
+    ) -> list[dict[str, Any]]:
+        """Return every recorded callsite row for the given claims,
+        ordered by (claim_id, file_path, line) so callers can render a
+        stable list. Empty input short-circuits to an empty list."""
+        if not claim_ids:
+            return []
+        await self.init()
+        placeholders = ",".join("?" for _ in claim_ids)
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                "SELECT * FROM claim_symbol_callsites "
+                f"WHERE claim_id IN ({placeholders}) "
+                "ORDER BY claim_id, file_path, line",
+                claim_ids,
+            )
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+    async def callsites_intersecting(
+        self,
+        file_path: str,
+        start_line: int,
+        end_line: int,
+    ) -> list[dict[str, Any]]:
+        """v0.31 wave 2: callsite rows landing inside
+        ``file_path[start_line..end_line]`` (inclusive, 1-based) joined
+        to their owning ACTIVE claims. The advisory CALLSITE_OVERLAP
+        pass uses this to ask "whose claimed symbol is called from the
+        range I am about to edit?".
+
+        Active means ``released_at IS NULL`` plus a Python-side TTL
+        check on ``expires_at`` -- the same pattern as
+        :meth:`list_active_claims_rows`, so string-vs-datetime
+        comparison quirks live in exactly one idiom.
+        """
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                """
+                SELECT cs.claim_id, cs.file_path, cs.line, cs.character,
+                       cs.symbol_path,
+                       c.engineer, c.pattern, c.session_id, c.repo,
+                       c.expires_at
+                FROM claim_symbol_callsites cs
+                JOIN claims c ON c.id = cs.claim_id
+                WHERE cs.file_path = ?
+                  AND cs.line >= ?
+                  AND cs.line <= ?
+                  AND c.released_at IS NULL
+                """,
+                (file_path, start_line, end_line),
+            )
+            rows = await cur.fetchall()
+        now = datetime.now(UTC)
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            exp_raw = str(r["expires_at"])
+            try:
+                exp = datetime.fromisoformat(exp_raw.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if exp <= now:
+                continue
+            out.append(dict(r))
+        return out
+
+    async def insert_claim_symbol_rename(
+        self,
+        *,
+        claim_id: str,
+        file_path: str,
+        old_symbol_name: str,
+        new_symbol_name: str,
+        old_symbol_path: str | None = None,
+        new_symbol_path: str | None = None,
+        old_start_line: int | None = None,
+        old_end_line: int | None = None,
+        new_start_line: int | None = None,
+        new_end_line: int | None = None,
+        resolved_by: str,
+        detected_at: str | None = None,
+    ) -> str:
+        """v0.31 wave 2: append one rename audit row (v16
+        ``claim_symbol_renames`` columns). Standalone variant for
+        callers that detected a rename without needing the atomic
+        claim-row update -- the auto-follow sweep goes through
+        :meth:`update_claim_symbol_rename` instead, which writes the
+        same row inside its transaction. Returns the new row id."""
+        await self.init()
+        new_id = str(uuid4())
+        async with aiosqlite.connect(self.path) as conn:
+            await _configure_sqlite(conn)
+            await conn.execute(
+                """
+                INSERT INTO claim_symbol_renames
+                    (id, claim_id, file_path, old_symbol_name,
+                     new_symbol_name, old_symbol_path, new_symbol_path,
+                     old_start_line, old_end_line, new_start_line,
+                     new_end_line, detected_at, resolved_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    new_id,
+                    claim_id,
+                    file_path,
+                    old_symbol_name,
+                    new_symbol_name,
+                    old_symbol_path,
+                    new_symbol_path,
+                    old_start_line,
+                    old_end_line,
+                    new_start_line,
+                    new_end_line,
+                    detected_at or _utcnow(),
+                    resolved_by,
+                ),
+            )
+            await conn.commit()
+        return new_id
+
+    async def list_symbol_renames_for_claims(
+        self, claim_ids: list[str]
+    ) -> list[dict[str, Any]]:
+        """Return every rename audit row for the given claims, newest
+        first within each claim so the dashboard can show the latest
+        rename without sorting client-side."""
+        if not claim_ids:
+            return []
+        await self.init()
+        placeholders = ",".join("?" for _ in claim_ids)
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                "SELECT * FROM claim_symbol_renames "
+                f"WHERE claim_id IN ({placeholders}) "
+                "ORDER BY claim_id, detected_at DESC, id",
+                claim_ids,
+            )
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+    async def update_claim_symbol_rename(
+        self,
+        claim_id: str,
+        *,
+        file_path: str,
+        old_symbol_name: str,
+        new_symbol_name: str,
+        new_start_line: int | None,
+        new_start_col: int | None,
+        new_end_line: int | None,
+        new_end_col: int | None,
+        resolved_by: str,
+        new_pattern: str | None,
+    ) -> bool:
+        """v0.31 wave 2: apply a detected rename atomically.
+
+        In ONE BEGIN IMMEDIATE transaction:
+
+        1. read the matching ``claim_symbols`` row (old span + parent,
+           needed for the audit trail);
+        2. update its ``symbol_name``, span columns, and
+           ``resolved_by``;
+        3. update ``claims.pattern`` when ``new_pattern`` is not None
+           (today the pattern is the file path and never embeds the
+           symbol, so the sweep always passes None -- the column update
+           exists for any future pattern scheme that does embed it);
+        4. insert the ``claim_symbol_renames`` audit row.
+
+        Partial application is impossible: any failure rolls the whole
+        transaction back. Returns False (with nothing written) when no
+        ``claim_symbols`` row matches ``(claim_id, file_path,
+        old_symbol_name)`` -- e.g. a concurrent release or a second
+        sweep racing this one.
+        """
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = await conn.execute(
+                    """
+                    SELECT id, parent_symbol, start_line, end_line
+                    FROM claim_symbols
+                    WHERE claim_id = ? AND file_path = ?
+                      AND symbol_name = ?
+                    """,
+                    (claim_id, file_path, old_symbol_name),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    await conn.rollback()
+                    return False
+                parent = row["parent_symbol"]
+                old_path = (
+                    f"{parent}::{old_symbol_name}"
+                    if parent
+                    else old_symbol_name
+                )
+                new_path = (
+                    f"{parent}::{new_symbol_name}"
+                    if parent
+                    else new_symbol_name
+                )
+                await conn.execute(
+                    """
+                    UPDATE claim_symbols
+                    SET symbol_name = ?, start_line = ?, start_col = ?,
+                        end_line = ?, end_col = ?, resolved_by = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        new_symbol_name,
+                        new_start_line,
+                        new_start_col,
+                        new_end_line,
+                        new_end_col,
+                        resolved_by,
+                        row["id"],
+                    ),
+                )
+                if new_pattern is not None:
+                    await conn.execute(
+                        "UPDATE claims SET pattern = ? WHERE id = ?",
+                        (new_pattern, claim_id),
+                    )
+                await conn.execute(
+                    """
+                    INSERT INTO claim_symbol_renames
+                        (id, claim_id, file_path, old_symbol_name,
+                         new_symbol_name, old_symbol_path,
+                         new_symbol_path, old_start_line, old_end_line,
+                         new_start_line, new_end_line, detected_at,
+                         resolved_by)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid4()),
+                        claim_id,
+                        file_path,
+                        old_symbol_name,
+                        new_symbol_name,
+                        old_path,
+                        new_path,
+                        row["start_line"],
+                        row["end_line"],
+                        new_start_line,
+                        new_end_line,
+                        _utcnow(),
+                        resolved_by,
+                    ),
+                )
+            except Exception:
+                try:
+                    await conn.rollback()
+                except Exception:
+                    pass
+                raise
+            await conn.commit()
+        return True
+
     async def get_symbol_rows_on_file(
         self,
         *,

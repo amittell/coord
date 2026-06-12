@@ -9,6 +9,53 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.31.0] - 2026-06-12
+
+### Added
+
+- LSP-aware symbol claims, flag-gated behind ``COORD_LSP_ENABLED``
+  (default off, tree-sitter behavior unchanged when off). Coord
+  spawns language servers as child processes (``pylsp``,
+  ``typescript-language-server``, ``gopls``; commands overridable
+  via ``COORD_LSP_COMMAND_*``), speaks JSON-RPC over stdio, reaps
+  idle servers, and trips a per-server circuit breaker on failure
+  -- LSP can upgrade symbol resolution but can never make claim
+  creation fail or deny a symbol the parser accepted.
+- Schema migration v16: ``claim_symbols`` gains definition spans
+  (``start_line``/``start_col``/``end_line``/``end_col``, lines
+  1-based, columns 0-based) plus ``resolved_by``
+  (``parser``/``lsp``); new ``claim_symbol_callsites`` and
+  ``claim_symbol_renames`` tables. Parser spans persist on every
+  symbol claim when ``COORD_REPO_ROOT`` is set, LSP refines them
+  when enabled, and the dashboard renders symbol ranges
+  (``file.py::sym (lines 10-42, lsp)``).
+- Callsite-aware overlap (advisory): granted symbol claims record
+  their callsites via ``textDocument/references`` in a background
+  enrichment pass (capped at 200 per claim). When a later claim by
+  a different engineer covers recorded callsites of an active
+  holder, the grant still succeeds and carries an advisory warning
+  naming the holder and the overlap -- semantic conflicts surface
+  without hard-blocking, because callsite data goes stale.
+- Symbol rename auto-follow: a bounded background sweep re-checks
+  active symbol claims; when a claimed symbol vanished and exactly
+  one same-kind same-parent symbol overlaps its stored span, the
+  claim follows the rename atomically (symbol row, spans, pattern,
+  audit row in ``claim_symbol_renames``, ``symbol_renamed`` webhook
+  event, dashboard note). Ambiguity means no action.
+- ``templates/skills/coordinating-file-claims/``: an Agent Skill
+  (SKILL.md, agentskills.io format, portable across Claude Code,
+  Codex CLI, Cursor and other skill-capable agents) that teaches an
+  agent to install, configure, and use coord end to end -- the
+  claim/release protocol, symbol claims, queueing, conflict
+  negotiation, and error recovery.
+- ``POST /claims/refactor`` + MCP tool ``claim_refactor``: expands
+  a (file, symbol) refactor intent into one normal claims batch --
+  the definition symbol plus the enclosing symbol of every callsite
+  (file claim for module-level references), deduplicated and
+  capped. Conflicts, queueing (``wait_seconds``) and v0.30 rate
+  limits apply unchanged; 503 when no language server can answer,
+  because refactor claims are meaningless without references.
+
 ## [0.30.0] - 2026-06-12
 
 ### Added

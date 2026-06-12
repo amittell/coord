@@ -50,6 +50,14 @@ The 429 body is structured:
 
 ``scope`` is one of ``claims`` / ``queue`` / ``repo_queue``. The MCP ``claim_files`` tool returns this payload as data (like 409 conflicts) instead of raising.
 
+## `POST /claims/refactor` (v0.31.0+)
+
+Expands a (file, symbol) refactor intent into one normal claims batch: the symbol's definition plus the enclosing symbol of every callsite the language server reports (file claims for module-level references), deduplicated and capped at `COORD_MAX_CLAIM_FILES`. Requires `COORD_LSP_ENABLED=true` and a live language server; returns 503 otherwise, because refactor claims are meaningless without reference discovery.
+
+Body: `{engineer, file, symbol, new_name?, wait_seconds?, repo?, session_id?, branch?, description?, ttl_hours?, urgency?}`. Response shapes are identical to `POST /claims` (200 grant with warnings/advisories, 409 conflict payload, queueing via `wait_seconds`, 429 rate limits). The MCP tool `claim_refactor` wraps this endpoint and surfaces 503 as a structured `{error, status}` result.
+
+Granted symbol claims record their callsites in the background when LSP is enabled; later claims by other engineers covering those callsites still grant but carry an `advisory:` warning naming the holder, so semantic conflicts surface without hard-blocking.
+
 ## `GET /health`
 
 Unauthenticated liveness probe.
