@@ -132,6 +132,8 @@ coord tokens revoke <token-id>
 
 The raw token is printed exactly once at creation; only its sha256 lands in the database. Tokens created without `--expires-in` never expire (matching pre-v0.29.4 behavior).
 
+From v0.29.5 the same lifecycle is available in the dashboard: engineers logged in with a per-engineer token manage their own tokens (list, revoke, create with a capped expiry), and a shared-token session gets the operator view over all tokens.
+
 ### Zero-downtime rotation (v0.29.4+)
 
 `coord tokens rotate <token-id> --grace 24h` mints a successor token for the same engineer and keeps the old token valid for the grace window, so every cached copy of the old token keeps working while you roll the new value out to MCP configs and worktrees. After the window closes the old token gets a specific 401 telling the caller it was rotated. Use `--grace 0h` for an immediate cutover, and `--expires-in` to give the successor an expiry.

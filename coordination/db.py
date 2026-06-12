@@ -1689,10 +1689,33 @@ class Database:
             rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
+    async def get_engineer_token_by_id(
+        self, token_id: str
+    ) -> dict[str, Any] | None:
+        """v0.29.5: fetch one token row by id for the dashboard token
+        panel. Returns the same safe column set as
+        ``list_engineer_tokens`` (never ``token_sha256``), including
+        ``revoked_at`` so callers can distinguish "already revoked"
+        from "not yours"; None when the id is unknown."""
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                "SELECT id, engineer, description, created_at, "
+                "revoked_at, last_used_at, expires_at, rotated_from, "
+                "rotation_grace_until, request_count, last_source_ip, "
+                "last_user_agent FROM engineer_tokens WHERE id = ?",
+                (token_id,),
+            )
+            row = await cur.fetchone()
+        return dict(row) if row is not None else None
+
     async def revoke_engineer_token(
         self,
         token_id: str,
         *,
+        engineer: str | None = None,
         now: datetime | None = None,
     ) -> bool:
         """v0.29: idempotent revocation. Returns True if a previously
@@ -1700,16 +1723,25 @@ class Database:
         the token was already revoked. The row is preserved (not
         deleted) so audit queries against ``engineer_tokens`` keep their
         historical shape -- a revoked token simply never matches in
-        ``lookup_engineer_token``."""
+        ``lookup_engineer_token``.
+
+        v0.29.5: ``engineer`` scopes the revocation -- the UPDATE only
+        matches when the row belongs to that engineer, so a
+        self-service dashboard revoke is atomic (no read-then-write
+        race against an operator acting on the same row)."""
         await self.init()
         ts = (now or datetime.now(UTC)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        sql = (
+            "UPDATE engineer_tokens SET revoked_at = ? "
+            "WHERE id = ? AND revoked_at IS NULL"
+        )
+        params: list[Any] = [ts, token_id]
+        if engineer is not None:
+            sql += " AND engineer = ?"
+            params.append(engineer)
         async with aiosqlite.connect(self.path) as conn:
             await _configure_sqlite(conn)
-            cur = await conn.execute(
-                "UPDATE engineer_tokens SET revoked_at = ? "
-                "WHERE id = ? AND revoked_at IS NULL",
-                (ts, token_id),
-            )
+            cur = await conn.execute(sql, params)
             await conn.commit()
             return cur.rowcount > 0
 

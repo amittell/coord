@@ -9,6 +9,52 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.29.5] - 2026-06-12
+
+### Added
+
+- In-dashboard token management. The dashboard grows an "engineer
+  tokens" panel: a per-engineer session (logged in with a
+  per-engineer token) sees and manages its own tokens; a shared-token
+  session acts as operator and sees every engineer's tokens. Rows
+  show short id, status (``active`` / ``rotating`` /
+  ``grace-elapsed`` / ``expired`` / ``revoked`` -- the same
+  vocabulary as ``coord tokens list``), creation/last-use/expiry
+  timestamps, request count, and last source IP. Every non-revoked
+  row carries an inline revoke action; a create form mints new
+  tokens with optional ``expires-in`` (v0.29.4 duration grammar).
+- ``POST /dashboard/tokens/create`` returns a one-time page showing
+  the raw token exactly once (``Cache-Control: no-store``); the raw
+  value is never logged or re-renderable. ``POST
+  /dashboard/tokens/revoke`` is PRG (303 back to the dashboard) and
+  idempotent.
+- Self-service guardrails: a per-engineer session can only create
+  tokens for itself (the submitted engineer field is ignored) and
+  only revoke its own tokens (atomically scoped in SQL). If the
+  session's own token has an expiry, self-minted tokens must expire
+  no later -- a holder of an expiring credential cannot mint
+  themselves an immortal one. Operator sessions are uncapped.
+  Insecure no-auth sessions cannot manage tokens at all.
+- New ``coordination/tokens.py`` pure helper module (token
+  generation, hashing, status derivation) shared by the CLI and the
+  dashboard; ``coordination/db.py`` gains
+  ``get_engineer_token_by_id`` and an optional atomic ``engineer=``
+  scope on ``revoke_engineer_token``.
+
+### Security
+
+- CSRF protection for state-changing dashboard operations. A
+  ``coord_csrf`` double-submit cookie (HttpOnly, SameSite=Lax,
+  Secure behind TLS/proxies, rotated on login, cleared on logout)
+  must match the hidden ``csrf_token`` form field on ``POST
+  /dashboard/tokens/create``, ``POST /dashboard/tokens/revoke`` and
+  ``POST /dashboard/logout``; mismatches get a 403 with no state
+  change. ``POST /dashboard/login`` is deliberately exempt so the
+  documented curl login probe keeps working; it instead gets a soft
+  Origin guard (a present-but-cross-site ``Origin`` header is
+  rejected; absent ``Origin`` -- curl -- passes), which closes
+  browser-based login CSRF without breaking scripts.
+
 ## [0.29.4] - 2026-06-12
 
 ### Added

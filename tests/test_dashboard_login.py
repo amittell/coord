@@ -235,17 +235,132 @@ async def test_dashboard_get_with_expired_cookie_shows_expiry_hint(
 async def test_logout_clears_cookie_and_redirects(
     client: AsyncClient,
 ) -> None:
+    # v0.29.5: logout now requires the double-submit CSRF pair
+    # (coord_csrf cookie + matching csrf_token form field); the old
+    # no-csrf logout is pinned as a 403 in
+    # test_logout_without_csrf_is_rejected below.
+    csrf = "c" * 64
     r = await client.post(
         "/dashboard/logout",
-        cookies={"coord_session": "anything"},
+        data={"csrf_token": csrf},
+        cookies={"coord_session": "anything", "coord_csrf": csrf},
         follow_redirects=False,
     )
     assert r.status_code == 303
     assert r.headers["location"] == "/dashboard/login"
-    set_cookie = r.headers.get("set-cookie", "")
-    # delete_cookie issues an empty-value Set-Cookie with a past expiry.
-    assert "coord_session=" in set_cookie
-    assert "Max-Age=0" in set_cookie or "expires" in set_cookie.lower()
+    set_cookies = r.headers.get_list("set-cookie")
+    # delete_cookie issues an empty-value Set-Cookie with a past
+    # expiry -- for BOTH the session and the csrf cookie (v0.29.5).
+    session_clears = [c for c in set_cookies if c.startswith("coord_session=")]
+    csrf_clears = [c for c in set_cookies if c.startswith("coord_csrf=")]
+    assert session_clears and csrf_clears
+    for cleared in (*session_clears, *csrf_clears):
+        assert "Max-Age=0" in cleared or "expires" in cleared.lower()
+
+
+async def test_logout_without_csrf_is_rejected(
+    client: AsyncClient,
+) -> None:
+    """A cross-site form can POST /dashboard/logout but cannot read
+    the coord_csrf cookie to forge the matching field, so a missing
+    or mismatched csrf_token must 403 and leave the cookies alone."""
+    # Missing csrf_token field entirely.
+    r = await client.post(
+        "/dashboard/logout",
+        cookies={"coord_session": "anything", "coord_csrf": "c" * 64},
+        follow_redirects=False,
+    )
+    assert r.status_code == 403
+    assert "CSRF validation failed" in r.text
+    assert r.headers.get("set-cookie") is None
+
+    # Mismatched csrf_token value.
+    r = await client.post(
+        "/dashboard/logout",
+        data={"csrf_token": "d" * 64},
+        cookies={"coord_session": "anything", "coord_csrf": "c" * 64},
+        follow_redirects=False,
+    )
+    assert r.status_code == 403
+    assert r.headers.get("set-cookie") is None
+
+
+async def test_login_success_sets_fresh_csrf_cookie(
+    client: AsyncClient,
+) -> None:
+    """v0.29.5: a successful login rotates coord_csrf alongside
+    coord_session so forms rendered for a previous session cannot
+    submit into the new one."""
+    from coordination.deps import get_service
+
+    svc = get_service()
+    raw = "coordt_" + "c" * 64
+    await svc.db.create_engineer_token("alex/claude/main", _sha256(raw))
+
+    r = await client.post(
+        "/dashboard/login",
+        data={"token": raw},
+        follow_redirects=False,
+    )
+    assert r.status_code == 303
+    set_cookies = r.headers.get_list("set-cookie")
+    assert any(c.startswith("coord_session=") for c in set_cookies)
+    csrf_cookies = [c for c in set_cookies if c.startswith("coord_csrf=")]
+    assert csrf_cookies
+    assert "HttpOnly" in csrf_cookies[0]
+    assert "SameSite=lax" in csrf_cookies[0]
+
+
+async def test_login_with_cross_site_origin_is_rejected(
+    client: AsyncClient,
+) -> None:
+    """The login POST is deliberately CSRF-exempt (curl scripting),
+    but a browser always sends Origin on a cross-site form post --
+    a present-but-mismatched Origin is rejected with the form's
+    error banner and no cookie."""
+    from coordination.deps import get_service
+
+    svc = get_service()
+    raw = "coordt_" + "d" * 64
+    await svc.db.create_engineer_token("alex/claude/main", _sha256(raw))
+
+    r = await client.post(
+        "/dashboard/login",
+        data={"token": raw},
+        headers={"origin": "https://evil.example"},
+        follow_redirects=False,
+    )
+    assert r.status_code == 200
+    assert "Cross-site login submission rejected" in r.text
+    assert "coord_session=" not in r.headers.get("set-cookie", "")
+
+
+async def test_login_without_origin_header_still_works(
+    client: AsyncClient,
+) -> None:
+    """curl never sends Origin; the soft guard must let it through
+    (this is why the login POST is not behind the full CSRF check)."""
+    from coordination.deps import get_service
+
+    svc = get_service()
+    raw = "coordt_" + "e" * 64
+    await svc.db.create_engineer_token("alex/claude/main", _sha256(raw))
+
+    r = await client.post(
+        "/dashboard/login",
+        data={"token": raw},
+        follow_redirects=False,
+    )
+    assert r.status_code == 303
+
+    # A same-origin browser post (Origin matching Host) also passes.
+    r = await client.post(
+        "/dashboard/login",
+        data={"token": raw},
+        headers={"origin": "http://test"},
+        follow_redirects=False,
+    )
+    assert r.status_code == 303
 
 
 async def test_secure_cookie_flag_honours_x_forwarded_proto(
@@ -276,11 +391,20 @@ async def test_secure_cookie_flag_honours_x_forwarded_proto(
         follow_redirects=False,
     )
     assert proxied.status_code == 303
-    cookie = proxied.headers.get("set-cookie", "")
-    assert "coord_session=" in cookie
-    assert "Secure" in cookie, (
-        f"Secure flag should be set when X-Forwarded-Proto is https; "
-        f"got Set-Cookie: {cookie!r}"
+    # Assert per-cookie: httpx joins duplicate Set-Cookie headers with
+    # ", ", so a joined-string check would pass as long as EITHER
+    # cookie carried Secure. Both the session cookie and the v0.29.5
+    # csrf cookie must carry it independently.
+    set_cookies = proxied.headers.get_list("set-cookie")
+    sess = [c for c in set_cookies if c.startswith("coord_session=")]
+    assert sess and "Secure" in sess[0], (
+        f"Secure flag should be set on coord_session when "
+        f"X-Forwarded-Proto is https; got: {sess!r}"
+    )
+    csrf = [c for c in set_cookies if c.startswith("coord_csrf=")]
+    assert csrf and "Secure" in csrf[0], (
+        f"Secure flag should be set on coord_csrf when "
+        f"X-Forwarded-Proto is https; got: {csrf!r}"
     )
 
     # Plain dev (no proxy): no Secure flag, otherwise localhost over
@@ -333,10 +457,15 @@ async def test_secure_cookie_flag_honours_cf_visitor(
         follow_redirects=False,
     )
     assert r.status_code == 303
-    cookie = r.headers.get("set-cookie", "")
-    assert "Secure" in cookie, (
-        f"CF-Visitor scheme=https must set Secure; got Set-Cookie: {cookie!r}"
-    )
+    for prefix in ("coord_session=", "coord_csrf="):
+        match = [
+            c for c in r.headers.get_list("set-cookie")
+            if c.startswith(prefix)
+        ]
+        assert match and "Secure" in match[0], (
+            f"CF-Visitor scheme=https must set Secure on {prefix}; "
+            f"got: {match!r}"
+        )
 
     # Mangled JSON in CF-Visitor must not crash auth -- we treat it
     # as absent and fall through to the next signal.
@@ -377,7 +506,47 @@ async def test_dashboard_cookie_force_secure_operator_override(
             follow_redirects=False,
         )
         assert r.status_code == 303
-        assert "Secure" in r.headers.get("set-cookie", "")
+        for prefix in ("coord_session=", "coord_csrf="):
+            match = [
+                c for c in r.headers.get_list("set-cookie")
+                if c.startswith(prefix)
+            ]
+            assert match and "Secure" in match[0], (
+                f"force-secure must set Secure on {prefix}; got: {match!r}"
+            )
+
+
+async def test_login_origin_guard_with_port_bearing_host(
+    client: AsyncClient,
+) -> None:
+    """Dev runs on localhost:8000; the Origin guard compares the full
+    netloc, so a matching port passes and a missing port is rejected.
+    Pins the comparison against a future host-only or default-port
+    normalisation regressing the common dev configuration."""
+    from coordination.deps import get_service
+
+    svc = get_service()
+    raw = "coordt_" + "f" * 64
+    await svc.db.create_engineer_token("alex/claude/main", _sha256(raw))
+
+    # Origin and Host both carry the port: same-origin, accepted.
+    r = await client.post(
+        "/dashboard/login",
+        data={"token": raw},
+        headers={"origin": "http://test:8000", "host": "test:8000"},
+        follow_redirects=False,
+    )
+    assert r.status_code == 303
+
+    # Origin lacks the port the Host carries: mismatch, rejected.
+    r = await client.post(
+        "/dashboard/login",
+        data={"token": raw},
+        headers={"origin": "http://test", "host": "test:8000"},
+        follow_redirects=False,
+    )
+    assert r.status_code == 200
+    assert "coord_session=" not in r.headers.get("set-cookie", "")
 
 
 async def test_login_form_does_not_leak_token_back_into_html(

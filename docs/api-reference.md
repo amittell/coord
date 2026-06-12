@@ -65,7 +65,16 @@ Unauthenticated service metadata.
 
 ## `GET /dashboard`
 
-Authenticated HTML dashboard that lists active claims, recent conflicts, and stored ownership. The dashboard is protected by the same bearer token as the rest of the API; load it in a browser by adding the `Authorization` header via an extension, or use `curl` plus a local proxy.
+Authenticated HTML dashboard that lists active claims, recent conflicts, and stored ownership. Browsers that are not yet authenticated get an HTML login form (v0.29.0): paste a per-engineer token (or the shared token) into `POST /dashboard/login` and the session continues via the `coord_session` cookie (HttpOnly, SameSite=Lax, Secure behind TLS-terminating proxies). `POST /dashboard/logout` clears it. Scripts can mint a session cookie directly: `curl -X POST -d "token=$T" -c cookies.txt https://host/dashboard/login`.
+
+### Dashboard token management (v0.29.5)
+
+A logged-in session sees an "engineer tokens" panel. Per-engineer sessions manage only their own tokens; a shared-token session is the operator view over all tokens.
+
+- `POST /dashboard/tokens/create` (form: `engineer`, `description`, `expires_in`, `csrf_token`): mints a token and renders it exactly once on a `Cache-Control: no-store` page. Per-engineer sessions always create for themselves, and when their own token carries an expiry the new token must expire no later.
+- `POST /dashboard/tokens/revoke` (form: `token_id`, `csrf_token`): revokes and redirects back to the dashboard (303). Idempotent; per-engineer sessions can only revoke their own tokens.
+
+Both endpoints (plus logout) require the `csrf_token` form field to match the `coord_csrf` cookie the dashboard sets; mismatches return 403 with no state change. `POST /dashboard/login` is deliberately CSRF-exempt so the curl pattern above keeps working, and instead rejects browser requests whose `Origin` header does not match the request host.
 
 Response: `text/html`.
 

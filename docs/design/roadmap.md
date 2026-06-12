@@ -1,7 +1,7 @@
 # Coord roadmap
 
 Status: living document
-Last updated: 2026-06-12 (after v0.29.4)
+Last updated: 2026-06-12 (after v0.29.5)
 
 This is the post-v0.29 forward look. Items here are candidates, not commitments -- order and scope move as production telemetry and operator feedback arrive. Entries already shipped live in [CHANGELOG.md](../../CHANGELOG.md); see also [docs/design/sub-file-claims.md](./sub-file-claims.md) for the v0.14-v0.26 arc design.
 
@@ -41,10 +41,13 @@ Shipped in v0.29.4 (schema migration v15 on ``engineer_tokens``):
 - **Token activity tracking**: per-token ``request_count`` + last source IP/UA, bumped best-effort on auth. Surfaced in ``coord tokens list`` with a derived status word per row; dashboard panel lands with the v0.29.x dashboard token UI.
 - **Auth consolidation**: the triplicated per-engineer/shared/require-flag pipeline now lives in one ``_authenticate_bearer`` helper; per-engineer-only deployments (no shared token at all) are legal and report ``auth_mode: per_engineer``.
 
+### v0.29.5 (shipped) -- Dashboard token management + CSRF
+
+- **In-dashboard token management**: per-engineer sessions manage their own tokens (list, revoke, create-for-self with an expiry cap at their own token's expiry); shared-token sessions act as operator over all tokens. One-time raw-token page on create; PRG revoke.
+- **CSRF tokens**: ``coord_csrf`` double-submit cookie + hidden form field on tokens/create, tokens/revoke, and logout. Login stays CSRF-exempt for curl scripting and gets a soft Origin guard instead.
+
 ### v0.29.x candidate follow-ups (remaining)
 
-- **In-dashboard token management UI**: a logged-in engineer can view their own tokens, revoke them, and generate new ones from the dashboard. Today it is CLI-only on the server.
-- **CSRF tokens** for state-changing dashboard operations. ``SameSite=Lax`` already blocks cross-site POSTs, but a per-form CSRF token adds defense in depth against the SameSite=None opt-out future.
 - **SSO/OIDC integration**: an alternative to per-engineer tokens where dashboard auth proxies through an external identity provider (Google, GitHub, Okta) and tokens are minted automatically.
 
 ## v0.28.0 (shipped) -- Queue QoS + housekeeping
@@ -152,3 +155,4 @@ This roadmap supersedes the older "candidate" markers in the v0.14 sub-file clai
 | v0.29.2 | cookie Secure honours X-Forwarded-Proto |
 | v0.29.3 | cookie Secure also honours CF-Visitor (Traefik strips XFP) + force-secure escape hatch |
 | v0.29.4 | token expiry + rotation with grace + activity tracking + auth consolidation (schema v15) |
+| v0.29.5 | dashboard token management panel + CSRF double-submit cookie + login Origin guard |

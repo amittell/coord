@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from coordination.deps import get_service
+from coordination.tokens import derive_token_status
 
 
 def _esc(s: str | None) -> str:
@@ -755,6 +756,64 @@ tbody tr td.empty {
 .webhooks .wbcell.wbfailed { color: var(--red); }
 .webhooks .wbcell.wbpending { color: var(--amber); }
 .webhooks .wbcell.wbexhausted { color: var(--red); }
+
+/* v0.29.5 engineer tokens panel */
+.pill.tok-active { color: var(--phosphor); }
+.pill.tok-rotating { color: var(--amber); }
+.pill.tok-expired { color: var(--muted); }
+.pill.tok-grace-elapsed { color: var(--muted); }
+.pill.tok-revoked { color: var(--muted-2); text-decoration: line-through; }
+.tokenbanner {
+  margin: calc(var(--grid) * 2) calc(var(--grid) * 2) 0;
+  padding: calc(var(--grid)) calc(var(--grid) * 1.5);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+}
+.tokenbanner.err { color: var(--red); border: 1px solid var(--red); }
+.tokenbanner.ok { color: var(--phosphor); border: 1px solid var(--phosphor); }
+.tokrevoke { display: inline; margin: 0; }
+.tokrevoke button,
+.tokcreate button,
+.logoutform button {
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: lowercase;
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--hairline-bright);
+  padding: 1px 8px;
+  cursor: pointer;
+}
+.tokrevoke button:hover { color: var(--red); border-color: var(--red); }
+.tokcreate button:hover,
+.logoutform button:hover { color: var(--phosphor); border-color: var(--phosphor); }
+.tokcreate {
+  display: flex;
+  flex-wrap: wrap;
+  gap: calc(var(--grid) * 2);
+  align-items: center;
+  padding: calc(var(--grid) * 2);
+  border-top: 1px solid var(--hairline);
+  font-size: 11px;
+  color: var(--muted);
+}
+.tokcreate label {
+  display: flex;
+  gap: calc(var(--grid));
+  align-items: center;
+  letter-spacing: 0.04em;
+}
+.tokcreate input[type=text] {
+  font: inherit;
+  font-size: 11px;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--hairline-bright);
+  padding: 2px 8px;
+}
+.tokcreate .tokself { color: var(--cyan); }
+.logoutform { display: inline; margin: 0 0 0 auto; }
 """
 
 
@@ -770,7 +829,24 @@ def _pill(status: str, label: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-async def render_dashboard() -> str:
+async def render_dashboard(
+    *,
+    viewer_engineer: str | None = None,
+    is_operator: bool = False,
+    csrf_token: str | None = None,
+    token_error: str | None = None,
+    token_success: str | None = None,
+) -> str:
+    """Render the operator dashboard.
+
+    v0.29.5 viewer context: ``viewer_engineer`` (a per-engineer
+    session's identity) or ``is_operator`` (shared-token session)
+    switches on the engineer-tokens panel -- scoped to the viewer's
+    own tokens for the former, everyone's for the latter; both unset
+    (the insecure no-auth mode, or pre-v0.29.5 callers) hides it.
+    ``csrf_token`` is embedded as a hidden field in every
+    state-changing form; ``token_error`` / ``token_success`` render
+    as a banner above the panel."""
     svc = get_service()
     now = datetime.now(UTC)
 
@@ -1370,6 +1446,128 @@ async def render_dashboard() -> str:
         + webhook_body + '</div></section>'
     )
 
+    # v0.29.5: engineer tokens panel. Per-engineer viewers see (and
+    # manage) only their own tokens; operators see everyone's,
+    # revoked included. Pure server-rendered forms, no JS: each
+    # non-revoked row carries an inline revoke form and the create
+    # form sits below the table. All mutations go through
+    # /dashboard/tokens/* which re-checks auth + CSRF; the panel is
+    # presentation only.
+    csrf_attr = _esc(csrf_token)
+    tokens_html = ""
+    if is_operator or viewer_engineer:
+        if is_operator:
+            token_rows = await svc.db.list_engineer_tokens(
+                include_revoked=True
+            )
+        else:
+            token_rows = await svc.db.list_engineer_tokens(
+                engineer=viewer_engineer, include_revoked=True
+            )
+
+        banner_html = ""
+        if token_error:
+            banner_html = (
+                f'<div class="tokenbanner err">{_esc(token_error)}</div>'
+            )
+        elif token_success:
+            banner_html = (
+                f'<div class="tokenbanner ok">{_esc(token_success)}</div>'
+            )
+
+        engineer_head = "<th>engineer</th>" if is_operator else ""
+        token_colspan = 10 if is_operator else 9
+        if token_rows:
+            token_rows_html = ""
+            for t in token_rows:
+                status = derive_token_status(t, now=now)
+                tid = str(t.get("id") or "")
+                engineer_cell = (
+                    f"<td>{_esc(t.get('engineer'))}</td>" if is_operator else ""
+                )
+                if status == "revoked":
+                    action_cell = "<td class='muted'>—</td>"
+                else:
+                    action_cell = (
+                        "<td>"
+                        '<form method="POST" action="/dashboard/tokens/revoke" '
+                        'class="tokrevoke">'
+                        f'<input type="hidden" name="token_id" value="{_esc(tid)}">'
+                        f'<input type="hidden" name="csrf_token" value="{csrf_attr}">'
+                        '<button type="submit">revoke</button>'
+                        "</form></td>"
+                    )
+                token_rows_html += (
+                    "<tr>"
+                    f"<td class='muted' title='{_esc(tid)}'>"
+                    f"<code>{_esc(tid[:8])}</code></td>"
+                    f"{engineer_cell}"
+                    f"<td class='muted'>{_esc(t.get('description'))}</td>"
+                    f"<td><span class='pill tok-{_esc(status)}'>"
+                    f"{_esc(status)}</span></td>"
+                    f"<td class='muted'>{_esc(_ago(t.get('created_at'), now))}</td>"
+                    f"<td class='muted'>{_esc(_ago(t.get('last_used_at'), now) if t.get('last_used_at') else '—')}</td>"
+                    f"<td class='num-col'>{int(t.get('request_count') or 0)}</td>"
+                    f"<td class='muted'>{_esc(t.get('last_source_ip') or '—')}</td>"
+                    f"<td class='muted'>{_esc(t.get('expires_at') or 'never')}</td>"
+                    f"{action_cell}"
+                    "</tr>"
+                )
+        else:
+            token_rows_html = (
+                f"<tr><td class='empty' colspan='{token_colspan}'>"
+                "no tokens issued yet</td></tr>"
+            )
+
+        if is_operator:
+            engineer_input = (
+                '<label>engineer '
+                '<input type="text" name="engineer" placeholder="engineer id">'
+                "</label>"
+            )
+            scope_meta = f"{len(token_rows)} tokens · all engineers"
+        else:
+            engineer_input = (
+                '<label>engineer '
+                f'<span class="tokself">{_esc(viewer_engineer)}</span>'
+                '<input type="hidden" name="engineer" '
+                f'value="{_esc(viewer_engineer)}">'
+                "</label>"
+            )
+            scope_meta = f"{len(token_rows)} tokens · {_esc(viewer_engineer)}"
+
+        tokens_html = (
+            '<section class="panel">'
+            "<header><h2>engineer tokens</h2>"
+            f'<span class="meta">{scope_meta}</span></header>'
+            f"{banner_html}"
+            "<table><thead><tr>"
+            "<th>id</th>"
+            f"{engineer_head}"
+            "<th>description</th>"
+            "<th>status</th>"
+            "<th>created</th>"
+            "<th>last used</th>"
+            '<th class="num-col">reqs</th>'
+            "<th>last ip</th>"
+            "<th>expires</th>"
+            "<th>actions</th>"
+            "</tr></thead>"
+            f"<tbody>{token_rows_html}</tbody></table>"
+            '<form method="POST" action="/dashboard/tokens/create" '
+            'class="tokcreate">'
+            f"{engineer_input}"
+            '<label>description '
+            '<input type="text" name="description"></label>'
+            '<label>expires_in '
+            '<input type="text" name="expires_in" '
+            'placeholder="30d (optional)"></label>'
+            f'<input type="hidden" name="csrf_token" value="{csrf_attr}">'
+            '<button type="submit">create token</button>'
+            "</form>"
+            "</section>"
+        )
+
     auto_resolutions_html = (
         '<section class="panel">'
         '<header><h2>auto-resolutions (24h)</h2>'
@@ -1401,6 +1599,21 @@ async def render_dashboard() -> str:
 
     now_label = now.strftime("%Y-%m-%d %H:%M:%SZ")
 
+    # Logout is a POST (state-changing), so it ships as a tiny form in
+    # the statusbar with the CSRF hidden field rather than a link.
+    # Only rendered when the caller supplied a CSRF value -- direct
+    # render_dashboard() calls (tests, pre-v0.29.5 embeds) skip it.
+    if csrf_token:
+        logout_html = (
+            '<form method="POST" action="/dashboard/logout" '
+            'class="logoutform">'
+            f'<input type="hidden" name="csrf_token" value="{csrf_attr}">'
+            '<button type="submit">log out</button>'
+            "</form>"
+        )
+    else:
+        logout_html = ""
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1421,6 +1634,7 @@ async def render_dashboard() -> str:
       <span class="seg">{len(rows)} active claims</span>
       <span class="sep">│</span>
       <span class="seg">{open_conflicts} blocked</span>
+      {logout_html}
     </div>
 
     <h1 class="title">multi-agent coordination</h1>
@@ -1441,6 +1655,8 @@ async def render_dashboard() -> str:
     {stale_html}
 
     {webhooks_html}
+
+    {tokens_html}
 
     <div class="row split-7-5">
       <section class="panel">

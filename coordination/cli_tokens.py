@@ -51,40 +51,31 @@ from __future__ import annotations
 import argparse
 import asyncio
 from datetime import UTC, datetime
-import hashlib
 import json
-import secrets
 import sys
 from pathlib import Path
-from typing import Any
 
 from coordination.cli_shared import parse_duration
 from coordination.config import get_settings
 from coordination.db import Database
 
+# Generation, hashing, and status derivation moved to
+# ``coordination.tokens`` in v0.29.5 so the dashboard token panel can
+# share them without importing argparse machinery. TOKEN_PREFIX is
+# re-exported here because callers (and tests) treat cli_tokens as
+# the operator-facing namespace.
+from coordination.tokens import (
+    TOKEN_PREFIX,
+    derive_token_status,
+    generate_raw_token,
+    sha256_token,
+)
 
-# Tokens are sha256-hashed before storage; the raw form below is
-# what the operator copies into local.env. Prefix mimics the GitHub
-# PAT convention (``ghp_...``) so a leaked token in CI logs or
-# clipboards is immediately recognisable as a coord credential and
-# can be grepped for during incident response.
-TOKEN_PREFIX = "coordt_"
+__all__ = ["TOKEN_PREFIX", "add_tokens_subparser", "run_tokens"]
 
 
 def _db_path() -> Path:
     return Path(get_settings().database_path)
-
-
-def _generate_raw_token() -> str:
-    """A new token is ``coordt_`` + 64 hex chars (~256 bits of
-    entropy). ``secrets.token_hex(32)`` is the standard library's
-    safe random source; we never use ``random`` for credentials.
-    """
-    return TOKEN_PREFIX + secrets.token_hex(32)
-
-
-def _sha256_hex(token: str) -> str:
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def _iso_z(dt: datetime) -> str:
@@ -92,31 +83,6 @@ def _iso_z(dt: datetime) -> str:
     second precision, UTC, ``Z`` suffix -- the same shape the db layer
     writes, so CLI output and stored rows compare byte-for-byte."""
     return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def _elapsed(ts: str | None, now: datetime) -> bool:
-    """True when a stored ``...Z`` timestamp is at or before ``now``.
-    Empty / NULL means "no deadline", which never elapses."""
-    if not ts:
-        return False
-    return datetime.fromisoformat(ts.replace("Z", "+00:00")) <= now
-
-
-def _row_status(row: dict[str, Any], now: datetime) -> str:
-    """Derive the one-word lifecycle status for a token row. Revocation
-    dominates (a revoked token is dead no matter what else says), then
-    expiry, then the rotation grace window -- ``rotating`` while the
-    old token still authenticates, ``grace-elapsed`` once the window
-    has closed."""
-    if row.get("revoked_at"):
-        return "revoked"
-    if _elapsed(row.get("expires_at"), now):
-        return "expired"
-    if row.get("rotation_grace_until"):
-        if _elapsed(row.get("rotation_grace_until"), now):
-            return "grace-elapsed"
-        return "rotating"
-    return "active"
 
 
 async def _create(args: argparse.Namespace) -> int:
@@ -130,10 +96,10 @@ async def _create(args: argparse.Namespace) -> int:
             print(str(exc), file=sys.stderr)
             return 1
     db = Database(_db_path())
-    raw = _generate_raw_token()
+    raw = generate_raw_token()
     token_id = await db.create_engineer_token(
         args.engineer,
-        _sha256_hex(raw),
+        sha256_token(raw),
         description=args.description,
         expires_at=expires_at,
     )
@@ -179,10 +145,10 @@ async def _rotate(args: argparse.Namespace) -> int:
     now = datetime.now(UTC)
     expires_at = now + expires_delta if expires_delta else None
     db = Database(_db_path())
-    raw = _generate_raw_token()
+    raw = generate_raw_token()
     result = await db.rotate_engineer_token(
         args.token_id,
-        _sha256_hex(raw),
+        sha256_token(raw),
         grace_until=now + grace_delta,
         expires_at=expires_at,
         now=now,
@@ -267,7 +233,7 @@ async def _list(args: argparse.Namespace) -> int:
     for r in rows:
         tid = r["id"][:8]
         eng = (r["engineer"] or "")[:30]
-        status = _row_status(r, now)
+        status = derive_token_status(r, now=now)
         expires = (r.get("expires_at") or "-")[:22]
         last = (r["last_used_at"] or "-")[:22]
         reqs = int(r.get("request_count") or 0)

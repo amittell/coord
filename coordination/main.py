@@ -3,12 +3,17 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import html as html_mod
 import json
 import logging
 import os
+import secrets
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
@@ -17,10 +22,12 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from coordination import __version__
 from coordination import metrics
+from coordination.cli_shared import parse_duration
 from coordination.config import get_settings
 from coordination.dashboard import render_dashboard
 from coordination.db import acquire_instance_lock
 from coordination.deps import get_service
+from coordination.tokens import generate_raw_token, sha256_token
 from coordination.logging import ACCESS_LOGGER_NAME, configure_logging, request_id_var
 from coordination.ownership import parse_ownership_yaml
 from coordination.schemas import (
@@ -281,6 +288,10 @@ class AuthOutcome:
     auth_kind: str | None = None  # "per_engineer" | "shared" | None
     engineer: str | None = None
     token_id: str | None = None
+    # v0.29.5: the session token's own expiry (ISO ``...Z`` or None for
+    # never), populated on the per-engineer ok path. The dashboard
+    # token-create endpoint uses it to cap self-service token expiry.
+    token_expires_at: str | None = None
     status_code: int = 200  # 401 or 500 when not ok
     detail: str | None = None
 
@@ -386,6 +397,7 @@ async def _authenticate_bearer(
                 auth_kind="per_engineer",
                 engineer=resolved["engineer"],
                 token_id=resolved["id"],
+                token_expires_at=resolved.get("expires_at"),
             )
         metrics.auth_failures_total.inc()
         if resolved["status"] == "expired":
@@ -490,6 +502,65 @@ def _extract_bearer(
     return None
 
 
+# v0.29.5 CSRF protection for the dashboard's state-changing forms
+# (logout, token create/revoke). Double-submit cookie pattern: the
+# server mints a random value into ``coord_csrf`` and every form
+# embeds the same value as a hidden ``csrf_token`` field; a cross-site
+# attacker can make the browser send the cookie but cannot read it to
+# forge the matching field. The cookie is deliberately session-scoped
+# (no max_age) -- it dies with the browser session, and login rotates
+# it anyway.
+CSRF_COOKIE = "coord_csrf"
+
+
+def _issue_csrf_token() -> str:
+    return secrets.token_hex(32)
+
+
+def _csrf_cookie_kwargs(request: Request) -> dict[str, Any]:
+    """Cookie attributes for ``coord_csrf``, mirroring the session
+    cookie (HttpOnly, SameSite=Lax, Secure behind TLS/proxies, path=/)
+    except for ``max_age``: the CSRF cookie is session-scoped."""
+    return {
+        "httponly": True,
+        "samesite": "lax",
+        "secure": _request_uses_https(request),
+        "path": "/",
+    }
+
+
+def _valid_csrf_shape(value: str | None) -> bool:
+    """True for exactly 64 lowercase hex chars -- the only shape
+    ``_issue_csrf_token`` ever mints. Anything else is treated as
+    absent so a corrupt or attacker-planted cookie gets re-minted."""
+    if not value or len(value) != 64:
+        return False
+    return all(c in "0123456789abcdef" for c in value)
+
+
+def _validate_dashboard_csrf(request: Request, form_value: str | None) -> bool:
+    """Double-submit check: both the ``coord_csrf`` cookie and the
+    form's ``csrf_token`` field must be present, well-shaped, and
+    equal (constant-time compare)."""
+    cookie = request.cookies.get(CSRF_COOKIE)
+    if not _valid_csrf_shape(cookie) or not _valid_csrf_shape(form_value):
+        return False
+    return hmac.compare_digest(cookie or "", form_value or "")
+
+
+def _csrf_failure_response() -> HTMLResponse:
+    """403 page for a failed CSRF check. Cookies are deliberately left
+    untouched: a stale tab should not be able to log anyone out."""
+    return HTMLResponse(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+        "<title>coord -- CSRF validation failed</title></head><body>"
+        "<p>CSRF validation failed. Reload the dashboard and retry.</p>"
+        "<p><a href=\"/dashboard\">back to dashboard</a></p>"
+        "</body></html>",
+        status_code=403,
+    )
+
+
 @app.get("/health", response_class=PlainTextResponse)
 async def health() -> str:
     return "ok"
@@ -531,6 +602,51 @@ async def meta() -> dict[str, str | bool]:
     }
 
 
+def _csrf_for_request(request: Request) -> tuple[str, bool]:
+    """Resolve the CSRF value the rendered page's forms must embed.
+    Returns ``(value, minted)``: the existing well-shaped cookie value
+    with ``minted=False``, or a fresh token with ``minted=True`` (the
+    caller sets the cookie on its response)."""
+    cookie = request.cookies.get(CSRF_COOKIE)
+    if _valid_csrf_shape(cookie):
+        return cookie or "", False
+    return _issue_csrf_token(), True
+
+
+def _login_page_with_csrf(
+    request: Request, *, error: str | None = None
+) -> HTMLResponse:
+    """Login page response that also guarantees a CSRF cookie exists,
+    so the very first GET already arms the dashboard's forms."""
+    csrf, minted = _csrf_for_request(request)
+    response = _login_page_response(error=error, csrf_token=csrf)
+    if minted:
+        response.set_cookie(
+            CSRF_COOKIE, value=csrf, **_csrf_cookie_kwargs(request)
+        )
+    return response
+
+
+async def _render_dashboard_for(
+    outcome: AuthOutcome,
+    csrf: str,
+    *,
+    token_error: str | None = None,
+    token_success: str | None = None,
+) -> str:
+    """Map an auth outcome onto render_dashboard's viewer context.
+    Per-engineer sessions see their own token panel; shared-token
+    sessions are operators and see everyone's; the insecure no-auth
+    mode (ok with auth_kind None) gets no token panel at all."""
+    return await render_dashboard(
+        viewer_engineer=outcome.engineer,
+        is_operator=outcome.auth_kind == "shared",
+        csrf_token=csrf,
+        token_error=token_error,
+        token_success=token_success,
+    )
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(
     request: Request,
@@ -542,22 +658,33 @@ async def dashboard(
     (``_authenticate_bearer`` since v0.29.4); a failure surfaces as
     the login form, not a 401 -- and never a 500, so per-engineer-only
     deployments (no shared token) still get a usable login page.
+
+    v0.29.5: also seeds the ``coord_csrf`` cookie and threads the
+    viewer's identity into the renderer so the engineer-tokens panel
+    can scope itself (own tokens vs operator view).
     """
     token = _extract_bearer(authorization, request)
-    if not token:
-        return _login_page_response()
-
     outcome = await _authenticate_bearer(request, token)
     if outcome.ok:
-        return HTMLResponse(await render_dashboard())
+        csrf, minted = _csrf_for_request(request)
+        response = HTMLResponse(await _render_dashboard_for(outcome, csrf))
+        if minted:
+            response.set_cookie(
+                CSRF_COOKIE, value=csrf, **_csrf_cookie_kwargs(request)
+            )
+        return response
+
+    if not token:
+        return _login_page_with_csrf(request)
 
     # Stale or wrong token: render login form with an error banner so
     # the user can paste a fresh token without poking at curl. Surface
     # the pipeline's specific hint (expired vs rotated vs invalid) --
     # the cookie path is where an expired token is most likely to be
     # discovered, and the same detail already ships in API 401s.
-    return _login_page_response(
-        error=outcome.detail or "Invalid or expired token. Paste a fresh one."
+    return _login_page_with_csrf(
+        request,
+        error=outcome.detail or "Invalid or expired token. Paste a fresh one.",
     )
 
 
@@ -567,7 +694,7 @@ async def dashboard_login_form(request: Request) -> Response:
     authenticated) -- this is the bookmark target for ``log out then
     log back in as someone else``. Logging in a fresh time
     overwrites the existing cookie."""
-    return _login_page_response()
+    return _login_page_with_csrf(request)
 
 
 @app.post("/dashboard/login", response_class=HTMLResponse)
@@ -582,8 +709,25 @@ async def dashboard_login_submit(request: Request) -> Response:
     dashboard; on failure we re-render the login form with the
     outcome's detail as the error banner -- an expired or
     rotated-past-grace token shows its specific replacement hint
-    instead of a generic "invalid"."""
+    instead of a generic "invalid".
+
+    v0.29.5: deliberately exempt from the CSRF check the other
+    dashboard POSTs enforce -- operators script this endpoint with
+    curl (no cookie jar, no prior GET), and SameSite=Lax on the
+    session cookie already blocks the cross-site POST that CSRF
+    would otherwise enable. Instead there is a soft Origin guard:
+    a browser sends ``Origin`` on cross-site form posts, so a
+    present-but-mismatched Origin is rejected; an absent Origin
+    (curl) passes."""
     settings = get_settings()
+    origin = request.headers.get("origin")
+    if origin:
+        origin_host = urlsplit(origin).netloc.strip().lower()
+        request_host = request.headers.get("host", "").strip().lower()
+        if not origin_host or origin_host != request_host:
+            return _login_page_response(
+                error="Cross-site login submission rejected."
+            )
     form = await request.form()
     raw = form.get("token") or ""
     # form.get can return UploadFile when a multipart field is bound to
@@ -624,6 +768,14 @@ async def dashboard_login_submit(request: Request) -> Response:
         samesite="lax",
         secure=_request_uses_https(request),
         path="/",
+    )
+    # v0.29.5: rotate the CSRF cookie on every successful login so a
+    # form rendered for the previous session (a stale tab) can never
+    # submit into the new one.
+    response.set_cookie(
+        CSRF_COOKIE,
+        value=_issue_csrf_token(),
+        **_csrf_cookie_kwargs(request),
     )
     return response
 
@@ -684,16 +836,28 @@ def _request_uses_https(request: Request) -> bool:
 
 @app.post("/dashboard/logout", response_class=HTMLResponse)
 async def dashboard_logout(request: Request) -> Response:
-    """Clear the session cookie and bounce back to the login form.
+    """Clear the session cookies and bounce back to the login form.
 
     Always returns 303 so a browser refresh after logout doesn't
-    re-submit a POST. The cookie is cleared regardless of whether
-    one was set, so a user who lost their session can hit
+    re-submit a POST. The cookies are cleared regardless of whether
+    they were set, so a user who lost their session can hit
     /dashboard/logout to force-clean cookies before the next login.
+
+    v0.29.5: requires a valid ``csrf_token`` form field -- a
+    cross-site page must not be able to log the operator out (logout
+    CSRF is a real annoyance attack). On failure the cookies stay
+    untouched.
     """
+    form = await request.form()
+    csrf_value = form.get("csrf_token")
+    if not isinstance(csrf_value, str) or not _validate_dashboard_csrf(
+        request, csrf_value
+    ):
+        return _csrf_failure_response()
     response = Response(status_code=303)
     response.headers["Location"] = "/dashboard/login"
     response.delete_cookie(DASHBOARD_SESSION_COOKIE, path="/")
+    response.delete_cookie(CSRF_COOKIE, path="/")
     return response
 
 
@@ -811,7 +975,7 @@ _LOGIN_HTML = """\
       <label for="token">bearer token</label>
       <input id="token" type="password" name="token" required autofocus
              placeholder="coordt_..." spellcheck="false">
-      <button type="submit">log in</button>
+      {csrf_html}<button type="submit">log in</button>
     </form>
     <p class="help">
       Generate a per-engineer token on the server with
@@ -826,10 +990,17 @@ _LOGIN_HTML = """\
 """
 
 
-def _login_page_response(*, error: str | None = None) -> HTMLResponse:
+def _login_page_response(
+    *, error: str | None = None, csrf_token: str | None = None
+) -> HTMLResponse:
     """Render the login form. Status is always 200 so browsers do
     not display a default-style error page; the auth failure path
-    surfaces via the inline error banner instead."""
+    surfaces via the inline error banner instead.
+
+    ``csrf_token`` (v0.29.5) embeds the hidden ``csrf_token`` field.
+    The login POST itself does not enforce CSRF (see
+    ``dashboard_login_submit``), so the field is informational here;
+    POST-failure re-renders may omit it."""
     error_html = ""
     if error:
         # Escape '<', '>', '&' so an attacker-controlled error string
@@ -839,7 +1010,253 @@ def _login_page_response(*, error: str | None = None) -> HTMLResponse:
             error.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         )
         error_html = f'<p class="error">{safe}</p>'
-    return HTMLResponse(_LOGIN_HTML.format(error_html=error_html))
+    csrf_html = ""
+    if csrf_token:
+        csrf_html = (
+            '<input type="hidden" name="csrf_token" '
+            f'value="{html_mod.escape(csrf_token)}">\n      '
+        )
+    return HTMLResponse(
+        _LOGIN_HTML.format(error_html=error_html, csrf_html=csrf_html)
+    )
+
+
+# ---------------------------------------------------------------------------
+# v0.29.5 in-dashboard token management
+# ---------------------------------------------------------------------------
+
+
+def _form_str(form: Any, name: str) -> str:
+    """Pull a text field out of a parsed form. ``form.get`` can return
+    UploadFile when a multipart field is bound to a file input; only
+    strings are credentials/identifiers here, so anything else reads
+    as empty."""
+    value = form.get(name)
+    return value.strip() if isinstance(value, str) else ""
+
+
+async def _authenticate_token_management(
+    request: Request, authorization: str | None
+) -> AuthOutcome | Response:
+    """Shared gate for the token create/revoke endpoints. Returns the
+    AuthOutcome for an authenticated per-engineer or shared session,
+    or a ready-to-send error Response otherwise. The insecure no-auth
+    mode is deliberately locked out: with no identity and no
+    credential there is nothing to bind a minted token to and nothing
+    stopping anyone on the network from revoking everything."""
+    outcome = await _authenticate_bearer(
+        request, _extract_bearer(authorization, request)
+    )
+    if not outcome.ok:
+        raise HTTPException(
+            status_code=outcome.status_code, detail=outcome.detail
+        )
+    if outcome.auth_kind not in ("per_engineer", "shared"):
+        return HTMLResponse(
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+            "<title>coord -- forbidden</title></head><body>"
+            "<p>Token management requires an authenticated session. "
+            "The insecure no-auth mode cannot manage tokens.</p>"
+            "</body></html>",
+            status_code=403,
+        )
+    return outcome
+
+
+async def _dashboard_with_token_error(
+    request: Request, outcome: AuthOutcome, message: str
+) -> HTMLResponse:
+    """Re-render the dashboard with the token panel's error banner.
+    Only reached after the CSRF check passed, so the cookie is known
+    to be present and well-shaped -- no minting needed."""
+    csrf, _ = _csrf_for_request(request)
+    return HTMLResponse(
+        await _render_dashboard_for(outcome, csrf, token_error=message)
+    )
+
+
+def _iso_z_or_never(dt: datetime | None) -> str:
+    if dt is None:
+        return "never"
+    return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+@app.post("/dashboard/tokens/create", response_class=HTMLResponse)
+async def dashboard_tokens_create(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """Mint a per-engineer token from the dashboard's create form.
+
+    Form fields: ``engineer``, ``description``, ``expires_in``,
+    ``csrf_token``. Per-engineer sessions can only mint for
+    themselves (the submitted engineer field is ignored) and, when
+    their own session token expires, only tokens that expire no later
+    -- self-service must never escalate lifetime. Shared-token
+    (operator) sessions mint for anyone with no expiry cap.
+
+    On success the raw token is returned in a one-time HTML page with
+    ``Cache-Control: no-store``; it is never logged and cannot be
+    re-rendered -- only its sha256 hash is stored.
+    """
+    gate = await _authenticate_token_management(request, authorization)
+    if isinstance(gate, Response):
+        return gate
+    outcome = gate
+
+    form = await request.form()
+    csrf_value = form.get("csrf_token")
+    if not isinstance(csrf_value, str) or not _validate_dashboard_csrf(
+        request, csrf_value
+    ):
+        return _csrf_failure_response()
+
+    description = _form_str(form, "description") or None
+    expires_in = _form_str(form, "expires_in")
+
+    if outcome.auth_kind == "per_engineer":
+        # Self-service: the session's identity wins, always. A forged
+        # engineer field must not mint credentials for someone else.
+        engineer = outcome.engineer or ""
+    else:
+        engineer = _form_str(form, "engineer")
+        if not engineer:
+            return await _dashboard_with_token_error(
+                request, outcome, "Engineer is required to mint a token."
+            )
+
+    expires_at: datetime | None = None
+    if expires_in:
+        # Parse before touching the database so a typo'd duration
+        # never leaves a half-configured token behind.
+        try:
+            expires_at = datetime.now(UTC) + parse_duration(expires_in)
+        except ValueError as exc:
+            return await _dashboard_with_token_error(
+                request, outcome, str(exc)
+            )
+
+    # Self-service expiry policy: a per-engineer session whose own
+    # token expires can only mint tokens that expire at or before
+    # that point. Otherwise an engineer with a 7-day token could mint
+    # themselves a never-expiring one and defeat the operator's
+    # rotation policy. Operator (shared) sessions are uncapped.
+    if (
+        outcome.auth_kind == "per_engineer"
+        and outcome.token_expires_at is not None
+    ):
+        try:
+            cap = datetime.fromisoformat(
+                outcome.token_expires_at.replace("Z", "+00:00")
+            )
+        except ValueError:
+            return await _dashboard_with_token_error(
+                request,
+                outcome,
+                "Your session token's expiry could not be read; "
+                "ask an operator to mint the token.",
+            )
+        if expires_at is None:
+            return await _dashboard_with_token_error(
+                request,
+                outcome,
+                "Your session token expires "
+                f"{outcome.token_expires_at}; new tokens must set "
+                "expires_in and expire no later than that.",
+            )
+        if expires_at > cap:
+            return await _dashboard_with_token_error(
+                request,
+                outcome,
+                f"expires_in reaches past {outcome.token_expires_at}, "
+                "your own token's expiry. Self-service tokens cannot "
+                "outlive the session token; pick a shorter duration.",
+            )
+
+    raw = generate_raw_token()
+    token_id = await get_service().db.create_engineer_token(
+        engineer,
+        sha256_token(raw),
+        description=description,
+        expires_at=expires_at,
+    )
+
+    # One-time reveal page. The raw value exists only in this
+    # response body: not logged, not stored, not re-renderable.
+    # no-store keeps it out of browser/proxy caches.
+    page = (
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+        "<title>coord -- token created</title></head><body>"
+        "<h1>token created</h1>"
+        "<p><strong>This token is shown exactly once.</strong> "
+        "coord stores only its sha256 hash; if lost, revoke and "
+        "reissue.</p>"
+        f"<p><code>{html_mod.escape(raw)}</code></p>"
+        f"<p>engineer: {html_mod.escape(engineer)}<br>"
+        f"token id: {html_mod.escape(token_id)}<br>"
+        f"expires: {html_mod.escape(_iso_z_or_never(expires_at))}</p>"
+        "<p><a href=\"/dashboard\">back to dashboard</a></p>"
+        "</body></html>"
+    )
+    return HTMLResponse(
+        page,
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
+
+
+@app.post("/dashboard/tokens/revoke", response_class=HTMLResponse)
+async def dashboard_tokens_revoke(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """Revoke a token from the dashboard's inline revoke buttons.
+
+    Form fields: ``token_id``, ``csrf_token``. Per-engineer sessions
+    can only revoke their own tokens (the UPDATE is engineer-scoped
+    in the database, so the check is atomic); a foreign live token
+    answers 403 with no mutation. Operators revoke anyone's. Missing
+    or already-revoked ids are idempotent successes -- 303 back to
+    the dashboard either way (PRG)."""
+    gate = await _authenticate_token_management(request, authorization)
+    if isinstance(gate, Response):
+        return gate
+    outcome = gate
+
+    form = await request.form()
+    csrf_value = form.get("csrf_token")
+    if not isinstance(csrf_value, str) or not _validate_dashboard_csrf(
+        request, csrf_value
+    ):
+        return _csrf_failure_response()
+
+    token_id = _form_str(form, "token_id")
+    db = get_service().db
+    if outcome.auth_kind == "per_engineer":
+        revoked = await db.revoke_engineer_token(
+            token_id, engineer=outcome.engineer
+        )
+        if not revoked:
+            # Distinguish "not yours" (403, no mutation) from "gone or
+            # already revoked" (idempotent 303). The scoped UPDATE
+            # already guaranteed no foreign row was touched.
+            row = await db.get_engineer_token_by_id(token_id)
+            if row is not None and row.get("engineer") != outcome.engineer:
+                return HTMLResponse(
+                    "<!doctype html><html lang=\"en\"><head>"
+                    "<meta charset=\"utf-8\">"
+                    "<title>coord -- forbidden</title></head><body>"
+                    "<p>That token belongs to another engineer. Ask an "
+                    "operator to revoke it.</p>"
+                    "<p><a href=\"/dashboard\">back to dashboard</a></p>"
+                    "</body></html>",
+                    status_code=403,
+                )
+    else:
+        await db.revoke_engineer_token(token_id)
+
+    response = Response(status_code=303)
+    response.headers["Location"] = "/dashboard"
+    return response
 
 
 @app.post("/claims")
