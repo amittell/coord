@@ -138,6 +138,76 @@ class Settings(BaseSettings):
     # False; the auto-detection handles Cloudflare Tunnel + Traefik
     # + nginx + ALB out of the box.
     dashboard_cookie_force_secure: bool = False
+    # v0.29.6 generic OIDC SSO for the dashboard. When the four core
+    # fields below (issuer, client_id, client_secret, redirect_uri)
+    # are all set, the login page grows a "Sign in with SSO" link and
+    # the /auth/oidc/* routes come alive. The flow is the standard
+    # authorization-code + PKCE dance: coord redirects the browser to
+    # the IdP, validates the returned ID token against the IdP's JWKS,
+    # maps a claim to an engineer name, and mints a normal
+    # per-engineer token bound to the dashboard session cookie -- SSO
+    # logins reuse the existing v0.29 token machinery wholesale rather
+    # than inventing a parallel session type.
+    oidc_issuer: str = ""
+    oidc_client_id: str = ""
+    oidc_client_secret: str = ""
+    # The EXACT callback URL registered with the IdP, e.g.
+    # ``https://coord.example.com/auth/oidc/callback``. Required for
+    # the feature (no inference): behind Cloudflare/Traefik the origin
+    # cannot reliably reconstruct its public URL, and IdPs enforce an
+    # exact string match on redirect_uri -- a guessed value fails the
+    # IdP-side check with an opaque error, so we make the operator
+    # state it explicitly.
+    oidc_redirect_uri: str = ""
+    # Which ID-token claim becomes the coord engineer name. ``email``
+    # (the default) gets extra handling: lowercased, and rejected when
+    # the IdP explicitly says ``email_verified: false``.
+    oidc_engineer_claim: str = "email"
+    oidc_scopes: str = "openid email profile"
+    # Comma-separated allowlist of principals (claim values) permitted
+    # to log in. Empty means "no allowlist", which is fine for
+    # tenant-scoped IdPs (Okta, Entra, Keycloak -- only your org's
+    # users exist there) but dangerous for public issuers where anyone
+    # on the internet holds a valid account; the login route refuses
+    # to start the flow against a known public issuer until either
+    # this is set or ``oidc_allow_any_principal`` is flipped on.
+    oidc_allowed_principals: str = ""
+    oidc_allow_any_principal: bool = False
+    # Prefix applied to the mapped claim value when forming the
+    # engineer name, e.g. ``sso/`` turns dev@example.com into
+    # ``sso/dev@example.com``. Keeps SSO-minted identities visually
+    # distinct from hand-minted ones in claims and token listings.
+    oidc_engineer_prefix: str = ""
+
+    @property
+    def oidc_enabled(self) -> bool:
+        """SSO is all-or-nothing: every one of the four core fields
+        must be set before the routes activate. A partially configured
+        deployment (say, issuer without redirect_uri) keeps the
+        feature dark rather than half-working."""
+        return bool(
+            self.oidc_issuer
+            and self.oidc_client_id
+            and self.oidc_client_secret
+            and self.oidc_redirect_uri
+        )
+
+    @property
+    def oidc_allowed_principal_set(self) -> frozenset[str]:
+        """Parsed allowlist: split on commas, strip whitespace, drop
+        empties, lowercase. Lowercasing here means operators can paste
+        mixed-case emails and they still match the lowercased email
+        claim; non-email principals should be configured in the exact
+        (lowercase) form the IdP emits."""
+        return frozenset(
+            p.strip().lower()
+            for p in self.oidc_allowed_principals.split(",")
+            if p.strip()
+        )
+
+    @property
+    def oidc_scopes_list(self) -> list[str]:
+        return [s for s in self.oidc_scopes.split() if s]
 
     @property
     def auth_mode(self) -> str:

@@ -1,7 +1,7 @@
 # Coord roadmap
 
 Status: living document
-Last updated: 2026-06-12 (after v0.29.5)
+Last updated: 2026-06-12 (after v0.29.6)
 
 This is the post-v0.29 forward look. Items here are candidates, not commitments -- order and scope move as production telemetry and operator feedback arrive. Entries already shipped live in [CHANGELOG.md](../../CHANGELOG.md); see also [docs/design/sub-file-claims.md](./sub-file-claims.md) for the v0.14-v0.26 arc design.
 
@@ -46,9 +46,9 @@ Shipped in v0.29.4 (schema migration v15 on ``engineer_tokens``):
 - **In-dashboard token management**: per-engineer sessions manage their own tokens (list, revoke, create-for-self with an expiry cap at their own token's expiry); shared-token sessions act as operator over all tokens. One-time raw-token page on create; PRG revoke.
 - **CSRF tokens**: ``coord_csrf`` double-submit cookie + hidden form field on tokens/create, tokens/revoke, and logout. Login stays CSRF-exempt for curl scripting and gets a soft Origin guard instead.
 
-### v0.29.x candidate follow-ups (remaining)
+### v0.29.6 (shipped) -- OIDC SSO
 
-- **SSO/OIDC integration**: an alternative to per-engineer tokens where dashboard auth proxies through an external identity provider (Google, GitHub, Okta) and tokens are minted automatically.
+- **SSO/OIDC integration**: dashboard auth through any OIDC IdP (authorization code + PKCE, discovery, JWKS rotation). Successful logins mint short-lived per-engineer tokens so the whole v0.29.4/5 token surface applies; fail-closed allowlist policy for public issuers. Configure via ``COORD_OIDC_*`` env vars; see docs/deployment.md.
 
 ## v0.28.0 (shipped) -- Queue QoS + housekeeping
 
@@ -156,3 +156,4 @@ This roadmap supersedes the older "candidate" markers in the v0.14 sub-file clai
 | v0.29.3 | cookie Secure also honours CF-Visitor (Traefik strips XFP) + force-secure escape hatch |
 | v0.29.4 | token expiry + rotation with grace + activity tracking + auth consolidation (schema v15) |
 | v0.29.5 | dashboard token management panel + CSRF double-submit cookie + login Origin guard |
+| v0.29.6 | OIDC SSO: code+PKCE flow, SSO logins mint short-lived per-engineer tokens |

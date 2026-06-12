@@ -11,17 +11,19 @@ import secrets
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from coordination import __version__
 from coordination import metrics
+from coordination import oidc
 from coordination.cli_shared import parse_duration
 from coordination.config import get_settings
 from coordination.dashboard import render_dashboard
@@ -599,6 +601,7 @@ async def meta() -> dict[str, str | bool]:
         "version": __version__,
         "auth_mode": settings.auth_mode,
         "repo_root_configured": bool(settings.repo_root),
+        "oidc_enabled": settings.oidc_enabled,
     }
 
 
@@ -944,6 +947,26 @@ _LOGIN_HTML = """\
       cursor: pointer;
     }}
     button:hover {{ filter: brightness(1.1); }}
+    .sso-sep {{
+      margin: 1.25rem 0 0.75rem 0;
+      text-align: center;
+      color: var(--muted);
+      font-size: 0.8rem;
+      text-transform: lowercase;
+    }}
+    a.sso {{
+      display: block;
+      box-sizing: border-box;
+      width: 100%;
+      padding: 0.5rem 1rem;
+      text-align: center;
+      font-weight: 600;
+      color: var(--accent);
+      border: 1px solid var(--accent);
+      border-radius: 6px;
+      text-decoration: none;
+    }}
+    a.sso:hover {{ filter: brightness(1.1); }}
     .error {{
       margin: 0 0 1rem 0;
       padding: 0.5rem 0.75rem;
@@ -977,7 +1000,7 @@ _LOGIN_HTML = """\
              placeholder="coordt_..." spellcheck="false">
       {csrf_html}<button type="submit">log in</button>
     </form>
-    <p class="help">
+    {sso_html}<p class="help">
       Generate a per-engineer token on the server with
       <code>coord tokens create &lt;engineer&gt;</code>.
       The legacy shared <code>COORD_AUTH_TOKEN</code> still works
@@ -1016,9 +1039,294 @@ def _login_page_response(
             '<input type="hidden" name="csrf_token" '
             f'value="{html_mod.escape(csrf_token)}">\n      '
         )
+    # v0.29.6: when SSO is configured the page offers it as an
+    # alternative below the token form -- the form stays primary so
+    # headless/per-engineer-token users keep their muscle memory.
+    sso_html = ""
+    if get_settings().oidc_enabled:
+        sso_html = (
+            '<div class="sso-sep">or</div>\n    '
+            '<a class="sso" href="/auth/oidc/login">Sign in with SSO</a>\n    '
+        )
     return HTMLResponse(
-        _LOGIN_HTML.format(error_html=error_html, csrf_html=csrf_html)
+        _LOGIN_HTML.format(
+            error_html=error_html, csrf_html=csrf_html, sso_html=sso_html
+        )
     )
+
+
+# ---------------------------------------------------------------------------
+# v0.29.6 OIDC SSO login (generic authorization-code + PKCE)
+# ---------------------------------------------------------------------------
+
+
+# Transient cookie that carries the signed login state (state, nonce,
+# PKCE verifier) across the redirect to the IdP and back. Ten minutes
+# is plenty for a human to finish the IdP's login screen; the blob is
+# HMAC-signed (keyed off the client secret) so it verifies on any
+# replica and cannot be tampered with by the browser.
+OIDC_LOGIN_STATE_COOKIE = "coord_oidc"
+OIDC_LOGIN_STATE_MAX_AGE_SEC = 600
+
+
+def _oidc_http_client() -> httpx.AsyncClient:
+    """Factory for the outbound client used to talk to the IdP.
+
+    Module-level and trivially small on purpose: tests monkeypatch
+    this to return an ``AsyncClient`` backed by ``MockTransport`` so
+    the real routes exercise the full protocol against an in-process
+    fake IdP. Callers use ``async with`` so every request-handling
+    closes its connections."""
+    return httpx.AsyncClient(timeout=10.0)
+
+
+def _oidc_error_page(
+    title: str, message: str, status_code: int
+) -> HTMLResponse:
+    """Small HTML error page in the style of the other dashboard
+    error pages (CSRF failure, token-management forbidden). Both the
+    title and message are escaped, so IdP-supplied strings (the
+    ``error`` query param) can be surfaced verbatim-but-safe."""
+    safe_title = html_mod.escape(title)
+    safe_message = html_mod.escape(message)
+    return HTMLResponse(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+        f"<title>coord -- {safe_title}</title></head><body>"
+        f"<h1>{safe_title}</h1>"
+        f"<p>{safe_message}</p>"
+        "<p><a href=\"/dashboard/login\">back to login</a></p>"
+        "</body></html>",
+        status_code=status_code,
+    )
+
+
+def _oidc_error_clearing_state(
+    title: str, message: str, status_code: int
+) -> HTMLResponse:
+    """Error page that also drops the coord_oidc cookie -- used when
+    the login state itself is the problem (missing, tampered,
+    expired), so the user's retry starts from a clean slate."""
+    response = _oidc_error_page(title, message, status_code)
+    response.delete_cookie(OIDC_LOGIN_STATE_COOKIE, path="/")
+    return response
+
+
+@app.get("/auth/oidc/login")
+async def oidc_login(request: Request) -> Response:
+    """Start the OIDC authorization-code flow.
+
+    Mints fresh state/nonce/PKCE material, signs it into the
+    ``coord_oidc`` cookie, and 302s the browser to the IdP's
+    authorize endpoint. Returns the API-style JSON 404 when SSO is
+    not configured (the route effectively does not exist), the
+    public-issuer policy refusal as a 403 HTML page, and discovery
+    failures as a 502 HTML page."""
+    settings = get_settings()
+    if not settings.oidc_enabled:
+        # detail is byte-identical to FastAPI's default for a route
+        # that does not exist, so a probe cannot distinguish "coord
+        # without SSO configured" from "no such endpoint".
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    policy_error = oidc.principal_policy_error(settings)
+    if policy_error:
+        return _oidc_error_page(
+            "SSO configuration refused", policy_error, 403
+        )
+
+    state = secrets.token_urlsafe(32)
+    nonce = secrets.token_urlsafe(32)
+    verifier, challenge = oidc.make_pkce()
+
+    try:
+        async with _oidc_http_client() as client:
+            metadata = await oidc.fetch_metadata(client, settings.oidc_issuer)
+    except oidc.OIDCProtocolError as exc:
+        return _oidc_error_page("IdP discovery failed", str(exc), 502)
+
+    authorize_url = oidc.build_authorize_url(
+        metadata,
+        client_id=settings.oidc_client_id,
+        redirect_uri=settings.oidc_redirect_uri,
+        scopes=settings.oidc_scopes_list,
+        state=state,
+        nonce=nonce,
+        code_challenge=challenge,
+    )
+
+    response = Response(status_code=302)
+    response.headers["Location"] = authorize_url
+    response.set_cookie(
+        OIDC_LOGIN_STATE_COOKIE,
+        value=oidc.sign_login_state(
+            {"state": state, "nonce": nonce, "verifier": verifier},
+            secret=settings.oidc_client_secret,
+        ),
+        max_age=OIDC_LOGIN_STATE_MAX_AGE_SEC,
+        httponly=True,
+        samesite="lax",
+        secure=_request_uses_https(request),
+        path="/",
+    )
+    return response
+
+
+@app.get("/auth/oidc/callback")
+async def oidc_callback(request: Request) -> Response:
+    """Finish the OIDC flow: verify the login state, redeem the code,
+    validate the ID token, map the claim to an engineer, and mint a
+    real per-engineer token bound to the session cookie.
+
+    Every failure mode maps onto the oidc module's error taxonomy:
+    state/cookie problems are 403 (the request is not a continuation
+    of a login this server started), IdP/network problems are 502,
+    token-validation problems are 401, and claim-policy problems are
+    403. The raw session token is never logged and never appears in
+    any rendered page -- it travels only inside the Set-Cookie header.
+    """
+    settings = get_settings()
+    if not settings.oidc_enabled:
+        # Same indistinguishable-404 posture as /auth/oidc/login.
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    cookie = request.cookies.get(OIDC_LOGIN_STATE_COOKIE)
+    login_state = (
+        oidc.verify_login_state(cookie, secret=settings.oidc_client_secret)
+        if cookie
+        else None
+    )
+    if login_state is None:
+        return _oidc_error_clearing_state(
+            "SSO sign-in failed",
+            "The sign-in attempt is missing, expired, or invalid. "
+            "Start again from the login page.",
+            403,
+        )
+
+    # IdP-reported denial (user clicked cancel, consent refused, ...).
+    # The error code is attacker-influenced query input; the error
+    # page escapes it.
+    idp_error = request.query_params.get("error")
+    if idp_error:
+        return _oidc_error_clearing_state(
+            "SSO sign-in failed",
+            f"The identity provider reported: {idp_error}",
+            403,
+        )
+
+    code = request.query_params.get("code")
+    state = request.query_params.get("state")
+    if not code or not state:
+        return _oidc_error_clearing_state(
+            "SSO sign-in failed",
+            "The identity provider's response is missing the "
+            "authorization code or state.",
+            403,
+        )
+    if not hmac.compare_digest(state, login_state["state"]):
+        return _oidc_error_clearing_state(
+            "SSO sign-in failed",
+            "State mismatch: this response does not belong to the "
+            "sign-in attempt this browser started.",
+            403,
+        )
+
+    try:
+        async with _oidc_http_client() as client:
+            metadata = await oidc.fetch_metadata(
+                client, settings.oidc_issuer
+            )
+            token_payload = await oidc.exchange_code(
+                client,
+                token_endpoint=metadata["token_endpoint"],
+                client_id=settings.oidc_client_id,
+                client_secret=settings.oidc_client_secret,
+                code=code,
+                redirect_uri=settings.oidc_redirect_uri,
+                code_verifier=login_state["verifier"],
+            )
+            claims = await oidc.validate_id_token(
+                client,
+                id_token=token_payload["id_token"],
+                issuer=settings.oidc_issuer,
+                client_id=settings.oidc_client_id,
+                nonce=login_state["nonce"],
+                jwks_uri=metadata["jwks_uri"],
+            )
+    except oidc.OIDCProtocolError as exc:
+        return _oidc_error_clearing_state(
+            "SSO sign-in failed", str(exc), 502
+        )
+    except oidc.OIDCValidationError as exc:
+        return _oidc_error_clearing_state(
+            "SSO sign-in failed", str(exc), 401
+        )
+
+    try:
+        engineer = oidc.map_claim_to_engineer(
+            claims,
+            claim_name=settings.oidc_engineer_claim,
+            allowed=settings.oidc_allowed_principal_set,
+            prefix=settings.oidc_engineer_prefix,
+            allow_any=settings.oidc_allow_any_principal,
+            issuer=settings.oidc_issuer,
+        )
+    except oidc.OIDCClaimError as exc:
+        return _oidc_error_clearing_state(
+            "SSO sign-in refused", str(exc), 403
+        )
+
+    # SSO sessions mint a REAL per-engineer token whose lifetime is
+    # exactly the dashboard session lifetime, so the credential dies
+    # with the cookie instead of accumulating as an immortal row. A
+    # deployment that disabled cookie sessions (lifetime <= 0) cannot
+    # host SSO logins at all -- there would be nothing to bind the
+    # minted token to and a max_age=0 cookie would never persist --
+    # so that combination is a configuration error, not a silent
+    # fallback.
+    if settings.dashboard_session_lifetime_sec <= 0:
+        return _oidc_error_clearing_state(
+            "SSO configuration error",
+            "COORD_DASHBOARD_SESSION_LIFETIME_SEC must be positive for "
+            "OIDC SSO logins (the session cookie is the credential).",
+            500,
+        )
+    expires_at = datetime.now(UTC) + timedelta(
+        seconds=settings.dashboard_session_lifetime_sec
+    )
+    raw = generate_raw_token()
+    await get_service().db.create_engineer_token(
+        engineer,
+        sha256_token(raw),
+        description="oidc sso login",
+        expires_at=expires_at,
+    )
+
+    response = Response(status_code=303)
+    response.headers["Location"] = "/dashboard"
+    # Same cookie posture as the form login: HttpOnly, SameSite=Lax,
+    # Secure behind TLS/proxies (see dashboard_login_submit for the
+    # full rationale), lifetime matching the minted token's expiry.
+    response.set_cookie(
+        DASHBOARD_SESSION_COOKIE,
+        value=raw,
+        max_age=settings.dashboard_session_lifetime_sec,
+        httponly=True,
+        samesite="lax",
+        secure=_request_uses_https(request),
+        path="/",
+    )
+    # Rotate the CSRF cookie exactly like the form login does, so a
+    # form rendered for a previous session cannot submit into the
+    # fresh SSO session.
+    response.set_cookie(
+        CSRF_COOKIE,
+        value=_issue_csrf_token(),
+        **_csrf_cookie_kwargs(request),
+    )
+    # The login state is single-use: success consumes it.
+    response.delete_cookie(OIDC_LOGIN_STATE_COOKIE, path="/")
+    return response
 
 
 # ---------------------------------------------------------------------------

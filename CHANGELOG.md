@@ -9,6 +9,45 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.29.6] - 2026-06-12
+
+### Added
+
+- OIDC SSO for the dashboard. Configure ``COORD_OIDC_ISSUER`` /
+  ``COORD_OIDC_CLIENT_ID`` / ``COORD_OIDC_CLIENT_SECRET`` /
+  ``COORD_OIDC_REDIRECT_URI`` and the login page grows a "Sign in
+  with SSO" link. The flow is a standard authorization code +
+  PKCE exchange: discovery document and JWKS are fetched from the
+  issuer (cached, kid-rotation aware), the ID token is validated
+  (RS256/ES256 allowlist, issuer, audience, azp, expiry with 60s
+  leeway, nonce), and the identity claim
+  (``COORD_OIDC_ENGINEER_CLAIM``, default ``email``) maps to a
+  coord engineer name, optionally prefixed via
+  ``COORD_OIDC_ENGINEER_PREFIX``.
+- A successful SSO login mints a real per-engineer token
+  (description ``oidc sso login``) expiring with the dashboard
+  session lifetime, and continues through the existing cookie
+  machinery: the entire v0.29.4/v0.29.5 surface (expiry
+  enforcement, activity tracking, the dashboard token panel,
+  self-service revoke) applies to SSO sessions with no second
+  auth path. Operators see SSO logins as ordinary token rows.
+- Login state (state, nonce, PKCE verifier) travels in a
+  short-lived HMAC-signed cookie keyed on the client secret, so
+  the flow is stateless and works across replicas without sticky
+  sessions.
+
+### Security
+
+- Fail-closed principal policy: a known-public issuer
+  (accounts.google.com) with no ``COORD_OIDC_ALLOWED_PRINCIPALS``
+  allowlist refuses SSO logins unless
+  ``COORD_OIDC_ALLOW_ANY_PRINCIPAL=true`` is set explicitly --
+  "any Google account may administer my coordination server" is
+  never an accident. ``email_verified: false`` identities are
+  rejected when mapping by email; ``alg=none`` and non-allowlisted
+  algorithms are rejected before signature work; issuers must be
+  HTTPS (localhost excepted for development).
+
 ## [0.29.5] - 2026-06-12
 
 ### Added

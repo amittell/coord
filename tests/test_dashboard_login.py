@@ -564,3 +564,47 @@ async def test_login_form_does_not_leak_token_back_into_html(
     )
     assert r.status_code == 200
     assert payload not in r.text
+
+
+async def test_login_page_shows_sso_link_when_oidc_configured(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """v0.29.6: with the four COORD_OIDC_* core vars set, the login
+    page offers "Sign in with SSO" below the token form. The token
+    form stays present -- SSO is an alternative, not a replacement."""
+    db_path = tmp_path / "db.sqlite"
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "shared-test-token")
+    monkeypatch.setenv("COORD_DATABASE_PATH", str(db_path))
+    monkeypatch.setenv("COORD_DISABLE_BACKGROUND_CLEANUP", "1")
+    monkeypatch.setenv("COORD_DISABLE_INSTANCE_LOCK", "1")
+    monkeypatch.delenv("COORD_REPO_ROOT", raising=False)
+    monkeypatch.setenv("COORD_OIDC_ISSUER", "https://idp.test")
+    monkeypatch.setenv("COORD_OIDC_CLIENT_ID", "coord-dashboard")
+    monkeypatch.setenv("COORD_OIDC_CLIENT_SECRET", "secret")
+    monkeypatch.setenv(
+        "COORD_OIDC_REDIRECT_URI", "http://test/auth/oidc/callback"
+    )
+    monkeypatch.setenv("COORD_OIDC_ALLOWED_PRINCIPALS", "dev@example.com")
+
+    from coordination import deps
+
+    deps.get_service.cache_clear()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        r = await ac.get("/dashboard/login")
+        assert r.status_code == 200
+        assert 'href="/auth/oidc/login"' in r.text
+        assert "Sign in with SSO" in r.text
+        assert "<form" in r.text  # the token form is still there
+
+
+async def test_login_page_hides_sso_link_when_oidc_not_configured(
+    client: AsyncClient,
+) -> None:
+    """The default fixture sets no COORD_OIDC_* vars, so the page
+    must not advertise a route that would only answer 404."""
+    r = await client.get("/dashboard/login")
+    assert r.status_code == 200
+    assert "/auth/oidc/login" not in r.text
+    assert "Sign in with SSO" not in r.text

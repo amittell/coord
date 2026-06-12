@@ -140,6 +140,24 @@ From v0.29.5 the same lifecycle is available in the dashboard: engineers logged 
 
 Rotation refuses revoked, expired, and already-rotated tokens; a rotation can never revive a dead credential. For a lost or leaked token, use `coord tokens revoke` followed by `coord tokens create`.
 
+### SSO via OIDC (v0.29.6+)
+
+Dashboard logins can go through any OIDC identity provider instead of pasted tokens:
+
+```bash
+COORD_OIDC_ISSUER=https://your-idp.example.com
+COORD_OIDC_CLIENT_ID=coord-dashboard
+COORD_OIDC_CLIENT_SECRET=...
+# Must exactly match the redirect URI registered at the IdP:
+COORD_OIDC_REDIRECT_URI=https://coord.example.com/auth/oidc/callback
+# Who may log in (identity claim values, default claim: email):
+COORD_OIDC_ALLOWED_PRINCIPALS=alice@example.com,bob@example.com
+# Optional namespace for SSO-mapped engineer names:
+COORD_OIDC_ENGINEER_PREFIX=sso/
+```
+
+A successful SSO login mints a per-engineer token that expires with the dashboard session lifetime, so SSO sessions show up in `coord tokens list` and the dashboard token panel like any other token. Public issuers (accounts.google.com) require either an allowlist or an explicit `COORD_OIDC_ALLOW_ANY_PRINCIPAL=true` -- without one of those the SSO login refuses, because "any Google account" is never a sane default for an operator surface.
+
 ### Retiring the shared token
 
 Once every caller is on per-engineer tokens, set `COORD_REQUIRE_PER_ENGINEER_TOKEN=true` to reject the shared token cluster-wide. From v0.29.4 a deployment in this mode may omit `COORD_AUTH_TOKEN` entirely (per-engineer-only mode); `/readyz` reports `auth_mode: per_engineer`.
