@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import timedelta
 import os
 from pathlib import Path
 import re
@@ -31,6 +32,42 @@ _MANAGED_WARNING = (
 # Used to verify via `ps` that a recorded PID actually belongs to us (and not
 # to some unrelated process that reused the PID after ours exited).
 COORD_SERVE_MARKER = "coordination.cli _serve"
+
+# Operator-facing durations (token expiry, rotation grace) are a bare
+# integer plus a single unit letter. Deliberately strict: no floats, no
+# compound forms like "1h30m", no signs. An operator who needs 90
+# minutes writes 90m -- one obvious spelling per duration keeps flag
+# values grep-able and copy-paste safe.
+_DURATION_RE = re.compile(r"^(\d+)([mhdw])$")
+
+_DURATION_UNITS = {
+    "m": timedelta(minutes=1),
+    "h": timedelta(hours=1),
+    "d": timedelta(days=1),
+    "w": timedelta(weeks=1),
+}
+
+
+def parse_duration(value: str, *, allow_zero: bool = False) -> timedelta:
+    """Parse an operator duration like ``30d``, ``12h``, ``45m`` or
+    ``2w`` into a timedelta. Only ``<digits><unit>`` with a unit of
+    m/h/d/w is accepted; anything else (missing unit, negative, float,
+    empty, unknown unit) raises ValueError with a message suitable for
+    printing straight to stderr. Zero durations also raise unless
+    ``allow_zero`` is set -- ``--grace 0h`` is a meaningful "cut over
+    immediately", but ``--expires-in 0h`` would mint a dead token."""
+    match = _DURATION_RE.fullmatch(value or "")
+    if match is None:
+        raise ValueError(
+            f"Invalid duration {value!r}: expected a whole number plus "
+            "a unit of m/h/d/w (e.g. 30d, 12h, 45m, 2w)."
+        )
+    count = int(match.group(1))
+    if count == 0 and not allow_zero:
+        raise ValueError(
+            f"Invalid duration {value!r}: must be greater than zero."
+        )
+    return count * _DURATION_UNITS[match.group(2)]
 
 
 def coord_home() -> Path:

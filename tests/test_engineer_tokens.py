@@ -364,6 +364,34 @@ async def test_rotated_token_dies_after_grace(tmp_path: Path) -> None:
     assert await db.lookup_engineer_token(_sha256(new_raw)) is not None
 
 
+async def test_grace_boundary_is_inclusive(tmp_path: Path) -> None:
+    """``_ts_elapsed`` uses ``<=``: at the exact instant
+    ``rotation_grace_until == now`` the old token is already dead.
+    Pins the boundary so a future ``<=`` -> ``<`` regression (which
+    would extend validity past the advertised cutoff) fails loudly.
+    One second earlier the token must still authenticate."""
+    db = Database(tmp_path / "tok.sqlite")
+    old_raw = "coordt_" + "v" * 64
+    new_raw = "coordt_" + "w" * 64
+    old_id = await db.create_engineer_token("alex/claude/main", _sha256(old_raw))
+
+    cutoff = datetime(2026, 6, 12, 12, 0, 0, tzinfo=UTC)
+    result = await db.rotate_engineer_token(
+        old_id, _sha256(new_raw), grace_until=cutoff
+    )
+    assert result["ok"] is True
+
+    inside = await db.resolve_engineer_token(
+        _sha256(old_raw), now=cutoff - timedelta(seconds=1)
+    )
+    assert inside is not None
+    assert inside["status"] == "ok"
+
+    at_cutoff = await db.resolve_engineer_token(_sha256(old_raw), now=cutoff)
+    assert at_cutoff is not None
+    assert at_cutoff["status"] == "rotation_grace_elapsed"
+
+
 async def test_rotate_rejects_dead_or_already_rotated(tmp_path: Path) -> None:
     """A rotation must never revive a dead credential: revoked,
     expired, and already-rotated tokens all refuse to rotate with a

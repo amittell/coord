@@ -141,6 +141,17 @@ class Settings(BaseSettings):
 
     @property
     def auth_mode(self) -> str:
+        """Human-readable auth posture for ``/readyz`` and ``/meta``.
+
+        ``per_engineer`` wins over ``bearer``: once the operator flips
+        ``require_per_engineer_token`` the shared token no longer
+        authenticates, so reporting ``bearer`` would be misleading.
+        The flag alone also makes a deployment viable -- v0.29.4
+        per-engineer-only mode needs no ``auth_token`` at all, with
+        the ``engineer_tokens`` table as the only credential store.
+        """
+        if self.require_per_engineer_token:
+            return "per_engineer"
         if self.auth_token:
             return "bearer"
         if self.allow_insecure_no_auth:

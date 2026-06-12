@@ -22,6 +22,7 @@ These tests pin the behaviour real browsers depend on:
 from __future__ import annotations
 
 import hashlib
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -111,6 +112,9 @@ async def test_login_post_with_shared_token_works_by_default(
 async def test_login_post_with_bad_token_renders_error_banner(
     client: AsyncClient,
 ) -> None:
+    # v0.29.4: the form surfaces the auth pipeline's own detail
+    # ("Invalid bearer token") instead of a dashboard-only string, so
+    # the curl and browser paths report failures identically.
     r = await client.post(
         "/dashboard/login",
         data={"token": "not-a-real-token"},
@@ -118,7 +122,35 @@ async def test_login_post_with_bad_token_renders_error_banner(
     )
     assert r.status_code == 200
     assert "<form" in r.text
-    assert "Invalid token" in r.text
+    assert "Invalid bearer token" in r.text
+    assert "coord_session=" not in r.headers.get("set-cookie", "")
+
+
+async def test_login_post_with_expired_token_shows_expiry_hint(
+    client: AsyncClient,
+) -> None:
+    """v0.29.4: an expired per-engineer token pasted into the form
+    must re-render with the specific expiry hint -- the user learns
+    they need a rotation, not that they fat-fingered the paste."""
+    from coordination.deps import get_service
+
+    svc = get_service()
+    raw = "coordt_" + "7" * 64
+    await svc.db.create_engineer_token(
+        "alex/claude/main",
+        _sha256(raw),
+        expires_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    r = await client.post(
+        "/dashboard/login",
+        data={"token": raw},
+        follow_redirects=False,
+    )
+    assert r.status_code == 200
+    assert "<form" in r.text
+    assert "Per-engineer token expired" in r.text
+    assert "2026-01-01T00:00:00Z" in r.text
     assert "coord_session=" not in r.headers.get("set-cookie", "")
 
 
@@ -169,7 +201,35 @@ async def test_dashboard_with_stale_cookie_shows_error_banner(
     )
     assert r.status_code == 200
     assert "<form" in r.text
-    assert "Invalid or expired token" in r.text
+    # v0.29.4: the GET path surfaces the auth pipeline's specific
+    # detail, so an unknown/revoked token shows the invalid-bearer
+    # message rather than a generic banner.
+    assert "Invalid bearer token" in r.text
+
+
+async def test_dashboard_get_with_expired_cookie_shows_expiry_hint(
+    client: AsyncClient,
+) -> None:
+    """A coord_session cookie holding a token that has since expired
+    is the most common way a user discovers expiry (login once, come
+    back next month, refresh). The dashboard GET must show the same
+    actionable expiry hint that the API 401 and the login form show,
+    not a generic invalid-token banner."""
+    from coordination.deps import get_service
+
+    svc = get_service()
+    raw = "coordt_" + "9" * 64
+    await svc.db.create_engineer_token(
+        "alex/claude/main",
+        _sha256(raw),
+        expires_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    r = await client.get("/dashboard", cookies={"coord_session": raw})
+    assert r.status_code == 200
+    assert "<form" in r.text
+    assert "Per-engineer token expired" in r.text
+    assert "2026-01-01T00:00:00Z" in r.text
 
 
 async def test_logout_clears_cookie_and_redirects(

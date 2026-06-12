@@ -8,6 +8,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
@@ -39,10 +40,20 @@ access_logger = logging.getLogger(ACCESS_LOGGER_NAME)
 async def lifespan(app: FastAPI):
     configure_logging()
     settings = get_settings()
-    if not settings.auth_token and not settings.allow_insecure_no_auth:
+    # v0.29.4: a deployment with COORD_REQUIRE_PER_ENGINEER_TOKEN=true
+    # and no shared token is legal (per-engineer-only mode) -- the
+    # engineer_tokens table is the credential store, so the process
+    # must boot without COORD_AUTH_TOKEN. The hard refusal stays for
+    # the configuration where nothing could ever authenticate.
+    if (
+        not settings.auth_token
+        and not settings.require_per_engineer_token
+        and not settings.allow_insecure_no_auth
+    ):
         raise RuntimeError(
-            "Set COORD_AUTH_TOKEN, or explicitly allow insecure local mode with "
-            "COORD_ALLOW_INSECURE_NO_AUTH=true."
+            "Set COORD_AUTH_TOKEN, enable per-engineer-only auth with "
+            "COORD_REQUIRE_PER_ENGINEER_TOKEN=true, or explicitly allow "
+            "insecure local mode with COORD_ALLOW_INSECURE_NO_AUTH=true."
         )
 
     # Take an advisory lock on <db>.lock before opening the database.
@@ -253,64 +264,158 @@ async def _access_log_middleware(request: Request, call_next):
     return response
 
 
-async def require_auth(
-    request: Request,
-    authorization: str | None = Header(default=None),
-) -> None:
-    """v0.29: two-tier bearer auth.
+@dataclass(frozen=True)
+class AuthOutcome:
+    """Result of one pass through the bearer-auth pipeline.
 
-    Per-engineer tokens (the new, recommended path) live in the
+    v0.29.4 collapses the per-engineer -> shared -> require-flag
+    decision tree (previously triplicated across ``require_auth``,
+    ``GET /dashboard`` and ``POST /dashboard/login``) into
+    ``_authenticate_bearer``; this is its return type. ``ok`` is the
+    only field a caller must branch on -- the rest carry either the
+    authenticated identity (``auth_kind``/``engineer``/``token_id``)
+    or the HTTP shape of the failure (``status_code``/``detail``).
+    """
+
+    ok: bool
+    auth_kind: str | None = None  # "per_engineer" | "shared" | None
+    engineer: str | None = None
+    token_id: str | None = None
+    status_code: int = 200  # 401 or 500 when not ok
+    detail: str | None = None
+
+
+def _source_ip_from_request(request: Request) -> str | None:
+    """Best-effort client IP for token activity records.
+
+    Priority order mirrors what the proxy chain actually guarantees:
+    ``CF-Connecting-IP`` (Cloudflare stamps the real client address
+    at the edge and cloudflared/Traefik pass it through untouched),
+    then the first hop of ``X-Forwarded-For`` (the multi-proxy
+    convention -- later hops are the proxies themselves), then the
+    raw socket peer. Every signal here is spoofable by a direct
+    caller, so the value is operator-facing audit metadata only and
+    must never feed an auth decision."""
+    cf = request.headers.get("cf-connecting-ip", "").strip()
+    if cf:
+        return cf
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        first = forwarded.split(",")[0].strip()
+        if first:
+            return first
+    if request.client:
+        return request.client.host
+    return None
+
+
+async def _authenticate_bearer(
+    request: Request, token: str | None
+) -> AuthOutcome:
+    """Single source of truth for bearer authentication (v0.29.4).
+
+    Per-engineer tokens (the recommended path) live in the
     ``engineer_tokens`` table as sha256 hashes. The shared
     ``COORD_AUTH_TOKEN`` is still accepted by default for
     back-compat -- existing clients keep working untouched on
     upgrade -- and is fully rejected once the operator flips
     ``COORD_REQUIRE_PER_ENGINEER_TOKEN=true``.
 
-    The dashboard cookie also feeds this path: when the browser
-    has a ``coord_session`` cookie set by ``/dashboard/login``, we
-    treat its value as a bearer token, which means the same
-    per-engineer / shared-token lookup applies to browser and
-    headless clients uniformly. That keeps the security model
-    flat -- there is no separate "session token" type to audit.
+    ``resolve_engineer_token`` (rather than the valid-only
+    ``lookup_engineer_token``) tells us WHY a known token stopped
+    authenticating, so the 401 carries an actionable hint -- expired
+    vs rotated-past-grace -- instead of a bare "invalid". Token ids
+    are deliberately never echoed into 401 details.
+
+    Counts ``auth_failures_total`` on every 401 it produces; the
+    misconfiguration 500 is not an auth failure and is not counted.
     """
     settings = get_settings()
+
+    # Configuration short-circuits. Same shape as the pre-v0.29.4
+    # require_auth preamble with one deliberate widening: a deployment
+    # that sets COORD_REQUIRE_PER_ENGINEER_TOKEN=true and never
+    # configures a shared COORD_AUTH_TOKEN is now legal
+    # (per-engineer-only mode) -- per-engineer tokens authenticate
+    # below and everything else 401s with the migration hint. The 500
+    # stays reserved for the configuration where nothing could ever
+    # authenticate.
     if not settings.auth_token:
         if settings.allow_insecure_no_auth:
-            return
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Server misconfigured: set COORD_AUTH_TOKEN or "
-                "COORD_ALLOW_INSECURE_NO_AUTH=true"
-            ),
-        )
+            return AuthOutcome(ok=True)
+        if not settings.require_per_engineer_token:
+            return AuthOutcome(
+                ok=False,
+                status_code=500,
+                detail=(
+                    "Server misconfigured: set COORD_AUTH_TOKEN, enable "
+                    "per-engineer-only auth with "
+                    "COORD_REQUIRE_PER_ENGINEER_TOKEN=true, or explicitly "
+                    "allow insecure local mode with "
+                    "COORD_ALLOW_INSECURE_NO_AUTH=true"
+                ),
+            )
 
-    token = _extract_bearer(authorization, request)
     if not token:
         metrics.auth_failures_total.inc()
-        raise HTTPException(status_code=401, detail="Missing bearer token")
+        return AuthOutcome(
+            ok=False, status_code=401, detail="Missing bearer token"
+        )
 
     # Try per-engineer first: a leaked per-engineer token surfaces
     # in ``coord tokens list`` and can be revoked individually,
     # which is the whole point of having them.
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     service = get_service()
-    engineer_row = await service.db.lookup_engineer_token(token_hash)
-    if engineer_row is not None:
-        # Best-effort touch. The auth path must never 401 because
-        # the update failed (e.g. transient lock contention), so a
-        # broad except is correct here.
-        try:
-            await service.db.touch_engineer_token(token_hash)
-        except Exception:  # noqa: BLE001 - intentional swallow
-            pass
-        request.state.engineer = engineer_row["engineer"]
-        request.state.auth_kind = "per_engineer"
-        return
+    resolved = await service.db.resolve_engineer_token(token_hash)
+    if resolved is not None:
+        if resolved["status"] == "ok":
+            # Best-effort activity capture. The auth path must never
+            # 401 because the update failed (e.g. transient lock
+            # contention), so a broad except is correct here.
+            try:
+                await service.db.touch_engineer_token(
+                    token_hash,
+                    source_ip=_source_ip_from_request(request),
+                    user_agent=request.headers.get("user-agent"),
+                )
+            except Exception:  # noqa: BLE001 - intentional swallow
+                pass
+            return AuthOutcome(
+                ok=True,
+                auth_kind="per_engineer",
+                engineer=resolved["engineer"],
+                token_id=resolved["id"],
+            )
+        metrics.auth_failures_total.inc()
+        if resolved["status"] == "expired":
+            return AuthOutcome(
+                ok=False,
+                status_code=401,
+                detail=(
+                    f"Per-engineer token expired {resolved['expires_at']}. "
+                    "Ask an operator for a replacement: coord tokens "
+                    "rotate (before expiry) or coord tokens create."
+                ),
+            )
+        # Only remaining resolve status: "rotation_grace_elapsed".
+        return AuthOutcome(
+            ok=False,
+            status_code=401,
+            detail=(
+                "Per-engineer token was rotated and its grace window "
+                f"closed {resolved['rotation_grace_until']}. Switch to "
+                "the replacement token, or ask an operator to mint a "
+                "new one: coord tokens create."
+            ),
+        )
 
+    # Unknown or revoked token (indistinguishable on purpose: both
+    # mean "not a credential").
     if settings.require_per_engineer_token:
         metrics.auth_failures_total.inc()
-        raise HTTPException(
+        return AuthOutcome(
+            ok=False,
             status_code=401,
             detail=(
                 "Per-engineer token required "
@@ -321,12 +426,41 @@ async def require_auth(
         )
 
     # Legacy shared-token fallback.
-    if hmac.compare_digest(token, settings.auth_token):
-        request.state.auth_kind = "shared"
-        return
+    if settings.auth_token and hmac.compare_digest(token, settings.auth_token):
+        return AuthOutcome(ok=True, auth_kind="shared")
 
     metrics.auth_failures_total.inc()
-    raise HTTPException(status_code=401, detail="Invalid bearer token")
+    return AuthOutcome(ok=False, status_code=401, detail="Invalid bearer token")
+
+
+async def require_auth(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> None:
+    """v0.29: two-tier bearer auth, delegated to
+    ``_authenticate_bearer`` (the single pipeline shared with the
+    dashboard routes since v0.29.4).
+
+    The dashboard cookie also feeds this path: when the browser
+    has a ``coord_session`` cookie set by ``/dashboard/login``, we
+    treat its value as a bearer token, which means the same
+    per-engineer / shared-token lookup applies to browser and
+    headless clients uniformly. That keeps the security model
+    flat -- there is no separate "session token" type to audit.
+    """
+    outcome = await _authenticate_bearer(
+        request, _extract_bearer(authorization, request)
+    )
+    if not outcome.ok:
+        raise HTTPException(
+            status_code=outcome.status_code, detail=outcome.detail
+        )
+    if outcome.auth_kind == "per_engineer":
+        request.state.engineer = outcome.engineer
+        request.state.auth_kind = "per_engineer"
+        request.state.token_id = outcome.token_id
+    elif outcome.auth_kind == "shared":
+        request.state.auth_kind = "shared"
 
 
 # Cookie set by ``/dashboard/login``. HTTP-only so JS in any
@@ -404,32 +538,27 @@ async def dashboard(
 ) -> Response:
     """v0.29: gracefully render the login form for unauthenticated
     browsers instead of returning the raw JSON 401 the rest of the
-    API uses. The auth path is exactly the same require_auth uses
-    (per-engineer token, then shared, then COORD_REQUIRE flag); a
-    failure surfaces as the login form, not a 401.
+    API uses. The auth path is exactly the one require_auth uses
+    (``_authenticate_bearer`` since v0.29.4); a failure surfaces as
+    the login form, not a 401 -- and never a 500, so per-engineer-only
+    deployments (no shared token) still get a usable login page.
     """
-    settings = get_settings()
     token = _extract_bearer(authorization, request)
     if not token:
         return _login_page_response()
 
-    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
-    service = get_service()
-    if await service.db.lookup_engineer_token(token_hash) is not None:
-        # Best-effort touch; never let it gate the page render.
-        try:
-            await service.db.touch_engineer_token(token_hash)
-        except Exception:  # noqa: BLE001
-            pass
+    outcome = await _authenticate_bearer(request, token)
+    if outcome.ok:
         return HTMLResponse(await render_dashboard())
-    if not settings.require_per_engineer_token and settings.auth_token:
-        if hmac.compare_digest(token, settings.auth_token):
-            return HTMLResponse(await render_dashboard())
 
     # Stale or wrong token: render login form with an error banner so
-    # the user can paste a fresh token without poking at curl.
-    metrics.auth_failures_total.inc()
-    return _login_page_response(error="Invalid or expired token. Paste a fresh one.")
+    # the user can paste a fresh token without poking at curl. Surface
+    # the pipeline's specific hint (expired vs rotated vs invalid) --
+    # the cookie path is where an expired token is most likely to be
+    # discovered, and the same detail already ships in API 401s.
+    return _login_page_response(
+        error=outcome.detail or "Invalid or expired token. Paste a fresh one."
+    )
 
 
 @app.get("/dashboard/login", response_class=HTMLResponse)
@@ -446,12 +575,14 @@ async def dashboard_login_submit(request: Request) -> Response:
     """Validate the submitted token and set the session cookie.
 
     The form submits ``application/x-www-form-urlencoded`` with one
-    field, ``token``. Validation flows through the same per-engineer
-    -> shared -> COORD_REQUIRE pipeline as ``require_auth`` so the
+    field, ``token``. Validation flows through the same
+    ``_authenticate_bearer`` pipeline as ``require_auth`` so the
     semantics stay identical between header-bearer and cookie-bearer
     paths. On success we set ``coord_session`` and 303 to the
-    dashboard; on failure we re-render the login form with an
-    error banner."""
+    dashboard; on failure we re-render the login form with the
+    outcome's detail as the error banner -- an expired or
+    rotated-past-grace token shows its specific replacement hint
+    instead of a generic "invalid"."""
     settings = get_settings()
     form = await request.form()
     raw = form.get("token") or ""
@@ -465,21 +596,9 @@ async def dashboard_login_submit(request: Request) -> Response:
     if not token:
         return _login_page_response(error="Token is required.")
 
-    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
-    service = get_service()
-    valid = False
-    if await service.db.lookup_engineer_token(token_hash) is not None:
-        valid = True
-    elif (
-        not settings.require_per_engineer_token
-        and settings.auth_token
-        and hmac.compare_digest(token, settings.auth_token)
-    ):
-        valid = True
-
-    if not valid:
-        metrics.auth_failures_total.inc()
-        return _login_page_response(error="Invalid token.")
+    outcome = await _authenticate_bearer(request, token)
+    if not outcome.ok:
+        return _login_page_response(error=outcome.detail or "Invalid token.")
 
     response = Response(status_code=303)
     response.headers["Location"] = "/dashboard"

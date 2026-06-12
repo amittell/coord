@@ -1,7 +1,7 @@
 # Coord roadmap
 
 Status: living document
-Last updated: 2026-06-11 (after v0.29.3)
+Last updated: 2026-06-12 (after v0.29.4)
 
 This is the post-v0.29 forward look. Items here are candidates, not commitments -- order and scope move as production telemetry and operator feedback arrive. Entries already shipped live in [CHANGELOG.md](../../CHANGELOG.md); see also [docs/design/sub-file-claims.md](./sub-file-claims.md) for the v0.14-v0.26 arc design.
 
@@ -32,14 +32,18 @@ Operational follow-ups shipped alongside (not feature work):
 - ``.github/dependabot.yml`` ignore rule for ``pydantic-core`` until pydantic itself ships a release that adopts it (pydantic 2.13.4 pins ``pydantic-core==2.46.4`` exactly).
 - Windows CI flake fix: three FIFO queue ordering tests in ``test_api.py`` were timing-flaky on Windows; replaced ``asyncio.sleep(0.05)`` with the existing ``_wait_for_queue_id`` poll helper.
 
-### v0.29.x candidate follow-ups
+### v0.29.4 (shipped) -- Token expiry, rotation, activity tracking
 
-The per-engineer token surface opened up several near-term enhancements:
+Shipped in v0.29.4 (schema migration v15 on ``engineer_tokens``):
 
-- **Token expiry**: ``engineer_tokens.expires_at`` column + ``coord tokens create --expires-in 30d`` flag. Auth path 401s on expired tokens with a hint to reissue. Same pattern as GitHub PATs.
-- **Token rotation with grace period**: a way to issue ``v2`` of a token before revoking ``v1``, with both valid during the rotation window. Useful for rotating tokens in tools that cache them.
+- **Token expiry**: ``expires_at`` column + ``coord tokens create --expires-in 30d`` flag (``m``/``h``/``d``/``w`` units). Auth path 401s on expired tokens with the expiry timestamp and a reissue hint. NULL keeps legacy never-expires semantics.
+- **Token rotation with grace period**: ``coord tokens rotate <id> --grace 24h`` mints a successor (``rotated_from`` chain) and keeps the predecessor valid until ``rotation_grace_until``. Refuses revoked/expired/already-rotated predecessors; atomic insert+grace transaction.
+- **Token activity tracking**: per-token ``request_count`` + last source IP/UA, bumped best-effort on auth. Surfaced in ``coord tokens list`` with a derived status word per row; dashboard panel lands with the v0.29.x dashboard token UI.
+- **Auth consolidation**: the triplicated per-engineer/shared/require-flag pipeline now lives in one ``_authenticate_bearer`` helper; per-engineer-only deployments (no shared token at all) are legal and report ``auth_mode: per_engineer``.
+
+### v0.29.x candidate follow-ups (remaining)
+
 - **In-dashboard token management UI**: a logged-in engineer can view their own tokens, revoke them, and generate new ones from the dashboard. Today it is CLI-only on the server.
-- **Token activity log**: per-token request count + last-source-IP/UA. Surfaces in the dashboard so operators can spot "this token has not been used in a month" or "this token is being used from an unexpected location".
 - **CSRF tokens** for state-changing dashboard operations. ``SameSite=Lax`` already blocks cross-site POSTs, but a per-form CSRF token adds defense in depth against the SameSite=None opt-out future.
 - **SSO/OIDC integration**: an alternative to per-engineer tokens where dashboard auth proxies through an external identity provider (Google, GitHub, Okta) and tokens are minted automatically.
 
@@ -147,3 +151,4 @@ This roadmap supersedes the older "candidate" markers in the v0.14 sub-file clai
 | v0.29.1 | hotfix: packaging dep in requirements.txt |
 | v0.29.2 | cookie Secure honours X-Forwarded-Proto |
 | v0.29.3 | cookie Secure also honours CF-Visitor (Traefik strips XFP) + force-secure escape hatch |
+| v0.29.4 | token expiry + rotation with grace + activity tracking + auth consolidation (schema v15) |

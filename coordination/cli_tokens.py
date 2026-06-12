@@ -10,17 +10,27 @@ managing those tokens from the command line.
 
 Subcommands:
 
-* ``coord tokens create <engineer> [--description "..."]``
+* ``coord tokens create <engineer> [--description "..."]
+  [--expires-in 30d]``
   Mint a fresh ``coordt_`` + 64-hex token, hash it with sha256, and
   insert the hash into ``engineer_tokens``. The raw token is printed
   exactly once -- there is no way to recover it later. The operator
   drops it into ``.coordination/local.env`` on the engineer's
-  machine.
+  machine. ``--expires-in`` (v0.29.4) sets an expiry as a duration
+  (m/h/d/w); absent means the token never expires.
 
 * ``coord tokens list [--engineer X] [--include-revoked]``
   Print the table of issued tokens (id, engineer, created_at,
-  last_used_at, revoked_at, description). The raw token and its
-  hash are never returned -- the audit view is metadata only.
+  last_used_at, status, expiry, request activity, description).
+  The raw token and its hash are never returned -- the audit view
+  is metadata only.
+
+* ``coord tokens rotate <token-id> [--grace 24h] [--expires-in 30d]``
+  v0.29.4: mint a successor token for the same engineer and put the
+  old token into a grace window (default 24h; ``--grace 0h`` cuts it
+  off immediately). The old token keeps authenticating until the
+  window closes, so the engineer can swap credentials without a
+  hard outage. ``--expires-in`` applies to the successor only.
 
 * ``coord tokens revoke <token-id>``
   Mark a token as revoked. The row stays for audit; lookup returns
@@ -40,12 +50,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from datetime import UTC, datetime
 import hashlib
 import json
 import secrets
 import sys
 from pathlib import Path
+from typing import Any
 
+from coordination.cli_shared import parse_duration
 from coordination.config import get_settings
 from coordination.db import Database
 
@@ -74,19 +87,63 @@ def _sha256_hex(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def _iso_z(dt: datetime) -> str:
+    """Render a datetime in the project's canonical timestamp form:
+    second precision, UTC, ``Z`` suffix -- the same shape the db layer
+    writes, so CLI output and stored rows compare byte-for-byte."""
+    return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _elapsed(ts: str | None, now: datetime) -> bool:
+    """True when a stored ``...Z`` timestamp is at or before ``now``.
+    Empty / NULL means "no deadline", which never elapses."""
+    if not ts:
+        return False
+    return datetime.fromisoformat(ts.replace("Z", "+00:00")) <= now
+
+
+def _row_status(row: dict[str, Any], now: datetime) -> str:
+    """Derive the one-word lifecycle status for a token row. Revocation
+    dominates (a revoked token is dead no matter what else says), then
+    expiry, then the rotation grace window -- ``rotating`` while the
+    old token still authenticates, ``grace-elapsed`` once the window
+    has closed."""
+    if row.get("revoked_at"):
+        return "revoked"
+    if _elapsed(row.get("expires_at"), now):
+        return "expired"
+    if row.get("rotation_grace_until"):
+        if _elapsed(row.get("rotation_grace_until"), now):
+            return "grace-elapsed"
+        return "rotating"
+    return "active"
+
+
 async def _create(args: argparse.Namespace) -> int:
+    expires_at: datetime | None = None
+    if args.expires_in:
+        # Parse before touching the database so a typo'd duration
+        # never leaves a half-configured token behind.
+        try:
+            expires_at = datetime.now(UTC) + parse_duration(args.expires_in)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
     db = Database(_db_path())
     raw = _generate_raw_token()
     token_id = await db.create_engineer_token(
         args.engineer,
         _sha256_hex(raw),
         description=args.description,
+        expires_at=expires_at,
     )
+    expires_str = _iso_z(expires_at) if expires_at else None
     if args.json:
         out = {
             "id": token_id,
             "engineer": args.engineer,
             "description": args.description,
+            "expires_at": expires_str,
             "token": raw,
         }
         print(json.dumps(out, indent=2))
@@ -95,6 +152,80 @@ async def _create(args: argparse.Namespace) -> int:
         print(f"Engineer:     {args.engineer}")
         if args.description:
             print(f"Description:  {args.description}")
+        if expires_str:
+            print(f"Expires:      {expires_str}")
+        print("")
+        print(f"  {raw}")
+        print("")
+        print("Paste the line above into the engineer's")
+        print(".coordination/local.env as COORD_AUTH_TOKEN=... .")
+        print("This token will NOT be shown again -- coord stores")
+        print("only the sha256 hash. If lost, revoke and reissue.")
+    return 0
+
+
+async def _rotate(args: argparse.Namespace) -> int:
+    # Both durations are validated before any database work; --grace
+    # allows zero (immediate cutoff) but --expires-in does not (a
+    # successor that is born expired is operator error).
+    try:
+        grace_delta = parse_duration(args.grace, allow_zero=True)
+        expires_delta = (
+            parse_duration(args.expires_in) if args.expires_in else None
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    now = datetime.now(UTC)
+    expires_at = now + expires_delta if expires_delta else None
+    db = Database(_db_path())
+    raw = _generate_raw_token()
+    result = await db.rotate_engineer_token(
+        args.token_id,
+        _sha256_hex(raw),
+        grace_until=now + grace_delta,
+        expires_at=expires_at,
+        now=now,
+    )
+    if not result["ok"]:
+        # Each refusal names the next move so the operator never has
+        # to dig into the rotation rules to recover.
+        messages = {
+            "not_found": f"No token with id {args.token_id}.",
+            "revoked": (
+                f"Token {args.token_id} is revoked; "
+                "create a fresh token instead."
+            ),
+            "expired": (
+                f"Token {args.token_id} has expired; "
+                "create a fresh token instead."
+            ),
+            "already_rotated": (
+                f"Token {args.token_id} was already rotated; rotate its "
+                "successor instead (coord tokens list shows the chain "
+                "via rotated_from)."
+            ),
+        }
+        print(messages[result["error"]], file=sys.stderr)
+        return 1
+    expires_str = _iso_z(expires_at) if expires_at else None
+    if args.json:
+        out = {
+            "token": raw,
+            "token_id": result["new_token_id"],
+            "engineer": result["engineer"],
+            "rotated_from": args.token_id,
+            "grace_until": result["grace_until"],
+            "expires_at": expires_str,
+        }
+        print(json.dumps(out, indent=2))
+    else:
+        print(f"Token id:     {result['new_token_id']}")
+        print(f"Engineer:     {result['engineer']}")
+        print(f"Rotated from: {args.token_id}")
+        if expires_str:
+            print(f"Expires:      {expires_str}")
+        print(f"Old token stops working at {result['grace_until']}.")
         print("")
         print(f"  {raw}")
         print("")
@@ -122,22 +253,30 @@ async def _list(args: argparse.Namespace) -> int:
         print(f"No tokens issued{scope}.")
         return 0
 
-    # Compact table: id (truncated), engineer, last used, created,
-    # status, description.
+    # Compact table: id (truncated), engineer, lifecycle status,
+    # expiry, last-used activity, source IP, description. The status
+    # word is derived here (the db stores the raw timestamps) so the
+    # table answers "can this token authenticate right now?" without
+    # the operator doing date math.
+    now = datetime.now(UTC)
     print(
-        f"{'TOKEN ID':<10} {'ENGINEER':<30} {'CREATED':<22} "
-        f"{'LAST USED':<22} {'STATUS':<10} DESCRIPTION"
+        f"{'TOKEN ID':<10} {'ENGINEER':<30} {'STATUS':<14} "
+        f"{'EXPIRES':<22} {'LAST USED':<22} {'REQS':>6} "
+        f"{'LAST IP':<16} DESCRIPTION"
     )
     for r in rows:
         tid = r["id"][:8]
         eng = (r["engineer"] or "")[:30]
-        created = (r["created_at"] or "-")[:22]
+        status = _row_status(r, now)
+        expires = (r.get("expires_at") or "-")[:22]
         last = (r["last_used_at"] or "-")[:22]
-        status = "revoked" if r["revoked_at"] else "live"
+        reqs = int(r.get("request_count") or 0)
+        ip = (r.get("last_source_ip") or "-")[:16]
         desc = r["description"] or ""
         print(
-            f"{tid:<10} {eng:<30} {created:<22} "
-            f"{last:<22} {status:<10} {desc}"
+            f"{tid:<10} {eng:<30} {status:<14} "
+            f"{expires:<22} {last:<22} {reqs:>6} "
+            f"{ip:<16} {desc}"
         )
     return 0
 
@@ -165,10 +304,12 @@ def run_tokens(args: argparse.Namespace) -> int:
         return asyncio.run(_create(args))
     if action == "list":
         return asyncio.run(_list(args))
+    if action == "rotate":
+        return asyncio.run(_rotate(args))
     if action == "revoke":
         return asyncio.run(_revoke(args))
     print(
-        "Use 'coord tokens create / list / revoke'. See "
+        "Use 'coord tokens create / list / rotate / revoke'. See "
         "'coord tokens -h' for the full surface.",
         file=sys.stderr,
     )
@@ -215,6 +356,14 @@ def add_tokens_subparser(sub: argparse._SubParsersAction) -> None:
         help="Optional human label (e.g. 'work laptop')",
     )
     create.add_argument(
+        "--expires-in",
+        metavar="DURATION",
+        help=(
+            "Optional expiry as <number><unit> with unit m/h/d/w "
+            "(e.g. 30d, 12h). Omit for a token that never expires"
+        ),
+    )
+    create.add_argument(
         "--json",
         action="store_true",
         help="Emit JSON instead of the human-readable text block",
@@ -226,10 +375,11 @@ def add_tokens_subparser(sub: argparse._SubParsersAction) -> None:
         help="List issued tokens (audit view; no raw values)",
         description=(
             "Print the metadata for issued tokens: id, engineer, "
-            "created_at, last_used_at, revoked_at, description. "
-            "The raw token and its hash are never surfaced by "
-            "this command -- there is no recovery path for a "
-            "lost token, only revoke + reissue."
+            "lifecycle status (active / rotating / grace-elapsed / "
+            "expired / revoked), expiry, request activity, "
+            "description. The raw token and its hash are never "
+            "surfaced by this command -- there is no recovery path "
+            "for a lost token, only revoke + reissue."
         ),
     )
     listc.add_argument(
@@ -247,6 +397,47 @@ def add_tokens_subparser(sub: argparse._SubParsersAction) -> None:
         help="Emit JSON instead of the human-readable table",
     )
     listc.set_defaults(func=run_tokens)
+
+    rotate = nested.add_parser(
+        "rotate",
+        help="Rotate a token: mint a successor, grace-expire the old one",
+        description=(
+            "Mint a successor coordt_... token for the same engineer "
+            "and put the old token into a grace window (default 24h). "
+            "The old token keeps authenticating until the window "
+            "closes, so the engineer can swap credentials without an "
+            "outage; --grace 0h cuts it off immediately. --expires-in "
+            "sets the successor's expiry and never touches the old "
+            "token. The new raw token is printed exactly once."
+        ),
+    )
+    rotate.add_argument(
+        "token_id",
+        help="Token id from 'coord tokens list'",
+    )
+    rotate.add_argument(
+        "--grace",
+        default="24h",
+        metavar="DURATION",
+        help=(
+            "How long the old token keeps working, as <number><unit> "
+            "with unit m/h/d/w (default: 24h; 0h cuts over immediately)"
+        ),
+    )
+    rotate.add_argument(
+        "--expires-in",
+        metavar="DURATION",
+        help=(
+            "Optional expiry for the SUCCESSOR token as <number><unit> "
+            "with unit m/h/d/w. Omit for a successor that never expires"
+        ),
+    )
+    rotate.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit JSON instead of the human-readable text block",
+    )
+    rotate.set_defaults(func=run_tokens)
 
     revoke = nested.add_parser(
         "revoke",

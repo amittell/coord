@@ -13,7 +13,10 @@ Two regressions drove v0.6.1:
 
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path
+
+import pytest
 
 from coordination.cli_shared import (
     MANAGED_BEGIN,
@@ -22,6 +25,7 @@ from coordination.cli_shared import (
     MANAGED_HASH_END,
     ensure_gitignore_entry,
     ensure_managed_block,
+    parse_duration,
 )
 
 
@@ -179,3 +183,57 @@ def test_managed_block_recovers_from_hash_marker_vandalism(
     assert "old hand-edited content" not in text
     # Surrounding content preserved.
     assert "project notes below" in text
+
+
+# --- parse_duration (v0.29.4 token expiry / rotation grace) ---------------
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("45m", timedelta(minutes=45)),
+        ("12h", timedelta(hours=12)),
+        ("30d", timedelta(days=30)),
+        ("2w", timedelta(weeks=2)),
+        ("1m", timedelta(minutes=1)),
+    ],
+)
+def test_parse_duration_accepts_each_unit(
+    value: str, expected: timedelta
+) -> None:
+    assert parse_duration(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "30",  # missing unit
+        "30x",  # unknown unit
+        "-5d",  # negative
+        "1.5h",  # float
+        "",  # empty
+        "d",  # unit with no number
+        "1h30m",  # compound forms are deliberately rejected
+        " 5d",  # leading whitespace
+    ],
+)
+def test_parse_duration_rejects_malformed_values(value: str) -> None:
+    """The format is strict by design: one integer, one unit letter.
+    Every rejection carries the offending value so the message can go
+    straight to stderr."""
+    with pytest.raises(ValueError, match="Invalid duration"):
+        parse_duration(value)
+
+
+def test_parse_duration_zero_rejected_by_default() -> None:
+    """A zero expiry would mint a token that is born dead -- operator
+    error, so it raises unless the caller opts in."""
+    with pytest.raises(ValueError, match="greater than zero"):
+        parse_duration("0h")
+
+
+def test_parse_duration_zero_allowed_when_opted_in() -> None:
+    """--grace 0h means "cut the old token off immediately", which is
+    a legitimate ask during incident response."""
+    assert parse_duration("0h", allow_zero=True) == timedelta(0)
+    assert parse_duration("0d", allow_zero=True) == timedelta(0)

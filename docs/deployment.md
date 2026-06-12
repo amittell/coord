@@ -32,7 +32,7 @@ At minimum:
 
 | Variable | Purpose |
 |----------|---------|
-| `COORD_AUTH_TOKEN` | Bearer token for the HTTP API. Unset means the service refuses to start unless `COORD_ALLOW_INSECURE_NO_AUTH=true`. |
+| `COORD_AUTH_TOKEN` | Shared bearer token for the HTTP API. May be omitted when `COORD_REQUIRE_PER_ENGINEER_TOKEN=true` (per-engineer-only mode, v0.29.4+) or when `COORD_ALLOW_INSECURE_NO_AUTH=true`; otherwise requests fail with a misconfiguration error. |
 | `COORD_DATABASE_PATH` | SQLite path. Default `/data/coordination.db` in the shipped image. |
 
 All other `COORD_*` variables (scope limits, TTLs, cleanup cadence) are optional and documented in the top-level README.
@@ -113,16 +113,43 @@ The SQLite file at `COORD_DATABASE_PATH` plus its `*-wal` and `*-shm` siblings t
 
 Because claims are short-lived (TTL in hours), most teams do not need historical backups. The conflict log is the most lossy piece on restore.
 
-## Token rotation
+## Token lifecycle
 
-There is currently one shared bearer token. To rotate:
+### Per-engineer tokens (v0.29+)
+
+Day-to-day agent traffic should run on per-engineer bearer tokens rather than the shared `COORD_AUTH_TOKEN`. Mint and manage them with the `coord tokens` CLI on the server (or inside the pod):
+
+```bash
+# Mint, optionally with an expiry (v0.29.4+)
+coord tokens create alex/claude/myrepo --description "laptop" --expires-in 90d
+
+# Inspect: status, expiry, request count, last source IP
+coord tokens list
+
+# Kill switch: token stops authenticating immediately
+coord tokens revoke <token-id>
+```
+
+The raw token is printed exactly once at creation; only its sha256 lands in the database. Tokens created without `--expires-in` never expire (matching pre-v0.29.4 behavior).
+
+### Zero-downtime rotation (v0.29.4+)
+
+`coord tokens rotate <token-id> --grace 24h` mints a successor token for the same engineer and keeps the old token valid for the grace window, so every cached copy of the old token keeps working while you roll the new value out to MCP configs and worktrees. After the window closes the old token gets a specific 401 telling the caller it was rotated. Use `--grace 0h` for an immediate cutover, and `--expires-in` to give the successor an expiry.
+
+Rotation refuses revoked, expired, and already-rotated tokens; a rotation can never revive a dead credential. For a lost or leaked token, use `coord tokens revoke` followed by `coord tokens create`.
+
+### Retiring the shared token
+
+Once every caller is on per-engineer tokens, set `COORD_REQUIRE_PER_ENGINEER_TOKEN=true` to reject the shared token cluster-wide. From v0.29.4 a deployment in this mode may omit `COORD_AUTH_TOKEN` entirely (per-engineer-only mode); `/readyz` reports `auth_mode: per_engineer`.
+
+To rotate the shared token itself (legacy deployments):
 
 1. Generate a new token with a secure random generator.
 2. Redeploy the service with the new `COORD_AUTH_TOKEN`.
 3. Update every engineer's `COORD_AUTH_TOKEN` (and `.coordination/local.env` in each application repo). The editor MCP configs pick up the updated value on next launch.
 4. Discard the old token.
 
-There is no in-service "allow two tokens during rollover" feature yet. If you need zero-downtime rotation, front the service with a proxy that rewrites the `Authorization` header during the changeover window.
+The shared token has no grace-window mechanism; if you need zero-downtime rotation, migrate to per-engineer tokens and use `coord tokens rotate`.
 
 ## Observability
 

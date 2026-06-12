@@ -9,6 +9,62 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.29.4] - 2026-06-12
+
+### Added
+
+- Schema migration v15: token lifecycle columns on
+  ``engineer_tokens``. ``expires_at`` makes a token
+  self-terminating (NULL keeps legacy never-expires semantics);
+  ``rotated_from`` links a successor token to the token it
+  replaced; ``rotation_grace_until`` on the old token marks it as
+  rotated while keeping it valid until the window closes;
+  ``request_count`` / ``last_source_ip`` / ``last_user_agent``
+  give operators last-state activity per token without a
+  per-request history table.
+- ``coord tokens create --expires-in 30d``: tokens can now be
+  minted with an expiry. Durations accept ``m``/``h``/``d``/``w``
+  units. The auth path rejects expired tokens with a 401 that
+  names the expiry timestamp and points at ``coord tokens
+  rotate`` / ``coord tokens create``.
+- ``coord tokens rotate <token-id> [--grace 24h] [--expires-in
+  30d]``: zero-downtime rotation. Mints a successor token for the
+  same engineer and keeps the predecessor valid through the grace
+  window so cached copies survive the swap; after the window the
+  old token gets a 401 explaining it was rotated. Rotation
+  refuses revoked, expired, and already-rotated tokens -- a
+  rotation can never revive a dead credential. Insert-successor
+  and set-grace happen in one transaction.
+- Per-token activity tracking: every successful per-engineer auth
+  bumps ``request_count`` and records the last source IP
+  (``CF-Connecting-IP``, else first hop of ``X-Forwarded-For``,
+  else the socket peer) and user agent, best-effort and truncated.
+  ``coord tokens list`` surfaces a derived status word
+  (``active`` / ``rotating`` / ``grace-elapsed`` / ``expired`` /
+  ``revoked``) plus expiry, request count, last-used and last-IP
+  columns; ``--json`` carries the raw fields.
+- New ``Database.resolve_engineer_token`` diagnostic resolver
+  returns ``ok`` / ``expired`` / ``rotation_grace_elapsed`` so
+  the auth layer can emit actionable 401 hints.
+  ``lookup_engineer_token`` keeps its valid-only contract.
+
+### Changed
+
+- The per-engineer -> shared -> require-flag auth pipeline was
+  triplicated across ``require_auth``, ``GET /dashboard``, and
+  ``POST /dashboard/login``; it now lives in a single
+  ``_authenticate_bearer`` helper, so the expiry/rotation/activity
+  logic exists exactly once. The dashboard login form now shows
+  the specific failure hint (expired vs rotated vs invalid)
+  instead of a generic invalid-token banner.
+- Per-engineer-only deployments are now legal: with
+  ``COORD_REQUIRE_PER_ENGINEER_TOKEN=true`` the service boots and
+  serves without any ``COORD_AUTH_TOKEN`` set. ``auth_mode`` (in
+  ``/readyz`` and ``/meta``) reports ``per_engineer`` in that
+  configuration. Previously the server refused to start and
+  ``require_auth`` answered 500 until a shared token was
+  configured even when nothing was meant to use it.
+
 ## [0.29.3] - 2026-06-09
 
 ### Security
