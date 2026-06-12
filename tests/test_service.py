@@ -1139,3 +1139,114 @@ async def test_pending_requests_excludes_other_sessions_inbox(
     assert all(p["attempted_by"] != "carol" for p in b_pending), (
         f"session-b must not see conflicts against session-a; got {b_pending}"
     )
+
+
+# ---------------------------------------------------------------------------
+# v0.31: claim-time span persistence (parser path, LSP-independent)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_symbol_claim_persists_parser_spans_with_repo_root(
+    tmp_path: Path,
+) -> None:
+    """With COORD_REPO_ROOT set (and LSP off, the default), the symbol
+    rows persisted for a symbol claim carry the parser's line span:
+    1-based start/end lines, NULL columns, resolved_by='parser'. The
+    extraction is the same one the v0.17 validation pass already ran,
+    plumbed through instead of re-parsing."""
+    from coordination.schemas import ClaimItem, CreateClaimsRequest
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "auth.py").write_text(
+        "def handle_login():\n"
+        "    return 1\n"
+        "\n"
+        "\n"
+        "def handle_logout():\n"
+        "    return 2\n",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "svc.sqlite"
+    db = Database(db_path)
+    await db.init()
+    settings = Settings(
+        database_path=db_path,
+        allow_insecure_no_auth=True,
+        repo_root=repo,
+        max_claim_ratio=1.0,
+    )
+    svc = CoordinationService(db=db, settings=settings)
+
+    result = await svc.create_claims(
+        CreateClaimsRequest(
+            engineer="alice",
+            claims=[
+                ClaimItem(
+                    type="file",
+                    pattern="auth.py",
+                    symbols=["handle_login", "handle_logout"],
+                )
+            ],
+        )
+    )
+
+    assert result.claim_ids, f"claim rejected: {result.warnings!r}"
+    rows = await svc.db.get_claim_symbols(result.claim_ids[0])
+    assert len(rows) == 2
+    by_name = {r["symbol_name"]: r for r in rows}
+
+    login = by_name["handle_login"]
+    assert login["resolved_by"] == "parser"
+    assert login["start_line"] == 1
+    assert isinstance(login["end_line"], int)
+    assert login["start_col"] is None, "parser spans never carry columns"
+    assert login["end_col"] is None
+
+    logout = by_name["handle_logout"]
+    assert logout["resolved_by"] == "parser"
+    assert logout["start_line"] == 5
+    assert logout["start_col"] is None
+
+
+@pytest.mark.asyncio
+async def test_symbol_claim_without_repo_root_has_null_spans(
+    tmp_path: Path,
+) -> None:
+    """No COORD_REPO_ROOT means no extraction ran, so spans stay NULL
+    and resolved_by stays NULL -- the documented pre-v16 semantics."""
+    from coordination.schemas import ClaimItem, CreateClaimsRequest
+
+    db_path = tmp_path / "svc.sqlite"
+    db = Database(db_path)
+    await db.init()
+    settings = Settings(
+        database_path=db_path,
+        allow_insecure_no_auth=True,
+        repo_root=None,
+    )
+    svc = CoordinationService(db=db, settings=settings)
+
+    result = await svc.create_claims(
+        CreateClaimsRequest(
+            engineer="alice",
+            claims=[
+                ClaimItem(
+                    type="file",
+                    pattern="src/auth/login.ts",
+                    symbols=["handleLogin"],
+                )
+            ],
+        )
+    )
+
+    assert result.claim_ids
+    rows = await svc.db.get_claim_symbols(result.claim_ids[0])
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["start_line"] is None
+    assert row["start_col"] is None
+    assert row["end_line"] is None
+    assert row["end_col"] is None
+    assert row["resolved_by"] is None

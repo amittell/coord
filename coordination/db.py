@@ -141,7 +141,7 @@ CREATE INDEX IF NOT EXISTS idx_claims_engineer ON claims (engineer);
 """
 
 
-CURRENT_SCHEMA_VERSION = 15
+CURRENT_SCHEMA_VERSION = 16
 
 
 # v0.28 fairness pass: per-blocking-claim counter that
@@ -501,6 +501,75 @@ MIGRATIONS: list[tuple[int, str]] = [
         "CREATE INDEX idx_engineer_tokens_rotated_from "
         "ON engineer_tokens (rotated_from);",
     ),
+    # v16: LSP-aware symbol claims (v0.31). One migration carries the
+    # whole feature's schema -- wave 1 (spans) populates the new
+    # ``claim_symbols`` columns immediately; wave 2 (callsites, rename
+    # auto-follow) ships later but gets its tables now so operators
+    # upgrade their database exactly once for v0.31.
+    #
+    # ``claim_symbols`` span columns record WHERE in the file each
+    # claimed symbol lived at claim time. Convention: ``start_line`` /
+    # ``end_line`` are 1-based (operators read line numbers the way
+    # their editor shows them), ``start_col`` / ``end_col`` are 0-based
+    # exactly as LSP reports them -- we convert lines once at the LSP
+    # boundary and never touch columns, so a span can always be pasted
+    # straight back into an LSP Range. All five columns are nullable:
+    # NULL means a pre-v16 row, or no extraction ran (no COORD_REPO_ROOT),
+    # or the parser could not produce a span for that symbol.
+    # ``resolved_by`` says who produced the span: 'parser' for
+    # tree-sitter/regex extraction (lines only, columns stay NULL) or
+    # 'lsp' for a language-server documentSymbol range (full precision).
+    #
+    # ``claim_symbol_callsites`` (wave 2): one row per reference the
+    # language server found for a claimed symbol, so the conflict
+    # engine can warn when an edit lands on a line that calls into
+    # someone else's claimed scope. ``character`` is nullable because
+    # some servers report line-only locations. Wave 1 only creates it.
+    #
+    # ``claim_symbol_renames`` (wave 2): audit trail for rename
+    # auto-follow -- when the server detects a claimed symbol was
+    # renamed, the old/new names, paths, and spans land here with the
+    # resolver identity. Wave 1 only creates it.
+    (
+        16,
+        "ALTER TABLE claim_symbols ADD COLUMN start_line INTEGER;\n"
+        "ALTER TABLE claim_symbols ADD COLUMN start_col INTEGER;\n"
+        "ALTER TABLE claim_symbols ADD COLUMN end_line INTEGER;\n"
+        "ALTER TABLE claim_symbols ADD COLUMN end_col INTEGER;\n"
+        "ALTER TABLE claim_symbols ADD COLUMN resolved_by TEXT;\n"
+        "CREATE TABLE claim_symbol_callsites (\n"
+        "    id TEXT PRIMARY KEY,\n"
+        "    claim_id TEXT NOT NULL,\n"
+        "    file_path TEXT NOT NULL,\n"
+        "    line INTEGER NOT NULL,\n"
+        "    character INTEGER,\n"
+        "    symbol_path TEXT,\n"
+        "    created_at TEXT NOT NULL,\n"
+        "    FOREIGN KEY (claim_id) REFERENCES claims(id)\n"
+        ");\n"
+        "CREATE INDEX idx_claim_symbol_callsites_claim_id "
+        "ON claim_symbol_callsites (claim_id);\n"
+        "CREATE INDEX idx_claim_symbol_callsites_file_line "
+        "ON claim_symbol_callsites (file_path, line);\n"
+        "CREATE TABLE claim_symbol_renames (\n"
+        "    id TEXT PRIMARY KEY,\n"
+        "    claim_id TEXT NOT NULL,\n"
+        "    file_path TEXT NOT NULL,\n"
+        "    old_symbol_name TEXT NOT NULL,\n"
+        "    new_symbol_name TEXT NOT NULL,\n"
+        "    old_symbol_path TEXT,\n"
+        "    new_symbol_path TEXT,\n"
+        "    old_start_line INTEGER,\n"
+        "    old_end_line INTEGER,\n"
+        "    new_start_line INTEGER,\n"
+        "    new_end_line INTEGER,\n"
+        "    detected_at TEXT NOT NULL,\n"
+        "    resolved_by TEXT NOT NULL,\n"
+        "    FOREIGN KEY (claim_id) REFERENCES claims(id)\n"
+        ");\n"
+        "CREATE INDEX idx_claim_symbol_renames_claim_id "
+        "ON claim_symbol_renames (claim_id);",
+    ),
 ]
 
 
@@ -816,12 +885,21 @@ class Database:
     async def insert_claim_symbols(
         self,
         *,
-        rows: list[tuple[str, str, str, str, str, str | None]],
+        rows: list[tuple[Any, ...]],
     ) -> None:
         """Insert symbol rows for ``scope_type='symbol'`` claims.
 
         Each row is ``(id, claim_id, file_path, symbol_name, symbol_kind,
-        parent_symbol)``. ``parent_symbol`` is ``None`` for top-level
+        parent_symbol)`` optionally extended with the v16 span columns
+        ``(start_line, start_col, end_line, end_col, resolved_by)``.
+        Six-element rows are padded with NULL spans so pre-v0.31 callers
+        and tests keep working unchanged; eleven-element rows persist
+        the spans verbatim. Span convention (see the v16 migration):
+        lines are 1-based, columns 0-based, ``resolved_by`` is
+        ``'parser'`` or ``'lsp'``, and NULL spans mean nobody produced
+        a span for this symbol.
+
+        ``parent_symbol`` is ``None`` for top-level
         (v0.14 legacy semantics) and a class / receiver name for
         method-level claims (v0.16). The caller (service layer) parses
         the ``"Parent::child"`` API notation into the column pair before
@@ -838,6 +916,7 @@ class Database:
         """
         if not rows:
             return
+        padded = [tuple(r) + (None,) * (11 - len(r)) for r in rows]
         await self.init()
         async with aiosqlite.connect(self.path) as conn:
             await _configure_sqlite(conn)
@@ -845,10 +924,11 @@ class Database:
                 """
                 INSERT OR IGNORE INTO claim_symbols
                     (id, claim_id, file_path, symbol_name, symbol_kind,
-                     parent_symbol)
-                VALUES (?, ?, ?, ?, ?, ?)
+                     parent_symbol, start_line, start_col, end_line,
+                     end_col, resolved_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                rows,
+                padded,
             )
             await conn.commit()
 
@@ -858,14 +938,17 @@ class Database:
         """Return all symbol rows for a claim. Empty list for file-scope
         claims or unknown claim_id. ``parent_symbol`` is ``None`` for
         top-level rows (v0.14) and a class / receiver name for
-        method-level rows (v0.16)."""
+        method-level rows (v0.16). The v16 span columns ride along:
+        1-based lines, 0-based columns, NULL when no span was resolved
+        at claim time (pre-v16 rows, no repo root, parser miss)."""
         await self.init()
         async with aiosqlite.connect(self.path) as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(
                 """
-                SELECT file_path, symbol_name, symbol_kind, parent_symbol
+                SELECT file_path, symbol_name, symbol_kind, parent_symbol,
+                       start_line, start_col, end_line, end_col, resolved_by
                 FROM claim_symbols
                 WHERE claim_id = ?
                 ORDER BY file_path, parent_symbol, symbol_name
@@ -895,7 +978,12 @@ class Database:
         sql = (
             "SELECT c.*, cs.symbol_name AS overlapping_symbol, "
             "cs.symbol_kind AS overlapping_symbol_kind, "
-            "cs.parent_symbol AS overlapping_parent_symbol "
+            "cs.parent_symbol AS overlapping_parent_symbol, "
+            "cs.start_line AS overlapping_symbol_start_line, "
+            "cs.start_col AS overlapping_symbol_start_col, "
+            "cs.end_line AS overlapping_symbol_end_line, "
+            "cs.end_col AS overlapping_symbol_end_col, "
+            "cs.resolved_by AS overlapping_symbol_resolved_by "
             "FROM claim_symbols cs JOIN claims c ON c.id = cs.claim_id "
             "WHERE cs.file_path = ? "
             "AND c.released_at IS NULL "

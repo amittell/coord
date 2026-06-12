@@ -6,6 +6,7 @@ import time as _time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 import logging
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -13,6 +14,7 @@ from coordination import metrics
 from coordination.config import Settings, get_settings
 from coordination.db import Database
 from coordination.engine import compute_overlap, files_matching_pattern, git_ls_files
+from coordination.lsp import get_lsp_pool, language_for_path
 from coordination.overlap_symbols import (
     OverlapKind,
     check_overlap as check_symbol_overlap,
@@ -29,7 +31,7 @@ from coordination.schemas import (
     CreateClaimsRequest,
     CreateClaimsResponse,
 )
-from coordination.symbols import extract_symbols
+from coordination.symbols import Symbol, extract_symbols
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +137,59 @@ def _coexist_partner_ids_from_rows(rows: list[dict[str, Any]]) -> set[str]:
         if isinstance(ids, list):
             partners.update(str(x) for x in ids)
     return partners
+
+
+def _lsp_symbol_path_set(flattened: list[dict[str, Any]]) -> set[str]:
+    """Build the set of claimable ``Outer::Inner::leaf`` paths from a
+    flattened LSP documentSymbol result (v0.31).
+
+    Mirrors the parser-side set construction in
+    ``_validate_claim_symbols``: every full path is claimable, and so is
+    every ancestor prefix, so a claim on ``"Outer"`` is accepted even if
+    the server only emitted leaf entries.
+    """
+
+    paths: set[str] = set()
+    for entry in flattened:
+        name = str(entry.get("name") or "")
+        if not name:
+            continue
+        parent = entry.get("parent_path")
+        parent = str(parent) if parent else None
+        paths.add(format_symbol_path(parent, name))
+        while parent:
+            paths.add(parent)
+            parent = parent.rsplit("::", 1)[0] if "::" in parent else None
+    return paths
+
+
+def _lsp_span_map(
+    flattened: list[dict[str, Any]],
+) -> dict[str, tuple[int, int, int, int]]:
+    """Map full symbol path -> (start_line, start_col, end_line,
+    end_col) from a flattened documentSymbol result. Lines arrive
+    already converted to 1-based by the pool; columns are 0-based as
+    the server reported them. Entries with missing pieces are skipped
+    rather than persisted half-formed."""
+
+    spans: dict[str, tuple[int, int, int, int]] = {}
+    for entry in flattened:
+        name = str(entry.get("name") or "")
+        if not name:
+            continue
+        parent = entry.get("parent_path")
+        parent = str(parent) if parent else None
+        try:
+            span = (
+                int(entry["start_line"]),
+                int(entry["start_col"]),
+                int(entry["end_line"]),
+                int(entry["end_col"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        spans[format_symbol_path(parent, name)] = span
+    return spans
 
 
 # v0.21: FIFO queue waiters. Keyed on claim_queue.id. The release-path
@@ -303,8 +358,41 @@ class CoordinationService:
             return "Combined claim scope exceeds max fraction of repository"
         return None
 
+    async def _lsp_document_symbols(
+        self,
+        pattern: str,
+        resolved: Path,
+        cache: dict[str, list[dict[str, Any]] | None] | None,
+    ) -> list[dict[str, Any]] | None:
+        """v0.31: one ``documentSymbol`` call per claimed file per
+        request, shared between validation fallback and span upgrade
+        via the caller-owned ``cache`` (pattern -> flattened entries,
+        with None cached too so a failed call is not retried within
+        the same request). Returns ``None`` whenever LSP is disabled,
+        the language is unsupported, or the pool reports any failure --
+        callers fall back to the parser path in every one of those
+        cases."""
+
+        root = self.settings.repo_root
+        if not self.settings.lsp_enabled or not root:
+            return None
+        if cache is not None and pattern in cache:
+            return cache[pattern]
+        result: list[dict[str, Any]] | None = None
+        language = language_for_path(str(resolved))
+        if language is not None:
+            pool = get_lsp_pool(self.settings)
+            result = await pool.document_symbols(root, language, resolved)
+        if cache is not None:
+            cache[pattern] = result
+        return result
+
     async def _validate_claim_symbols(
-        self, body: CreateClaimsRequest
+        self,
+        body: CreateClaimsRequest,
+        *,
+        parser_symbols_out: dict[str, list[Symbol]] | None = None,
+        lsp_symbols_cache: dict[str, list[dict[str, Any]] | None] | None = None,
     ) -> str | None:
         """Validate that every symbol in every symbol-scope claim exists
         in the corresponding file.
@@ -335,6 +423,22 @@ class CoordinationService:
         Returns a single combined error string listing the missing
         symbols per file plus up to 20 of the file's actual symbols as
         a hint, or ``None`` when every claimed symbol checks out.
+
+        v0.31 additions, both optional so the validation contract is
+        untouched for callers that pass neither:
+
+        - ``parser_symbols_out``: filled with pattern -> extracted
+          :class:`Symbol` list for every file this method actually
+          parsed, so span persistence can reuse the extraction instead
+          of re-parsing.
+        - ``lsp_symbols_cache``: when ``COORD_LSP_ENABLED`` is on, a
+          symbol the parser cannot find gets one more chance via a
+          language-server ``documentSymbol`` lookup before rejection
+          (one call per file, cached in this dict across the request).
+          The LSP can only ever ACCEPT symbols the parser missed --
+          parser-validated symbols never consult it -- and any LSP
+          failure silently restores the exact v0.17 rejection
+          behaviour.
         """
 
         root = self.settings.repo_root
@@ -365,6 +469,8 @@ class CoordinationService:
                 )
                 continue
             symbols = extract_symbols(str(resolved), content)
+            if parser_symbols_out is not None:
+                parser_symbols_out[item.pattern] = symbols
             if not symbols:
                 # Unsupported extension or empty file: no ground truth
                 # to validate against. Skip silently so non-TS/Py/Go
@@ -384,6 +490,19 @@ class CoordinationService:
                     else:
                         parent = None
             missing = [s for s in item.symbols if s not in valid_paths]
+            if missing and self.settings.lsp_enabled:
+                # v0.31 validation fallback: the parser said no, but
+                # parsers miss dynamically-significant declarations
+                # (conditional defs, decorated factories). Ask the
+                # language server before rejecting; an LSP failure
+                # (None) leaves ``missing`` exactly as the parser saw
+                # it, which is byte-identical to the v0.17 behaviour.
+                flattened = await self._lsp_document_symbols(
+                    item.pattern, resolved, lsp_symbols_cache
+                )
+                if flattened is not None:
+                    lsp_paths = _lsp_symbol_path_set(flattened)
+                    missing = [s for s in missing if s not in lsp_paths]
             if not missing:
                 continue
             hint_symbols = sorted(valid_paths)[:20]
@@ -585,7 +704,19 @@ class CoordinationService:
         # v0.17: when COORD_REPO_ROOT is set, validate that every claimed
         # symbol exists in its file. The helper short-circuits when the
         # repo root is unset so legacy deployments keep working.
-        symbol_err = await self._validate_claim_symbols(body)
+        #
+        # v0.31: the validation pass already parses every claimed file,
+        # so we capture its extraction (and any LSP documentSymbol
+        # results the fallback fetched) and hand both to the span
+        # persistence in _finalise_v14_scope -- no file is parsed twice
+        # and no file gets more than one LSP call per request.
+        parser_symbols_by_file: dict[str, list[Symbol]] = {}
+        lsp_symbols_by_file: dict[str, list[dict[str, Any]] | None] = {}
+        symbol_err = await self._validate_claim_symbols(
+            body,
+            parser_symbols_out=parser_symbols_by_file,
+            lsp_symbols_cache=lsp_symbols_by_file,
+        )
         if symbol_err:
             return CreateClaimsResponse(
                 claim_ids=[],
@@ -769,7 +900,10 @@ class CoordinationService:
         # and the migration footprint minimal -- the create_claims handler
         # owns the symbol contract.
         await self._finalise_v14_scope(
-            created=created, item_for_cid=item_for_cid
+            created=created,
+            item_for_cid=item_for_cid,
+            parser_symbols_by_file=parser_symbols_by_file,
+            lsp_symbols_by_file=lsp_symbols_by_file,
         )
 
         # v0.14: persist any auto-resolutions queued during overlap pass.
@@ -1008,6 +1142,8 @@ class CoordinationService:
         *,
         created: list[str],
         item_for_cid: dict[str, ClaimItem],
+        parser_symbols_by_file: dict[str, list[Symbol]] | None = None,
+        lsp_symbols_by_file: dict[str, list[dict[str, Any]] | None] | None = None,
     ) -> None:
         """Apply v0.14 ``scope_type`` / ``narrowable`` / ``claim_symbols``
         to each just-inserted claim row.
@@ -1019,6 +1155,19 @@ class CoordinationService:
         opt-out claims get ``narrowable=0``. Splitting this out of
         ``insert_claims_batch`` keeps the legacy contract intact and
         makes the v0.14 surface self-contained.
+
+        v0.31 span persistence: each ``claim_symbols`` row now carries
+        the symbol's location at claim time. ``parser_symbols_by_file``
+        is the extraction the validation pass already produced (parser
+        spans: 1-based lines, NULL columns, resolved_by='parser').
+        When LSP is enabled, one documentSymbol call per claimed file
+        (reusing ``lsp_symbols_by_file`` entries the validation
+        fallback may have cached) upgrades matching symbols to exact
+        ranges with resolved_by='lsp'; unmatched symbols keep their
+        parser spans, and a pool failure silently keeps the parser
+        spans for the whole file. No repo root / no extraction means
+        the spans simply stay NULL -- overlap detection remains purely
+        lexical either way.
         """
         if not created:
             return
@@ -1026,7 +1175,39 @@ class CoordinationService:
 
         from coordination.db import _configure_sqlite
 
-        symbol_rows: list[tuple[str, str, str, str, str, str | None]] = []
+        # Resolve span sources up front, before the DB connection
+        # opens: the LSP roundtrip can take up to the request timeout
+        # and there is no reason to hold a SQLite handle across it.
+        # One entry per unique pattern; duplicate patterns in a batch
+        # share the work.
+        parser_span_by_pattern: dict[str, dict[str, tuple[int, int]]] = {}
+        lsp_span_by_pattern: dict[str, dict[str, tuple[int, int, int, int]]] = {}
+        root = self.settings.repo_root
+        for cid in created:
+            item = item_for_cid.get(cid)
+            if item is None or not item.symbols:
+                continue
+            if item.pattern not in parser_span_by_pattern:
+                spans: dict[str, tuple[int, int]] = {}
+                for sym in (parser_symbols_by_file or {}).get(item.pattern, []):
+                    spans[format_symbol_path(sym.parent, sym.name)] = (
+                        sym.start_line,
+                        sym.end_line,
+                    )
+                parser_span_by_pattern[item.pattern] = spans
+            if (
+                item.pattern not in lsp_span_by_pattern
+                and self.settings.lsp_enabled
+                and root
+            ):
+                flattened = await self._lsp_document_symbols(
+                    item.pattern, root / item.pattern, lsp_symbols_by_file
+                )
+                lsp_span_by_pattern[item.pattern] = (
+                    _lsp_span_map(flattened) if flattened is not None else {}
+                )
+
+        symbol_rows: list[tuple[Any, ...]] = []
         async with aiosqlite.connect(self.db.path) as conn:
             await _configure_sqlite(conn)
             for cid in created:
@@ -1050,6 +1231,8 @@ class CoordinationService:
                         (want_scope, narrowable, cid),
                     )
                 if item.symbols:
+                    parser_spans = parser_span_by_pattern.get(item.pattern, {})
+                    lsp_spans = lsp_span_by_pattern.get(item.pattern, {})
                     for raw in item.symbols:
                         # v0.16: split "Parent::child" notation at insert
                         # time. parent_symbol=NULL for legacy top-level
@@ -1061,6 +1244,26 @@ class CoordinationService:
                             parent, _, leaf = raw.rpartition("::")
                         else:
                             parent, leaf = None, raw
+                        # v0.31: span resolution. LSP wins when it knows
+                        # this exact path (full range, resolved_by='lsp');
+                        # otherwise the parser's line span (columns NULL,
+                        # resolved_by='parser'); otherwise all-NULL --
+                        # e.g. ancestor-only claims a leaves-only backend
+                        # validated without emitting a matching span.
+                        span: tuple[Any, ...] = (None, None, None, None, None)
+                        lsp_hit = lsp_spans.get(raw)
+                        if lsp_hit is not None:
+                            span = (*lsp_hit, "lsp")
+                        else:
+                            parser_hit = parser_spans.get(raw)
+                            if parser_hit is not None:
+                                span = (
+                                    parser_hit[0],
+                                    None,
+                                    parser_hit[1],
+                                    None,
+                                    "parser",
+                                )
                         symbol_rows.append(
                             (
                                 str(uuid4()),
@@ -1069,6 +1272,7 @@ class CoordinationService:
                                 leaf,
                                 "unknown",
                                 parent,
+                                *span,
                             )
                         )
             await conn.commit()

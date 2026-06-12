@@ -932,6 +932,61 @@ async def test_dashboard_active_claims_show_symbol_names_for_symbol_scope(
 
 
 @pytest.mark.asyncio
+async def test_dashboard_symbol_spans_render_line_ranges_and_lsp_marker(
+    svc: CoordinationService,
+) -> None:
+    """v0.31: symbol claims with persisted spans render their claim-time
+    line range inline, with a subtle ``lsp`` marker only when the span
+    came from a language server. Rows with NULL spans (pre-v16 rows, no
+    repo root) render the bare name exactly as before."""
+    import aiosqlite
+    from uuid import uuid4
+
+    cid = await _insert_claim(
+        svc, engineer="alice", pattern="src/auth/login.ts"
+    )
+    async with aiosqlite.connect(svc.db.path) as conn:
+        await conn.execute(
+            "UPDATE claims SET scope_type = 'symbol' WHERE id = ?", (cid,)
+        )
+        await conn.commit()
+    await svc.db.insert_claim_symbols(
+        rows=[
+            # Parser-resolved span: lines only, columns NULL.
+            (
+                str(uuid4()), cid, "src/auth/login.ts", "handleLogin",
+                "function", None, 3, None, 9, None, "parser",
+            ),
+            # LSP-resolved span: full precision plus the marker.
+            (
+                str(uuid4()), cid, "src/auth/login.ts", "validateCredentials",
+                "function", None, 12, 0, 20, 1, "lsp",
+            ),
+            # Legacy six-column row: NULL spans, bare-name rendering.
+            (
+                str(uuid4()), cid, "src/auth/login.ts", "legacyHelper",
+                "function", None,
+            ),
+        ]
+    )
+
+    html_out = await render_dashboard()
+    start = html_out.lower().index("active claims")
+    end = html_out.lower().index("module heatmap")
+    panel = html_out[start:end]
+
+    assert "handleLogin (lines 3-9)" in panel
+    assert "handleLogin (lines 3-9, lsp)" not in panel, (
+        "lsp marker must only attach to lsp-resolved spans"
+    )
+    assert "validateCredentials (lines 12-20, lsp)" in panel
+    assert "legacyHelper" in panel
+    assert "legacyHelper (" not in panel, (
+        "NULL spans must render the bare name exactly as pre-v0.31"
+    )
+
+
+@pytest.mark.asyncio
 async def test_dashboard_renders_auto_resolutions_panel_with_counts(
     svc: CoordinationService,
 ) -> None:

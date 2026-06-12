@@ -961,11 +961,25 @@ async def render_dashboard(
                 symbol_names: list[str] = []
                 if claim_id:
                     sym_rows = await svc.db.get_claim_symbols(str(claim_id))
-                    symbol_names = [
-                        str(s.get("symbol_name") or "")
-                        for s in sym_rows
-                        if s.get("symbol_name")
-                    ]
+                    # v0.31: append the claim-time line span when one
+                    # was resolved, plus a subtle marker when the span
+                    # came from a language server rather than the
+                    # parser. NULL spans (pre-v16 rows, no repo root)
+                    # render the bare name exactly as before.
+                    for s in sym_rows:
+                        name = str(s.get("symbol_name") or "")
+                        if not name:
+                            continue
+                        start_line = s.get("start_line")
+                        end_line = s.get("end_line")
+                        if start_line is not None and end_line is not None:
+                            marker = (
+                                ", lsp"
+                                if s.get("resolved_by") == "lsp"
+                                else ""
+                            )
+                            name += f" (lines {start_line}-{end_line}{marker})"
+                        symbol_names.append(name)
                 if symbol_names:
                     symbols_inline = ", ".join(_esc(n) for n in symbol_names)
                     scope_cell = (

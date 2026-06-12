@@ -205,6 +205,40 @@ class Settings(BaseSettings):
     # repo's queue is this deep, new wait_seconds requests get an
     # immediate 429 instead of joining a line that will not clear.
     max_queue_depth_per_repo: int = 0
+    # v0.31 LSP-aware symbol claims (wave 1). When ``lsp_enabled`` is
+    # True AND ``repo_root`` is set, claim-time span persistence
+    # upgrades parser line spans to exact LSP documentSymbol ranges,
+    # and symbol validation falls back to the language server for
+    # names the tree-sitter/regex extraction cannot see (conditional
+    # defs, decorated factories, re-exports). Default False: no
+    # subprocess is ever spawned and behaviour is byte-identical to
+    # v0.30. Every LSP failure is silent -- parser spans / the v0.17
+    # rejection path are always the fallback, never an error.
+    lsp_enabled: bool = False
+    # A pooled language-server process that has not served a request
+    # for this many seconds is reaped by ``shutdown_idle``. Servers
+    # respawn on demand, so this only trades cold-start latency
+    # against resident memory.
+    lsp_idle_shutdown_sec: int = 300
+    # Ceiling for any single JSON-RPC roundtrip (the initialize
+    # handshake included). On expiry the call fails soft and counts
+    # one circuit-breaker failure.
+    lsp_request_timeout_sec: float = 5.0
+    # Circuit breaker, per (language, repo_root) pair: after this many
+    # consecutive failures the circuit opens and every LSP call
+    # short-circuits to None for ``lsp_circuit_cooldown_sec`` seconds.
+    # A spawn failure (server binary not installed) opens the circuit
+    # immediately -- retrying an uninstalled binary three times per
+    # claim would only add latency.
+    lsp_circuit_failure_threshold: int = 3
+    lsp_circuit_cooldown_sec: int = 600
+    # Server launch command lines. Each is shlex-split and exec'd
+    # directly (never through a shell), so quoting works but shell
+    # syntax does not. Override to pin versions or to wrap servers in
+    # ``uvx`` / ``npx`` style launchers.
+    lsp_command_python: str = "pylsp"
+    lsp_command_typescript: str = "typescript-language-server --stdio"
+    lsp_command_go: str = "gopls"
 
     @property
     def oidc_enabled(self) -> bool:

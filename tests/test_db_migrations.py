@@ -704,3 +704,157 @@ async def test_v15_preserves_existing_token_rows(tmp_path: Path) -> None:
     hit = await db.lookup_engineer_token("deadbeef")
     assert hit is not None
     assert hit["status"] == "ok"
+
+
+async def test_v16_adds_span_columns_and_wave2_tables(tmp_path: Path) -> None:
+    """v16 (v0.31) extends claim_symbols with nullable span columns
+    (1-based lines, 0-based columns, NULL = no span resolved) plus a
+    resolved_by provenance column, and creates the wave-2 tables
+    claim_symbol_callsites / claim_symbol_renames so the whole v0.31
+    feature needs exactly one database upgrade."""
+    db_path = tmp_path / "v16_spans.sqlite"
+    db = Database(db_path)
+    await db.init()
+
+    rows = await _fetch_all(db_path, "PRAGMA table_info(claim_symbols)")
+    cols = {r[1] for r in rows}
+    for expected in (
+        "start_line",
+        "start_col",
+        "end_line",
+        "end_col",
+        "resolved_by",
+    ):
+        assert expected in cols, f"claim_symbols missing {expected}; saw: {cols}"
+        col_row = next(r for r in rows if r[1] == expected)
+        assert col_row[3] == 0, f"{expected} must be nullable for backfill"
+
+    assert await _table_exists(db_path, "claim_symbol_callsites")
+    rows = await _fetch_all(
+        db_path, "PRAGMA table_info(claim_symbol_callsites)"
+    )
+    cols = {r[1] for r in rows}
+    for required in (
+        "id",
+        "claim_id",
+        "file_path",
+        "line",
+        "character",
+        "symbol_path",
+        "created_at",
+    ):
+        assert required in cols, (
+            f"claim_symbol_callsites missing {required!r}; saw: {cols}"
+        )
+    # line is mandatory; character / symbol_path are nullable (some
+    # servers report line-only locations).
+    assert next(r for r in rows if r[1] == "line")[3] == 1
+    assert next(r for r in rows if r[1] == "character")[3] == 0
+    assert next(r for r in rows if r[1] == "symbol_path")[3] == 0
+
+    assert await _table_exists(db_path, "claim_symbol_renames")
+    rows = await _fetch_all(db_path, "PRAGMA table_info(claim_symbol_renames)")
+    cols = {r[1] for r in rows}
+    for required in (
+        "id",
+        "claim_id",
+        "file_path",
+        "old_symbol_name",
+        "new_symbol_name",
+        "old_symbol_path",
+        "new_symbol_path",
+        "old_start_line",
+        "old_end_line",
+        "new_start_line",
+        "new_end_line",
+        "detected_at",
+        "resolved_by",
+    ):
+        assert required in cols, (
+            f"claim_symbol_renames missing {required!r}; saw: {cols}"
+        )
+    assert next(r for r in rows if r[1] == "old_symbol_name")[3] == 1
+    assert next(r for r in rows if r[1] == "old_symbol_path")[3] == 0
+    assert next(r for r in rows if r[1] == "resolved_by")[3] == 1
+
+    # Indexes the wave-2 queries depend on.
+    idx_rows = await _fetch_all(
+        db_path,
+        "SELECT name FROM sqlite_master WHERE type='index' "
+        "AND tbl_name IN ('claim_symbol_callsites', 'claim_symbol_renames')",
+    )
+    idx_names = {r[0] for r in idx_rows}
+    for expected_idx in (
+        "idx_claim_symbol_callsites_claim_id",
+        "idx_claim_symbol_callsites_file_line",
+        "idx_claim_symbol_renames_claim_id",
+    ):
+        assert expected_idx in idx_names, (
+            f"missing index {expected_idx}; saw: {idx_names}"
+        )
+
+
+async def test_v16_preserves_existing_claim_symbols_with_null_spans(
+    tmp_path: Path,
+) -> None:
+    """A v15 database with live claim_symbols rows upgrades to v16 with
+    every row intact and NULL spans (the documented meaning: pre-v16
+    row, nobody ever resolved a span for it)."""
+    db_path = tmp_path / "v16_upgrade.sqlite"
+
+    # Build a genuine v15 database: replay the migration registry up
+    # to and including v15, stamp it, and insert a symbol row with the
+    # v15 column set only.
+    async with aiosqlite.connect(db_path) as conn:
+        for version, sql in db_module.MIGRATIONS:
+            if version > 15:
+                break
+            for stmt in db_module._split_sql_statements(sql):
+                await conn.execute(stmt)
+        await conn.execute(db_module.SCHEMA_VERSION_TABLE_SQL)
+        await conn.execute(
+            "INSERT INTO schema_version (id, version) VALUES (1, 15)"
+        )
+        await conn.execute(
+            "INSERT INTO claims (id, engineer, branch, description, "
+            "claim_type, pattern, severity, created_at, expires_at, "
+            "released_at, scope_type) VALUES ('claim-1', 'alice', NULL, "
+            "'v15-era symbol claim', 'file', 'src/auth/login.ts', 'soft', "
+            "'2026-06-01T00:00:00Z', '2099-01-01T00:00:00Z', NULL, 'symbol')"
+        )
+        await conn.execute(
+            "INSERT INTO claim_symbols (id, claim_id, file_path, "
+            "symbol_name, symbol_kind, parent_symbol) VALUES "
+            "('sym-1', 'claim-1', 'src/auth/login.ts', 'handleLogin', "
+            "'function', NULL)"
+        )
+        await conn.commit()
+
+    db = Database(db_path)
+    await db.init()
+
+    version_row = await _fetch_one(
+        db_path, "SELECT version FROM schema_version WHERE id = 1"
+    )
+    assert version_row is not None
+    assert version_row[0] == db_module.CURRENT_SCHEMA_VERSION
+
+    row = await _fetch_one(
+        db_path,
+        "SELECT symbol_name, start_line, start_col, end_line, end_col, "
+        "resolved_by FROM claim_symbols WHERE id = 'sym-1'",
+    )
+    assert row is not None
+    assert row[0] == "handleLogin"
+    assert row[1] is None
+    assert row[2] is None
+    assert row[3] is None
+    assert row[4] is None
+    assert row[5] is None
+
+    # And the upgraded row still flows through the v16 read path.
+    symbols = await db.get_claim_symbols("claim-1")
+    assert len(symbols) == 1
+    assert symbols[0]["symbol_name"] == "handleLogin"
+    assert symbols[0]["start_line"] is None
+    assert symbols[0]["resolved_by"] is None
