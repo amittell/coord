@@ -178,6 +178,33 @@ class Settings(BaseSettings):
     # ``sso/dev@example.com``. Keeps SSO-minted identities visually
     # distinct from hand-minted ones in claims and token listings.
     oidc_engineer_prefix: str = ""
+    # v0.30 per-engineer rate limiting + per-repo queue-depth quota.
+    # All three knobs default to 0 = disabled, so an upgrade changes
+    # nothing until the operator opts in. Limits key on the
+    # request-body ``engineer`` field -- the worker identity that
+    # claims are stored and counted under -- NOT the authenticated
+    # bearer token. A client that lies about its engineer name can
+    # therefore dodge its own bucket; tying limits to authenticated
+    # token identity needs a token->engineer attribution column and is
+    # deferred to a future migration (v0.30 ships with no schema
+    # change).
+    #
+    # ``max_claims_per_engineer``: cap on simultaneously ACTIVE
+    # (unreleased, non-TTL-expired) claims one engineer may hold.
+    # Enforced at insert time only -- an at-cap engineer may still
+    # queue future work with wait_seconds; the cap re-fires when the
+    # queue grant would actually insert.
+    max_claims_per_engineer: int = 0
+    # ``max_queued_per_engineer``: cap on live (waiting or
+    # in_progress) claim_queue entries one engineer may have. Stops a
+    # single agent from carpeting the queue with speculative waits.
+    max_queued_per_engineer: int = 0
+    # ``max_queue_depth_per_repo``: cap on ``state='waiting'`` queue
+    # rows per repo bucket (NULL-repo requests form their own bucket).
+    # Admission control for a degraded-service situation: when the
+    # repo's queue is this deep, new wait_seconds requests get an
+    # immediate 429 instead of joining a line that will not clear.
+    max_queue_depth_per_repo: int = 0
 
     @property
     def oidc_enabled(self) -> bool:

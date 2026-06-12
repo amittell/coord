@@ -34,6 +34,22 @@ x-coord-queue-depth: 2
 
 A value of ``0`` means the engineer has no queued waiters; the header is still emitted to make the "no backpressure" signal explicit.
 
+## Rate limiting (v0.30.0+)
+
+Three env knobs, all default ``0`` (disabled); limits key on the request-body engineer:
+
+- ``COORD_MAX_CLAIMS_PER_ENGINEER``: an engineer cannot hold more than N active claims. A ``POST /claims`` that would push past the cap returns ``429`` with a ``Retry-After`` header derived from the engineer's soonest claim expiry (clamped 5s-1h). The cap is enforced where claims are inserted, so an at-cap engineer can still queue with ``wait_seconds``; if a later queue grant would breach the cap, that queue entry expires and the drain continues to the next waiter.
+- ``COORD_MAX_QUEUED_PER_ENGINEER``: caps an engineer's live (waiting or in-progress) queue entries at enqueue time.
+- ``COORD_MAX_QUEUE_DEPTH_PER_REPO``: refuses new ``wait_seconds`` requests against a repo whose waiting queue is at capacity ("service degraded" hint).
+
+The 429 body is structured:
+
+```json
+{"detail": "...", "scope": "claims", "retry_after": 120}
+```
+
+``scope`` is one of ``claims`` / ``queue`` / ``repo_queue``. The MCP ``claim_files`` tool returns this payload as data (like 409 conflicts) instead of raising.
+
 ## `GET /health`
 
 Unauthenticated liveness probe.

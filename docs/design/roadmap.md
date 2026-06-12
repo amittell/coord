@@ -1,7 +1,7 @@
 # Coord roadmap
 
 Status: living document
-Last updated: 2026-06-12 (after v0.29.6)
+Last updated: 2026-06-12 (after v0.30.0)
 
 This is the post-v0.29 forward look. Items here are candidates, not commitments -- order and scope move as production telemetry and operator feedback arrive. Entries already shipped live in [CHANGELOG.md](../../CHANGELOG.md); see also [docs/design/sub-file-claims.md](./sub-file-claims.md) for the v0.14-v0.26 arc design.
 
@@ -93,16 +93,11 @@ Candidate items:
 
 Risk: namespace design has lots of decisions (URL shape, tenant isolation level, billing surface) that will pull engineering time. May benefit from a separate design doc (`docs/design/multi-namespace.md`) before implementation.
 
-## v0.30 -- Queue quality of service (continued)
+## v0.30.0 (shipped) -- Queue quality of service (continued)
 
-v0.21-v0.28 covered priority, age boost, cancellation, fairness, decay, and the backpressure header. v0.30 (originally planned as v0.29 before per-engineer tokens jumped the queue) picks up the remaining queue-QoS items that need either schema or behavioural changes too disruptive to fit in the v0.28 no-migration release. The v0.29 per-engineer token work actually makes this easier: rate limiting now has a reliable per-engineer identity at auth time, not just a request-body engineer field that any holder of the shared token could lie about.
+Shipped: ``COORD_MAX_CLAIMS_PER_ENGINEER`` (active-claim cap, 429 + computed ``Retry-After``), ``COORD_MAX_QUEUED_PER_ENGINEER`` (queue-entry cap at enqueue), ``COORD_MAX_QUEUE_DEPTH_PER_REPO`` (per-repo admission control with a service-degraded hint). All default 0 = disabled. At-cap engineers can still queue; a queue grant that would breach the cap expires that entry and the drain continues to the next waiter. The MCP ``claim_files`` tool surfaces 429s as structured data.
 
-Candidate items:
-
-- Per-engineer rate limiting: an engineer cannot have more than N active claims or more than M queued requests at once (`COORD_MAX_CLAIMS_PER_ENGINEER`, `COORD_MAX_QUEUED_PER_ENGINEER`). Returns 429 with a `Retry-After` header. With per-engineer tokens the limit key is the authenticated engineer (not the engineer field in the body), which closes the obvious bypass.
-- Per-repo claim quotas mirroring the v0.4 max-claim-ratio but at the queue layer: a repo whose queue is > N deep refuses new wait_seconds requests with a "service degraded" hint, surfacing pushback at the API instead of letting waiters pile up.
-
-Risk: rate-limiting interacts with the v0.5 session_id self-exclusion and the v0.10 multi-session activity ping in ways that need careful testing. Coord must not 429 an agent's own subagents.
+Design deviation from the original sketch, on purpose: limits key on the request-body engineer (the identity claims are stored under -- in production one per-engineer token fronts 20+ worktree agents with distinct body engineers, so token-keyed caps would lump them into one bucket). The authenticated-token ceiling that closes the spoof bypass needs a migration adding token attribution to claim rows; deferred until that migration carries its weight.
 
 ## v0.31 -- Language-server-aware claims
 
@@ -157,3 +152,4 @@ This roadmap supersedes the older "candidate" markers in the v0.14 sub-file clai
 | v0.29.4 | token expiry + rotation with grace + activity tracking + auth consolidation (schema v15) |
 | v0.29.5 | dashboard token management panel + CSRF double-submit cookie + login Origin guard |
 | v0.29.6 | OIDC SSO: code+PKCE flow, SSO logins mint short-lived per-engineer tokens |
+| v0.30.0 | per-engineer claim/queue caps + per-repo queue admission control (429 + Retry-After) |

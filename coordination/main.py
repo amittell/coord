@@ -32,6 +32,7 @@ from coordination.deps import get_service
 from coordination.tokens import generate_raw_token, sha256_token
 from coordination.logging import ACCESS_LOGGER_NAME, configure_logging, request_id_var
 from coordination.ownership import parse_ownership_yaml
+from coordination.service import RateLimitExceeded
 from coordination.schemas import (
     CreateClaimsRequest,
     ExtendClaimRequest,
@@ -1569,7 +1570,26 @@ async def dashboard_tokens_revoke(
 
 @app.post("/claims")
 async def create_claims(body: CreateClaimsRequest, _: None = Depends(require_auth)) -> JSONResponse:
-    result = await get_service().create_claims(body)
+    # v0.30: rate-limit raises map to 429 before (and independent of)
+    # the warnings->400 mapping below -- a quota breach is not a
+    # validation problem and must carry its own Retry-After signal.
+    # This is the only endpoint that can see RateLimitExceeded: the
+    # release paths reach create_claims only via _drain_queue_for,
+    # which swallows the exception per-waiter, and the v0.11
+    # narrowed/coexist decisions create claims in the DB layer without
+    # passing through create_claims at all.
+    try:
+        result = await get_service().create_claims(body)
+    except RateLimitExceeded as exc:
+        return JSONResponse(
+            status_code=429,
+            content={
+                "detail": exc.detail,
+                "scope": exc.scope,
+                "retry_after": exc.retry_after_sec,
+            },
+            headers={"Retry-After": str(exc.retry_after_sec)},
+        )
     payload = jsonable_encoder(result)
     if result.conflicts:
         return JSONResponse(status_code=409, content=payload)

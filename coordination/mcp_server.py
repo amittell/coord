@@ -382,6 +382,18 @@ async def claim_files(
         body["urgency"] = urgency
     async with httpx.AsyncClient(timeout=30.0) as client:
         r = await client.post(f"{_base_url()}/claims", json=body, headers={**_headers(), "Content-Type": "application/json"})
+        if r.status_code == 429:
+            # v0.30 rate limit. Like 400/409 below this is structured
+            # data the agent should reason about, not an exception:
+            # ``scope`` says which quota fired (claims / queue /
+            # repo_queue) and ``retry_after`` is the server's hint, in
+            # seconds, for when a retry might succeed.
+            payload = r.json()
+            return {
+                "error": payload.get("detail"),
+                "scope": payload.get("scope"),
+                "retry_after": payload.get("retry_after"),
+            }
         if r.status_code in (400, 409):
             return r.json()
         r.raise_for_status()

@@ -9,6 +9,43 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.30.0] - 2026-06-12
+
+### Added
+
+- Per-engineer rate limiting, all disabled by default (0):
+  ``COORD_MAX_CLAIMS_PER_ENGINEER`` caps an engineer's
+  simultaneously active claims; a request that would push past the
+  cap gets HTTP 429 with a ``Retry-After`` header computed from the
+  engineer's soonest claim expiry (clamped 5s-1h).
+  ``COORD_MAX_QUEUED_PER_ENGINEER`` caps an engineer's live
+  (waiting or in-progress) queue entries at enqueue time.
+  ``COORD_MAX_QUEUE_DEPTH_PER_REPO`` refuses new ``wait_seconds``
+  requests against a repo whose waiting queue is at capacity, with
+  a service-degraded hint -- pushback surfaces at the API instead
+  of letting waiters pile up.
+- The 429 body is structured (``detail``, ``scope``,
+  ``retry_after``) and the MCP ``claim_files`` tool surfaces it as
+  data the agent can reason about, mirroring how 409 conflicts are
+  surfaced.
+- An at-cap engineer can still QUEUE work: the active-claim cap is
+  enforced where claims are inserted, not where requests arrive,
+  so queueing for future capacity keeps working. When a queue
+  grant would blast through the cap, the drain loop expires that
+  entry (logged with the reason) and continues to the next waiter
+  -- a rate-limited waiter can never wedge the queue.
+
+### Notes
+
+- Limits key on the request-body engineer (the worker identity
+  claims are stored under). A malicious holder of a valid token
+  can spread load across invented engineer names; closing that
+  requires a future migration that records the authenticated token
+  identity on claim rows. The audit trail makes invented-name
+  abuse visible in the meantime.
+- The ``X-Coord-Queue-Depth`` backpressure header is unchanged
+  (waiting-only count). Quota checks use separate counters.
+
 ## [0.29.6] - 2026-06-12
 
 ### Added

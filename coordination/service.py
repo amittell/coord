@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time as _time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 import logging
 from typing import Any
@@ -32,6 +32,36 @@ from coordination.schemas import (
 from coordination.symbols import extract_symbols
 
 logger = logging.getLogger(__name__)
+
+
+class RateLimitExceeded(Exception):
+    """v0.30: a per-engineer or per-repo quota would be breached.
+
+    ``scope`` says which quota fired:
+
+    - ``"claims"``: the engineer's active-claim cap
+      (``COORD_MAX_CLAIMS_PER_ENGINEER``) would be exceeded by the
+      rows about to be inserted.
+    - ``"queue"``: the engineer's live queue-entry cap
+      (``COORD_MAX_QUEUED_PER_ENGINEER``) is already full.
+    - ``"repo_queue"``: the repo's waiting-queue depth cap
+      (``COORD_MAX_QUEUE_DEPTH_PER_REPO``) is already full.
+
+    ``retry_after_sec`` is the server's best guess at when retrying
+    might succeed (for the claims scope: seconds until the engineer's
+    soonest active claim TTL-expires, clamped to [5, 3600]). The API
+    layer maps this exception to HTTP 429 with a ``Retry-After``
+    header; the drain path treats it as "skip this waiter, try the
+    next one".
+    """
+
+    def __init__(
+        self, *, scope: str, detail: str, retry_after_sec: int
+    ) -> None:
+        super().__init__(detail)
+        self.scope = scope
+        self.detail = detail
+        self.retry_after_sec = retry_after_sec
 
 
 def _expires_at(ttl_hours: int) -> str:
@@ -161,6 +191,16 @@ def _drop_waiter(queue_id: str) -> None:
 class CoordinationService:
     db: Database
     settings: Settings
+    # v0.30: serializes every rate-limit count-then-act critical
+    # section (active-claim cap + insert, enqueue quota checks +
+    # enqueue). Each Database call runs on its own connection in its
+    # own transaction, so without this two concurrent requests both
+    # read an under-cap count before either write lands and the cap
+    # overshoots. One asyncio.Lock is sufficient: the flock instance
+    # lock guarantees a single process per database, and a single
+    # event loop serializes everything else. Held only across the
+    # check+write pair -- never across the queue long-poll.
+    _quota_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     async def count_queued_for(self, engineer: str) -> int:
         """v0.28: return how many waiting queue rows the given engineer
@@ -454,6 +494,67 @@ class CoordinationService:
             suggestion=suggestion,
         )
 
+    async def _enforce_active_claim_cap(
+        self, *, engineer: str, about_to_insert: int
+    ) -> None:
+        """v0.30 active-claim cap: raise :class:`RateLimitExceeded`
+        when inserting ``about_to_insert`` new claim rows would push
+        ``engineer`` past ``max_claims_per_engineer``.
+
+        Called immediately before the insert path -- NOT at the top of
+        ``create_claims`` -- because a request that is going to 409 (or
+        queue behind a holder) never inserts anything: an at-cap
+        engineer must still be allowed to queue future work, with the
+        cap re-checked when the drain actually tries to grant.
+
+        There is no supersede flow to exclude: ``create_claims`` never
+        closes one of the requester's existing claims while opening a
+        replacement in the same call (auto-narrow narrows the HOLDER's
+        claim, a different engineer, and the v0.11 ``narrowed``
+        decision runs entirely in the DB layer), so a plain count of
+        the engineer's active rows is the correct denominator.
+
+        Retry-After is the time until the engineer's soonest active
+        claim TTL-expires, clamped to [5, 3600] so a far-future expiry
+        cannot tell a client to sleep for hours and a just-expiring
+        claim cannot produce a zero/negative hint. When the engineer
+        somehow has no active claims at all (the batch alone exceeds
+        the limit), there is no expiry to anchor on and we fall back
+        to a flat 60.
+        """
+        limit = self.settings.max_claims_per_engineer
+        if limit <= 0:
+            return
+        count, soonest_expiry = await self.db.count_active_claims_for_engineer(
+            engineer
+        )
+        if count + about_to_insert <= limit:
+            return
+        retry_after = 60
+        if soonest_expiry is not None:
+            try:
+                exp = datetime.fromisoformat(
+                    soonest_expiry.replace("Z", "+00:00")
+                )
+                retry_after = int((exp - datetime.now(UTC)).total_seconds())
+            except ValueError:
+                retry_after = 60
+            retry_after = max(5, min(3600, retry_after))
+        detail = (
+            f"engineer {engineer!r} holds {count} active claims and this "
+            f"request would insert {about_to_insert} more; the limit is "
+            f"{limit} (COORD_MAX_CLAIMS_PER_ENGINEER). Release finished "
+            "claims or wait for TTL expiry."
+        )
+        if about_to_insert > limit:
+            detail += (
+                f" The batch alone ({about_to_insert} claims) exceeds the "
+                "limit; reduce the batch size."
+            )
+        raise RateLimitExceeded(
+            scope="claims", detail=detail, retry_after_sec=retry_after
+        )
+
     async def create_claims(self, body: CreateClaimsRequest) -> CreateClaimsResponse:
         await self.db.expire_stale_claims(self.settings.idle_timeout_sec)
         # Activity ping: making a claim is the strongest possible
@@ -634,14 +735,35 @@ class CoordinationService:
             ids.append((cid, item.type, item.pattern, sev, exp))
             item_for_cid[cid] = item
 
-        created = await self.db.insert_claims_batch(
-            engineer=body.engineer,
-            branch=body.branch,
-            description=body.description,
-            items=ids,
-            repo=body.repo,
-            session_id=body.session_id,
-        )
+        # v0.30 active-claim cap: enforced here, on the only path in
+        # this method that inserts active claim rows, so that requests
+        # which 409 (or queue with wait_seconds) above are never
+        # blocked by the cap. Drain-time grants re-enter create_claims
+        # and hit this same check, so a queue grant cannot blast
+        # through the cap either -- _drain_queue_for catches the raise
+        # and moves on to the next waiter. The count and the insert
+        # run under _quota_lock so two concurrent requests cannot both
+        # observe an under-cap count and overshoot; when the cap is
+        # disabled (the default) the insert skips the lock entirely.
+
+        async def _insert_batch() -> Any:
+            return await self.db.insert_claims_batch(
+                engineer=body.engineer,
+                branch=body.branch,
+                description=body.description,
+                items=ids,
+                repo=body.repo,
+                session_id=body.session_id,
+            )
+
+        if self.settings.max_claims_per_engineer > 0:
+            async with self._quota_lock:
+                await self._enforce_active_claim_cap(
+                    engineer=body.engineer, about_to_insert=len(ids)
+                )
+                created = await _insert_batch()
+        else:
+            created = await _insert_batch()
         # v0.14: post-insert scope_type / narrowable / symbol rows. We
         # defer this from insert_claims_batch to keep its signature stable
         # and the migration footprint minimal -- the create_claims handler
@@ -1298,6 +1420,16 @@ class CoordinationService:
         the caller falls through to the legacy 409 response shape.
         """
 
+        # v0.30 enqueue-time admission control. Both checks run BEFORE
+        # the row is written and never again: pop/drain works through
+        # whatever is already in the queue regardless of how deep it
+        # has since become, so a quota change or a burst of admissions
+        # cannot strand entries that were legitimately accepted. The
+        # drain path cannot trip these either -- rehydrated grant
+        # requests carry wait_seconds=0 and never reach this method.
+        # Checks and the enqueue write share _quota_lock so concurrent
+        # requests cannot both observe under-quota counts and overshoot;
+        # the lock is released before the wait loop below.
         first_conflict = conflicts[0]
         blocking_claim_id = first_conflict.conflicting_claim.id
         # Find the requester ClaimItem that produced this conflict by
@@ -1309,21 +1441,53 @@ class CoordinationService:
                 target_item = item
                 break
 
-        entry = await self.db.enqueue_claim_request(
-            blocking_claim_id=blocking_claim_id,
-            requester_engineer=body.engineer,
-            requester_session_id=body.session_id,
-            requester_branch=body.branch,
-            requester_description=body.description,
-            repo=body.repo,
-            claim_type=target_item.type,
-            pattern=target_item.pattern,
-            symbols=list(target_item.symbols) if target_item.symbols else None,
-            narrowable=target_item.narrowable,
-            ttl_hours=body.ttl_hours,
-            wait_seconds=wait_seconds,
-            priority=body.urgency or "normal",
-        )
+        async with self._quota_lock:
+            engineer_queue_limit = self.settings.max_queued_per_engineer
+            if engineer_queue_limit > 0:
+                queued_count = await self.db.count_queue_entries_for_engineer(
+                    body.engineer
+                )
+                if queued_count + 1 > engineer_queue_limit:
+                    raise RateLimitExceeded(
+                        scope="queue",
+                        detail=(
+                            f"engineer {body.engineer!r} already has "
+                            f"{queued_count} live queue entries; the limit is "
+                            f"{engineer_queue_limit} "
+                            "(COORD_MAX_QUEUED_PER_ENGINEER). Wait for an "
+                            "existing entry to resolve or cancel one."
+                        ),
+                        retry_after_sec=60,
+                    )
+            repo_depth_limit = self.settings.max_queue_depth_per_repo
+            if repo_depth_limit > 0:
+                repo_depth = await self.db.queue_depth_for_repo(body.repo)
+                if repo_depth + 1 > repo_depth_limit:
+                    raise RateLimitExceeded(
+                        scope="repo_queue",
+                        detail=(
+                            f"queue for this repo is at capacity "
+                            f"({repo_depth} waiting); service degraded, retry "
+                            "later or work without wait_seconds"
+                        ),
+                        retry_after_sec=60,
+                    )
+
+            entry = await self.db.enqueue_claim_request(
+                blocking_claim_id=blocking_claim_id,
+                requester_engineer=body.engineer,
+                requester_session_id=body.session_id,
+                requester_branch=body.branch,
+                requester_description=body.description,
+                repo=body.repo,
+                claim_type=target_item.type,
+                pattern=target_item.pattern,
+                symbols=list(target_item.symbols) if target_item.symbols else None,
+                narrowable=target_item.narrowable,
+                ttl_hours=body.ttl_hours,
+                wait_seconds=wait_seconds,
+                priority=body.urgency or "normal",
+            )
 
         # v0.24: hybrid wait loop. Short event-wait covers the
         # same-process fast path (release-drain in this Python process
@@ -1430,6 +1594,29 @@ class CoordinationService:
             grant_body = self._queue_entry_to_create_request(entry)
             try:
                 resp = await self.create_claims(grant_body)
+            except RateLimitExceeded as exc:
+                # v0.30: a queue grant must not blast through the
+                # active-claim cap -- the waiter's engineer is at
+                # capacity, and granting now would hand them more than
+                # the operator allowed. The popped entry cannot stay
+                # in_progress (it would wedge the queue) and cannot be
+                # granted, so route it through the existing
+                # queue-expiry machinery (claim_queue has no
+                # reason column and v0.30 ships without a schema
+                # change, so the reason lives in this log line) and
+                # keep draining: the next waiter may belong to an
+                # under-cap engineer.
+                logger.info(
+                    "FIFO drain: queue %s expired -- requester %s is "
+                    "rate limited (scope=%s): %s",
+                    entry["id"],
+                    entry.get("requester_engineer"),
+                    exc.scope,
+                    exc.detail,
+                )
+                await self.db.mark_queue_expired(entry["id"])
+                _notify_waiter(entry["id"], {"granted_claim_id": None})
+                continue
             except Exception:  # noqa: BLE001 - the grant is best-effort
                 logger.exception(
                     "FIFO drain: grant attempt for queue %s raised",

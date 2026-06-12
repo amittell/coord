@@ -1392,6 +1392,115 @@ class Database:
             rows = await cur.fetchall()
             return [dict(r) for r in rows]
 
+    async def count_active_claims_for_engineer(
+        self,
+        engineer: str,
+        *,
+        now: datetime | None = None,
+    ) -> tuple[int, str | None]:
+        """v0.30: count this engineer's active claims and report the
+        soonest ``expires_at`` among them.
+
+        "Active" means ``released_at IS NULL`` and not TTL-expired.
+        The TTL filter runs in Python -- parse ``expires_at`` and drop
+        rows at-or-past ``now`` -- exactly like
+        :meth:`list_active_claims_rows` does, and deliberately NOT via
+        a SQLite ``datetime()`` comparison: the active-claim cap must
+        agree byte-for-byte with what the conflict pipeline considers
+        active, and two filters written in two dialects will
+        eventually disagree on some edge (timezone suffix handling,
+        a malformed timestamp). One pattern, mirrored.
+
+        Returns ``(count, soonest_expires_at)``; the second element is
+        ``None`` when the count is zero, and otherwise the raw stored
+        ISO string so the caller can compute a Retry-After without a
+        round-trip through reformatting.
+        """
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                "SELECT expires_at FROM claims "
+                "WHERE released_at IS NULL AND engineer = ?",
+                (engineer,),
+            )
+            rows = await cur.fetchall()
+        ref = now or datetime.now(UTC)
+        count = 0
+        soonest_raw: str | None = None
+        soonest_dt: datetime | None = None
+        for r in rows:
+            exp_raw = str(r["expires_at"])
+            exp = datetime.fromisoformat(exp_raw.replace("Z", "+00:00"))
+            if exp <= ref:
+                continue
+            count += 1
+            if soonest_dt is None or exp < soonest_dt:
+                soonest_dt = exp
+                soonest_raw = exp_raw
+        return count, soonest_raw
+
+    async def count_queue_entries_for_engineer(
+        self,
+        engineer: str,
+        *,
+        states: tuple[str, ...] = ("waiting", "in_progress"),
+    ) -> int:
+        """v0.30: count this engineer's live claim_queue entries.
+
+        Defaults to ``waiting`` + ``in_progress`` -- both represent a
+        slot the engineer is occupying in someone's line (an
+        ``in_progress`` row is a waiting row mid-drain). Terminal
+        states (granted/expired/cancelled) never count against the
+        per-engineer queue cap. Distinct from
+        :meth:`list_queued_with_holder` (which feeds the v0.28
+        backpressure header and counts waiting only); keeping this
+        separate means the header's semantics stay untouched.
+        """
+        if not states:
+            return 0
+        await self.init()
+        placeholders = ",".join("?" for _ in states)
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                "SELECT COUNT(*) AS n FROM claim_queue "
+                f"WHERE requester_engineer = ? AND state IN ({placeholders})",
+                (engineer, *states),
+            )
+            row = await cur.fetchone()
+            return int(row["n"]) if row else 0
+
+    async def queue_depth_for_repo(self, repo: str | None) -> int:
+        """v0.30: count ``state='waiting'`` queue rows in one repo
+        bucket. The NULL bucket only matches requests that were
+        themselves enqueued with ``repo=None`` -- mirroring how the
+        conflict pipeline buckets NULL-repo claims separately -- so a
+        busy named repo never inflates the legacy un-tagged bucket and
+        vice versa.
+        """
+        await self.init()
+        if repo is None:
+            sql = (
+                "SELECT COUNT(*) AS n FROM claim_queue "
+                "WHERE state = 'waiting' AND repo IS NULL"
+            )
+            params: tuple[Any, ...] = ()
+        else:
+            sql = (
+                "SELECT COUNT(*) AS n FROM claim_queue "
+                "WHERE state = 'waiting' AND repo = ?"
+            )
+            params = (repo,)
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(sql, params)
+            row = await cur.fetchone()
+            return int(row["n"]) if row else 0
+
     async def enqueue_webhook(
         self,
         *,
