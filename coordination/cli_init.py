@@ -130,6 +130,102 @@ def _detect_repo_id(repo_root: Path) -> str:
     return repo_root.name
 
 
+def _git_line(repo_root: Path, *args: str) -> tuple[int, str]:
+    """Run a git command, returning (returncode, stripped stdout).
+    Returns (-1, "") if git is unavailable. Never raises."""
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=repo_root,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, OSError):
+        return (-1, "")
+    return (result.returncode, result.stdout.strip())
+
+
+def _current_branch(repo_root: Path) -> str | None:
+    rc, out = _git_line(repo_root, "rev-parse", "--abbrev-ref", "HEAD")
+    return out if rc == 0 and out and out != "HEAD" else None
+
+
+def _default_branch(repo_root: Path) -> str | None:
+    """Best-effort default/integration branch: the ``origin/HEAD`` target,
+    falling back to a local ``main`` or ``master``. None when it cannot
+    be determined (so the caller stays quiet rather than guessing)."""
+    rc, out = _git_line(
+        repo_root, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"
+    )
+    if rc == 0 and out:
+        return out.rsplit("/", 1)[-1]
+    for candidate in ("main", "master"):
+        rc, _ = _git_line(
+            repo_root, "rev-parse", "--verify", "--quiet", f"refs/heads/{candidate}"
+        )
+        if rc == 0:
+            return candidate
+    return None
+
+
+def _has_staged_changes(repo_root: Path) -> bool:
+    # `git diff --cached --quiet` exits 1 when the index has staged changes.
+    rc, _ = _git_line(repo_root, "diff", "--cached", "--quiet")
+    return rc == 1
+
+
+def _warn_tracked_wiring_commit_risk(repo_root: Path, written: list[str]) -> None:
+    """coord writes TRACKED files (.mcp.json, the CLAUDE.md / AGENTS.md
+    managed block, .gitignore, etc.). On a contributor/feature branch a
+    careless ``git add -A && commit`` sweeps them into that branch's pull
+    request -- the failure mode behind several polluted PRs. Warn (never
+    block: onboarding via a PR is legitimate) at the moment of risk,
+    naming only the tracked files so the operator can stage coord's
+    wiring by itself. ``.coordination/`` and ``.git/`` entries are
+    gitignored / local and are excluded from the warning."""
+    tracked = [
+        entry.split(" (")[0]
+        for entry in written
+        if not entry.split(" (")[0].startswith((".coordination/", ".git/"))
+    ]
+    if not tracked:
+        return
+    current = _current_branch(repo_root)
+    default = _default_branch(repo_root)
+    off_default = bool(current and default and current != default)
+    staged = _has_staged_changes(repo_root)
+    if not off_default and not staged:
+        return
+    print("", file=sys.stderr)
+    print(
+        "WARNING: coord wrote these TRACKED files (git will commit them):",
+        file=sys.stderr,
+    )
+    for path in tracked:
+        print(f"  {path}", file=sys.stderr)
+    if off_default:
+        print(
+            f"You are on branch '{current}', not the default branch "
+            f"'{default}'. Committing here puts coord's wiring into any "
+            "pull request for this branch.",
+            file=sys.stderr,
+        )
+    if staged:
+        print(
+            "The index already has staged changes; committing now would "
+            "bundle coord's wiring with that unrelated work.",
+            file=sys.stderr,
+        )
+    print(
+        "Stage coord's wiring by itself (git add "
+        + " ".join(tracked)
+        + ") and commit it alone -- do not 'git add -A' it into other work.",
+        file=sys.stderr,
+    )
+    print("", file=sys.stderr)
+
+
 def _write_repo_config(
     repo_root: Path,
     tool: str,
@@ -432,5 +528,6 @@ def run_init(args) -> int:
         print(f"  {path}")
     print("")
     print("Next step: coord doctor")
+    _warn_tracked_wiring_commit_risk(repo_root, written)
     return 0
 

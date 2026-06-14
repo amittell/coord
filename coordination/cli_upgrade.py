@@ -27,6 +27,7 @@ from coordination.cli_init import (
     _resolve_root,
     _update_codex_config,
     _update_mcp_json,
+    _warn_tracked_wiring_commit_risk,
 )
 from coordination.cli_shared import (
     ensure_gitignore_entry,
@@ -174,4 +175,5 @@ def run_upgrade(args) -> int:
     print("  .coordination/config.toml")
     print("  .coordination/owners.yaml")
     print("  COORD_AUTH_TOKEN")
+    _warn_tracked_wiring_commit_risk(repo_root, written)
     return 0

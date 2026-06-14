@@ -1,10 +1,27 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
-from coordination import cli_upgrade
+from coordination import cli_init, cli_upgrade
+
+
+def _git(repo: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+        },
+    )
 
 
 def _git_init(repo: Path) -> None:
@@ -433,3 +450,73 @@ def test_upgrade_no_prettierignore_when_repo_has_no_prettier(
     _seed_initialised_repo(tmp_path)
     cli_upgrade.run_upgrade(_make_args(tmp_path))
     assert not (tmp_path / ".prettierignore").exists()
+
+
+def test_warn_tracked_wiring_fires_off_default_branch(tmp_path: Path, capsys) -> None:
+    """On a feature branch, the warning names the tracked wiring files
+    (so they can be staged alone) and excludes gitignored .coordination/
+    entries. This is the guard against coord wiring leaking into a PR."""
+    _git(tmp_path, "init", "-q", "-b", "main")
+    (tmp_path / "f.txt").write_text("x\n", encoding="utf-8")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "init")
+    _git(tmp_path, "checkout", "-q", "-b", "feature")
+
+    cli_init._warn_tracked_wiring_commit_risk(
+        tmp_path,
+        [".mcp.json", "CLAUDE.md (managed block)", ".coordination/config.toml"],
+    )
+    err = capsys.readouterr().err
+    assert "WARNING" in err
+    assert ".mcp.json" in err
+    assert "CLAUDE.md" in err
+    # gitignored / local paths are excluded from the warning
+    assert ".coordination/config.toml" not in err
+    assert "feature" in err and "main" in err
+
+
+def test_warn_tracked_wiring_silent_on_default_branch_clean_index(
+    tmp_path: Path, capsys
+) -> None:
+    _git(tmp_path, "init", "-q", "-b", "main")
+    (tmp_path / "f.txt").write_text("x\n", encoding="utf-8")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "init")
+
+    cli_init._warn_tracked_wiring_commit_risk(tmp_path, [".mcp.json"])
+    assert "WARNING" not in capsys.readouterr().err
+
+
+def test_warn_tracked_wiring_fires_with_staged_changes(
+    tmp_path: Path, capsys
+) -> None:
+    """Even on the default branch, a non-empty index means a commit
+    would bundle coord's wiring with unrelated staged work."""
+    _git(tmp_path, "init", "-q", "-b", "main")
+    (tmp_path / "f.txt").write_text("x\n", encoding="utf-8")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "init")
+    (tmp_path / "unrelated.txt").write_text("work in progress\n", encoding="utf-8")
+    _git(tmp_path, "add", "unrelated.txt")
+
+    cli_init._warn_tracked_wiring_commit_risk(tmp_path, [".mcp.json"])
+    err = capsys.readouterr().err
+    assert "WARNING" in err
+    assert "staged" in err.lower()
+
+
+def test_warn_tracked_wiring_silent_when_only_gitignored(
+    tmp_path: Path, capsys
+) -> None:
+    """If coord only touched .coordination/ (all gitignored), there is
+    nothing committable to warn about even on a feature branch."""
+    _git(tmp_path, "init", "-q", "-b", "main")
+    (tmp_path / "f.txt").write_text("x\n", encoding="utf-8")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "init")
+    _git(tmp_path, "checkout", "-q", "-b", "feature")
+
+    cli_init._warn_tracked_wiring_commit_risk(
+        tmp_path, [".coordination/config.toml", ".git/hooks/pre-push (shim)"]
+    )
+    assert "WARNING" not in capsys.readouterr().err

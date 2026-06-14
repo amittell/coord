@@ -9,6 +9,23 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.31.2] - 2026-06-14
+
+### Added
+
+- ``coord init`` / ``coord upgrade`` now warn when they write coord's
+  TRACKED wiring (``.mcp.json``, the CLAUDE.md / AGENTS.md managed
+  block, ``.gitignore``, etc.) on a non-default branch or with staged
+  changes already in the index -- the exact conditions where a later
+  ``git add -A && commit`` sweeps the wiring into an unrelated pull
+  request (the failure mode behind earlier polluted PRs). The warning
+  names only the committable files (gitignored ``.coordination/`` and
+  ``.git/`` entries are excluded) and prints the safe ``git add`` for
+  staging coord's wiring by itself. It is advisory, never blocking, so
+  legitimately onboarding a repo via a PR still works. New
+  ``cli_init`` helpers ``_current_branch`` / ``_default_branch`` /
+  ``_has_staged_changes`` / ``_warn_tracked_wiring_commit_risk``.
+
 ## [0.31.1] - 2026-06-14
 
 ### Fixed
