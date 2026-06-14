@@ -25,12 +25,14 @@ from coordination.assets import AGENTS_SNIPPET, CLAUDE_SNIPPET, CURSOR_RULE
 from coordination.cli_init import (
     _install_hook,
     _resolve_root,
+    _untrack_machine_configs,
     _update_codex_config,
     _update_mcp_json,
     _warn_tracked_wiring_commit_risk,
+    _MACHINE_CONFIGS,
 )
 from coordination.cli_shared import (
-    ensure_gitignore_entry,
+    ensure_gitignore_entries,
     ensure_managed_block,
     ensure_prettierignore_entries,
 )
@@ -161,8 +163,14 @@ def run_upgrade(args) -> int:
     # which left the rest of the dir vulnerable to `git stash -u`
     # cycles dropping the hook implementation. The wide rule plus the
     # in-place marker migration makes the upgrade idempotent.
-    ensure_gitignore_entry(repo_root, "/.coordination/")
+    ensure_gitignore_entries(repo_root, ["/.coordination/", *_MACHINE_CONFIGS])
     written.append(".gitignore (managed block)")
+
+    # v0.32: machine configs (.mcp.json etc.) are no longer tracked.
+    # Untrack any that an older coord version committed so the gitignore
+    # rule takes effect; the files stay on disk for local use.
+    for rel in _untrack_machine_configs(repo_root):
+        written.append(f"{rel} (untracked from git)")
 
     print(f"Upgraded coordination artefacts in {repo_root}")
     print(f"Tool: {config.tool}    Mode: {config.mode}    Service: {config.service_url}")

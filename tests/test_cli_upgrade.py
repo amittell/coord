@@ -520,3 +520,59 @@ def test_warn_tracked_wiring_silent_when_only_gitignored(
         tmp_path, [".coordination/config.toml", ".git/hooks/pre-push (shim)"]
     )
     assert "WARNING" not in capsys.readouterr().err
+
+
+def test_upgrade_gitignores_machine_configs(tmp_path: Path) -> None:
+    """v0.32: upgrade adds coord's generated machine configs to the
+    managed .gitignore block alongside /.coordination/."""
+    _seed_initialised_repo(tmp_path)
+    cli_upgrade.run_upgrade(_make_args(tmp_path))
+    gi = (tmp_path / ".gitignore").read_text(encoding="utf-8")
+    assert "/.coordination/" in gi
+    assert ".mcp.json" in gi
+    assert ".cursor/mcp.json" in gi
+    assert ".codex/config.toml" in gi
+
+
+def test_upgrade_untracks_already_tracked_mcp_json(tmp_path: Path) -> None:
+    """A .mcp.json committed by an older coord version must be untracked
+    on upgrade (git rm --cached) -- gitignore alone does not untrack --
+    while the file stays on disk for local use."""
+    _seed_initialised_repo(tmp_path)
+    (tmp_path / ".mcp.json").write_text('{"mcpServers": {}}\n', encoding="utf-8")
+    _git(tmp_path, "add", ".mcp.json")
+    _git(tmp_path, "commit", "-qm", "older coord: track .mcp.json")
+    # sanity: it is tracked before upgrade
+    pre = subprocess.run(
+        ["git", "-C", str(tmp_path), "ls-files", "--error-unmatch", ".mcp.json"],
+        capture_output=True,
+    )
+    assert pre.returncode == 0
+
+    cli_upgrade.run_upgrade(_make_args(tmp_path))
+
+    post = subprocess.run(
+        ["git", "-C", str(tmp_path), "ls-files", "--error-unmatch", ".mcp.json"],
+        capture_output=True,
+    )
+    assert post.returncode != 0, "expected .mcp.json to be untracked"
+    assert (tmp_path / ".mcp.json").exists(), "file must remain on disk"
+
+
+def test_warn_skips_gitignored_machine_config(tmp_path: Path, capsys) -> None:
+    """Once .mcp.json is gitignored, the commit-risk warning must not
+    flag it (git will not commit an ignored file), but still flags the
+    tracked protocol docs."""
+    _git(tmp_path, "init", "-q", "-b", "main")
+    (tmp_path / "f.txt").write_text("x\n", encoding="utf-8")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "init")
+    _git(tmp_path, "checkout", "-q", "-b", "feature")
+    (tmp_path / ".gitignore").write_text(".mcp.json\n", encoding="utf-8")
+
+    cli_init._warn_tracked_wiring_commit_risk(
+        tmp_path, [".mcp.json", "CLAUDE.md (managed block)"]
+    )
+    err = capsys.readouterr().err
+    assert ".mcp.json" not in err
+    assert "CLAUDE.md" in err

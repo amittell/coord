@@ -2,6 +2,18 @@
 
 This is the primary integration path for teams using Claude Code.
 
+## 0. Recommended: register coord once, user-scoped
+
+The cleanest setup registers the coord MCP server once for all your repos, so no per-repo `.mcp.json` is needed:
+
+```bash
+claude mcp add --scope user coord coord-mcp
+```
+
+`coord-mcp` resolves each repo's service URL, token, and repo id from that repo's gitignored `.coordination/local.env` at startup, so a single user-scoped server works everywhere. Because there is no tracked `.mcp.json`, coord's machine config can never be swept into a contributor PR.
+
+You still run `coord init` per repo (below) to create `.coordination/` and patch the protocol docs; from v0.32 it gitignores `.mcp.json` rather than tracking it.
+
 ## 1. Easiest path
 
 Inside the application repo:
@@ -11,7 +23,7 @@ coord init --tool claude --mode local --yes
 coord doctor
 ```
 
-That will create `.mcp.json`, patch `CLAUDE.md`, create `.coordination/config.toml`, create `.coordination/local.env`, and install the pre-push hook.
+That will patch `CLAUDE.md`, create `.coordination/config.toml`, create `.coordination/local.env`, write a (gitignored) `.mcp.json`, and install the pre-push hook. From v0.32, `.mcp.json` is added to the managed `.gitignore` block and any previously-committed `.mcp.json` is untracked on `coord upgrade` -- machine config stays local; only the protocol docs (`CLAUDE.md`) and `.gitignore` block are tracked.
 
 ## 2. Install the MCP bridge locally
 
@@ -120,4 +132,4 @@ For backpressure feedback (v0.28+), the MCP wrapper should set the `X-Coord-Engi
 1. The MCP child process environment (shell exports, `env` block in `.mcp.json`).
 2. `<repo-root>/.coordination/local.env`, auto-loaded at startup by walking up from cwd.
 
-The placeholder values `set-me`, `example-org/example-repo`, and `http://127.0.0.1:8080` are treated as "unset" for this purpose, so a committed `.mcp.json` template can ship them harmlessly and the wrapper still finds the real values in the gitignored `local.env`. This is why `coord init` is safe to run in a public repo: it writes credentials to `local.env` only and leaves `.mcp.json` as a template.
+The placeholder values `set-me`, `example-org/example-repo`, and `http://127.0.0.1:8080` are treated as "unset" for this purpose, so even if `.mcp.json` ships placeholders the wrapper still finds the real values in the gitignored `local.env`. `coord init` is safe to run in a public repo: it writes credentials to `local.env` only. From v0.32 `.mcp.json` is gitignored (not committed), so the safest pattern is a user-scoped server (see section 0) with all real values in `local.env`.

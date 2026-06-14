@@ -9,6 +9,36 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.32.0] - 2026-06-14
+
+### Changed
+
+- coord's generated MACHINE config is no longer tracked in git. ``coord
+  init`` / ``coord upgrade`` now add ``.mcp.json``, ``.cursor/mcp.json``
+  and ``.codex/config.toml`` to the managed ``.gitignore`` block (next
+  to ``/.coordination/``), and ``coord upgrade`` untracks any that an
+  older coord version committed (``git rm --cached``, file kept on
+  disk). Only the protocol docs (the ``CLAUDE.md`` / ``AGENTS.md``
+  managed block, cursor rules) and the ``.gitignore`` block remain
+  tracked. This removes the last way coord wiring could be swept into a
+  contributor PR by a careless ``git add -A``. Real per-repo config
+  continues to live only in the gitignored ``.coordination/local.env``.
+- The commit-risk warning added in v0.31.2 now skips gitignored paths
+  (via ``git check-ignore``), so the now-ignored ``.mcp.json`` is no
+  longer flagged -- only genuinely committable wiring is named.
+
+### Recommended setup
+
+- Register the coord MCP server once, user-scoped, instead of relying
+  on a per-repo ``.mcp.json``::
+
+      claude mcp add --scope user coord coord-mcp
+
+  ``coord-mcp`` resolves each repo's URL / token / repo id from that
+  repo's ``.coordination/local.env`` at startup, so one user-scoped
+  server works across every repo and no tracked MCP config file exists
+  to leak into a PR. See ``docs/integrations/claude-code.md``.
+
 ## [0.31.2] - 2026-06-14
 
 ### Added

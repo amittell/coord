@@ -210,6 +210,17 @@ def ensure_gitignore_entry(repo_root: Path, entry: str) -> None:
     _ensure_managed_hash_entry(repo_root / ".gitignore", entry)
 
 
+def ensure_gitignore_entries(repo_root: Path, entries: list[str]) -> None:
+    """Write several managed .gitignore entries in a single block (one
+    path per line). Used by init/upgrade to ignore the ``.coordination/``
+    state directory AND coord's generated machine configs (``.mcp.json``,
+    ``.cursor/mcp.json``, ``.codex/config.toml``) so the configs are
+    never tracked into a contributor PR. No-op on an empty list."""
+    if not entries:
+        return
+    _ensure_managed_hash_entry(repo_root / ".gitignore", "\n".join(entries))
+
+
 # Standalone Prettier config filenames. Presence of any one (or a
 # .prettierignore, or a prettier key / dependency in package.json) means
 # the repo runs ``prettier --check``, so coord's generated machine config
