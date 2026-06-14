@@ -409,3 +409,27 @@ def test_upgrade_skips_owners_yaml_even_if_force_flag_unused(tmp_path: Path) -> 
     cli_upgrade.run_upgrade(_make_args(tmp_path))
     after = (tmp_path / ".coordination" / "owners.yaml").read_text(encoding="utf-8")
     assert after == custom
+
+
+def test_upgrade_adds_mcp_json_to_prettierignore_when_prettier_present(
+    tmp_path: Path,
+) -> None:
+    """A Prettier-using repo gets coord's generated .mcp.json exempted
+    from format checks on upgrade -- the fix for onboarding reddening a
+    repo's `prettier --check` CI."""
+    _seed_initialised_repo(tmp_path)
+    (tmp_path / ".prettierrc").write_text("{}\n", encoding="utf-8")
+    cli_upgrade.run_upgrade(_make_args(tmp_path))
+    pi = tmp_path / ".prettierignore"
+    assert pi.exists()
+    assert ".mcp.json" in pi.read_text(encoding="utf-8")
+
+
+def test_upgrade_no_prettierignore_when_repo_has_no_prettier(
+    tmp_path: Path,
+) -> None:
+    """A repo with no Prettier config must not get a stray
+    .prettierignore created by upgrade."""
+    _seed_initialised_repo(tmp_path)
+    cli_upgrade.run_upgrade(_make_args(tmp_path))
+    assert not (tmp_path / ".prettierignore").exists()

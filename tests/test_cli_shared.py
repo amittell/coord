@@ -25,7 +25,9 @@ from coordination.cli_shared import (
     MANAGED_HASH_END,
     ensure_gitignore_entry,
     ensure_managed_block,
+    ensure_prettierignore_entries,
     parse_duration,
+    repo_uses_prettier,
 )
 
 
@@ -237,3 +239,86 @@ def test_parse_duration_zero_allowed_when_opted_in() -> None:
     a legitimate ask during incident response."""
     assert parse_duration("0h", allow_zero=True) == timedelta(0)
     assert parse_duration("0d", allow_zero=True) == timedelta(0)
+
+
+# --- v0.31.x: .prettierignore guard for coord-generated machine config ---
+
+
+def test_repo_uses_prettier_false_on_bare_repo(tmp_path: Path) -> None:
+    assert repo_uses_prettier(tmp_path) is False
+
+
+def test_repo_uses_prettier_via_standalone_config(tmp_path: Path) -> None:
+    (tmp_path / ".prettierrc").write_text("{}", encoding="utf-8")
+    assert repo_uses_prettier(tmp_path) is True
+
+
+def test_repo_uses_prettier_via_existing_prettierignore(tmp_path: Path) -> None:
+    (tmp_path / ".prettierignore").write_text("dist/\n", encoding="utf-8")
+    assert repo_uses_prettier(tmp_path) is True
+
+
+def test_repo_uses_prettier_via_package_json_dep_and_key(tmp_path: Path) -> None:
+    import json as _json
+
+    pkg = tmp_path / "package.json"
+    pkg.write_text(
+        _json.dumps({"devDependencies": {"prettier": "^3.0.0"}}), encoding="utf-8"
+    )
+    assert repo_uses_prettier(tmp_path) is True
+    pkg.write_text(_json.dumps({"prettier": {"tabWidth": 2}}), encoding="utf-8")
+    assert repo_uses_prettier(tmp_path) is True
+
+
+def test_repo_uses_prettier_malformed_package_json_is_false(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text("{not valid json", encoding="utf-8")
+    assert repo_uses_prettier(tmp_path) is False
+
+
+def test_prettierignore_noop_without_prettier(tmp_path: Path) -> None:
+    """A repo that does not use Prettier must never get a stray
+    .prettierignore dropped into it."""
+    wrote = ensure_prettierignore_entries(tmp_path, [".mcp.json"])
+    assert wrote is False
+    assert not (tmp_path / ".prettierignore").exists()
+
+
+def test_prettierignore_noop_on_empty_entries(tmp_path: Path) -> None:
+    (tmp_path / ".prettierrc").write_text("{}", encoding="utf-8")
+    assert ensure_prettierignore_entries(tmp_path, []) is False
+
+
+def test_prettierignore_created_with_hash_markers(tmp_path: Path) -> None:
+    (tmp_path / ".prettierrc").write_text("{}", encoding="utf-8")
+    assert ensure_prettierignore_entries(tmp_path, [".mcp.json"]) is True
+    text = (tmp_path / ".prettierignore").read_text(encoding="utf-8")
+    assert MANAGED_HASH_BEGIN in text
+    assert MANAGED_HASH_END in text
+    assert MANAGED_BEGIN not in text
+    assert ".mcp.json" in text
+
+
+def test_prettierignore_preserves_existing_and_is_idempotent(tmp_path: Path) -> None:
+    p = tmp_path / ".prettierignore"
+    p.write_text("dist/\nbuild/\n", encoding="utf-8")
+    ensure_prettierignore_entries(tmp_path, [".mcp.json"])
+    first = p.read_text(encoding="utf-8")
+    assert "dist/" in first and "build/" in first
+    assert ".mcp.json" in first
+    # A second call replaces the managed block in place; no duplicates.
+    ensure_prettierignore_entries(tmp_path, [".mcp.json"])
+    second = p.read_text(encoding="utf-8")
+    assert second.count(MANAGED_HASH_BEGIN) == 1
+    assert second.count(".mcp.json") == 1
+
+
+def test_prettierignore_multiple_entries_single_block(tmp_path: Path) -> None:
+    """A repo wired for both claude and cursor needs both generated
+    configs ignored, and they must share one managed block (the second
+    write must not clobber the first)."""
+    (tmp_path / ".prettierrc").write_text("{}", encoding="utf-8")
+    ensure_prettierignore_entries(tmp_path, [".mcp.json", ".cursor/mcp.json"])
+    text = (tmp_path / ".prettierignore").read_text(encoding="utf-8")
+    assert text.count(MANAGED_HASH_BEGIN) == 1
+    assert ".mcp.json" in text
+    assert ".cursor/mcp.json" in text

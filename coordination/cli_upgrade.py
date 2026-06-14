@@ -28,7 +28,11 @@ from coordination.cli_init import (
     _update_codex_config,
     _update_mcp_json,
 )
-from coordination.cli_shared import ensure_gitignore_entry, ensure_managed_block
+from coordination.cli_shared import (
+    ensure_gitignore_entry,
+    ensure_managed_block,
+    ensure_prettierignore_entries,
+)
 from coordination.repo_config import RepoConfig
 
 
@@ -112,11 +116,18 @@ def run_upgrade(args) -> int:
     # and `repo_id` locals in this function are still required by
     # _rewrite_local_env above so the real config keeps flowing into
     # the gitignored local.env file.
+    # Coord-generated machine config files (JSON) that a Prettier-using
+    # repo would otherwise format-check and fail on. Collected across
+    # every wired tool and exempted via .prettierignore once below. This
+    # is the fix for the class of CI breakage where an onboarded repo's
+    # `prettier --check` rejected coord's 2-space .mcp.json.
+    prettier_targets: list[str] = []
     mcp_json = repo_root / ".mcp.json"
     if mcp_json.exists() or config.tool == "claude":
         _update_mcp_json(mcp_json)
         ensure_managed_block(repo_root / "CLAUDE.md", CLAUDE_SNIPPET)
         written.extend([".mcp.json", "CLAUDE.md (managed block)"])
+        prettier_targets.append(".mcp.json")
 
     codex_cfg = repo_root / ".codex" / "config.toml"
     if codex_cfg.exists() or config.tool == "codex":
@@ -131,6 +142,10 @@ def run_upgrade(args) -> int:
             repo_root / ".cursor" / "rules" / "coordination.mdc", CURSOR_RULE
         )
         written.extend([".cursor/mcp.json", ".cursor/rules/coordination.mdc"])
+        prettier_targets.append(".cursor/mcp.json")
+
+    if ensure_prettierignore_entries(repo_root, prettier_targets):
+        written.append(".prettierignore (managed block)")
 
     # Always force-refresh the hook shim. The user expects 'upgrade' to
     # propagate hook fixes; init's force-gate doesn't apply here.

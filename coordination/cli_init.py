@@ -13,6 +13,7 @@ from coordination.assets import AGENTS_SNIPPET, CLAUDE_SNIPPET, CURSOR_RULE, PRE
 from coordination.cli_shared import (
     ensure_gitignore_entry,
     ensure_managed_block,
+    ensure_prettierignore_entries,
     ensure_token_file,
     find_repo_root,
     state_paths,
@@ -383,10 +384,15 @@ def run_init(args) -> int:
             owners_path.write_text(_starter_owners(repo_root), encoding="utf-8")
             written.append(".coordination/owners.yaml")
 
+    # Coord-generated machine config files (JSON) that a Prettier-using
+    # repo would otherwise format-check and fail on. Collected per tool
+    # and exempted via .prettierignore once below.
+    prettier_targets: list[str] = []
     if tool == "claude":
         _update_mcp_json(repo_root / ".mcp.json")
         ensure_managed_block(repo_root / "CLAUDE.md", CLAUDE_SNIPPET)
         written.extend([".mcp.json", "CLAUDE.md (managed block)"])
+        prettier_targets.append(".mcp.json")
     elif tool == "codex":
         _update_codex_config(repo_root / ".codex" / "config.toml")
         ensure_managed_block(repo_root / "AGENTS.md", AGENTS_SNIPPET)
@@ -395,6 +401,10 @@ def run_init(args) -> int:
         _update_mcp_json(repo_root / ".cursor" / "mcp.json")
         ensure_managed_block(repo_root / ".cursor" / "rules" / "coordination.mdc", CURSOR_RULE)
         written.extend([".cursor/mcp.json", ".cursor/rules/coordination.mdc"])
+        prettier_targets.append(".cursor/mcp.json")
+
+    if ensure_prettierignore_entries(repo_root, prettier_targets):
+        written.append(".prettierignore (managed block)")
 
     if not args.no_hook:
         _install_hook(repo_root, args.force)

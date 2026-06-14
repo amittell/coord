@@ -9,6 +9,25 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.31.1] - 2026-06-14
+
+### Fixed
+
+- ``coord init`` / ``coord upgrade`` now exempt coord's generated
+  machine config from a repo's Prettier format check. The generated
+  ``.mcp.json`` (and ``.cursor/mcp.json``) use 2-space JSON with
+  placeholder values; a repo whose CI runs ``prettier --check`` would
+  fail on it (and every later ``coord upgrade`` would re-break a
+  previously green build). Onboarding now detects Prettier usage (a
+  ``.prettierrc*`` / ``prettier.config.*`` file, an existing
+  ``.prettierignore``, or a ``prettier`` key/dependency in
+  ``package.json``) and adds the generated config to a managed block in
+  ``.prettierignore`` -- the same treatment ``package-lock.json``
+  already gets. No-op for repos that do not use Prettier, so onboarding
+  never drops a stray ``.prettierignore`` into an unrelated repo. New
+  ``cli_shared`` helpers ``repo_uses_prettier`` and
+  ``ensure_prettierignore_entries``; 12 new tests.
+
 ## [0.31.0] - 2026-06-12
 
 ### Added

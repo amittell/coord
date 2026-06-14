@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+import json
 import os
 from pathlib import Path
 import re
@@ -162,17 +163,18 @@ def has_managed_block(path: Path) -> bool:
     return MANAGED_BEGIN in text or MANAGED_HASH_BEGIN in text
 
 
-def ensure_gitignore_entry(repo_root: Path, entry: str) -> None:
-    """Write a managed gitignore entry using shell-comment markers.
+def _ensure_managed_hash_entry(path: Path, entry: str) -> None:
+    """Write ``entry`` into ``path`` inside a hash-comment managed block.
 
-    Hash-style markers are valid gitignore comment syntax; the older
-    HTML-style markers are not (they parse as never-matching path
-    patterns, which is silently noisy and prompts agents to "fix"
-    them). The replacement pass detects either style, so a repo
-    upgrading from an older coord version migrates cleanly without
-    losing the entry.
+    Shared by the .gitignore and .prettierignore writers -- both use
+    gitignore-style syntax where ``# coord:begin`` is a valid comment.
+    Hash-style markers are used (not the HTML-comment style of managed
+    Markdown blocks) because ``<!--`` parses as a literal path pattern
+    here. The replacement pass detects either marker style so a repo
+    created by an older coord version migrates cleanly without losing
+    the entry. ``entry`` may be multi-line (one path per line) to manage
+    several paths in a single block.
     """
-    path = repo_root / ".gitignore"
     block = (
         f"{MANAGED_HASH_BEGIN}\n"
         f"# {_MANAGED_WARNING}\n"
@@ -180,6 +182,7 @@ def ensure_gitignore_entry(repo_root: Path, entry: str) -> None:
         f"{MANAGED_HASH_END}\n"
     )
     if not path.exists():
+        ensure_parent(path)
         path.write_text(block, encoding="utf-8")
         return
     existing = path.read_text(encoding="utf-8")
@@ -192,6 +195,81 @@ def ensure_gitignore_entry(repo_root: Path, entry: str) -> None:
         return
     suffix = "\n" if existing and not existing.endswith("\n") else ""
     path.write_text(f"{existing}{suffix}\n{block}", encoding="utf-8")
+
+
+def ensure_gitignore_entry(repo_root: Path, entry: str) -> None:
+    """Write a managed gitignore entry using shell-comment markers.
+
+    Hash-style markers are valid gitignore comment syntax; the older
+    HTML-style markers are not (they parse as never-matching path
+    patterns, which is silently noisy and prompts agents to "fix"
+    them). The replacement pass detects either style, so a repo
+    upgrading from an older coord version migrates cleanly without
+    losing the entry.
+    """
+    _ensure_managed_hash_entry(repo_root / ".gitignore", entry)
+
+
+# Standalone Prettier config filenames. Presence of any one (or a
+# .prettierignore, or a prettier key / dependency in package.json) means
+# the repo runs ``prettier --check``, so coord's generated machine config
+# would gate the repo's format CI unless we exempt it.
+_PRETTIER_CONFIG_FILES = (
+    ".prettierrc",
+    ".prettierrc.json",
+    ".prettierrc.json5",
+    ".prettierrc.yaml",
+    ".prettierrc.yml",
+    ".prettierrc.toml",
+    ".prettierrc.js",
+    ".prettierrc.cjs",
+    ".prettierrc.mjs",
+    "prettier.config.js",
+    "prettier.config.cjs",
+    "prettier.config.mjs",
+)
+
+
+def repo_uses_prettier(repo_root: Path) -> bool:
+    """True when the repo appears to run Prettier. Detects a standalone
+    config file, an existing .prettierignore, or a ``prettier`` key /
+    dependency in package.json. Coord uses this to decide whether to add
+    its generated config to .prettierignore -- we never drop a stray
+    .prettierignore into a repo that does not use Prettier."""
+    if (repo_root / ".prettierignore").exists():
+        return True
+    for name in _PRETTIER_CONFIG_FILES:
+        if (repo_root / name).exists():
+            return True
+    pkg = repo_root / "package.json"
+    if pkg.exists():
+        try:
+            data = json.loads(pkg.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            return False
+        if isinstance(data, dict):
+            if "prettier" in data:
+                return True
+            for dep_key in ("devDependencies", "dependencies"):
+                deps = data.get(dep_key)
+                if isinstance(deps, dict) and "prettier" in deps:
+                    return True
+    return False
+
+
+def ensure_prettierignore_entries(repo_root: Path, entries: list[str]) -> bool:
+    """If the repo uses Prettier, list ``entries`` (coord-generated
+    machine config paths such as ``.mcp.json``) in ``.prettierignore``
+    under a single managed block, and return True. Generated config is
+    the analogue of package-lock.json: it must never gate a repo's
+    format check, and re-running ``coord upgrade`` would otherwise
+    re-break a previously green CI. Returns False (no-op) when there are
+    no entries or the repo does not use Prettier, so onboarding never
+    drops a stray .prettierignore into an unrelated repo."""
+    if not entries or not repo_uses_prettier(repo_root):
+        return False
+    _ensure_managed_hash_entry(repo_root / ".prettierignore", "\n".join(entries))
+    return True
 
 
 def write_executable(path: Path, content: str) -> None:
