@@ -220,6 +220,30 @@ def _uri_to_path(uri: str) -> Path:
     return Path(unquote(parts.path))
 
 
+def relpath_under_root(path: str | Path, root: str | Path) -> str | None:
+    """Return ``path`` rendered repo-root-relative with posix separators
+    when it lands under ``root``, else None.
+
+    Uses ``os.path.relpath`` over realpath'd operands rather than
+    ``Path.relative_to``. On Windows ``relative_to`` compares path
+    components case-sensitively, so it wrongly rejects a path that sits
+    under the root but differs only in drive-letter or component case --
+    the repo's long-standing Windows CI failure. ``os.path.relpath``
+    (ntpath) compares case-insensitively; a path on a different drive
+    raises ValueError, which we treat as "outside the root". realpath on
+    both operands also collapses the macOS ``/var`` -> ``/private/var``
+    symlink so the comparison is stable on every platform."""
+    try:
+        rel = os.path.relpath(os.path.realpath(path), os.path.realpath(root))
+    except (OSError, ValueError):
+        return None
+    if rel == os.curdir:
+        return ""
+    if rel == os.pardir or rel.startswith(os.pardir + os.sep):
+        return None
+    return Path(rel).as_posix()
+
+
 def _normalize_references(raw: Any, repo_root: Path) -> list[dict[str, Any]] | None:
     """Normalise a ``textDocument/references`` result to callsite dicts.
 
@@ -243,17 +267,14 @@ def _normalize_references(raw: Any, repo_root: Path) -> list[dict[str, Any]] | N
         return []
     if not isinstance(raw, list):
         return None
-    root_resolved = Path(repo_root).resolve()
     out: list[dict[str, Any]] = []
     try:
         for item in raw:
             if not isinstance(item, dict):
                 raise TypeError("references entry is not an object")
-            path = _uri_to_path(str(item["uri"])).resolve()
-            try:
-                rendered = path.relative_to(root_resolved).as_posix()
-            except ValueError:
-                rendered = str(path)
+            src = _uri_to_path(str(item["uri"]))
+            rel = relpath_under_root(src, repo_root)
+            rendered = rel if rel is not None else Path(src).resolve().as_posix()
             start = item["range"]["start"]
             out.append(
                 {

@@ -14,7 +14,7 @@ from coordination import metrics
 from coordination.config import Settings, get_settings
 from coordination.db import Database
 from coordination.engine import compute_overlap, files_matching_pattern, git_ls_files
-from coordination.lsp import get_lsp_pool, language_for_path
+from coordination.lsp import get_lsp_pool, language_for_path, relpath_under_root
 from coordination.overlap_symbols import (
     OverlapKind,
     check_overlap as check_symbol_overlap,
@@ -537,10 +537,7 @@ class CoordinationService:
             if not item.symbols:
                 continue
             resolved = (root / item.pattern).resolve()
-            try:
-                root_resolved = root.resolve()
-                resolved.relative_to(root_resolved)
-            except (OSError, ValueError):
+            if relpath_under_root(resolved, root) is None:
                 # Path escapes the repo root or cannot be resolved;
                 # leave validation to the scope-check layer.
                 continue
@@ -1620,7 +1617,6 @@ class CoordinationService:
         root = self.settings.repo_root
         if not root or not root.is_dir():
             return 0
-        root_resolved = root.resolve()
         active = await self.db.list_active_claims_rows(exclude_engineer=None)
         symbol_claims = [
             r for r in active if r.get("scope_type") == "symbol"
@@ -1636,9 +1632,7 @@ class CoordinationService:
                 by_file.setdefault(str(row["file_path"]), []).append(row)
             for file_path, file_rows in by_file.items():
                 resolved = (root / file_path).resolve()
-                try:
-                    resolved.relative_to(root_resolved)
-                except ValueError:
+                if relpath_under_root(resolved, root) is None:
                     continue
                 if not resolved.is_file():
                     # Deleted or moved file: a rename we cannot follow.

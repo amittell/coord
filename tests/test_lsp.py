@@ -881,7 +881,11 @@ async def test_enrichment_caps_stored_callsites_at_200(
     repo = _make_repo(tmp_path)
     refs = [_loc(repo / "caller.py", i, 0) for i in range(205)]
     monkeypatch.setenv("FAKE_LSP_SYMBOLS_JSON", _handler_fixture())
-    monkeypatch.setenv("FAKE_LSP_REFERENCES_JSON", json.dumps(refs))
+    # 205 references serialize past Windows' 32767-char env-var limit, so
+    # hand the fixture to the fake server via a file instead.
+    refs_file = tmp_path / "refs.json"
+    refs_file.write_text(json.dumps(refs), encoding="utf-8")
+    monkeypatch.setenv("FAKE_LSP_REFERENCES_FILE", str(refs_file))
     svc = await _make_service(
         tmp_path, repo, lsp_enabled=True, lsp_command_python=FAKE_CMD
     )

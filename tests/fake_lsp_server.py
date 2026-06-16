@@ -73,11 +73,20 @@ def main() -> int:
     stdin = sys.stdin.buffer
     stdout = sys.stdout.buffer
 
-    symbols = json.loads(os.environ.get("FAKE_LSP_SYMBOLS_JSON", "[]"))
-    symbols_by_file = json.loads(
-        os.environ.get("FAKE_LSP_SYMBOLS_BY_FILE_JSON", "{}") or "{}"
-    )
-    references = json.loads(os.environ.get("FAKE_LSP_REFERENCES_JSON", "[]"))
+    # Each fixture can be supplied inline via ``<NAME>_JSON`` or, for
+    # payloads too large for an environment variable (Windows caps env
+    # vars at 32767 chars), from a file via ``<NAME>_FILE``. The file
+    # wins when both are set.
+    def _fixture(name: str, default: str):
+        file_path = os.environ.get(name.replace("_JSON", "_FILE"))
+        if file_path:
+            with open(file_path, encoding="utf-8") as fh:
+                return json.load(fh)
+        return json.loads(os.environ.get(name, default) or default)
+
+    symbols = _fixture("FAKE_LSP_SYMBOLS_JSON", "[]")
+    symbols_by_file = _fixture("FAKE_LSP_SYMBOLS_BY_FILE_JSON", "{}")
+    references = _fixture("FAKE_LSP_REFERENCES_JSON", "[]")
     delay = float(os.environ.get("FAKE_LSP_DELAY_SEC", "0") or "0")
     die_after_raw = os.environ.get("FAKE_LSP_DIE_AFTER", "")
     die_after = int(die_after_raw) if die_after_raw else None

@@ -9,6 +9,30 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.32.1] - 2026-06-16
+
+### Fixed
+
+- Windows: LSP callsite / refactor paths are now rendered repo-root
+  relative on Windows. ``Path.relative_to`` compares path components
+  case-sensitively, so on Windows it wrongly rejected paths that sit
+  under the repo root but differ only in drive-letter or component
+  case, falling back to an absolute path. That broke callsite
+  enrichment, the callsite-overlap advisory, and ``claim_refactor``
+  claim de-duplication on Windows (the ``ci`` workflow's
+  ``windows-latest`` job had been red since v0.31.0). Replaced the
+  three ``relative_to`` under-root checks (LSP reference normalization,
+  symbol-claim validation, rename-sweep) with a shared
+  ``relpath_under_root`` helper built on ``os.path.relpath`` over
+  realpath'd operands (case-insensitive, cross-drive safe, and stable
+  across the macOS ``/var`` symlink). No behavior change on Linux /
+  macOS, where these paths already resolved correctly; prod is
+  unaffected (it runs Linux with ``COORD_LSP_ENABLED`` off).
+- Test harness: the fake LSP server accepts large fixtures via a
+  ``FAKE_LSP_*_FILE`` env var (a JSON file path) in addition to the
+  inline ``FAKE_LSP_*_JSON`` var, so the 200+ callsite cap test no
+  longer overflows Windows' 32767-char environment-variable limit.
+
 ## [0.32.0] - 2026-06-14
 
 ### Changed
