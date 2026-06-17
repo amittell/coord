@@ -9,6 +9,33 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.32.2] - 2026-06-17
+
+### Changed
+
+- ``coord doctor`` no longer hard-fails on conditions that are not
+  coordination breaks, so the fleet reads cleanly under the v0.32
+  user-scoped MCP model. Root-cause fixes:
+  - **Per-repo MCP config is optional when a user-scoped coord MCP
+    server is registered.** doctor now detects a user-scoped server
+    (any ``~/.claude.json`` ``mcpServers`` entry whose command runs
+    ``coord-mcp``) and passes the MCP-config check ("via user-scoped
+    coord MCP server") instead of FAILing on a missing local
+    ``.mcp.json`` -- which v0.32 intentionally made untracked/optional.
+    With neither a local config nor a user-scoped server the check is a
+    WARN (the repo still works via the CLI/HTTP), not a hard FAIL.
+  - **The coordination protocol block is found in CLAUDE.md *or*
+    AGENTS.md** (a repo may use either regardless of ``config.tool``),
+    and a missing block is a WARN, not a FAIL -- on a feature branch it
+    arrives with the next merge from the default branch.
+  - **Stale ``sessions.live`` dead-PID entries are a WARN**, matching
+    their own long-standing "self-healing, harmless" description; they
+    are pruned on read and never a coordination break.
+- Net effect: ``coord doctor`` exits non-zero only when coordination is
+  genuinely broken (uninitialized repo, server unreachable, auth
+  failure, version skew, or a missing pre-push hook target). 4 new
+  tests.
+
 ## [0.32.1] - 2026-06-16
 
 ### Fixed

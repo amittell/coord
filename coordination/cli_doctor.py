@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 import shutil
 
@@ -45,6 +46,45 @@ def _load_token(repo_root: Path, config: RepoConfig) -> str:
             if line.startswith("COORD_AUTH_TOKEN="):
                 return line.split("=", 1)[1].strip()
     return ""
+
+
+def _user_scoped_coord_mcp() -> bool:
+    """True when a user-scoped coord MCP server is registered in Claude
+    Code (``~/.claude.json`` top-level ``mcpServers``). When one exists a
+    per-repo ``.mcp.json`` is optional: ``coord-mcp`` resolves each repo's
+    token/URL from ``.coordination/local.env`` at startup, so the same
+    user-scoped server coordinates every repo. Matches any server whose
+    command runs ``coord-mcp``, regardless of the entry's name."""
+    cfg = Path.home() / ".claude.json"
+    if not cfg.is_file():
+        return False
+    try:
+        data = json.loads(cfg.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return False
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict):
+        return False
+    for entry in servers.values():
+        if isinstance(entry, dict) and "coord-mcp" in str(entry.get("command", "")):
+            return True
+    return False
+
+
+def _managed_block_doc(repo_root: Path) -> str | None:
+    """Return the doc file that carries the coordination protocol block
+    (``CLAUDE.md`` or ``AGENTS.md``), or None. Checking both -- rather
+    than only the ``config.tool`` default -- is the robust choice: a
+    repo may keep the block in either file regardless of which tool it
+    was initialized with."""
+    for doc in ("CLAUDE.md", "AGENTS.md"):
+        path = repo_root / doc
+        try:
+            if path.exists() and MANAGED_BEGIN in path.read_text(encoding="utf-8"):
+                return doc
+        except OSError:
+            continue
+    return None
 
 
 def _check_service(config: RepoConfig, token: str) -> list[CheckResult]:
@@ -204,6 +244,9 @@ def _check_sessions_live(repo_root: Path) -> list[CheckResult]:
                 "hook). To clean up immediately: 'pkill -f coord-mcp' will "
                 "force a fresh sweep on every running agent's next coord call."
             ),
+            # Self-healing runtime noise, never a coordination break -- the
+            # entries are pruned on read. A warning, not a hard failure.
+            level="warn",
         )
     ]
 
@@ -572,21 +615,72 @@ def run_doctor(args) -> int:
     except Exception as exc:  # pragma: no cover - broad to keep doctor resilient
         results.append(CheckResult("ownership file parses", False, str(exc)))
 
+    # Per-repo MCP config and the protocol doc block are conveniences,
+    # not hard requirements: with a user-scoped coord MCP server (v0.32+)
+    # the local .mcp.json is optional, and a missing doc block on a
+    # feature branch arrives with the next merge from the default
+    # branch. So a missing local config is OK when a user-scoped server
+    # exists, and an absent block is a soft warning -- never a hard
+    # FAIL that masks the genuinely-broken cases (server unreachable,
+    # auth, version skew, missing hook target).
+    user_scoped = _user_scoped_coord_mcp()
+
+    def _mcp_config_result(label: str, local_present: bool) -> CheckResult:
+        if local_present:
+            return CheckResult(label, True)
+        if user_scoped:
+            return CheckResult(label, True, "via user-scoped coord MCP server")
+        return CheckResult(
+            label,
+            False,
+            "no local config and no user-scoped coord server",
+            "Register one with 'claude mcp add --scope user coord coord-mcp', "
+            "or run 'coord init' to write a local config.",
+            level="warn",
+        )
+
+    def _block_result() -> CheckResult:
+        doc = _managed_block_doc(repo_root)
+        if doc is not None:
+            return CheckResult("coordination protocol block present", True, f"in {doc}")
+        return CheckResult(
+            "coordination protocol block present",
+            False,
+            "not found in CLAUDE.md or AGENTS.md on this branch",
+            "Run 'coord upgrade' on the repo's default branch to (re)write "
+            "the managed block; on a feature branch it arrives with the next merge.",
+            level="warn",
+        )
+
     if config.tool == "claude":
-        mcp_ok = (repo_root / ".mcp.json").exists() and '"coord"' in (
+        local = (repo_root / ".mcp.json").exists() and '"coord"' in (
             repo_root / ".mcp.json"
         ).read_text(encoding="utf-8")
-        results.append(CheckResult("Claude Code MCP config found", mcp_ok))
-        doc_ok = (repo_root / "CLAUDE.md").exists() and MANAGED_BEGIN in (
-            repo_root / "CLAUDE.md"
-        ).read_text(encoding="utf-8")
-        results.append(CheckResult("CLAUDE.md coordination block found", doc_ok))
+        results.append(_mcp_config_result("Claude Code MCP config", local))
+        results.append(_block_result())
     elif config.tool == "codex":
-        results.append(CheckResult("Codex MCP config found", (repo_root / ".codex" / "config.toml").exists()))
-        results.append(CheckResult("AGENTS.md coordination block found", (repo_root / "AGENTS.md").exists()))
+        results.append(
+            _mcp_config_result(
+                "Codex MCP config", (repo_root / ".codex" / "config.toml").exists()
+            )
+        )
+        results.append(_block_result())
     else:
-        results.append(CheckResult("Cursor MCP config found", (repo_root / ".cursor" / "mcp.json").exists()))
-        results.append(CheckResult("Cursor rule found", (repo_root / ".cursor" / "rules" / "coordination.mdc").exists()))
+        results.append(
+            _mcp_config_result(
+                "Cursor MCP config", (repo_root / ".cursor" / "mcp.json").exists()
+            )
+        )
+        rule_ok = (repo_root / ".cursor" / "rules" / "coordination.mdc").exists()
+        results.append(
+            CheckResult(
+                "Cursor rule found",
+                rule_ok,
+                "" if rule_ok else "missing .cursor/rules/coordination.mdc",
+                "" if rule_ok else "Run 'coord upgrade' to restore it.",
+                level="fail" if rule_ok else "warn",
+            )
+        )
 
     hook_ok = (repo_root / ".git" / "hooks" / "pre-push").exists()
     results.append(CheckResult("pre-push hook installed", hook_ok))

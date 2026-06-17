@@ -440,3 +440,68 @@ def test_symbol_parser_check_fails_when_treesitter_forced_and_missing(monkeypatc
     assert "COORD_SYMBOL_PARSER=treesitter" in result.detail
     # The hint must mention how to fix it.
     assert "symbols" in result.hint
+
+
+# --- v0.32.2: doctor robustness under the user-scoped MCP model ---
+
+
+def _write_claude_json(home: Path, mcp_servers: dict) -> None:
+    import json
+
+    (home / ".claude.json").write_text(
+        json.dumps({"mcpServers": mcp_servers}), encoding="utf-8"
+    )
+
+
+def test_user_scoped_coord_mcp_detected_by_command(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # Named "coord"
+    _write_claude_json(tmp_path, {"coord": {"command": "coord-mcp", "args": []}})
+    assert cli_doctor._user_scoped_coord_mcp() is True
+    # Matched by command even under a different entry name.
+    _write_claude_json(tmp_path, {"whatever": {"command": "coord-mcp"}})
+    assert cli_doctor._user_scoped_coord_mcp() is True
+
+
+def test_user_scoped_coord_mcp_absent_and_malformed(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # No file at all.
+    assert cli_doctor._user_scoped_coord_mcp() is False
+    # File present but no coord server.
+    _write_claude_json(tmp_path, {"other": {"command": "other-mcp"}})
+    assert cli_doctor._user_scoped_coord_mcp() is False
+    # Malformed JSON does not raise.
+    (tmp_path / ".claude.json").write_text("{not json", encoding="utf-8")
+    assert cli_doctor._user_scoped_coord_mcp() is False
+
+
+def test_managed_block_doc_checks_both_docs(tmp_path):
+    from coordination.cli_shared import MANAGED_BEGIN
+
+    assert cli_doctor._managed_block_doc(tmp_path) is None
+    # Block in AGENTS.md (not CLAUDE.md) is still found.
+    (tmp_path / "AGENTS.md").write_text(
+        f"# Agents\n{MANAGED_BEGIN}\nproto\n", encoding="utf-8"
+    )
+    assert cli_doctor._managed_block_doc(tmp_path) == "AGENTS.md"
+    # CLAUDE.md takes precedence in the check order.
+    (tmp_path / "CLAUDE.md").write_text(
+        f"# Claude\n{MANAGED_BEGIN}\nproto\n", encoding="utf-8"
+    )
+    assert cli_doctor._managed_block_doc(tmp_path) == "CLAUDE.md"
+
+
+def test_sessions_live_stale_entries_are_warn_not_fail(tmp_path):
+    """Stale dead-PID entries are self-healing noise; doctor must surface
+    them as WARN so they never flip the exit code."""
+    coord = tmp_path / ".coordination"
+    coord.mkdir()
+    # PID 1 is alive (init); a huge PID is dead.
+    (coord / "sessions.live").write_text(
+        "sess-a 1\nsess-b 2147480000\n", encoding="utf-8"
+    )
+    results = cli_doctor._check_sessions_live(tmp_path)
+    assert results, "expected a sessions.live result"
+    stale = results[0]
+    assert stale.ok is False
+    assert stale.level == "warn"
