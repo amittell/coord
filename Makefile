@@ -27,7 +27,21 @@ lint:
 typecheck:
 	$(ACTIVATE) && mypy coordination
 
+# Refuse to start when another run of THIS repo's pytest is already
+# active. The integration tests share fixed resources (the instance
+# lock + service port), so two concurrent full runs deadlock -- a
+# stray background run from a prior session has stalled `make check`
+# (and the pre-push hook that calls it) for hours. Fail fast with a
+# clear message instead. pgrep matches only this venv's pytest, so
+# unrelated projects' test runs are ignored; if pgrep is unavailable
+# the guard degrades to a no-op.
 test:
+	@if pgrep -f "$(CURDIR)/$(VENV)/bin/pytest" >/dev/null 2>&1; then \
+	  echo "ERROR: another coord pytest run is already active; refusing to start a"; \
+	  echo "second (the integration tests deadlock on shared resources). Wait for it,"; \
+	  echo "or kill it:  pkill -f '$(CURDIR)/$(VENV)/bin/pytest'"; \
+	  exit 1; \
+	fi
 	$(ACTIVATE) && pytest -q
 
 # Fast loop: skip the real-process integration tests. Use during active
