@@ -45,7 +45,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import urlsplit
+from urllib.request import url2pathname
 
 from coordination.config import Settings
 
@@ -217,7 +218,12 @@ def _uri_to_path(uri: str) -> Path:
     parts = urlsplit(uri)
     if parts.scheme != "file":
         raise ValueError(f"non-file URI in references result: {uri!r}")
-    return Path(unquote(parts.path))
+    # url2pathname handles the platform quirks unquote alone does not:
+    # on Windows a ``file:///C:/x`` URI has path ``/C:/x`` (a leading
+    # slash before the drive), and ``Path('/C:/x')`` mangles it into the
+    # drive-relative ``C:x``. url2pathname strips that slash and emits a
+    # real ``C:\x``; on POSIX it is an unquoting no-op.
+    return Path(url2pathname(parts.path))
 
 
 def relpath_under_root(path: str | Path, root: str | Path) -> str | None:
