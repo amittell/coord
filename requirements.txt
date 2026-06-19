@@ -9,13 +9,13 @@
 aiosqlite==0.22.1
 annotated-doc==0.0.4
 annotated-types==0.7.0
-anyio==4.13.0
+anyio==4.14.0
 attrs==26.1.0
-certifi==2026.5.20
+certifi==2026.6.17
 cffi==2.0.0
 click==8.4.1
 cryptography==49.0.0
-fastapi==0.137.0
+fastapi==0.137.2
 h11==0.16.0
 httpcore==1.0.9
 httptools==0.8.0
@@ -24,7 +24,7 @@ httpx-sse==0.4.3
 idna==3.18
 jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
-mcp==1.27.2
+mcp==1.28.0
 packaging==26.2
 pathspec==1.1.1
 pycparser==3.0
