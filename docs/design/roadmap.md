@@ -3,7 +3,38 @@
 Status: living document
 Last updated: 2026-06-19 (after v0.32.4)
 
-This is the post-v0.29 forward look. Items here are candidates, not commitments -- order and scope move as production telemetry and operator feedback arrive. Entries already shipped live in [CHANGELOG.md](../../CHANGELOG.md); see also [docs/design/sub-file-claims.md](./sub-file-claims.md) for the v0.14-v0.26 arc design.
+This is the post-v0.32 forward look. Items here are candidates, not commitments -- order and scope move as production telemetry and operator feedback arrive. Entries already shipped live in [CHANGELOG.md](../../CHANGELOG.md); see also [docs/design/sub-file-claims.md](./sub-file-claims.md) for the v0.14-v0.26 arc design. The shipped sections below are kept for context; the **Forward plan** immediately following is the live priority order.
+
+## Forward plan (unshipped)
+
+Version-assigned by current priority, using value-per-effort against today's single-fleet deployment. Candidates, not commitments; the ordering moves when the usage shape changes (multi-team / multi-tenant demand is the big lever). Detailed designs for the larger items live in their own sections further down.
+
+### v0.32.5 (next) -- Outbox retry CLI
+
+``coord outbox retry --exhausted`` + ``coord outbox stats`` so an operator can drive the webhook retry rotation after fixing a receiver, without touching SQLite directly. No schema migration; finishes the v0.27 webhook story. Smallest self-contained increment, effectively zero risk -- the natural next point release.
+
+### v0.33.0 -- GitHub PR-comment integration
+
+When a pre-push hook 409s, the next push that succeeds comments on the PR naming the files that bounced and which engineer held them. Closes the "why did my PR sit unmerged" gap -- the most-felt day-to-day friction. Reuses the v0.27 webhook delivery + HMAC surface.
+
+### v0.34.0 -- Symbol-level coexist
+
+Extend ``coexist`` so two claims can share a single symbol-scope file with explicit boundaries (``coexist_pattern`` -> ``coexist_symbols``). Builds directly on the v0.14-v0.31 symbol / LSP arc while that code and its parsers are freshest. Small migration on the coexist representation.
+
+### v0.35.0 -- Operator approval workflow
+
+A ``pending_promotion`` row that an operator approves from the dashboard, bridging v0.21 fully-soft and v0.22 fully-automatic auto-promote. Schema migration for the pending-promotion table plus a dashboard approve / deny surface.
+
+### Design-gated (no firm version -- write the design doc first)
+
+- **Multi-namespace coordination** -- one instance serving multiple repos / teams. Build only once multi-tenant demand is concrete, and after ``docs/design/multi-namespace.md`` settles the irreversible decisions (URL shape, isolation level, tenant tokens). Candidate items in the Multi-namespace section below.
+- **Postgres backend** -- the large bet that gates a whole tier of optimizations (NOTIFY-driven queue grant, partitioned conflict_log, read-replica dashboard). Pull the trigger when topology shifts to multi-replica / high-throughput. Full detail and the dependent optimizations in the Large bets section below.
+
+### Parked (unsized, no demand signal yet)
+
+- **First-party Slack adapter** -- the generic v0.27 webhook already covers integration; a bespoke adapter earns its keep only once a Slack workspace actually fronts this.
+- **Conflict-prediction ML** -- predict which pending claims will 409 from conflict_log history. Highest uncertainty, least-proven demand; revisit once there is enough history to model.
+- **Activity replay** (``coord replay``) -- re-run a captured claim / decision timeline for race repro and conflict-engine regression testing. A good tool, not yet pulling weight.
 
 ## v0.29.0-0.29.3 (shipped) -- Per-engineer bearer tokens + dashboard login UI
 
@@ -74,7 +105,7 @@ Shipped in v0.27.0:
 - Outbox table for retry-on-failure (`webhook_outbox`, schema v13) with exponential backoff capped at `COORD_WEBHOOK_MAX_RETRIES` (default 5), so a transient receiver outage does not lose events; rows that exhaust their retry budget land in the `exhausted` state and are visible in the dashboard's "webhook delivery (24h)" panel.
 - Five new db helpers (`enqueue_webhook`, `list_pending_webhooks`, `mark_webhook_delivered`, `mark_webhook_failed`, `webhook_delivery_stats`) and a background delivery loop wired into `main.py`'s lifespan, gated on `COORD_WEBHOOK_URL`.
 
-Follow-ups deferred to v0.27.x (or rolled into v0.28's external-integrations theme):
+Follow-ups, now scheduled in the Forward plan above (outbox retry CLI -> v0.32.5, GitHub PR-comment integration -> v0.33.0; the Slack adapter is parked). Canonical descriptions:
 
 - A first-party Slack adapter that turns the webhook payloads into a single channel message stream. Optional bot mode that responds to `/coord pending` and `/coord queue` slash commands.
 - GitHub PR comment integration: when a pre-push hook 409s, the next push that does succeed includes a comment on the PR description listing the files that bounced and which engineer held them. Closes the "why did my PR sit unmerged" feedback gap.
@@ -82,7 +113,7 @@ Follow-ups deferred to v0.27.x (or rolled into v0.28's external-integrations the
 
 ## Multi-namespace coordination (deferred from v0.28)
 
-Today coord is single-tenant per instance: one ownership YAML, one claim table, one queue. This body of work scales to multi-repo and multi-team usage without forcing a separate coord instance per topology. Originally sized for v0.28, deferred to v0.29 or v0.30 (whichever ships first) pending actual multi-tenant demand surfacing in production telemetry.
+Today coord is single-tenant per instance: one ownership YAML, one claim table, one queue. This body of work scales to multi-repo and multi-team usage without forcing a separate coord instance per topology. Originally sized for v0.28; still unshipped through v0.32 and now design-gated in the Forward plan above -- it waits on concrete multi-tenant demand in production telemetry and on ``docs/design/multi-namespace.md`` settling the irreversible decisions before any code.
 
 Candidate items:
 
@@ -128,15 +159,11 @@ Maintenance policy (adopted 2026-06-19): routine dependency patches land on ``ma
 
 Also out-of-band in this window: the ``make test`` target gained a ``pgrep`` guard that refuses to start when another project pytest is already running, after a stale background run deadlocked the pre-push ``make check``.
 
-## Future bucket (no version assigned)
+## Large bets (design / demand-gated)
 
-Items worth tracking but not yet sized:
+The unsized tail -- each is weeks of work and/or gated on a design doc or real demand. The smaller former-future-bucket items (symbol-level coexist, operator approval) have been pulled up into the Forward plan as v0.34.0 / v0.35.0; conflict-prediction ML and activity replay are parked there.
 
-- **Postgres backend** (deferred from v0.26 candidate list). Removes the SQLite single-writer ceiling, unlocks LISTEN/NOTIFY to eliminate the v0.24 0.5s poll interval on the cross-process queue, enables proper hot-standby HA. Estimated 2-3 weeks of dual-backend engineering plus a 2-3x test-suite slowdown for the per-test Postgres fixture. Worth it when deployment topology shifts to multi-tenant or multi-replica + high-throughput.
-- **Symbol-level coexist**: today `coexist` lets two claims share a file scope at the holder's discretion. Extend to let two symbol claims share a single symbol-scope file with explicit boundaries (`coexist_pattern` becomes `coexist_symbols`).
-- **Conflict-prediction ML**: feed the conflict_log + claim history into a small model that predicts which pending claims are likely to 409. Surface in the dashboard so an operator can proactively split a module before the storm hits.
-- **Activity replay / debug mode**: a `coord replay` CLI that re-runs every claim and decision from a captured timeline. Useful for reproducing tricky race conditions and validating proposed conflict-engine changes against historical traffic.
-- **Operator approval workflow** (alternative to v0.22 hard auto-promote): instead of writing immediately, the conflict pipeline files a `pending_promotion` row that the operator approves via the dashboard. Bridges the gap between v0.21 fully-soft and v0.22 fully-automatic.
+- **Postgres backend** (deferred from the v0.26 candidate list). Removes the SQLite single-writer ceiling, unlocks LISTEN/NOTIFY to eliminate the v0.24 0.5s poll interval on the cross-process queue, and enables proper hot-standby HA. Estimated 2-3 weeks of dual-backend engineering plus a 2-3x test-suite slowdown for the per-test Postgres fixture. Worth it when deployment topology shifts to multi-tenant or multi-replica + high-throughput. Gates the optimizations below.
 - **Postgres-only optimisations** (post-Postgres-backend): NOTIFY-driven queue grant (zero poll latency), partitioned conflict_log for repos with >1M attempts per month, read-replica routing for the dashboard.
 
 ## Done in the v0.13 -> v0.29 arc (for context)
