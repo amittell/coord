@@ -9,6 +9,15 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.32.4] - 2026-06-19
+
+### Changed
+
+- Dependency bumps in the pinned ``requirements.txt`` (Dependabot PR
+  #25): ``anyio`` 4.13.0 -> 4.14.0, ``certifi`` 2026.5.20 ->
+  2026.6.17, ``fastapi`` 0.137.0 -> 0.137.2, ``mcp`` 1.27.2 -> 1.28.0.
+  Full suite green on the new versions across the matrix.
+
 ## [0.32.3] - 2026-06-19
 
 ### Changed
