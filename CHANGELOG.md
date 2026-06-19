@@ -9,6 +9,16 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.32.3] - 2026-06-19
+
+### Changed
+
+- Dependency bumps in the pinned ``requirements.txt`` (Dependabot PRs
+  #23, #24), so the container image ships current runtime deps:
+  ``cryptography`` 48.0.0 -> 49.0.0, ``fastapi`` 0.136.3 -> 0.137.0,
+  ``starlette`` 1.2.1 -> 1.3.1. Full suite green on the new versions
+  across the matrix.
+
 ## [0.32.2] - 2026-06-17
 
 ### Changed
