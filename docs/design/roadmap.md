@@ -1,7 +1,7 @@
 # Coord roadmap
 
 Status: living document
-Last updated: 2026-06-12 (after v0.31.0)
+Last updated: 2026-06-19 (after v0.32.4)
 
 This is the post-v0.29 forward look. Items here are candidates, not commitments -- order and scope move as production telemetry and operator feedback arrive. Entries already shipped live in [CHANGELOG.md](../../CHANGELOG.md); see also [docs/design/sub-file-claims.md](./sub-file-claims.md) for the v0.14-v0.26 arc design.
 
@@ -111,6 +111,23 @@ Shipped (schema migration v16):
 - **Symbol rename auto-follow**: a bounded background sweep follows unambiguous renames (same kind, same parent, span overlap, exactly one candidate) atomically across claim_symbols, the claim pattern, an audit row, a ``symbol_renamed`` webhook, and a dashboard note. The roadmap's "query the LSP rename refactor preview" was reinterpreted: that API works pre-apply, not post-hoc, so detection is span-anchored heuristics with a hard ambiguity stop.
 - **Cross-file refactor claims**: ``POST /claims/refactor`` / MCP ``claim_refactor`` reserve the definition plus every callsite's enclosing symbol as one normal claims batch (conflicts/queue/rate limits unchanged; 503 without a live language server).
 
+## v0.31.1-v0.31.2 + v0.32.x (shipped) -- Wiring hygiene, the user-scoped MCP model, and maintenance
+
+No roadmap feature landed between v0.31.0 and v0.32.4. This line is operational hardening, a deliberate change to how coord wires itself into a repo, a Windows correctness fix, and routine dependency maintenance. It is recorded here so the roadmap reflects what actually shipped, not because any of it was a planned feature.
+
+The throughline of v0.31.1 -> v0.32.2 is a single root cause: coord's generated wiring was being swept into unrelated contributor PRs, and agents were then building worktree workarounds instead of using coord. The fix moved coord to a **user-scoped MCP model** and made its machine config untracked, then taught ``coord doctor`` to read the new model without false failures.
+
+- **v0.31.1 -- Prettier exemption.** ``coord init`` / ``coord upgrade`` detect a repo's Prettier usage and add coord's generated ``.mcp.json`` / ``.cursor/mcp.json`` (2-space JSON with placeholders) to a managed ``.prettierignore`` block, so a repo running ``prettier --check`` in CI no longer fails on coord's wiring. No-op for non-Prettier repos.
+- **v0.31.2 -- Commit-risk warning.** Onboarding warns when it writes tracked wiring on a non-default branch or with an already-staged index -- the exact setup where a later ``git add -A`` sweeps coord into an unrelated PR. Advisory, never blocking; names only committable files and prints the safe ``git add``.
+- **v0.32.0 -- Untracked machine config + user-scoped server.** coord's generated machine config (``.mcp.json``, ``.cursor/mcp.json``, ``.codex/config.toml``) is no longer tracked; ``coord upgrade`` untracks any an older version committed. Recommended setup is now one user-scoped server (``claude mcp add --scope user coord coord-mcp``) that resolves each repo's URL/token/repo-id from that repo's gitignored ``.coordination/local.env`` at startup -- so no tracked MCP config exists to leak into a PR. Only protocol docs and the ``.gitignore`` block stay tracked.
+- **v0.32.1 -- Windows LSP path fix.** ``Path.relative_to`` compares path components case-sensitively, so on Windows it wrongly rejected under-root paths differing only in drive-letter / component case, breaking callsite enrichment, the overlap advisory, and ``claim_refactor`` de-duplication (``windows-latest`` CI had been red since v0.31.0). Replaced the three under-root checks with a shared ``relpath_under_root`` helper (``os.path.relpath`` over realpath'd operands; case-insensitive, cross-drive safe, stable across the macOS ``/var`` symlink). No behavior change on Linux/macOS; prod is unaffected (Linux, ``COORD_LSP_ENABLED`` off).
+- **v0.32.2 -- doctor hardening.** ``coord doctor`` exits non-zero only when coordination is genuinely broken. Per-repo MCP config is now optional when a user-scoped coord MCP server is registered; the protocol block is accepted in ``CLAUDE.md`` *or* ``AGENTS.md`` and a missing one is a WARN (it arrives with the next default-branch merge); stale ``sessions.live`` dead-PID rows are a WARN, pruned on read.
+- **v0.32.3 / v0.32.4 -- dependency maintenance.** Pinned ``requirements.txt`` bumps from grouped Dependabot PRs so the container image ships current runtime deps: cryptography 49, fastapi 0.137.2, starlette 1.3.1, anyio 4.14.0, certifi 2026.6.17, mcp 1.28.0. Full suite green across the matrix on each.
+
+Maintenance policy (adopted 2026-06-19): routine dependency patches land on ``main`` to keep the image source current but do **not** trigger a standalone tagged release; they reach prod with the next substantive release. Security-relevant bumps (e.g. cryptography) and actual code changes still cut a release. This stops one prod redeploy per micro-bump while keeping deps current.
+
+Also out-of-band in this window: the ``make test`` target gained a ``pgrep`` guard that refuses to start when another project pytest is already running, after a stale background run deadlocked the pre-push ``make check``.
+
 ## Future bucket (no version assigned)
 
 Items worth tracking but not yet sized:
@@ -152,3 +169,10 @@ This roadmap supersedes the older "candidate" markers in the v0.14 sub-file clai
 | v0.29.6 | OIDC SSO: code+PKCE flow, SSO logins mint short-lived per-engineer tokens |
 | v0.30.0 | per-engineer claim/queue caps + per-repo queue admission control (429 + Retry-After) |
 | v0.31.0 | LSP-aware symbol claims: spans, callsite advisories, rename auto-follow, claim_refactor (schema v16) |
+| v0.31.1 | onboarding exempts coord's generated config from a repo's Prettier check (managed .prettierignore block) |
+| v0.31.2 | onboarding warns when writing tracked wiring on a non-default branch / staged index (PR-pollution guard) |
+| v0.32.0 | machine config (.mcp.json/.cursor/.codex) untracked + gitignored; user-scoped coord-mcp the recommended setup |
+| v0.32.1 | Windows LSP path fix: relpath_under_root replaces Path.relative_to (windows-latest CI green again) |
+| v0.32.2 | coord doctor hardening: user-scoped MCP optional, CLAUDE.md-or-AGENTS.md block, dead-PID rows are WARN |
+| v0.32.3 | dependency maintenance: cryptography 49, fastapi 0.137.0, starlette 1.3.1 |
+| v0.32.4 | dependency maintenance: anyio 4.14.0, certifi 2026.6.17, fastapi 0.137.2, mcp 1.28.0 |
