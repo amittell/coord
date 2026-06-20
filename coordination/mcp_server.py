@@ -761,15 +761,18 @@ async def cancel_queue_request(
 def _repo_root_for_marker() -> Path | None:
     """Return the enclosing repo's ``.coordination/`` directory if present.
 
-    Shells out to ``git rev-parse --show-toplevel`` to find the repo root.
-    Returns ``None`` if git is unavailable, the cwd is not inside a repo, or
+    Shells out to ``git rev-parse --git-common-dir`` and takes its parent,
+    so the MAIN worktree root is found even from a linked git worktree
+    (``--show-toplevel`` would point at the linked worktree root, which has
+    no ``.coordination/`` of its own). Returns ``None`` if git is
+    unavailable, the cwd is not inside a repo, or
     the repo has no ``.coordination/`` subdirectory yet (i.e. ``coord init``
     has not been run). Never raises -- the marker is a best-effort hint, not
     a hard contract.
     """
     try:
         result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
+            ["git", "rev-parse", "--git-common-dir"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -779,10 +782,19 @@ def _repo_root_for_marker() -> Path | None:
         return None
     if result.returncode != 0:
         return None
-    root_str = result.stdout.strip()
-    if not root_str:
+    common_str = result.stdout.strip()
+    if not common_str:
         return None
-    coord_dir = Path(root_str) / ".coordination"
+    # --git-common-dir resolves to the shared .git directory: relative
+    # (".git") in the main worktree, absolute ("/path/main/.git") in a
+    # linked worktree. Its parent is the MAIN worktree root, where
+    # .coordination/ lives. Resolving ".." collapses both forms (and any
+    # subdir-relative "../../.git") to that root.
+    try:
+        repo_root = (Path(common_str) / "..").resolve()
+    except OSError:
+        return None
+    coord_dir = repo_root / ".coordination"
     try:
         if not coord_dir.is_dir():
             return None

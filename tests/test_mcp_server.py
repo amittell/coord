@@ -1476,7 +1476,7 @@ def test_register_skips_silently_on_filesystem_error(
 def test_repo_root_for_marker_returns_none_outside_git_repo(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """_repo_root_for_marker shells out to `git rev-parse --show-toplevel`.
+    """_repo_root_for_marker shells out to `git rev-parse --git-common-dir`.
     Running it from a directory that is not inside any git repo must return
     None rather than raising or guessing. (If pytest's tmp_path happens to
     sit inside an outer repo on the dev machine, that repo is highly
@@ -1512,6 +1512,42 @@ def test_repo_root_for_marker_returns_coord_dir_when_present(
     coord_dir.mkdir()
     monkeypatch.chdir(tmp_path)
 
+    result = mcp_server._repo_root_for_marker()
+    assert result is not None
+    assert result.resolve() == coord_dir.resolve()
+
+
+def test_repo_root_for_marker_resolves_main_root_from_linked_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """From a linked git worktree the marker root must resolve to the MAIN
+    worktree's .coordination/ (where it lives), not the linked worktree root
+    (which has none). Regression test for the --show-toplevel ->
+    --git-common-dir fix: --show-toplevel would have returned the linked
+    root and yielded None."""
+    import subprocess
+
+    main = tmp_path / "main"
+    main.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=str(main), check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "t@example.com"], cwd=str(main), check=True
+    )
+    subprocess.run(["git", "config", "user.name", "t"], cwd=str(main), check=True)
+    (main / "f.txt").write_text("x\n", encoding="utf-8")
+    subprocess.run(["git", "add", "f.txt"], cwd=str(main), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=str(main), check=True)
+    coord_dir = main / ".coordination"
+    coord_dir.mkdir()
+
+    linked = tmp_path / "linked"
+    subprocess.run(
+        ["git", "worktree", "add", "-q", str(linked)], cwd=str(main), check=True
+    )
+    # The linked worktree has no .coordination/ of its own.
+    assert not (linked / ".coordination").exists()
+
+    monkeypatch.chdir(linked)
     result = mcp_server._repo_root_for_marker()
     assert result is not None
     assert result.resolve() == coord_dir.resolve()
