@@ -272,7 +272,7 @@ def test_constructor_carries_parent() -> None:
         "}\n"
     )
     result = extract_symbols("Widget.java", src)
-    ctor = _by_name(result, "Widget")
+    _by_name(result, "Widget")  # raises if the constructor symbol is absent
     # The class type and the constructor share the simple name; both appear.
     kinds = {s.kind for s in result if s.name == "Widget"}
     assert kinds == {"class", "function"}
@@ -359,7 +359,6 @@ def test_nested_class_method_parents_to_nested_type() -> None:
         "}\n"
     )
     result = extract_symbols("Outer.java", src)
-    names = _names(result)
     # Top-level type only.
     assert _by_name(result, "Outer").kind == "class"
     type_names = {s.name for s in result if s.kind == "class"}
