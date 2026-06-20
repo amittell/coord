@@ -95,6 +95,12 @@ def test_upgrade_refreshes_pre_push_hook_content(tmp_path: Path) -> None:
     hook = (tmp_path / ".coordination" / "hooks" / "pre-push").read_text(encoding="utf-8")
     assert hook == PRE_PUSH_SCRIPT
     assert "OBSOLETE PLACEHOLDER" not in hook
+    # The .git/hooks/pre-push shim must also migrate from the old
+    # show-toplevel form to the worktree-invariant git-common-dir form
+    # (issue #28), so already-deployed buggy shims self-heal on upgrade.
+    shim = (tmp_path / ".git" / "hooks" / "pre-push").read_text(encoding="utf-8")
+    assert "git rev-parse --git-common-dir" in shim
+    assert "rev-parse --show-toplevel)" not in shim
 
 
 def test_upgrade_preserves_owners_yaml(tmp_path: Path) -> None:
