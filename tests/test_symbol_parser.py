@@ -261,10 +261,11 @@ def test_start_line_is_one_indexed(backend: str) -> None:
 
 def test_unknown_extension_returns_empty(backend: str) -> None:
     # ``.py`` and ``.go`` used to land here but are first-class backends as
-    # of v0.15; ``.unknown`` and extensionless paths remain unparseable.
+    # of v0.15; ``.rs`` joined as a first-class backend in v0.33. ``.unknown``,
+    # ``.txt`` and extensionless paths remain unparseable.
     assert extract_symbols("foo.unknown", "function ignored() {}") == []
     assert extract_symbols("noext", "function ignored() {}") == []
-    assert extract_symbols("foo.rs", "fn x() {}") == []
+    assert extract_symbols("foo.txt", "fn x() {}") == []
 
 
 def test_cache_returns_same_list_object() -> None:

@@ -68,11 +68,33 @@ Backend = Callable[[str], list[Symbol]]
 #
 # v0.14: TypeScript only.
 # v0.15: Python (.py) and Go (.go) added.
+# v0.33: JavaScript, Rust, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift, Scala.
+#        ``.h`` maps to C and ``.hpp``/``.hh`` map to C++; no extension is
+#        claimed by two languages.
 _BACKENDS: dict[str, tuple[str, str, str]] = {
     ".ts": ("typescript", "ts_treesitter", "ts_regex"),
     ".tsx": ("typescript", "ts_treesitter", "ts_regex"),
     ".py": ("python", "py_treesitter", "py_regex"),
     ".go": ("go", "go_treesitter", "go_regex"),
+    ".js": ("javascript", "javascript_treesitter", "javascript_regex"),
+    ".jsx": ("javascript", "javascript_treesitter", "javascript_regex"),
+    ".rs": ("rust", "rust_treesitter", "rust_regex"),
+    ".java": ("java", "java_treesitter", "java_regex"),
+    ".c": ("c", "c_treesitter", "c_regex"),
+    ".h": ("c", "c_treesitter", "c_regex"),
+    ".cc": ("cpp", "cpp_treesitter", "cpp_regex"),
+    ".cpp": ("cpp", "cpp_treesitter", "cpp_regex"),
+    ".cxx": ("cpp", "cpp_treesitter", "cpp_regex"),
+    ".hpp": ("cpp", "cpp_treesitter", "cpp_regex"),
+    ".hh": ("cpp", "cpp_treesitter", "cpp_regex"),
+    ".cs": ("csharp", "csharp_treesitter", "csharp_regex"),
+    ".rb": ("ruby", "ruby_treesitter", "ruby_regex"),
+    ".php": ("php", "php_treesitter", "php_regex"),
+    ".kt": ("kotlin", "kotlin_treesitter", "kotlin_regex"),
+    ".kts": ("kotlin", "kotlin_treesitter", "kotlin_regex"),
+    ".swift": ("swift", "swift_treesitter", "swift_regex"),
+    ".scala": ("scala", "scala_treesitter", "scala_regex"),
+    ".sc": ("scala", "scala_treesitter", "scala_regex"),
 }
 
 # Per-process memoisation. Key: (file_path, sha256 hex of content).
