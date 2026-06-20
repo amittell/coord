@@ -393,10 +393,16 @@ def test_shim_resolves_helper_from_main_root_in_linked_worktree(tmp_path) -> Non
     assert "MARKER_HELPER_RAN" in result.stdout, result.stdout
     # ...and it must be the helper under the MAIN worktree root, never the
     # linked worktree root (which has no .coordination/ at all).
-    main_helper_path = str(helper)
-    linked_helper_path = str(linked / ".coordination" / "hooks" / "pre-push")
-    assert main_helper_path in result.stdout, result.stdout
-    assert linked_helper_path not in result.stdout, result.stdout
+    # $0 is reported in the invoking shell's own path style: a native path on
+    # POSIX, but an MSYS POSIX path (/c/Users/...) under Git-bash on Windows,
+    # which never matches a str(Path) like C:\\...\\. Compare on a
+    # forward-slash-normalised path tail relative to the worktree directory,
+    # which is stable across both shells and drive-prefix styles.
+    norm_stdout = result.stdout.replace("\\", "/")
+    main_tail = f"/{main_repo.name}/.coordination/hooks/pre-push"
+    linked_tail = f"/{linked.name}/.coordination/hooks/pre-push"
+    assert main_tail in norm_stdout, result.stdout
+    assert linked_tail not in norm_stdout, result.stdout
 
 
 def test_shim_exits_zero_when_helper_missing(tmp_path) -> None:
