@@ -9,6 +9,43 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.33.0] - 2026-06-20
+
+### Added
+
+- Function-level (symbol) claims now cover 11 more languages beyond
+  TypeScript/Python/Go: JavaScript (``.js``/``.jsx``), Rust (``.rs``),
+  Java (``.java``), C (``.c``/``.h``), C++
+  (``.cc``/``.cpp``/``.cxx``/``.hpp``/``.hh``), C# (``.cs``), Ruby
+  (``.rb``), PHP (``.php``), Kotlin (``.kt``/``.kts``), Swift
+  (``.swift``), and Scala (``.scala``/``.sc``). Each language ships a
+  tree-sitter backend (gated on its optional grammar wheel via
+  ``GRAMMAR_MODULE``, so it degrades to regex when the wheel is absent)
+  plus a regex fallback, so symbol claims work with or without the
+  ``symbols`` extra. Nested types and their methods use the canonical
+  ``Outer::Inner::method`` parent path uniformly across languages, and
+  LSP ``_command_for`` is wired for the languages with a standard
+  language server. The new grammars are added to the ``symbols`` and
+  ``dev`` extras only; the pinned production image is unaffected. (#29)
+
+### Fixed
+
+- The pre-push git hook no longer hard-fails when run from a linked git
+  worktree. It resolved ``.coordination`` via ``git rev-parse
+  --show-toplevel`` (the linked worktree root, which has no
+  ``.coordination/``), so the push exec'd a nonexistent helper and was
+  blocked. Both the ``.git/hooks/pre-push`` shim and the managed helper
+  now resolve the MAIN worktree root via ``git rev-parse
+  --git-common-dir`` and its parent, and the shim fails OPEN (exit 0)
+  when the helper is missing rather than blocking a push. The helper's
+  own conflict check stays fail-closed. Already-deployed shims self-heal
+  on ``coord upgrade``. (#28)
+- ``_repo_root_for_marker`` (which locates ``.coordination/`` for the
+  ``sessions.live`` session marker) had the same linked-worktree blind
+  spot and silently returned ``None`` from a linked worktree. It now
+  resolves the main worktree root via ``--git-common-dir`` too, so
+  session markers register correctly from any worktree.
+
 ## [0.32.5] - 2026-06-20
 
 ### Fixed
