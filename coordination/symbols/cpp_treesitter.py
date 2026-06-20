@@ -27,15 +27,20 @@ Recognised top-level declarations:
   unscoped (``enum Color``) enums both use this node; the enumerators inside
   are not emitted as separate claimable units.
 
-Not claimable / skipped by design:
+Transparent (non-claimable) containers we descend into:
 
-- ``namespace_definition`` -- a namespace is not a claimable unit and this
-  backend does not recurse into namespace bodies. The extractor mirrors the
-  Go backend's contract of walking only the direct children of the root node,
-  so declarations nested inside a ``namespace { ... }`` block are not
-  surfaced. Out-of-line member definitions written at file scope
-  (``void Foo::bar() {}``) are still captured because they live at the top
-  level of the translation unit.
+- ``namespace_definition`` -- a namespace is not itself a claimable unit, but
+  the declarations it encloses are. The extractor recurses into namespace
+  bodies (mirroring the C# backend's treatment of ``namespace`` blocks) and
+  surfaces their members at the SAME grain they would have at file scope: a
+  free function inside ``namespace app { ... }`` emits ``parent=None`` and a
+  class inside it emits a top-level ``class`` symbol. The namespace name never
+  appears in any dotted ``parent`` path. Nested and C++17 ``namespace A::B``
+  forms recurse to any depth. Out-of-line member definitions written at file
+  scope (``void Foo::bar() {}``) are still captured because they live at the
+  top level of the translation unit.
+
+Not claimable / skipped by design:
 - Data members of a class/struct (``int count_;``) are not callable units of
   coordination, so a ``field_declaration`` only emits a Symbol when its
   declarator is a ``function_declarator`` (a member-function prototype).
@@ -440,24 +445,38 @@ def _handle_template(
             out.append(sym)
 
 
-def extract(content: str) -> list[Symbol]:
-    """Return top-level declarations as :class:`Symbol` instances.
+def _namespace_body(node: Any) -> Any | None:
+    """Return the ``declaration_list`` body of a ``namespace_definition``.
 
-    Walks the direct children of the ``translation_unit`` node. Free functions
-    and out-of-line member definitions emit ``kind='function'`` (with
-    ``parent`` set to the qualifier for ``Foo::bar`` forms). Classes
-    (``kind='class'``), structs (``kind='type'``), and enums (``kind='enum'``)
-    emit their own symbol; class and struct bodies are walked for member
-    functions and nested containers, which carry the full ancestor path in
-    ``parent``. Namespaces are not claimable and their bodies are not walked.
+    Prefers the named ``body`` field; falls back to scanning children for a
+    ``declaration_list`` when the field is not exposed by the grammar (e.g.
+    an empty namespace or a grammar revision that omits the field).
     """
 
-    parser = _cpp_parser()
-    tree = parser.parse(content.encode("utf-8"))
-    root = tree.root_node
+    body = node.child_by_field_name("body")
+    if body is not None and body.type == "declaration_list":
+        return body
+    for child in node.children:
+        if child.type == "declaration_list":
+            return child
+    return None
 
-    out: list[Symbol] = []
-    for child in root.children:
+
+def _walk_top_level(children: Any, out: list[Symbol]) -> None:
+    """Dispatch a sequence of top-level (file- or namespace-scope) children.
+
+    Namespaces are transparent containers: their bodies are walked at the same
+    grain as file scope, so members keep ``parent=None`` (free functions) or
+    emit top-level type symbols (classes / structs / enums). The namespace
+    name never enters a dotted ``parent`` path. Nested and C++17
+    ``namespace A::B { ... }`` forms recurse to arbitrary depth.
+
+    Class / struct bodies are NOT walked here -- :func:`_record_container`
+    owns that recursion so nested types follow the ``"::"`` ancestor-path
+    contract.
+    """
+
+    for child in children:
         child_type = child.type
 
         if child_type == "function_definition":
@@ -484,10 +503,35 @@ def extract(content: str) -> list[Symbol]:
             _handle_template(child, None, out)
             continue
 
-        # namespace_definition, preproc_*, using_declaration, declaration
-        # (data globals), comments, and linkage_specification bodies are not
-        # claimable top-level units and are skipped. We deliberately do not
-        # recurse into namespaces -- only direct children of translation_unit
-        # are top-level for coordination purposes.
+        if child_type == "namespace_definition":
+            body = _namespace_body(child)
+            if body is not None:
+                _walk_top_level(body.children, out)
+            continue
 
+        # preproc_*, using_declaration, declaration (data globals), comments,
+        # and linkage_specification bodies are not claimable units and are
+        # skipped.
+
+
+def extract(content: str) -> list[Symbol]:
+    """Return top-level declarations as :class:`Symbol` instances.
+
+    Walks the direct children of the ``translation_unit`` node. Free functions
+    and out-of-line member definitions emit ``kind='function'`` (with
+    ``parent`` set to the qualifier for ``Foo::bar`` forms). Classes
+    (``kind='class'``), structs (``kind='type'``), and enums (``kind='enum'``)
+    emit their own symbol; class and struct bodies are walked for member
+    functions and nested containers, which carry the full ancestor path in
+    ``parent``. Namespaces are transparent: their bodies are walked at file
+    grain so the declarations they enclose surface as if at top level, with the
+    namespace name absent from every ``parent`` path.
+    """
+
+    parser = _cpp_parser()
+    tree = parser.parse(content.encode("utf-8"))
+    root = tree.root_node
+
+    out: list[Symbol] = []
+    _walk_top_level(root.children, out)
     return out

@@ -354,6 +354,84 @@ def test_treesitter_object_method_has_parent() -> None:
     assert run.parent == "Singleton"
 
 
+def test_treesitter_nested_class_has_dotted_parents() -> None:
+    """A class declared inside a class is emitted with the enclosing type as
+    ``parent``; its method carries the full ``Outer::Inner`` path."""
+
+    pytest.importorskip("tree_sitter_kotlin")
+    from coordination.symbols import kotlin_treesitter
+
+    src = (
+        "package demo\n"
+        "\n"
+        "class Outer {\n"
+        "    fun outerMethod() {}\n"
+        "    class Inner {\n"
+        "        fun innerMethod() {}\n"
+        "    }\n"
+        "}\n"
+    )
+    result = kotlin_treesitter.extract(src)
+
+    outer = _by_name(result, "Outer")
+    assert outer.kind == "class"
+    assert outer.parent is None
+
+    outer_method = _by_name(result, "outerMethod")
+    assert outer_method.kind == "function"
+    assert outer_method.parent == "Outer"
+
+    inner = _by_name(result, "Inner")
+    assert inner.kind == "class"
+    assert inner.parent == "Outer"
+
+    inner_method = _by_name(result, "innerMethod")
+    assert inner_method.kind == "function"
+    assert inner_method.parent == "Outer::Inner"
+
+
+def test_treesitter_nested_type_kinds_and_deep_nesting() -> None:
+    """Nested interfaces / objects keep their kind, and nesting recurses to any
+    depth with a ``"::"``-joined ancestor path."""
+
+    pytest.importorskip("tree_sitter_kotlin")
+    from coordination.symbols import kotlin_treesitter
+
+    src = (
+        "package demo\n"
+        "\n"
+        "class Outer {\n"
+        "    interface InnerIface {\n"
+        "        fun ifaceMethod()\n"
+        "    }\n"
+        "    object InnerObj {\n"
+        "        fun objMethod() {}\n"
+        "    }\n"
+        "    class Mid {\n"
+        "        class Deep {\n"
+        "            fun deepMethod() {}\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+    )
+    result = kotlin_treesitter.extract(src)
+
+    iface = _by_name(result, "InnerIface")
+    assert iface.kind == "interface"
+    assert iface.parent == "Outer"
+    assert _by_name(result, "ifaceMethod").parent == "Outer::InnerIface"
+
+    obj = _by_name(result, "InnerObj")
+    assert obj.kind == "class"
+    assert obj.parent == "Outer"
+    assert _by_name(result, "objMethod").parent == "Outer::InnerObj"
+
+    deep = _by_name(result, "Deep")
+    assert deep.kind == "class"
+    assert deep.parent == "Outer::Mid"
+    assert _by_name(result, "deepMethod").parent == "Outer::Mid::Deep"
+
+
 def test_treesitter_top_level_func_no_parent() -> None:
     pytest.importorskip("tree_sitter_kotlin")
     from coordination.symbols import kotlin_treesitter

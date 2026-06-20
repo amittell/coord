@@ -9,8 +9,12 @@ descends through namespace containers (which are not themselves claimable) to
 reach the top-level type declarations, then descends one level into each type
 body to surface its members with ``parent`` set to the enclosing type name so
 ``Class::method`` notation works. Nested types are handled recursively: a type
-declared inside another type's body is emitted in its own right and its members
-parent to the nested type name.
+declared inside another type's body is emitted in its own right with ``parent``
+set to the ``"::"``-joined path of its enclosing types, and its members parent
+to the full path (``Outer::Inner`` for a method of ``Outer.Inner``).
+Namespaces never contribute to the path: only types do, so a method of
+``namespace N { class Outer { class Inner { ... } } }`` parents to
+``Outer::Inner``, not ``N::Outer::Inner``.
 
 Recognised declarations:
 
@@ -114,25 +118,34 @@ def _body_node(node):
     return None
 
 
-def _walk_type(node, out: list[Symbol]) -> None:
+def _walk_type(node, out: list[Symbol], ancestor_path: str | None = None) -> None:
     """Emit a type declaration and recurse into its body for members.
 
-    ``node`` is one of the keys in :data:`_TYPE_KINDS`. The type itself is
-    emitted with ``parent=None`` (types coordinate at file grain regardless of
-    the namespace that encloses them). Direct members surface with ``parent``
-    set to this type's name; nested types recurse so their members parent to the
-    nested type name.
+    ``node`` is one of the keys in :data:`_TYPE_KINDS`. ``ancestor_path`` is the
+    ``"::"``-joined path of the ENCLOSING types leading UP TO (but not
+    including) this type: ``None`` for a top-level type, ``"Outer"`` for a type
+    declared directly inside ``Outer``, ``"Outer::Inner"`` deeper still.
+    Namespaces never contribute to this path, so a top-level type always emits
+    with ``parent=None`` regardless of the namespace that encloses it.
+
+    The type itself is emitted with ``parent=ancestor_path``. Direct members
+    surface with ``parent`` set to this type's full path (``"Outer"`` for a
+    member of a top-level ``Outer``, ``"Outer::Inner"`` for a member of a
+    nested ``Inner``); nested types recurse with the path extended by this
+    type's name so their own members and types parent to the full path.
     """
 
     name = _name_text(node)
     if name is None:
         return
+    full_path = f"{ancestor_path}::{name}" if ancestor_path else name
     out.append(
         Symbol(
             name=name,
             kind=_TYPE_KINDS[node.type],
             start_line=node.start_point[0] + 1,
             end_line=node.end_point[0] + 1,
+            parent=ancestor_path,
         )
     )
 
@@ -150,24 +163,27 @@ def _walk_type(node, out: list[Symbol]) -> None:
                     kind=_MEMBER_KINDS[child.type],
                     start_line=child.start_point[0] + 1,
                     end_line=child.end_point[0] + 1,
-                    parent=name,
+                    parent=full_path,
                 )
             )
         elif child.type in _TYPE_KINDS:
-            _walk_type(child, out)
+            _walk_type(child, out, full_path)
 
 
 def _walk_container(node, out: list[Symbol]) -> None:
     """Descend a compilation unit or namespace body, dispatching declarations.
 
-    Type declarations are handed to :func:`_walk_type`; namespace declarations
-    are descended into (but never emitted); everything else (using directives,
-    attributes, global statements) is ignored.
+    Type declarations are handed to :func:`_walk_type` with ``ancestor_path``
+    ``None`` -- namespaces are transparent containers that never contribute to
+    the dotted type path, so a type reached through any depth of namespace
+    nesting is still a top-level type for parenting purposes. Namespace
+    declarations are descended into (but never emitted); everything else (using
+    directives, attributes, global statements) is ignored.
     """
 
     for child in node.children:
         if child.type in _TYPE_KINDS:
-            _walk_type(child, out)
+            _walk_type(child, out, None)
         elif child.type in _NAMESPACE_NODES:
             body = _body_node(child)
             if body is not None:
@@ -178,10 +194,12 @@ def extract(content: str) -> list[Symbol]:
     """Return top-level declarations as :class:`Symbol` instances.
 
     Namespaces are transparent containers: the extractor descends through them
-    to reach the type declarations they hold. Each type emits one Symbol and its
-    direct methods and properties emit one Symbol each with ``parent`` set to the
-    enclosing type name. Nested types recurse so members parent to the nearest
-    enclosing type.
+    to reach the type declarations they hold without contributing to the dotted
+    path. Each type emits one Symbol (top-level types with ``parent=None``,
+    nested types with ``parent`` set to the ``"::"``-joined path of their
+    enclosing types) and its direct methods and properties emit one Symbol each
+    with ``parent`` set to the type's full path. Nested types recurse so their
+    members parent to the full ``Outer::Inner`` path.
     """
 
     parser = _csharp_parser()

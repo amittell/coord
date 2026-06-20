@@ -341,11 +341,11 @@ def test_fields_are_not_emitted() -> None:
 
 
 def test_nested_class_method_parents_to_nested_type() -> None:
-    """A method inside a nested class is parented to the nested class name.
+    """A nested class emits its own Symbol and its method gets the dotted path.
 
-    Only the top-level type emits a type Symbol; the nested type does not get
-    its own type Symbol, but its methods surface with the nested type as their
-    immediate parent so ``Inner::method`` resolves.
+    The nested type surfaces as its own type Symbol parented to the enclosing
+    type (``parent='Outer'``), and its methods carry the full ``"::"``-joined
+    path of all enclosing types so ``Outer::Inner::method`` resolves.
     """
 
     pytest.importorskip("tree_sitter_java")
@@ -359,14 +359,16 @@ def test_nested_class_method_parents_to_nested_type() -> None:
         "}\n"
     )
     result = extract_symbols("Outer.java", src)
-    # Top-level type only.
     assert _by_name(result, "Outer").kind == "class"
-    type_names = {s.name for s in result if s.kind == "class"}
-    assert "Inner" not in type_names
+    assert _by_name(result, "Outer").parent is None
+    # The nested type is emitted with the enclosing type as its parent.
+    inner = _by_name(result, "Inner")
+    assert inner.kind == "class"
+    assert inner.parent == "Outer"
     outer_method = _by_name(result, "outerMethod")
     inner_method = _by_name(result, "innerMethod")
     assert outer_method.parent == "Outer"
-    assert inner_method.parent == "Inner"
+    assert inner_method.parent == "Outer::Inner"
     assert inner_method.kind == "function"
 
 

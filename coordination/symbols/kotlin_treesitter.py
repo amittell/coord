@@ -2,8 +2,9 @@
 
 Walks the top level of the ``source_file`` node produced by
 ``tree-sitter-kotlin`` and emits one :class:`Symbol` per claimable
-declaration. Methods inside a class / interface / object body are descended
-one level so they can be addressed with ``Class::method`` notation.
+declaration. Class / interface / object bodies are walked RECURSIVELY so
+methods and nested types surface with the full ancestor path joined by
+``"::"``, addressable as ``Class::method`` and ``Outer::Inner::method``.
 
 Recognised declarations:
 
@@ -15,9 +16,16 @@ Recognised declarations:
 - ``object_declaration`` -- ``kind='class'`` (a Kotlin ``object`` is a named
   singleton; it coordinates at the same grain as a class).
 - Methods inside a class / interface / object body -- ``function_declaration``
-  nodes one level down -- emit ``kind='function'`` with ``parent`` set to the
-  enclosing type name so ``Foo::handle`` is distinct from a free-standing
-  ``handle``.
+  nodes -- emit ``kind='function'`` with ``parent`` set to the full ``"::"``-
+  joined path of the enclosing types so ``Foo::handle`` is distinct from a
+  free-standing ``handle`` and ``Outer::Inner::handle`` from a method of the
+  outer class.
+- Nested types declared inside a class / interface / object body
+  (``class`` / ``interface`` / ``enum class`` / ``object``) -- emitted as their
+  own symbol with ``parent`` set to the ``"::"``-joined path of the enclosing
+  types (``Symbol(name='Inner', parent='Outer')`` for ``Outer.Inner``,
+  ``parent='Outer::Mid'`` deeper still), then walked recursively for their own
+  members.
 - ``companion_object`` inside a class body -- ``kind='class'`` with the
   enclosing class as ``parent``. An unnamed companion takes the conventional
   name ``Companion``; ``companion object Named`` keeps ``Named``.
@@ -27,14 +35,15 @@ Recognised declarations:
 
 Nesting posture:
 
-Kotlin classes can nest arbitrarily, but the coordination grain only needs a
-single parent edge: a method's enclosing type. We descend exactly one level
-into a class / interface / object body to attach methods and the companion
-object, mirroring how the Go backend records the receiver type as ``parent``.
-Deeper nesting (a class declared inside another class, a local fun inside a
-method body) is intentionally not flattened into top-level symbols because
-those units are not independently claimable from outside their enclosing
-scope.
+Kotlin classes can nest arbitrarily. The backend walks RECURSIVELY into nested
+class / interface / object bodies, threading the full ancestor path so an inner
+type and its methods are addressable as ``Outer::Inner`` and
+``Outer::Inner::method``. The ``parent`` string is the ancestor chain joined by
+``"::"``; the schema column is a single ``parent_symbol`` string and the overlap
+engine matches on the full canonical path, so arbitrary nesting depth works
+without schema changes. Only direct members of each type body are emitted: a
+local ``fun`` declared inside a method body is not flattened into a symbol
+because it is not independently claimable from outside that method scope.
 
 Generic type parameters (``fun <T> id(x: T): T``, ``class Box<T>``) are
 excluded from the captured name because the name node sits before the
@@ -164,24 +173,69 @@ def _companion_name(node) -> str:
     return "Companion"
 
 
-def _members(body, parent_name: str) -> list[Symbol]:
-    """Extract methods and the companion object from a class / object body."""
+def _container_kind(node) -> str:
+    """Map a class / object declaration node to its emitted kind.
 
-    out: list[Symbol] = []
+    A ``class_declaration`` resolves through :func:`_class_kind` (so an
+    ``interface`` or ``enum class`` keeps its precise kind); an
+    ``object_declaration`` is always ``'class'`` because a Kotlin ``object`` is
+    a named singleton that coordinates at the class grain.
+    """
+
+    if node.type == "object_declaration":
+        return "class"
+    return _class_kind(node)
+
+
+def _walk_container(node, ancestor_path: str | None) -> list[Symbol]:
+    """Emit a class / interface / object symbol and walk its body recursively.
+
+    ``ancestor_path`` is the ``"::"``-joined path leading UP TO (but not
+    including) this container: ``None`` for a top-level type, ``"Outer"`` for a
+    type declared directly inside ``Outer``, ``"Outer::Inner"`` deeper still.
+
+    The returned list starts with this container's own symbol (``parent`` set to
+    ``ancestor_path``), followed by its members in source order. Nested types are
+    followed immediately by their own members (depth-first), matching the visual
+    order of the source.
+    """
+
+    name = _decl_name(node)
+    if name is None:
+        return []
+    kind = _container_kind(node)
+    full_path = f"{ancestor_path}::{name}" if ancestor_path else name
+
+    out: list[Symbol] = [
+        Symbol(
+            name=name,
+            kind=kind,
+            start_line=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
+            parent=ancestor_path,
+        )
+    ]
+
+    body = _find_body(node)
+    if body is None:
+        return out
+
     for child in body.children:
         if child.type == "function_declaration":
-            name = _decl_name(child)
-            if name is None:
+            member_name = _decl_name(child)
+            if member_name is None:
                 continue
             out.append(
                 Symbol(
-                    name=name,
+                    name=member_name,
                     kind="function",
                     start_line=child.start_point[0] + 1,
                     end_line=child.end_point[0] + 1,
-                    parent=parent_name,
+                    parent=full_path,
                 )
             )
+        elif child.type in {"class_declaration", "object_declaration"}:
+            out.extend(_walk_container(child, full_path))
         elif child.type == "companion_object":
             companion_name = _companion_name(child)
             out.append(
@@ -190,7 +244,7 @@ def _members(body, parent_name: str) -> list[Symbol]:
                     kind="class",
                     start_line=child.start_point[0] + 1,
                     end_line=child.end_point[0] + 1,
-                    parent=parent_name,
+                    parent=full_path,
                 )
             )
             # Methods declared inside the companion body are claimable units
@@ -213,6 +267,10 @@ def _members(body, parent_name: str) -> list[Symbol]:
                             parent=companion_name,
                         )
                     )
+        # Anything else (property declarations, init blocks, secondary
+        # constructors, comments) is not a claimable member in v1. A local
+        # ``fun`` nested inside a method body is excluded because the walk only
+        # visits direct children of this body.
     return out
 
 
@@ -245,8 +303,11 @@ def extract(content: str) -> list[Symbol]:
     """Return top-level declarations as :class:`Symbol` instances.
 
     Only direct children of ``source_file`` become top-level symbols. Class /
-    interface / object bodies are descended exactly one level so methods and
-    the companion object surface with the enclosing type as ``parent``.
+    interface / object bodies are walked recursively so methods, the companion
+    object, and nested types surface with the full ``"::"``-joined ancestor path
+    as ``parent`` (``"Outer"``, ``"Outer::Inner"`` and so on). Output order
+    follows source order: each type is immediately followed by its members, with
+    inner types recursively expanded in place.
     """
 
     parser = _kotlin_parser()
@@ -267,36 +328,8 @@ def extract(content: str) -> list[Symbol]:
                     end_line=child.end_point[0] + 1,
                 )
             )
-        elif child.type == "class_declaration":
-            name = _decl_name(child)
-            if name is None:
-                continue
-            out.append(
-                Symbol(
-                    name=name,
-                    kind=_class_kind(child),
-                    start_line=child.start_point[0] + 1,
-                    end_line=child.end_point[0] + 1,
-                )
-            )
-            body = _find_body(child)
-            if body is not None:
-                out.extend(_members(body, name))
-        elif child.type == "object_declaration":
-            name = _decl_name(child)
-            if name is None:
-                continue
-            out.append(
-                Symbol(
-                    name=name,
-                    kind="class",
-                    start_line=child.start_point[0] + 1,
-                    end_line=child.end_point[0] + 1,
-                )
-            )
-            body = _find_body(child)
-            if body is not None:
-                out.extend(_members(body, name))
+        elif child.type in {"class_declaration", "object_declaration"}:
+            out.extend(_walk_container(child, None))
         elif child.type == "property_declaration":
             for name in _property_names(child):
                 out.append(

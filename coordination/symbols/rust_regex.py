@@ -26,6 +26,10 @@ Known false-negatives (documented so callers know the trade-off):
   next line). Real rustfmt output keeps the keyword and name together, so this
   only bites hand-mangled or macro-printed source.
 
+- A single-line impl body (``impl Foo { fn bar() {} }`` all on one line)
+  yields no methods, because ``_IMPL_METHOD_RE`` requires the ``fn`` to start
+  its own indented line; conventional multi-line rustfmt output works.
+
 - Braces inside string literals, char literals, or ``//`` / ``/* */`` comments
   shift the brace-depth counter, which can mis-scope or drop an ``impl`` method.
   The tree-sitter backend handles these correctly; install the ``symbols``

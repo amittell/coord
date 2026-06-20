@@ -319,6 +319,41 @@ def test_nested_def_inside_method_excluded(
 
 
 # ---------------------------------------------------------------------------
+# Singleton-class (`class << self`) attribution -- regex backend only
+# ---------------------------------------------------------------------------
+
+
+def test_singleton_class_block_over_attributes_to_surrounding_class() -> None:
+    """Pin the regex backend's documented ``class << self`` behavior.
+
+    ``ruby_regex`` does not recognise a ``class << self`` block as its own
+    namespace (the ``<< self`` header has no constant name to capture). A
+    method whose indent lands at the surrounding class's body indent is
+    therefore attributed to that class -- an over-attribution the module
+    docstring calls out. This test is regex-only and locks the current
+    behavior so a future refactor cannot change it silently; if the regex ever
+    learns to model the singleton scope, update this expectation deliberately.
+    """
+
+    src = (
+        "class Config\n"
+        "  class << self\n"
+        "  def setup\n"
+        "  end\n"
+        "  end\n"
+        "end\n"
+    )
+    result = ruby_regex.extract(src)
+    assert "Config" in _names(result)
+    assert _by_name(result, "Config").kind == "class"
+    # ``setup`` is over-attributed to the surrounding class, not to a
+    # singleton-class scope, because the regex models indent, not ``<< self``.
+    setup = _by_name(result, "setup")
+    assert setup.kind == "function"
+    assert setup.parent == "Config"
+
+
+# ---------------------------------------------------------------------------
 # Empty / structural files
 # ---------------------------------------------------------------------------
 

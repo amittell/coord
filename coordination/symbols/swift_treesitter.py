@@ -17,6 +17,12 @@ Recognised top-level declarations:
     - ``enum`` -> ``kind='enum'``
     - ``extension`` -> ``kind='type'``; the name is the extended type and its
       members inherit that name as ``parent``.
+
+  Note: ``class Foo`` and ``extension Foo`` in the same file intentionally emit
+  two top-level rows -- a ``'class'`` row and a ``'type'`` row that share the
+  name ``Foo``. They are not deduplicated here; downstream they collapse to one
+  claimable unit because the overlap engine keys on the canonical
+  ``parent::name`` path, so both rows resolve to the same ``Foo`` scope.
 - ``protocol_declaration`` -- ``kind='interface'``. Method requirements inside
   the protocol body (``protocol_function_declaration``) surface as members.
 - ``property_declaration`` -- a top-level ``let`` / ``var`` binding ->

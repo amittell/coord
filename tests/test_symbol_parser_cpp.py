@@ -325,23 +325,84 @@ def test_pointer_return_free_function() -> None:
 @pytest.mark.skipif(
     not _TREESITTER_AVAILABLE, reason="tree-sitter-cpp not installed"
 )
-def test_namespace_body_not_walked() -> None:
-    """Declarations inside a namespace block are not surfaced as top-level.
+def test_namespace_body_is_walked() -> None:
+    """Declarations inside a namespace block surface at file grain.
 
-    The namespace itself is not claimable and the extractor does not recurse
-    into namespace bodies, mirroring the Go backend's top-level-only contract.
+    The namespace itself is not claimable, but the extractor recurses into its
+    body (like the C# backend). A free function inside the namespace keeps
+    ``parent=None`` and a class inside it emits a top-level ``class`` symbol;
+    the namespace name never appears as a symbol or in any ``parent`` path.
     """
 
     src = (
         "namespace app {\n"
-        "void hidden() {\n"
+        "void worker() {\n"
         "    return;\n"
         "}\n"
+        "class Engine {\n"
+        "public:\n"
+        "    void run();\n"
+        "};\n"
         "}\n"
     )
     result = cpp_treesitter.extract(src)
     assert "app" not in _names(result)
-    assert "hidden" not in _names(result)
+
+    worker = _by_name(result, "worker")
+    assert worker.kind == "function"
+    assert worker.parent is None
+
+    engine = _by_name(result, "Engine")
+    assert engine.kind == "class"
+    assert engine.parent is None
+
+    run = _by_name(result, "run")
+    assert run.kind == "function"
+    assert run.parent == "Engine"
+
+
+@pytest.mark.skipif(
+    not _TREESITTER_AVAILABLE, reason="tree-sitter-cpp not installed"
+)
+def test_nested_namespaces_walked_to_file_grain() -> None:
+    """Nested and C++17 ``namespace A::B`` bodies recurse to file grain.
+
+    Members at any namespace depth surface as if at top level; no namespace
+    name enters a ``parent`` path.
+    """
+
+    src = (
+        "namespace outer {\n"
+        "namespace inner {\n"
+        "int compute(int x) {\n"
+        "    return x;\n"
+        "}\n"
+        "}\n"
+        "}\n"
+        "namespace a::b {\n"
+        "struct Box {\n"
+        "    int volume() const;\n"
+        "};\n"
+        "}\n"
+    )
+    result = cpp_treesitter.extract(src)
+    names = _names(result)
+    assert "outer" not in names
+    assert "inner" not in names
+    assert "a" not in names
+    assert "b" not in names
+
+    compute = _by_name(result, "compute")
+    assert compute.kind == "function"
+    assert compute.parent is None
+
+    box = _by_name(result, "Box")
+    assert box.kind == "type"
+    assert box.parent is None
+
+    volume = _by_name(result, "volume")
+    assert volume.kind == "function"
+    assert volume.parent == "Box"
 
 
 # ---------------------------------------------------------------------------

@@ -333,7 +333,7 @@ def test_block_namespace_descent(treesitter) -> None:
 
 
 def test_nested_type_members_parent_to_nested(treesitter) -> None:
-    """A type nested in another type emits, and its members parent to it."""
+    """A nested type parents to its enclosing type and its members to the full path."""
 
     src = (
         "public class Outer\n"
@@ -350,11 +350,13 @@ def test_nested_type_members_parent_to_nested(treesitter) -> None:
     names = _names(result)
     assert "Outer" in names
     assert "Inner" in names
+    inner = _by_name(result, "Inner")
+    assert inner.kind == "class"
+    assert inner.parent == "Outer"
     outer_method = _by_name(result, "OuterMethod")
     inner_method = _by_name(result, "InnerMethod")
     assert outer_method.parent == "Outer"
-    assert inner_method.parent == "Inner"
-    assert _by_name(result, "Inner").kind == "class"
+    assert inner_method.parent == "Outer::Inner"
 
 
 def test_top_level_type_has_no_parent(treesitter) -> None:

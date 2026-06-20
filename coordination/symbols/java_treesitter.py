@@ -26,13 +26,16 @@ skipped: they hold no body to scope a sub-file claim against.
 
 Nesting posture:
 
-Only top-level types emit a type Symbol. A nested type (a class declared
-inside another class body) does not get its own type Symbol; instead we
-descend into its body so that its methods surface with ``parent`` set to the
-nested type's simple name. This mirrors the Go backend's single-level parent
-edge: ``parent`` always names the immediate lexical type, never a dotted path.
-A claim on a method inside a nested type therefore addresses ``Inner::method``,
-which the recursive ``Outer::Inner::method`` notation composes on top of.
+Nested types are walked recursively. A type declared inside another type body
+(``class`` / ``interface`` / ``enum`` / ``record``) emits its own type Symbol
+whose ``parent`` is the ``"::"``-joined path of its enclosing types
+(``parent='Outer'`` for ``Outer.Inner``, ``parent='Outer::Mid'`` deeper
+still). Methods inside a nested type carry ``parent`` set to the full
+``"::"``-joined path of all enclosing types, so a method of ``Outer.Inner``
+has ``parent='Outer::Inner'`` and resolves through the ``Outer::Inner::method``
+notation. A method of a top-level type keeps ``parent='Outer'``. The overlap
+engine matches on the full canonical path, so arbitrary nesting depth works
+without schema changes.
 
 ``start_line`` / ``end_line`` are 1-indexed inclusive, taken from
 ``node.start_point[0] + 1`` and ``node.end_point[0] + 1``.
@@ -95,28 +98,34 @@ def _body_node(node):
     return node.child_by_field_name("body")
 
 
-def _walk_type_body(type_node, type_name: str, out: list[Symbol]) -> None:
-    """Collect methods and constructors inside ``type_node``'s body.
+def _walk_type_body(type_node, type_path: str, out: list[Symbol]) -> None:
+    """Collect members and nested types inside ``type_node``'s body.
 
-    Methods and constructors are emitted with ``parent=type_name``. Nested
-    type declarations are not emitted as type Symbols; instead we recurse into
-    their bodies so their members carry the nested type's name as ``parent``.
-    The enum member block wraps its methods in an ``enum_body_declarations``
-    node (after the constant list), so that wrapper is descended transparently.
+    ``type_path`` is the full ``"::"``-joined path of this type, INCLUDING its
+    own name (``"Outer"`` for a top-level type, ``"Outer::Inner"`` for a nested
+    one). Methods and constructors are emitted with ``parent=type_path``.
+    Nested type declarations emit their own type Symbol with ``parent`` set to
+    ``type_path`` and are then walked recursively with the path extended by the
+    nested type's name. The enum member block wraps its methods in an
+    ``enum_body_declarations`` node (after the constant list), so that wrapper
+    is descended transparently.
     """
 
     body = _body_node(type_node)
     if body is None:
         return
-    _scan_members(body, type_name, out)
+    _scan_members(body, type_path, out)
 
 
-def _scan_members(container, type_name: str, out: list[Symbol]) -> None:
-    """Iterate ``container``'s children for claimable members.
+def _scan_members(container, type_path: str, out: list[Symbol]) -> None:
+    """Iterate ``container``'s children for claimable members and nested types.
 
     ``container`` is a type body (``class_body`` / ``interface_body`` /
-    ``enum_body``) or the ``enum_body_declarations`` wrapper. Methods and
-    constructors emit a Symbol; nested types recurse; the enum wrapper is
+    ``enum_body``) or the ``enum_body_declarations`` wrapper, and ``type_path``
+    is the full ``"::"``-joined path of the enclosing type. Methods and
+    constructors emit a Symbol with ``parent=type_path``; nested types emit
+    their own type Symbol with ``parent=type_path`` and are then walked
+    recursively under ``type_path::<nested name>``; the enum wrapper is
     flattened in place; everything else (fields, enum constants, comments) is
     ignored.
     """
@@ -132,28 +141,41 @@ def _scan_members(container, type_name: str, out: list[Symbol]) -> None:
                     kind="function",
                     start_line=child.start_point[0] + 1,
                     end_line=child.end_point[0] + 1,
-                    parent=type_name,
+                    parent=type_path,
                 )
             )
         elif child.type in _TYPE_KINDS:
             nested_name = _name_text(child)
             if nested_name is None:
                 continue
-            _walk_type_body(child, nested_name, out)
+            out.append(
+                Symbol(
+                    name=nested_name,
+                    kind=_TYPE_KINDS[child.type],
+                    start_line=child.start_point[0] + 1,
+                    end_line=child.end_point[0] + 1,
+                    parent=type_path,
+                )
+            )
+            _walk_type_body(child, f"{type_path}::{nested_name}", out)
         elif child.type == "enum_body_declarations":
             # Enum methods live inside this wrapper, after the constant list.
-            _scan_members(child, type_name, out)
+            _scan_members(child, type_path, out)
         # field_declaration, enum_constant, comments and other members are not
         # claimable units and are skipped.
 
 
 def extract(content: str) -> list[Symbol]:
-    """Return top-level declarations as :class:`Symbol` instances.
+    """Return top-level and nested declarations as :class:`Symbol` instances.
 
-    Only top-level types (direct children of ``program``) emit a type Symbol.
-    Their methods and constructors -- and the methods of any nested types --
-    are emitted with ``parent`` naming the immediate enclosing type so
-    ``Class::method`` notation resolves.
+    Top-level types (direct children of ``program``) emit a type Symbol with
+    ``parent=None``. Nested types emit their own type Symbol with ``parent``
+    set to the ``"::"``-joined path of their enclosing types. Methods and
+    constructors are emitted with ``parent`` set to the full ``"::"``-joined
+    path of their enclosing type (``"Outer"`` for a top-level type,
+    ``"Outer::Inner"`` for a nested one) so ``Outer::Inner::method`` notation
+    resolves. Output order follows source order, with each nested type
+    immediately followed by its own members.
     """
 
     parser = _java_parser()
