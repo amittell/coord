@@ -92,7 +92,17 @@ set -euo pipefail
 # in the pushing shell's environment. Without this, a remote-mode repo
 # would silently fall back to http://127.0.0.1:8080 and quietly soft-pass
 # every push.
-REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+# Resolve the MAIN worktree root via the common git dir's parent so the
+# hook still finds .coordination/local.env when invoked from a linked git
+# worktree (where --show-toplevel points at the linked root, which has no
+# .coordination/). This stays fail-soft: a missing local.env just means we
+# fall back to env vars and defaults below. The conflict check further
+# down remains fail-closed on real conflicts.
+COORD_COMMON_DIR="$(git rev-parse --git-common-dir 2>/dev/null || true)"
+REPO_ROOT=""
+if [[ -n "${COORD_COMMON_DIR}" ]]; then
+  REPO_ROOT="$(cd "${COORD_COMMON_DIR}/.." 2>/dev/null && pwd || true)"
+fi
 if [[ -n "${REPO_ROOT}" && -f "${REPO_ROOT}/.coordination/local.env" ]]; then
   set -a
   # shellcheck disable=SC1090,SC1091

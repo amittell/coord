@@ -378,7 +378,20 @@ def _install_hook(repo_root: Path, force: bool) -> None:
     git_hook = repo_root / ".git" / "hooks" / "pre-push"
     shim = (
         "#!/usr/bin/env bash\n"
-        'exec "$(git rev-parse --show-toplevel)/.coordination/hooks/pre-push" "$@"\n'
+        "# Resolve coord's managed pre-push helper relative to the MAIN\n"
+        "# worktree root, not whichever worktree we were invoked from. In a\n"
+        "# linked git worktree `git rev-parse --show-toplevel` points at the\n"
+        "# linked root (which has no .coordination/), so we derive the main\n"
+        "# root from the common git dir's parent instead. Fail open (exit 0)\n"
+        "# if we cannot resolve it or the helper is missing -- coord must\n"
+        "# never hard-block a push just because it cannot find its own helper.\n"
+        'common="$(git rev-parse --git-common-dir 2>/dev/null)"\n'
+        '[ -n "$common" ] || exit 0\n'
+        'repo_root="$(cd "$common/.." 2>/dev/null && pwd)" || exit 0\n'
+        '[ -n "$repo_root" ] || exit 0\n'
+        'helper="$repo_root/.coordination/hooks/pre-push"\n'
+        '[ -x "$helper" ] && exec "$helper" "$@"\n'
+        "exit 0\n"
     )
 
     # CRITICAL: never follow a symlink with write_text. The target is
@@ -397,7 +410,7 @@ def _install_hook(repo_root: Path, force: bool) -> None:
             f"  To run coord's conflict check alongside your existing hook, add\n"
             f"  this near the end of {target}:\n"
             f"\n"
-            f"    COORD_HOOK=\"$(git rev-parse --show-toplevel)/.coordination/hooks/pre-push\"\n"
+            f"    COORD_HOOK=\"$(cd \"$(git rev-parse --git-common-dir)/..\" && pwd)/.coordination/hooks/pre-push\"\n"
             f"    [ -x \"$COORD_HOOK\" ] && \"$COORD_HOOK\" \"$@\"\n",
             file=sys.stderr,
         )
@@ -411,7 +424,7 @@ def _install_hook(repo_root: Path, force: bool) -> None:
                 "  chain coord's check by adding this line near the end of\n"
                 "  your existing hook:\n"
                 "\n"
-                "    COORD_HOOK=\"$(git rev-parse --show-toplevel)/.coordination/hooks/pre-push\"\n"
+                "    COORD_HOOK=\"$(cd \"$(git rev-parse --git-common-dir)/..\" && pwd)/.coordination/hooks/pre-push\"\n"
                 "    [ -x \"$COORD_HOOK\" ] && \"$COORD_HOOK\" \"$@\"\n",
                 file=sys.stderr,
             )

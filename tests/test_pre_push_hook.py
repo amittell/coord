@@ -3,10 +3,12 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
 from coordination.assets import PRE_PUSH_SCRIPT
+from coordination.cli_init import _install_hook
 
 
 def test_script_runs_conflict_check_when_token_is_empty() -> None:
@@ -299,3 +301,148 @@ def test_script_session_qs_e2e_empty_when_file_missing(tmp_path) -> None:
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout == "[]", result.stdout
+
+
+def _git(repo: Path, *args: str) -> None:
+    env = dict(os.environ)
+    # Deterministic identity so commits succeed in a clean CI sandbox.
+    env.update(
+        {
+            "GIT_AUTHOR_NAME": "coord test",
+            "GIT_AUTHOR_EMAIL": "coord-test@example.com",
+            "GIT_COMMITTER_NAME": "coord test",
+            "GIT_COMMITTER_EMAIL": "coord-test@example.com",
+        }
+    )
+    subprocess.run(
+        ["git", *args],
+        cwd=str(repo),
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_shim_resolves_helper_from_main_root_in_linked_worktree(tmp_path) -> None:
+    # Regression test for #28: the installed .git/hooks/pre-push shim must
+    # resolve coord's managed helper relative to the MAIN worktree root,
+    # not whichever (linked) worktree the push was launched from. A linked
+    # worktree has no .coordination/ of its own, so a show-toplevel-based
+    # shim used to exec a nonexistent helper and hard-block the push. The
+    # git-common-dir-based shim resolves the main root instead.
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("bash not available on this platform")
+    if not shutil.which("git"):
+        pytest.skip("git not available on this platform")
+
+    main_repo = tmp_path / "main"
+    main_repo.mkdir()
+    _git(main_repo, "init", "-q")
+    (main_repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+    _git(main_repo, "add", "seed.txt")
+    _git(main_repo, "commit", "-q", "-m", "seed")
+
+    # Install the real shim (and the managed helper) into the main repo.
+    _install_hook(main_repo, force=False)
+
+    shim = main_repo / ".git" / "hooks" / "pre-push"
+    assert shim.is_file()
+    # The shim must no longer hard-code show-toplevel; it derives the main
+    # root from the common git dir's parent.
+    shim_text = shim.read_text(encoding="utf-8")
+    assert "git rev-parse --git-common-dir" in shim_text
+    # The shim must not actually *invoke* show-toplevel any more (a mention
+    # in the explanatory comment is fine, the executable resolution is not).
+    assert "rev-parse --show-toplevel)" not in shim_text
+
+    # Replace the managed helper with a marker that reveals the path it was
+    # exec'd as ($0) so we can prove which worktree's helper ran. exec in
+    # the shim sets $0 to "$repo_root/.coordination/hooks/pre-push".
+    helper = main_repo / ".coordination" / "hooks" / "pre-push"
+    marker = (
+        "#!/usr/bin/env bash\n"
+        'echo "MARKER_HELPER_RAN"\n'
+        'echo "$0"\n'
+        "exit 0\n"
+    )
+    helper.write_text(marker, encoding="utf-8")
+    helper.chmod(0o755)
+
+    # Add a linked worktree and commit in it so a push from there is real.
+    linked = tmp_path / "linked"
+    _git(main_repo, "worktree", "add", "-q", "-b", "feature", str(linked))
+    (linked / "work.txt").write_text("work\n", encoding="utf-8")
+    _git(linked, "add", "work.txt")
+    _git(linked, "commit", "-q", "-m", "work in linked worktree")
+
+    # Invoke the shim with cwd = the LINKED worktree. git would run the
+    # shared hook (main/.git/hooks/pre-push) from this directory on push,
+    # so `git rev-parse --git-common-dir` resolves to main/.git here.
+    result = subprocess.run(
+        [bash, str(shim)],
+        cwd=str(linked),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    # The marker helper must have actually run...
+    assert "MARKER_HELPER_RAN" in result.stdout, result.stdout
+    # ...and it must be the helper under the MAIN worktree root, never the
+    # linked worktree root (which has no .coordination/ at all).
+    # $0 is reported in the invoking shell's own path style: a native path on
+    # POSIX, but an MSYS POSIX path (/c/Users/...) under Git-bash on Windows,
+    # which never matches a str(Path) like C:\\...\\. Compare on a
+    # forward-slash-normalised path tail relative to the worktree directory,
+    # which is stable across both shells and drive-prefix styles.
+    norm_stdout = result.stdout.replace("\\", "/")
+    main_tail = f"/{main_repo.name}/.coordination/hooks/pre-push"
+    linked_tail = f"/{linked.name}/.coordination/hooks/pre-push"
+    assert main_tail in norm_stdout, result.stdout
+    assert linked_tail not in norm_stdout, result.stdout
+
+
+def test_shim_exits_zero_when_helper_missing(tmp_path) -> None:
+    # The shim must FAIL OPEN: if coord's managed helper is absent (e.g.
+    # .coordination/ was never installed in this checkout, or was removed),
+    # the shim exits 0 and lets the push proceed rather than hard-blocking
+    # it. Only the helper itself is fail-closed on real conflicts; the shim
+    # never blocks a push just because it cannot find the helper.
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("bash not available on this platform")
+    if not shutil.which("git"):
+        pytest.skip("git not available on this platform")
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+    _git(repo, "add", "seed.txt")
+    _git(repo, "commit", "-q", "-m", "seed")
+
+    _install_hook(repo, force=False)
+
+    shim = repo / ".git" / "hooks" / "pre-push"
+    helper = repo / ".coordination" / "hooks" / "pre-push"
+    assert shim.is_file()
+    assert helper.is_file()
+
+    # Remove the managed helper to simulate a checkout without it.
+    helper.unlink()
+    assert not helper.exists()
+
+    result = subprocess.run(
+        [bash, str(shim)],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    # Push allowed: the shim resolves the (now missing) helper and exits 0
+    # instead of erroring on a nonexistent exec target.
+    assert result.returncode == 0, result.stderr
