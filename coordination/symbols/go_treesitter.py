@@ -57,6 +57,10 @@ from __future__ import annotations
 
 from . import Symbol
 
+# Native grammar wheel this backend needs; probed by the dispatcher so a
+# missing wheel degrades to the regex backend instead of crashing at call time.
+GRAMMAR_MODULE = "tree_sitter_go"
+
 # Cached parser; populated on first ``extract`` call.
 _parser_go = None
 

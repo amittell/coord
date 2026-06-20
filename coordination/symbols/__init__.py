@@ -26,6 +26,7 @@ do not otherwise need.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import os
 from dataclasses import dataclass
 from typing import Callable
@@ -94,7 +95,17 @@ def _import_backend(module_name: str) -> Backend | None:
     """Import a backend module from this package; return its ``extract``
     callable or ``None`` if the module / its native dependency is missing.
     The caller decides how to react to ``None`` (auto mode falls back,
-    treesitter mode raises)."""
+    treesitter mode raises).
+
+    A tree-sitter backend imports its native grammar lazily (inside the
+    parser getter), so the backend module itself imports fine even when the
+    grammar wheel is absent -- the ``ModuleNotFoundError`` would otherwise
+    only surface when ``extract()`` is finally called, escaping auto-mode's
+    fallback and crashing the caller. To make availability honest at
+    selection time, a tree-sitter backend declares ``GRAMMAR_MODULE`` (the
+    name of its native wheel); we probe it with ``find_spec`` (cheap, no
+    heavy import) and treat the backend as unavailable when it's missing.
+    """
 
     try:
         module = __import__(
@@ -103,6 +114,13 @@ def _import_backend(module_name: str) -> Backend | None:
         )
     except ImportError:
         return None
+    grammar = getattr(module, "GRAMMAR_MODULE", None)
+    if grammar is not None:
+        try:
+            if importlib.util.find_spec(grammar) is None:
+                return None
+        except (ImportError, ValueError):
+            return None
     extract = getattr(module, "extract", None)
     if not callable(extract):
         return None

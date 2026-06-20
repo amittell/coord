@@ -9,6 +9,22 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.32.5] - 2026-06-20
+
+### Fixed
+
+- Symbol (sub-file) claims no longer crash with ``No module named
+  'tree_sitter_<lang>'`` when the optional native grammar wheel is absent.
+  The tree-sitter backends import their grammar lazily (inside the parser
+  getter), so ``auto`` mode committed to the tree-sitter backend -- its
+  module imports fine -- and only hit the missing wheel at ``extract()``
+  time, escaping the regex fallback and crashing the caller. The dispatcher
+  now probes the grammar at selection time (``find_spec`` via each backend's
+  new ``GRAMMAR_MODULE``), so ``auto`` correctly degrades to the regex
+  backend and ``coord doctor`` (``probe_backend``) reports it accurately.
+  ``COORD_SYMBOL_PARSER=treesitter`` still raises (loud-by-design). Tests:
+  ``tests/test_symbols_fallback.py``.
+
 ## [0.32.4] - 2026-06-19
 
 ### Changed

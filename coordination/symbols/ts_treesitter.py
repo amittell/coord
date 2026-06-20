@@ -56,6 +56,11 @@ from __future__ import annotations
 
 from . import Symbol
 
+# Native grammar wheel this backend needs. The dispatcher probes it (via
+# find_spec) at selection time so a missing wheel degrades to the regex
+# backend in auto mode instead of crashing when extract() is finally called.
+GRAMMAR_MODULE = "tree_sitter_typescript"
+
 # Lazy imports so a missing tree_sitter dependency does not break the package.
 _parser_tsx = None
 

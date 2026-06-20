@@ -61,6 +61,10 @@ from typing import Any
 
 from . import Symbol
 
+# Native grammar wheel this backend needs; probed by the dispatcher so a
+# missing wheel degrades to the regex backend instead of crashing at call time.
+GRAMMAR_MODULE = "tree_sitter_python"
+
 # Lazy module-level parser cache so a missing tree_sitter dependency does not
 # break the package on import.
 _parser_py: Any = None
