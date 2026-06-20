@@ -622,6 +622,18 @@ class LspClientPool:
             "python": self.settings.lsp_command_python,
             "typescript": self.settings.lsp_command_typescript,
             "go": self.settings.lsp_command_go,
+            # v0.33 (#29): JavaScript shares the TypeScript server.
+            "javascript": self.settings.lsp_command_typescript,
+            "rust": self.settings.lsp_command_rust,
+            "java": self.settings.lsp_command_java,
+            "c": self.settings.lsp_command_c,
+            "cpp": self.settings.lsp_command_cpp,
+            "csharp": self.settings.lsp_command_csharp,
+            "ruby": self.settings.lsp_command_ruby,
+            "php": self.settings.lsp_command_php,
+            "kotlin": self.settings.lsp_command_kotlin,
+            "swift": self.settings.lsp_command_swift,
+            "scala": self.settings.lsp_command_scala,
         }.get(language)
 
     async def _prepare_call(

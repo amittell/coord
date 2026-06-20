@@ -239,6 +239,19 @@ class Settings(BaseSettings):
     lsp_command_python: str = "pylsp"
     lsp_command_typescript: str = "typescript-language-server --stdio"
     lsp_command_go: str = "gopls"
+    # v0.33: per-language servers for the symbol backends added in #29.
+    # JavaScript rides on the TypeScript server, so it has no field of its
+    # own; ``_command_for`` maps it onto ``lsp_command_typescript``.
+    lsp_command_rust: str = "rust-analyzer"
+    lsp_command_java: str = "jdtls"
+    lsp_command_c: str = "clangd"
+    lsp_command_cpp: str = "clangd"
+    lsp_command_csharp: str = "OmniSharp"
+    lsp_command_ruby: str = "ruby-lsp"
+    lsp_command_php: str = "intelephense --stdio"
+    lsp_command_kotlin: str = "kotlin-language-server"
+    lsp_command_swift: str = "sourcekit-lsp"
+    lsp_command_scala: str = "metals"
 
     @property
     def oidc_enabled(self) -> bool:
