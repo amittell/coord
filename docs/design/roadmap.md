@@ -1,27 +1,29 @@
 # Coord roadmap
 
 Status: living document
-Last updated: 2026-06-19 (after v0.32.4)
+Last updated: 2026-06-21 (after v0.33.0)
 
-This is the post-v0.32 forward look. Items here are candidates, not commitments -- order and scope move as production telemetry and operator feedback arrive. Entries already shipped live in [CHANGELOG.md](../../CHANGELOG.md); see also [docs/design/sub-file-claims.md](./sub-file-claims.md) for the v0.14-v0.26 arc design. The shipped sections below are kept for context; the **Forward plan** immediately following is the live priority order.
+This is the post-v0.33 forward look. Items here are candidates, not commitments -- order and scope move as production telemetry and operator feedback arrive. Entries already shipped live in [CHANGELOG.md](../../CHANGELOG.md); see also [docs/design/sub-file-claims.md](./sub-file-claims.md) for the v0.14-v0.26 arc design. The shipped sections below are kept for context; the **Forward plan** immediately following is the live priority order.
 
 ## Forward plan (unshipped)
 
 Version-assigned by current priority, using value-per-effort against today's single-fleet deployment. Candidates, not commitments; the ordering moves when the usage shape changes (multi-team / multi-tenant demand is the big lever). Detailed designs for the larger items live in their own sections further down.
 
-### v0.32.5 (next) -- Outbox retry CLI
+Note: ``v0.32.5`` and ``v0.33.0`` did not ship what an earlier revision of this plan slotted there. ``v0.32.5`` became a regex-degradation hotfix (symbol claims fall back to regex cleanly when a native grammar wheel is absent) and ``v0.33.0`` became the 11-language symbol expansion (issue #29) plus the linked-worktree pre-push fix (issue #28) and a session-marker worktree fix. Both are in the shipped section below; the items here are renumbered around them.
 
-``coord outbox retry --exhausted`` + ``coord outbox stats`` so an operator can drive the webhook retry rotation after fixing a receiver, without touching SQLite directly. No schema migration; finishes the v0.27 webhook story. Smallest self-contained increment, effectively zero risk -- the natural next point release.
+### v0.33.1 (next) -- Outbox retry CLI + small fixes
 
-### v0.33.0 -- GitHub PR-comment integration
+``coord outbox retry --exhausted`` + ``coord outbox stats`` so an operator can drive the webhook retry rotation after fixing a receiver, without touching SQLite directly. No schema migration; finishes the v0.27 webhook story. Smallest self-contained increment, effectively zero risk -- the natural next point release. Bundle the known small follow-up here too: ``coord upgrade`` currently errors when run from a linked git worktree (``.git/hooks`` is a file, not a directory, there) -- it should resolve the common git dir, the same fix v0.33.0 applied to the hook shim.
+
+### v0.34.0 -- GitHub PR-comment integration
 
 When a pre-push hook 409s, the next push that succeeds comments on the PR naming the files that bounced and which engineer held them. Closes the "why did my PR sit unmerged" gap -- the most-felt day-to-day friction. Reuses the v0.27 webhook delivery + HMAC surface.
 
-### v0.34.0 -- Symbol-level coexist
+### v0.35.0 -- Symbol-level coexist
 
-Extend ``coexist`` so two claims can share a single symbol-scope file with explicit boundaries (``coexist_pattern`` -> ``coexist_symbols``). Builds directly on the v0.14-v0.31 symbol / LSP arc while that code and its parsers are freshest. Small migration on the coexist representation.
+Extend ``coexist`` so two claims can share a single symbol-scope file with explicit boundaries (``coexist_pattern`` -> ``coexist_symbols``). Higher value after v0.33.0: symbol claims now span 14 languages, so two agents working disjoint symbols of the same large file is a much more common shape. Small migration on the coexist representation.
 
-### v0.35.0 -- Operator approval workflow
+### v0.36.0 -- Operator approval workflow
 
 A ``pending_promotion`` row that an operator approves from the dashboard, bridging v0.21 fully-soft and v0.22 fully-automatic auto-promote. Schema migration for the pending-promotion table plus a dashboard approve / deny surface.
 
@@ -159,6 +161,12 @@ Maintenance policy (adopted 2026-06-19): routine dependency patches land on ``ma
 
 Also out-of-band in this window: the ``make test`` target gained a ``pgrep`` guard that refuses to start when another project pytest is already running, after a stale background run deadlocked the pre-push ``make check``.
 
+## v0.32.5 + v0.33.0 (shipped) -- Regex degradation + the symbol-claims language expansion
+
+- **v0.32.5 -- Grammar-absent degradation.** Symbol claims crashed with ``No module named tree_sitter_<lang>`` when the optional grammar wheel was missing: the tree-sitter backends import their grammar lazily, so the module imported fine and ``auto`` mode committed to it, only failing at ``extract()`` time -- past the regex fallback. Each backend now declares ``GRAMMAR_MODULE`` and the dispatcher probes it with ``importlib.util.find_spec`` at selection time, so ``auto`` degrades to regex correctly and ``coord doctor`` reports availability accurately. Bumped in-repo but never tagged on its own; shipped as part of v0.33.0.
+- **v0.33.0 -- Symbol claims for 11 more languages (#29).** Function-level claims now cover JavaScript, Rust, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift, and Scala on top of TS/Python/Go -- each with a tree-sitter backend (gated on its optional wheel) and a regex fallback. Nested types and methods use the canonical ``Outer::Inner::method`` path uniformly across languages; LSP ``_command_for`` is wired for the languages with a standard server; the new grammars live in the ``symbols``/``dev`` extras only (prod image untouched). Landed two review rounds deep -- the first caught Java/Kotlin silently dropping nested classes, non-canonical method paths in Java/Kotlin/C#, and C++ namespace blindness, all fixed before merge.
+- **v0.33.0 -- Linked-worktree pre-push fix (#28) + marker fix.** The pre-push hook (shim + helper) and ``_repo_root_for_marker`` resolved ``.coordination`` via ``git rev-parse --show-toplevel``, which from a linked git worktree points at the worktree root that has no ``.coordination/`` -- so pushes hard-failed and session markers silently no-op'd. Both now resolve the MAIN worktree root via ``git rev-parse --git-common-dir`` + parent; the shim fails open on a missing helper while the conflict check stays fail-closed. Deployed shims self-heal on ``coord upgrade``. Known follow-up: ``coord upgrade`` itself still cannot run from a linked worktree (see v0.33.1).
+
 ## Large bets (design / demand-gated)
 
 The unsized tail -- each is weeks of work and/or gated on a design doc or real demand. The smaller former-future-bucket items (symbol-level coexist, operator approval) have been pulled up into the Forward plan as v0.34.0 / v0.35.0; conflict-prediction ML and activity replay are parked there.
@@ -203,3 +211,5 @@ This roadmap supersedes the older "candidate" markers in the v0.14 sub-file clai
 | v0.32.2 | coord doctor hardening: user-scoped MCP optional, CLAUDE.md-or-AGENTS.md block, dead-PID rows are WARN |
 | v0.32.3 | dependency maintenance: cryptography 49, fastapi 0.137.0, starlette 1.3.1 |
 | v0.32.4 | dependency maintenance: anyio 4.14.0, certifi 2026.6.17, fastapi 0.137.2, mcp 1.28.0 |
+| v0.32.5 | symbol backends declare GRAMMAR_MODULE; dispatcher find_spec-degrades to regex when a grammar wheel is absent (shipped within v0.33.0) |
+| v0.33.0 | symbol claims for 11 more languages JS/Rust/Java/C/C++/C#/Ruby/PHP/Kotlin/Swift/Scala (#29) + linked-worktree pre-push & session-marker fix (#28) |
