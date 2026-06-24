@@ -7,6 +7,10 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+(none recorded yet)
+
+## [0.35.1] - 2026-06-24
+
 ### Fixed
 
 - ``sessions.live`` stale-process rows are now pruned proactively instead
