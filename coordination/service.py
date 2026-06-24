@@ -607,6 +607,7 @@ class CoordinationService:
         engineer: str,
         repo: str | None = None,
         session_ids: list[str] | None = None,
+        pushing_branch: str | None = None,
     ) -> ConflictCheckResponse:
         for pat in patterns:
             err = _validate_pattern_syntax(pat)
@@ -659,6 +660,14 @@ class CoordinationService:
             partner_ids = _coexist_partner_ids_from_rows(own_claims)
             if partner_ids:
                 active = [r for r in active if str(r.get("id")) not in partner_ids]
+        # v0.34: when the GitHub integration is enabled we accumulate a
+        # parallel ``bounced`` list off the same overlap computation so a
+        # conflict can be surfaced as a PR comment. Each entry carries the
+        # holder claim's branch/description/pattern plus the overlapping
+        # files. The list is only built when github_token is set so a
+        # repo without the integration pays zero extra cost.
+        github_enabled = bool((self.settings.github_token or "").strip())
+        bounced: list[dict[str, Any]] = []
         conflicts: list[dict[str, Any]] = []
         for pat in patterns:
             for row in active:
@@ -680,6 +689,16 @@ class CoordinationService:
                         "overlap": overlap,
                     }
                 )
+                if github_enabled:
+                    bounced.append(
+                        {
+                            "files": overlap,
+                            "holder_engineer": row["engineer"],
+                            "holder_branch": row.get("branch"),
+                            "holder_pattern": row["pattern"],
+                            "holder_description": row.get("description"),
+                        }
+                    )
         safe = len(conflicts) == 0
         suggestion: str | None = None
         if not safe:
@@ -689,6 +708,21 @@ class CoordinationService:
                 f"(expires {c0.get('expires_at')}). Wait for TTL, narrow your patterns, "
                 "or coordinate with the other engineer."
             )
+        # v0.34: a bounced push emits a ``push_bounced`` event routed
+        # through the webhook outbox with kind='github'. The delivery
+        # loop hands the detail to the GitHub adapter, which posts/updates
+        # a de-duplicated comment on the open PR for ``pushing_branch``.
+        # Fully gated on github_token: when it is unset ``github_enabled``
+        # is False, no row is built or enqueued, and the whole feature is
+        # a no-op. The conflict response below is unchanged either way.
+        if github_enabled and not safe:
+            detail = {
+                "repo": repo or "",
+                "pushing_engineer": engineer,
+                "pushing_branch": pushing_branch or "",
+                "bounced": bounced,
+            }
+            await self.fire_webhook("push_bounced", detail, kind="github")
         return ConflictCheckResponse(
             has_conflicts=not safe,
             conflicts=conflicts,
@@ -2625,6 +2659,7 @@ class CoordinationService:
         self,
         event_type: str,
         detail: dict[str, Any],
+        kind: str = "webhook",
     ) -> str | None:
         """v0.27: emit an event into the webhook delivery outbox.
 
@@ -2639,19 +2674,41 @@ class CoordinationService:
         The actual HTTP POST happens in the background delivery
         loop (v0.27 agent A); this method is fire-and-forget from
         the caller's perspective.
+
+        ``kind`` (v0.34) is persisted on the outbox row and tells the
+        delivery loop which transport to use -- 'webhook' (default)
+        for the HTTP POST path, 'github' for the GitHub PR-comment
+        adapter.
+
+        Gating differs per transport. The default 'webhook' kind is
+        gated on COORD_WEBHOOK_URL and filtered by COORD_WEBHOOK_EVENTS,
+        exactly as before. The 'github' kind is instead gated on
+        COORD_GITHUB_TOKEN (mirroring how webhook_url gates webhooks):
+        with no token configured this returns None and no row is
+        enqueued, so the GitHub feature is a complete no-op. The
+        webhook events allowlist does not apply to github rows -- that
+        filter governs the HTTP webhook surface only. The github
+        delivery path ignores the row's ``url``, so it is set to the
+        configured webhook_url when present and a stable sentinel
+        otherwise just for dashboard legibility.
         """
-        url = (self.settings.webhook_url or "").strip()
-        if not url:
-            return None
-        events_filter = (self.settings.webhook_events or "").strip()
-        if events_filter:
-            allowed = {
-                tok.strip()
-                for tok in events_filter.split(",")
-                if tok.strip()
-            }
-            if event_type not in allowed:
+        if kind == "github":
+            if not (self.settings.github_token or "").strip():
                 return None
+            url = (self.settings.webhook_url or "").strip() or "github://pr-comment"
+        else:
+            url = (self.settings.webhook_url or "").strip()
+            if not url:
+                return None
+            events_filter = (self.settings.webhook_events or "").strip()
+            if events_filter:
+                allowed = {
+                    tok.strip()
+                    for tok in events_filter.split(",")
+                    if tok.strip()
+                }
+                if event_type not in allowed:
+                    return None
         import hashlib
         import hmac
         import json as _json
@@ -2678,6 +2735,7 @@ class CoordinationService:
                 event_type=event_type,
                 payload_json=payload_json,
                 hmac_signature=signature,
+                kind=kind,
             )
         except Exception:  # noqa: BLE001 - best-effort emit
             logger.exception(
@@ -2726,6 +2784,15 @@ class CoordinationService:
         async with httpx.AsyncClient(timeout=10.0) as client:
             for row in rows:
                 outbox_id = str(row["id"])
+                if str(row.get("kind") or "webhook") == "github":
+                    await self._deliver_github_row(
+                        row=row,
+                        backoff=backoff,
+                        max_retries=max_retries,
+                        exponent_cap=exponent_cap,
+                        counts=counts,
+                    )
+                    continue
                 try:
                     response = await client.post(
                         row["url"],
@@ -2817,6 +2884,82 @@ class CoordinationService:
             counts["exhausted"] += 1
         else:
             counts["failed"] += 1
+
+    async def _deliver_github_row(
+        self,
+        *,
+        row: dict[str, Any],
+        backoff: int,
+        max_retries: int,
+        exponent_cap: int,
+        counts: dict[str, int],
+    ) -> None:
+        """v0.34: deliver a ``kind='github'`` outbox row.
+
+        Routes the row's ``detail`` to the GitHub adapter, which
+        find-or-updates a de-duplicated comment on the open PR for the
+        pushing branch. When ``github_token`` is empty the feature is
+        disabled: the row is marked delivered with a skipped note so it
+        is never retried forever (a github row only exists when the
+        token was set at emit time, but the token may have been cleared
+        between emit and delivery). Any HTTP failure raised by the
+        adapter routes through the shared ``_record_webhook_failure``
+        retry/backoff path, identical to the webhook transport."""
+
+        from coordination import github_adapter
+
+        outbox_id = str(row["id"])
+        token = (self.settings.github_token or "").strip()
+        if not token:
+            try:
+                await self.db.mark_webhook_delivered(outbox_id)
+                counts["delivered"] += 1
+            except Exception:  # noqa: BLE001 - audit best-effort
+                logger.exception(
+                    "deliver_pending_webhooks: github skip mark_delivered "
+                    "failed for %s",
+                    outbox_id,
+                )
+            return
+
+        try:
+            payload = json.loads(row["payload_json"])
+            detail = payload["detail"]
+        except (ValueError, KeyError, TypeError) as exc:
+            # A malformed payload can never succeed -- mark it failed so
+            # backoff applies; it will exhaust rather than loop forever.
+            await self._record_webhook_failure(
+                row=row,
+                error=f"github payload error: {type(exc).__name__}: {exc}",
+                backoff=backoff,
+                max_retries=max_retries,
+                exponent_cap=exponent_cap,
+                counts=counts,
+            )
+            return
+
+        try:
+            await github_adapter.post_bounce_comment(self.settings, detail)
+        except Exception as exc:  # noqa: BLE001 - per-row isolation
+            await self._record_webhook_failure(
+                row=row,
+                error=f"{type(exc).__name__}: {exc}",
+                backoff=backoff,
+                max_retries=max_retries,
+                exponent_cap=exponent_cap,
+                counts=counts,
+            )
+            return
+
+        try:
+            await self.db.mark_webhook_delivered(outbox_id)
+            counts["delivered"] += 1
+        except Exception:  # noqa: BLE001 - audit best-effort
+            logger.exception(
+                "deliver_pending_webhooks: github mark_delivered "
+                "failed for %s",
+                outbox_id,
+            )
 
     async def set_ownership_yaml(self, yaml_text: str) -> None:
         await self.db.set_ownership_yaml(yaml_text)

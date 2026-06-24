@@ -259,6 +259,16 @@ if [[ -n "${REPO_ID}" ]]; then
   REPO_QS="&repo=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${REPO_ID}")"
 fi
 
+# v0.34: forward the pushing branch to /conflicts so a bounced push can
+# be surfaced as a comment on the corresponding open PR. BRANCH is the
+# current ref (resolved above); only sent when non-empty so a detached
+# HEAD (BRANCH="HEAD") still leaves a clean URL without a literal
+# trailing "&branch=".
+BRANCH_QS=""
+if [[ -n "${BRANCH}" ]]; then
+  BRANCH_QS="&branch=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${BRANCH}")"
+fi
+
 # v0.10: hand the active coord-mcp session ids to /conflicts so the
 # server can self-exclude claims that originated from this very repo's
 # in-flight MCP sessions. Without this, an agent's own subagent claims
@@ -344,7 +354,7 @@ while IFS= read -r file; do
   # made network glitches silently bypass the conflict check.
   if ! resp="$(curl -fsS \\
     ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} \\
-    "${COORD_URL}/conflicts?pattern=${enc}&engineer=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${ENGINEER}")${REPO_QS}${SESSION_QS}")"; then
+    "${COORD_URL}/conflicts?pattern=${enc}&engineer=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${ENGINEER}")${REPO_QS}${SESSION_QS}${BRANCH_QS}")"; then
     echo "coordination pre-push: conflict check failed for ${file}; refusing to push" >&2
     exit 1
   fi

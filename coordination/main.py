@@ -1787,6 +1787,7 @@ async def conflicts(
     engineer: str = Query(...),
     repo: str | None = Query(default=None),
     session_id: list[str] | None = Query(default=None),
+    branch: str | None = Query(default=None),
     _: None = Depends(require_auth),
 ) -> dict:
     if not pattern:
@@ -1797,11 +1798,18 @@ async def conflicts(
         # .coordination/sessions.live so the agent's own subagent
         # claims under different engineer names don't false-positive
         # on its own push.
+        #
+        # ``branch`` (v0.34) is the pushing branch the hook resolved.
+        # check_conflicts uses it to build the push_bounced GitHub
+        # event so a bounced push can comment on the open PR; it is a
+        # no-op when COORD_GITHUB_TOKEN is unset and never affects the
+        # conflict response shape.
         result = await get_service().check_conflicts(
             patterns=pattern,
             engineer=engineer,
             repo=repo,
             session_ids=session_id,
+            pushing_branch=branch,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
