@@ -861,6 +861,61 @@ async def test_symbol_coexist_disjoint_grants_symbol_claim(db: Database) -> None
 
 
 @pytest.mark.asyncio
+async def test_symbol_coexist_rejects_file_outside_holder_claim(db: Database) -> None:
+    """A holder cannot grant a symbol coexist on a file outside this
+    request's subject -- e.g. an unrelated claim the requester also holds
+    on a different file. The grant is restricted to files the holder
+    actually claims, closing the cross-file consent hole."""
+    holder_cid = await _seed_symbol_claim(
+        db,
+        engineer="alice",
+        pattern="src/auth/login.ts",
+        symbols=["Login::handleLogin"],
+    )
+    # Bob holds the on-subject claim on login.ts ...
+    await _seed_symbol_claim(
+        db,
+        engineer="bob",
+        pattern="src/auth/login.ts",
+        symbols=["Login::validateCredentials"],
+        session_id="bob-sess",
+    )
+    # ... and a completely unrelated symbol claim on another file.
+    await _seed_symbol_claim(
+        db,
+        engineer="bob",
+        pattern="src/billing/charge.ts",
+        symbols=["Charge::run"],
+        session_id="bob-sess",
+    )
+    req = await _file_request(
+        db, claim_id=holder_cid, requested_pattern="src/auth/login.ts"
+    )
+
+    svc = _service(db)
+    # The holder claims nothing on charge.ts, so granting a sibling there
+    # (borrowing bob's unrelated claim) must be refused.
+    with pytest.raises(ValueError, match="holder's symbol claim"):
+        await svc.respond_to_request(
+            request_id=req["id"],
+            decision="coexist",
+            actor_engineer="alice",
+            actor_session_id="holder-sess",
+            coexist_symbols={"src/billing/charge.ts": ["Charge::run"]},
+        )
+    # No sibling was minted on the unrelated file.
+    active = await db.list_active_claims_rows()
+    charge_grants = [
+        c
+        for c in active
+        if c["engineer"] == "bob"
+        and "charge.ts" in str(c["pattern"])
+        and c["coexists_with"]
+    ]
+    assert charge_grants == []
+
+
+@pytest.mark.asyncio
 async def test_symbol_coexist_overlapping_symbols_rejected(db: Database) -> None:
     """When the granted symbols overlap the holder's claimed symbols
     under the prefix rule, the grant is refused (400) so a coexist

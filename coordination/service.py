@@ -2412,6 +2412,18 @@ class CoordinationService:
             )
 
         for file_path, syms in coexist_symbols.items():
+            # A symbol coexist can only be granted on a file the HOLDER
+            # actually claims symbols on. Without this, a holder could mint
+            # the requester a sibling on a file outside this request's
+            # subject (e.g. an unrelated claim the requester holds), and the
+            # disjoint check below would no-op because the holder has no
+            # symbols on that file to compare against.
+            if file_path not in holder_by_file:
+                raise ValueError(
+                    f"coexist_symbols: file {file_path!r} is not part of the "
+                    "holder's symbol claim; a symbol coexist can only be "
+                    "granted on a file the holder actually holds"
+                )
             granted = [parse_symbol_path(str(s)) for s in syms]
             req_paths = requester_by_file.get(file_path, [])
             held_paths = holder_by_file.get(file_path, [])
