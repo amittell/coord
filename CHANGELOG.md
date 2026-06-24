@@ -7,7 +7,20 @@ Semantic Versioning.
 
 ## [Unreleased]
 
-(none recorded yet)
+### Fixed
+
+- ``sessions.live`` stale-process rows are now pruned proactively instead
+  of waiting for a later graceful shutdown. ``coord-mcp`` compacts the
+  marker file under a repo-local lock on startup/shutdown, preserving the
+  v0.12 append-race fix while removing dead PID rows before they become
+  recurring ``coord doctor`` warnings. It also avoids unlocked appends
+  while another process owns the compaction lock. ``coord doctor`` now
+  uses the same lock and atomic write path to prune stale runtime rows
+  immediately when it can rewrite the file.
+- The symbol-parser remediation hint now uses the real PyPI package name,
+  ``coord-mcp-server[symbols]``. Install and upgrade docs now preserve the
+  ``symbols`` extra so parser environments do not drift back to regex
+  fallback after package upgrades.
 
 ## [0.33.0] - 2026-06-20
 
