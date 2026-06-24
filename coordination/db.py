@@ -141,7 +141,7 @@ CREATE INDEX IF NOT EXISTS idx_claims_engineer ON claims (engineer);
 """
 
 
-CURRENT_SCHEMA_VERSION = 17
+CURRENT_SCHEMA_VERSION = 18
 
 
 # v0.28 fairness pass: per-blocking-claim counter that
@@ -583,6 +583,19 @@ MIGRATIONS: list[tuple[int, str]] = [
         17,
         "ALTER TABLE webhook_outbox ADD COLUMN "
         "kind TEXT NOT NULL DEFAULT 'webhook';",
+    ),
+    # v18: symbol-level coexist (v0.35). ``requests.coexist_symbols`` records
+    # the symbol-scoped grant a holder made when responding ``coexist`` with
+    # ``coexist_symbols`` instead of a file-scope ``coexist_pattern``. The
+    # value is a JSON dict mapping ``file_path`` -> list of symbol-path
+    # strings (``"Foo::handleA"`` notation) -- exactly the symbols the
+    # requester's new sibling claim was granted. NULL keeps every pre-v0.35
+    # row (file-scope coexist or any other decision) behaving identically;
+    # the column rides only the new symbol-scoped path. No change to the
+    # ``claims`` table -- the pairwise ``coexists_with`` edges stay as-is.
+    (
+        18,
+        "ALTER TABLE requests ADD COLUMN coexist_symbols TEXT;",
     ),
 ]
 
@@ -3212,6 +3225,7 @@ class Database:
         note: str | None = None,
         narrowed_pattern: str | None = None,
         coexist_pattern: str | None = None,
+        coexist_symbols: dict[str, list[str]] | None = None,
         min_expires_at: str | None = None,
     ) -> dict[str, Any] | None:
         """Record the holder's decision and apply its side-effect.
@@ -3229,9 +3243,22 @@ class Database:
           the same scope. Both claims persist and self-exclude from
           each other via ``claims.coexists_with`` (a JSON array of
           partner ids). Useful when two agents want to edit different
-          functions in the same file. Requires ``coexist_pattern``;
+          functions in the same file. Requires ``coexist_pattern``
+          (file scope) OR ``coexist_symbols`` (v0.35 symbol scope);
           for v1 the linkage is pairwise (requester <-> holder), not
           transitive across the holder's existing partners.
+
+          v0.35: when ``coexist_symbols`` (a JSON-able dict mapping
+          ``file_path`` -> list of ``"Foo::handleA"`` symbol paths) is
+          supplied, the requester's sibling claim is created
+          ``scope_type='symbol'`` with ``claim_symbols`` rows for
+          exactly those symbols, so downstream overlap checks see real
+          symbols rather than a blanket file grant. The grant is also
+          recorded on the request row and the responded audit event.
+          The respond-time validation (both sides symbol-scoped,
+          symbols subset of the requester's claim, disjoint from the
+          holder) lives in the service layer; this layer trusts the
+          already-validated grant.
 
         The request row's ``decision`` is moved from ``pending`` only;
         if the request already has a terminal decision the call is a
@@ -3248,9 +3275,10 @@ class Database:
             raise ValueError(
                 "decision='narrowed' requires a non-empty 'narrowed_pattern' kwarg"
             )
-        if decision == "coexist" and not coexist_pattern:
+        if decision == "coexist" and not coexist_pattern and not coexist_symbols:
             raise ValueError(
-                "decision='coexist' requires a non-empty 'coexist_pattern' kwarg"
+                "decision='coexist' requires a non-empty 'coexist_pattern' "
+                "or 'coexist_symbols' kwarg"
             )
 
         await self.init()
@@ -3320,7 +3348,10 @@ class Database:
                     extra_detail = await self._apply_coexist(
                         conn,
                         request_row=req,
-                        coexist_pattern=str(coexist_pattern),
+                        coexist_pattern=(
+                            str(coexist_pattern) if coexist_pattern else None
+                        ),
+                        coexist_symbols=coexist_symbols,
                         now=now,
                         min_expires_at=min_expires_at,
                     )
@@ -3446,7 +3477,8 @@ class Database:
         conn: aiosqlite.Connection,
         *,
         request_row: aiosqlite.Row,
-        coexist_pattern: str,
+        coexist_pattern: str | None,
+        coexist_symbols: dict[str, list[str]] | None = None,
         now: str,
         min_expires_at: str | None = None,
     ) -> dict[str, Any]:
@@ -3460,6 +3492,15 @@ class Database:
         list, because each coexistence is a separate consent and
         adding C as a partner of B because B coexisted with A would
         bind C without C's holder agreeing.
+
+        v0.35 symbol scope: when ``coexist_symbols`` is supplied the
+        requester's sibling is created ``scope_type='symbol'`` (and
+        ``narrowable=0`` to mirror normal symbol claims) with
+        ``claim_symbols`` rows for exactly the granted symbol paths, the
+        grant is persisted on the request row's ``coexist_symbols``
+        column, and the responded-event detail carries it. When
+        ``coexist_symbols`` is None the path is byte-identical to the
+        v0.11 file-scope grant.
         """
         import json as _json
 
@@ -3477,6 +3518,18 @@ class Database:
         requester_session_id = request_row["requester_session_id"]
         requester_last_activity = now if requester_session_id else None
         request_id = str(request_row["id"])
+
+        # The sibling's pattern: an explicit file-scope ``coexist_pattern``
+        # wins; otherwise (symbol scope) inherit the holder's pattern,
+        # which for a symbol-scoped holder is the file path the granted
+        # symbols live in.
+        requester_pattern = coexist_pattern or str(holder["pattern"])
+        is_symbol = bool(coexist_symbols)
+        scope_type = "symbol" if is_symbol else "file"
+        # Symbol claims are non-narrowable, matching the create path
+        # (insert_claims_batch defaults symbol scope to narrowable=0);
+        # file-scope coexist keeps the legacy default of 1.
+        narrowable = 0 if is_symbol else 1
 
         # Floor the requester's new claim TTL at min_expires_at when
         # provided. The holder's TTL may have been shortened by the
@@ -3504,8 +3557,9 @@ class Database:
             INSERT INTO claims (
                 id, engineer, branch, description, claim_type, pattern,
                 severity, created_at, expires_at, released_at, repo,
-                session_id, last_activity, coexists_with
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
+                session_id, last_activity, coexists_with,
+                scope_type, narrowable
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)
             """,
             (
                 requester_claim_id,
@@ -3513,7 +3567,7 @@ class Database:
                 None,
                 f"coexist via request {request_id}",
                 "file",
-                coexist_pattern,
+                requester_pattern,
                 "soft",
                 now,
                 requester_expires_at,
@@ -3521,8 +3575,56 @@ class Database:
                 requester_session_id,
                 requester_last_activity,
                 _json.dumps([holder_claim_id]),
+                scope_type,
+                narrowable,
             ),
         )
+
+        # v0.35: persist the granted symbol rows so downstream overlap
+        # checks see real symbols, not a blanket file grant. Reuse the
+        # same INSERT OR IGNORE path normal symbol claims use; spans are
+        # NULL (the grant references already-validated symbol paths, not
+        # a fresh extraction) and symbol_kind is 'unknown'.
+        if coexist_symbols:
+            symbol_rows: list[tuple[Any, ...]] = []
+            for file_path, syms in coexist_symbols.items():
+                for raw in syms:
+                    if "::" in raw:
+                        parent, _, leaf = raw.rpartition("::")
+                    else:
+                        parent, leaf = None, raw
+                    symbol_rows.append(
+                        (
+                            str(uuid4()),
+                            requester_claim_id,
+                            str(file_path),
+                            leaf,
+                            "unknown",
+                            parent,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                    )
+            if symbol_rows:
+                await conn.executemany(
+                    """
+                    INSERT OR IGNORE INTO claim_symbols
+                        (id, claim_id, file_path, symbol_name, symbol_kind,
+                         parent_symbol, start_line, start_col, end_line,
+                         end_col, resolved_by)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    symbol_rows,
+                )
+            # Record the grant on the request row so it round-trips
+            # through get_request and the operator timeline.
+            await conn.execute(
+                "UPDATE requests SET coexist_symbols = ? WHERE id = ?",
+                (_json.dumps(coexist_symbols), request_id),
+            )
 
         # Append the requester's claim to the holder's coexists_with
         # array (creating it if the holder had no partners before).
@@ -3538,11 +3640,14 @@ class Database:
             (_json.dumps(holder_partners), holder_claim_id),
         )
 
-        return {
+        detail: dict[str, Any] = {
             "coexist_pattern": coexist_pattern,
             "holder_claim_id": holder_claim_id,
             "requester_claim_id": requester_claim_id,
         }
+        if coexist_symbols:
+            detail["coexist_symbols"] = coexist_symbols
+        return detail
 
     async def _detach_coexist_partners(self, claim_id: str) -> int:
         """Walk a (recently released) claim's ``coexists_with`` array

@@ -17,10 +17,13 @@ from coordination.engine import compute_overlap, files_matching_pattern, git_ls_
 from coordination.lsp import get_lsp_pool, language_for_path, relpath_under_root
 from coordination.overlap_symbols import (
     OverlapKind,
+    SymbolPath,
     check_overlap as check_symbol_overlap,
     format_symbol_path,
     group_callsite_overlaps,
+    parse_symbol_path,
     record_auto_resolution,
+    symbol_paths_overlap,
 )
 from coordination.ownership import PathRule, parse_ownership_yaml, severity_for_pattern
 from coordination.schemas import (
@@ -160,6 +163,42 @@ def _coexist_partner_ids_from_rows(rows: list[dict[str, Any]]) -> set[str]:
         if isinstance(ids, list):
             partners.update(str(x) for x in ids)
     return partners
+
+
+def _blanket_skip_partner_ids(
+    partner_ids: set[str], active: list[dict[str, Any]]
+) -> set[str]:
+    """Return the subset of ``partner_ids`` that should be invisible to
+    the caller's overlap check (v0.35 scope-aware coexist exclusion).
+
+    Pre-v0.35 every coexist partner was blanket-skipped: an in-pair edit
+    is cooperative, so the partner's claim never collided with the
+    caller. That stays exactly right for a FILE-scoped partner -- the two
+    sides agreed to share the whole file, so the caller never bounces on
+    it.
+
+    A SYMBOL-scoped coexist partner is different. The pair was granted
+    coexistence only on disjoint symbols, so a LATER claim by the caller
+    that touches the same file must be judged against the partner's
+    actual ``claim_symbols`` via the normal symbol-overlap path: it 409s
+    when it collides with the partner's granted symbols and auto-coexists
+    when disjoint. Blanket-skipping it would hide a real conflict, so a
+    symbol-scoped partner is deliberately NOT returned here and stays in
+    the adversarial ``active`` set.
+
+    Partner ids not present in ``active`` (expired / released) are
+    omitted; they are already gone from ``active`` so excluding them is a
+    no-op either way.
+    """
+    by_id = {str(r.get("id")): r for r in active}
+    skip: set[str] = set()
+    for pid in partner_ids:
+        row = by_id.get(pid)
+        if row is None:
+            continue
+        if str(row.get("scope_type") or "file") != "symbol":
+            skip.add(pid)
+    return skip
 
 
 def _lsp_symbol_path_set(flattened: list[dict[str, Any]]) -> set[str]:
@@ -659,7 +698,12 @@ class CoordinationService:
             ]
             partner_ids = _coexist_partner_ids_from_rows(own_claims)
             if partner_ids:
-                active = [r for r in active if str(r.get("id")) not in partner_ids]
+                # v0.35: only blanket-skip FILE-scoped partners. A
+                # symbol-scoped partner stays in ``active`` so a later
+                # claim is re-evaluated against its granted symbols.
+                skip = _blanket_skip_partner_ids(partner_ids, active)
+                if skip:
+                    active = [r for r in active if str(r.get("id")) not in skip]
         # v0.34: when the GitHub integration is enabled we accumulate a
         # parallel ``bounced`` list off the same overlap computation so a
         # conflict can be surfaced as a PR comment. Each entry carries the
@@ -886,7 +930,14 @@ class CoordinationService:
             ]
             partner_ids = _coexist_partner_ids_from_rows(own_claims)
             if partner_ids:
-                active = [r for r in active if str(r.get("id")) not in partner_ids]
+                # v0.35: only blanket-skip FILE-scoped partners. A
+                # symbol-scoped partner stays in ``active`` so this new
+                # claim is re-evaluated against its granted symbols via
+                # the normal symbol-overlap path (409 on collision,
+                # auto-coexist when disjoint).
+                skip = _blanket_skip_partner_ids(partner_ids, active)
+                if skip:
+                    active = [r for r in active if str(r.get("id")) not in skip]
         for item in body.claims:
             requester_scope = "symbol" if item.symbols else "file"
             requester_symbols_by_file: dict[str, list[str]] = (
@@ -2195,16 +2246,37 @@ class CoordinationService:
         note: str | None = None,
         narrowed_pattern: str | None = None,
         coexist_pattern: str | None = None,
+        coexist_symbols: dict[str, list[str]] | None = None,
     ) -> dict[str, Any] | None:
         """Forward to the DB layer with v0.11 decision verbs.
 
         For ``decision='narrowed'`` the service enforces that
         ``narrowed_pattern`` is a (non-strict) subset of the holder's
         current claim pattern. A disjoint or broader pattern is a
-        contract violation that the API handler maps to 400. Coexist
-        deliberately skips the subset check because coexisting claims
-        are intentionally on the same scope (or compatible scopes the
-        holder explicitly agreed to).
+        contract violation that the API handler maps to 400. File-scope
+        coexist (``coexist_pattern``) deliberately skips the subset
+        check because coexisting claims are intentionally on the same
+        scope (or compatible scopes the holder explicitly agreed to).
+
+        v0.35 symbol-scoped coexist (``coexist_symbols``) is the trust
+        boundary for the new path: the holder's decision is where the
+        grant is validated. When ``coexist_symbols`` is supplied the
+        service enforces, raising ``ValueError`` (-> 400) on any
+        violation, that:
+
+        - both the holder's claim AND the requester's original
+          (symbol-scoped) claim exist and are ``scope_type='symbol'``;
+        - every granted symbol path is covered by the requester's own
+          claimed symbols (you can only grant what the requester asked
+          for);
+        - every granted symbol is disjoint from the holder's claimed
+          symbols on the same file under
+          :func:`symbol_paths_overlap` -- a coexist that hid a real
+          symbol collision must be refused.
+
+        The validated grant is forwarded to the DB layer, which creates
+        the requester's sibling claim ``scope_type='symbol'`` with the
+        granted symbols.
         """
         if decision == "narrowed":
             if not narrowed_pattern:
@@ -2237,6 +2309,10 @@ class CoordinationService:
                     f"the holder's current pattern {original_pattern!r}; "
                     "narrowing must reduce scope, not move it"
                 )
+        if decision == "coexist" and coexist_symbols:
+            await self._validate_symbol_coexist(
+                request_id=request_id, coexist_symbols=coexist_symbols
+            )
         # Floor the new claim's TTL at the default working window so that a
         # narrowed or coexist claim created in response to a request does not
         # inherit the shortened deadline that request_release imposed on the
@@ -2250,8 +2326,120 @@ class CoordinationService:
             note=note,
             narrowed_pattern=narrowed_pattern,
             coexist_pattern=coexist_pattern,
+            coexist_symbols=coexist_symbols,
             min_expires_at=min_expires_at,
         )
+
+    async def _validate_symbol_coexist(
+        self,
+        *,
+        request_id: str,
+        coexist_symbols: dict[str, list[str]],
+    ) -> None:
+        """Respond-time validation for v0.35 symbol-scoped coexist.
+
+        Raises ``ValueError`` (which the API handler maps to 400) when
+        the grant is not safe. The holder's decision is the trust
+        boundary -- mirroring the ``narrowed_pattern`` subset check --
+        so all enforcement happens here before the DB writes anything.
+
+        Returns ``None`` when the grant is valid (or when the request
+        row is missing, in which case the DB call surfaces the 404 via
+        its own ``None`` return).
+        """
+        request_row = await self.db.get_request(request_id)
+        if request_row is None:
+            # Let the DB layer's None-return drive the 404; nothing to
+            # validate against a request that doesn't exist.
+            return
+        claim_id = str(request_row["claim_id"])
+        active_rows = await self.db.list_active_claims_rows(exclude_engineer=None)
+        by_id = {str(c.get("id")): c for c in active_rows}
+        holder_claim = by_id.get(claim_id)
+        if holder_claim is None:
+            raise ValueError(
+                f"coexist: holder claim {claim_id!r} is no longer active; "
+                "the request can no longer be granted"
+            )
+        if str(holder_claim.get("scope_type") or "file") != "symbol":
+            raise ValueError(
+                "coexist_symbols requires the holder's claim to be "
+                "symbol-scoped (scope_type='symbol'); use coexist_pattern "
+                "for a file-scope grant"
+            )
+
+        # Locate the requester's original claim(s): the requester's
+        # active symbol-scoped claims in the same repo as the holder.
+        # The granted symbols must be a subset of what the requester
+        # actually claimed, so we union the requester's claim_symbols
+        # per file.
+        requester_engineer = str(request_row["requester_engineer"])
+        holder_repo = holder_claim.get("repo")
+        requester_claims = [
+            c
+            for c in active_rows
+            if c.get("engineer") == requester_engineer
+            and str(c.get("scope_type") or "file") == "symbol"
+            and c.get("repo") == holder_repo
+        ]
+        if not requester_claims:
+            raise ValueError(
+                "coexist_symbols requires the requester to hold an active "
+                "symbol-scoped claim; none found for engineer "
+                f"{requester_engineer!r}"
+            )
+        requester_by_file: dict[str, list[SymbolPath]] = {}
+        for c in requester_claims:
+            rows = await self.db.get_claim_symbols(str(c.get("id")))
+            for row in rows:
+                f = str(row["file_path"])
+                parent = row.get("parent_symbol")
+                parent_str = str(parent) if parent else None
+                requester_by_file.setdefault(f, []).append(
+                    (parent_str, str(row["symbol_name"]))
+                )
+
+        # Holder's claimed symbols, grouped by file, for the disjoint
+        # check.
+        holder_rows = await self.db.get_claim_symbols(claim_id)
+        holder_by_file: dict[str, list[SymbolPath]] = {}
+        for row in holder_rows:
+            f = str(row["file_path"])
+            parent = row.get("parent_symbol")
+            parent_str = str(parent) if parent else None
+            holder_by_file.setdefault(f, []).append(
+                (parent_str, str(row["symbol_name"]))
+            )
+
+        for file_path, syms in coexist_symbols.items():
+            granted = [parse_symbol_path(str(s)) for s in syms]
+            req_paths = requester_by_file.get(file_path, [])
+            held_paths = holder_by_file.get(file_path, [])
+            for g in granted:
+                g_str = format_symbol_path(g[0], g[1])
+                # Subset: the granted symbol must be covered by one of
+                # the requester's own claimed symbols (exact match or a
+                # claimed ancestor that contains it).
+                covered = any(
+                    format_symbol_path(r[0], r[1]) == g_str
+                    or g_str.startswith(format_symbol_path(r[0], r[1]) + "::")
+                    for r in req_paths
+                )
+                if not covered:
+                    raise ValueError(
+                        f"coexist_symbols grants {g_str!r} in {file_path!r}, "
+                        "which is not within the requester's claimed symbols"
+                    )
+                # Disjoint: the granted symbol must not overlap any of
+                # the holder's claimed symbols on this file.
+                for h in held_paths:
+                    if symbol_paths_overlap(g, h):
+                        raise ValueError(
+                            f"coexist_symbols grants {g_str!r} in "
+                            f"{file_path!r}, which overlaps the holder's "
+                            f"claimed symbol {format_symbol_path(h[0], h[1])!r}; "
+                            "a coexist must not hide a real symbol conflict"
+                        )
 
     async def get_request(self, request_id: str) -> dict[str, Any] | None:
         return await self.db.get_request(request_id)

@@ -588,6 +588,7 @@ async def respond_to_request(
     note: str = "",
     narrowed_pattern: str = "",
     coexist_pattern: str = "",
+    coexist_symbols: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     """Approve, deny, narrow, or coexist on a release request filed
     against your claim.
@@ -601,10 +602,17 @@ async def respond_to_request(
       The server validates it's a subset of the original pattern and
       400s if not.
     - ``"coexist"`` (v0.11+): grant the requester a sibling claim on
-      the same scope. Pass ``coexist_pattern``. Both agents end up
-      with active claims, mutually self-excluded but still adversarial
-      to anyone outside the pair. Cooperative not enforced -- imports
-      and shared module-level state are still on the agents to handle.
+      the same scope. Pass ``coexist_pattern`` (file scope) or, for
+      v0.35 symbol-scoped grants, ``coexist_symbols`` -- a dict mapping
+      file path to the list of symbol paths the requester is granted
+      (e.g. ``{"src/auth.py": ["Login::handle"]}``). Symbol coexist
+      requires both the holder's claim and the requester's original
+      claim to be symbol-scoped; the granted symbols must be a subset
+      of the requester's claimed symbols and disjoint from the
+      holder's, else the server 400s. Both agents end up with active
+      claims, mutually self-excluded but still adversarial to anyone
+      outside the pair. Cooperative not enforced -- imports and shared
+      module-level state are still on the agents to handle.
 
     The decision and any pattern fields are audit-logged so the
     requester (and operators) can read the reasoning later.
@@ -618,6 +626,8 @@ async def respond_to_request(
         body["narrowed_pattern"] = narrowed_pattern
     if coexist_pattern:
         body["coexist_pattern"] = coexist_pattern
+    if coexist_symbols:
+        body["coexist_symbols"] = coexist_symbols
     async with httpx.AsyncClient(timeout=30.0) as client:
         r = await client.post(
             f"{_base_url()}/requests/{request_id}/respond",
