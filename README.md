@@ -53,10 +53,8 @@ python3 -m pip install --user pipx
 python3 -m pipx ensurepath
 # (open a new shell so PATH picks up the change)
 
-# install coord
+# install coord with the optional parser wheels used by symbol-level claims
 pipx install coord-mcp-server
-
-# optional: enable symbol-level claims (TypeScript, Python, Go parsers)
 pipx inject coord-mcp-server 'coord-mcp-server[symbols]'
 ```
 
@@ -155,9 +153,10 @@ Match the path you used to install:
 ```bash
 # pipx
 pipx upgrade coord-mcp-server
+pipx inject coord-mcp-server 'coord-mcp-server[symbols]'
 
 # pip (inside the same venv you installed into)
-pip install --upgrade coord-mcp-server
+pip install --upgrade 'coord-mcp-server[symbols]'
 
 # docker (self-hosted server)
 docker pull ghcr.io/amittell/coord:v0.28.2

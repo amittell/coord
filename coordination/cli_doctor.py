@@ -165,90 +165,124 @@ def _check_sessions_live(repo_root: Path) -> list[CheckResult]:
     """Inspect ``.coordination/sessions.live`` for entries pointing at
     dead PIDs (or pre-v0.12 entries with no PID at all).
 
-    Stale entries are not a hard failure -- the pre-push hook prunes
-    them on read and the next coord-mcp startup sweeps them out -- but
-    leaving them in the file means /conflicts gets dead session_ids
-    forwarded as self-exclusions on every push. Functionally a no-op
-    (they don't match any active claim), operationally noise. Surface
-    so an operator can run a quick sweep ('pkill coord-mcp' followed
-    by any agent activity) if they care.
+    Stale entries are not a hard failure -- the pre-push hook skips
+    them on read and the next coord-mcp startup sweeps them out. Since
+    this file is local runtime state, doctor also prunes stale rows under
+    the same repo-local lock when it can so the next run is quiet.
     """
-    import os as _os
+    from coordination.mcp_server import (
+        _acquire_marker_lock,
+        _atomic_write_lines,
+        _format_marker_line,
+        _is_live_pid,
+        _parse_marker_entry,
+        _release_marker_lock,
+    )
 
     marker = repo_root / ".coordination" / "sessions.live"
     if not marker.exists():
         return []
-    try:
-        raw_lines = marker.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeDecodeError):
+
+    lock = _acquire_marker_lock(marker.parent)
+    if lock is None:
         return [
             CheckResult(
-                "sessions.live readable",
+                "sessions.live entries are live",
                 False,
-                "could not read .coordination/sessions.live",
-                "Inspect file permissions; the pre-push hook needs to read it.",
+                "could not acquire .coordination/sessions.live lock",
+                (
+                    "Another coord-mcp process may be compacting the marker. "
+                    "Re-run coord doctor; the pre-push hook still skips dead PIDs."
+                ),
+                level="warn",
             )
         ]
 
-    total = 0
-    stale = 0
-    legacy = 0
-    for raw in raw_lines:
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        total += 1
-        parts = line.split()
-        if len(parts) < 2:
-            stale += 1
-            legacy += 1
-            continue
+    try:
         try:
-            pid = int(parts[1])
-        except ValueError:
-            stale += 1
-            continue
-        if pid <= 0:
-            stale += 1
-            continue
-        try:
-            _os.kill(pid, 0)
-        except ProcessLookupError:
-            stale += 1
-        except PermissionError:
-            # Process exists but is owned by another uid; treat as live.
-            pass
-        except OSError:
-            stale += 1
+            raw_lines = marker.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
+            return [
+                CheckResult(
+                    "sessions.live readable",
+                    False,
+                    "could not read .coordination/sessions.live",
+                    "Inspect file permissions; the pre-push hook needs to read it.",
+                )
+            ]
 
-    if total == 0:
-        return []
-    if stale == 0:
+        total = 0
+        stale = 0
+        legacy = 0
+        live_entries: list[tuple[str, int, int]] = []
+        for raw in raw_lines:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            parsed = _parse_marker_entry(raw)
+            if parsed is None:
+                continue
+            total += 1
+            sid, pid, start = parsed
+            if pid <= 0:
+                stale += 1
+                if len(line.split()) < 2:
+                    legacy += 1
+                continue
+            if _is_live_pid(pid, start):
+                live_entries.append((sid, pid, start))
+            else:
+                stale += 1
+
+        if total == 0:
+            return []
+        if stale == 0:
+            return [
+                CheckResult(
+                    f"sessions.live entries are live ({total}/{total})",
+                    True,
+                )
+            ]
+
+        try:
+            if live_entries:
+                _atomic_write_lines(
+                    marker,
+                    [_format_marker_line(s, p, st) for s, p, st in live_entries],
+                )
+            else:
+                marker.unlink()
+            return [
+                CheckResult(
+                    "sessions.live entries are live "
+                    f"({len(live_entries)}/{len(live_entries)})",
+                    True,
+                    f"pruned {stale}/{total} stale entries",
+                )
+            ]
+        except OSError:
+            pass
+
+        detail_bits = [f"{stale}/{total} entries point at dead PIDs"]
+        if legacy:
+            detail_bits.append(f"{legacy} use the pre-v0.12 format with no PID")
         return [
             CheckResult(
-                f"sessions.live entries are live ({total}/{total})",
-                True,
+                f"sessions.live entries are live ({total - stale}/{total})",
+                False,
+                "; ".join(detail_bits),
+                (
+                    "Doctor tried to prune stale entries but could not rewrite "
+                    ".coordination/sessions.live. Inspect file permissions; the "
+                    "pre-push hook will still skip dead PIDs."
+                ),
+                # Self-healing runtime noise, never a coordination break -- the
+                # entries are skipped on read. A warning, not a hard failure.
+                level="warn",
             )
         ]
-    detail_bits = [f"{stale}/{total} entries point at dead PIDs"]
-    if legacy:
-        detail_bits.append(f"{legacy} use the pre-v0.12 format with no PID")
-    return [
-        CheckResult(
-            f"sessions.live entries are live ({total - stale}/{total})",
-            False,
-            "; ".join(detail_bits),
-            (
-                "Stale entries are pruned automatically by the next coord-mcp "
-                "startup in this repo (and harmlessly skipped by the pre-push "
-                "hook). To clean up immediately: 'pkill -f coord-mcp' will "
-                "force a fresh sweep on every running agent's next coord call."
-            ),
-            # Self-healing runtime noise, never a coordination break -- the
-            # entries are pruned on read. A warning, not a hard failure.
-            level="warn",
-        )
-    ]
+    finally:
+        _release_marker_lock(lock)
 
 
 def _extract_managed_block(text: str) -> str | None:
@@ -552,7 +586,7 @@ def _check_symbol_parser_backend() -> CheckResult:
             ),
             hint=(
                 "Install the 'symbols' extra (pip install "
-                "'multi-agent-coordination[symbols]') or unset "
+                "'coord-mcp-server[symbols]') or unset "
                 "COORD_SYMBOL_PARSER to fall back to regex."
             ),
         )
@@ -568,7 +602,7 @@ def _check_symbol_parser_backend() -> CheckResult:
             ),
             hint=(
                 "Install the 'symbols' extra (pip install "
-                "'multi-agent-coordination[symbols]') for stricter parsing."
+                "'coord-mcp-server[symbols]') for stricter parsing."
             ),
         )
 

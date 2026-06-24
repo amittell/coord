@@ -1262,11 +1262,9 @@ def test_register_session_marker_appends_when_other_sessions_present(
 def test_register_session_marker_appends_own_line(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """_register_session_marker is append-only: each call adds one line
-    to sessions.live without reading or rewriting the file. Duplicate
-    entries from multiple calls are harmless -- the hook uses kill -0 to
-    filter, and _remove_session_marker rewrites with only live entries on
-    graceful shutdown."""
+    """Each registration preserves existing live rows and adds one row for
+    the current session. Duplicate rows from repeated starts are harmless --
+    the hook filters by PID liveness and the next compaction can clean up."""
     coord_dir = tmp_path / ".coordination"
     coord_dir.mkdir()
     monkeypatch.setattr(mcp_server, "_SESSION_ID", "dup-test-sid")
@@ -1284,13 +1282,12 @@ def test_register_session_marker_appends_own_line(
     assert all(sid == "dup-test-sid" for sid in ids)
 
 
-def test_register_session_marker_does_not_sweep_at_startup(
+def test_register_session_marker_sweeps_dead_pid_entries_at_startup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Registration no longer sweeps dead entries -- that responsibility
-    moved to _remove_session_marker so the registration path is a single
-    non-blocking append (no read-modify-write race). Dead entries remain
-    until the next graceful shutdown rewrites the file."""
+    """Registration compacts stale entries under a lock before adding
+    its own row, so dead-PID noise disappears on the next MCP startup
+    without reintroducing the old read/modify/write race."""
     coord_dir = tmp_path / ".coordination"
     coord_dir.mkdir()
     marker = coord_dir / "sessions.live"
@@ -1309,9 +1306,57 @@ def test_register_session_marker_does_not_sweep_at_startup(
 
     ids = _read_marker_session_ids(marker)
     assert "fresh-startup" in ids, "our session must be registered"
-    assert "ghost-session" in ids, (
-        "dead entries are NOT swept at registration; they wait for removal"
+    assert "ghost-session" not in ids
+
+
+def test_register_session_marker_skips_when_lock_busy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A busy compaction lock must not trigger an unlocked append, because
+    the lock holder could replace the file and drop that appended row."""
+    coord_dir = tmp_path / ".coordination"
+    coord_dir.mkdir()
+    marker = coord_dir / "sessions.live"
+    (coord_dir / ".sessions.live.lock").mkdir()
+    monkeypatch.setattr(mcp_server, "_MARKER_LOCK_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(mcp_server, "_SESSION_ID", "busy-lock-startup")
+    monkeypatch.setattr(
+        mcp_server, "_repo_root_for_marker", lambda: coord_dir
     )
+
+    mcp_server._register_session_marker()
+
+    ids = _read_marker_session_ids(marker)
+    assert ids == []
+
+
+def test_register_session_marker_reclaims_stale_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A killed process can leave the mkdir lock behind; old lock dirs are
+    evicted so compaction does not become another manual cleanup task."""
+    coord_dir = tmp_path / ".coordination"
+    coord_dir.mkdir()
+    lock = coord_dir / ".sessions.live.lock"
+    lock.mkdir()
+    old = 1
+    os.utime(lock, (old, old))
+    marker = coord_dir / "sessions.live"
+
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    marker.write_text(f"ghost-session {proc.pid} 0\n", encoding="utf-8")
+    monkeypatch.setattr(mcp_server, "_MARKER_LOCK_STALE_SECONDS", 0)
+    monkeypatch.setattr(mcp_server, "_SESSION_ID", "stale-lock-startup")
+    monkeypatch.setattr(
+        mcp_server, "_repo_root_for_marker", lambda: coord_dir
+    )
+
+    mcp_server._register_session_marker()
+
+    ids = _read_marker_session_ids(marker)
+    assert ids == ["stale-lock-startup"]
+    assert not lock.exists()
 
 
 def test_remove_session_marker_sweeps_dead_pid_entries(

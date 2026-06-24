@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import httpx
+import pytest
 
-from coordination import cli_doctor
+from coordination import cli_doctor, mcp_server
 from coordination.repo_config import RepoConfig
 
 
@@ -415,6 +417,7 @@ def test_symbol_parser_check_warns_when_forced_to_regex(monkeypatch):
         assert ext in result.detail
     assert "regex" in result.detail.lower()
     assert "symbols" in result.hint  # nudges toward the install extra
+    assert "coord-mcp-server[symbols]" in result.hint
 
 
 def test_symbol_parser_check_fails_when_treesitter_forced_and_missing(monkeypatch):
@@ -440,6 +443,7 @@ def test_symbol_parser_check_fails_when_treesitter_forced_and_missing(monkeypatc
     assert "COORD_SYMBOL_PARSER=treesitter" in result.detail
     # The hint must mention how to fix it.
     assert "symbols" in result.hint
+    assert "coord-mcp-server[symbols]" in result.hint
 
 
 # --- v0.32.2: doctor robustness under the user-scoped MCP model ---
@@ -491,17 +495,42 @@ def test_managed_block_doc_checks_both_docs(tmp_path):
     assert cli_doctor._managed_block_doc(tmp_path) == "CLAUDE.md"
 
 
-def test_sessions_live_stale_entries_are_warn_not_fail(tmp_path):
-    """Stale dead-PID entries are self-healing noise; doctor must surface
-    them as WARN so they never flip the exit code."""
+def test_sessions_live_stale_entries_are_pruned(tmp_path):
+    """Stale dead-PID entries are self-healing noise; doctor should prune
+    them from the local runtime file instead of leaving an operator warning."""
     coord = tmp_path / ".coordination"
     coord.mkdir()
-    # PID 1 is alive (init); a huge PID is dead.
+    live_pid = os.getpid()
+    live_start = mcp_server._process_start_time_ns(live_pid)
+    live_line = f"sess-a {live_pid} {live_start}"
     (coord / "sessions.live").write_text(
-        "sess-a 1\nsess-b 2147480000\n", encoding="utf-8"
+        f"{live_line}\nsess-b 2147480000 0\n", encoding="utf-8"
     )
     results = cli_doctor._check_sessions_live(tmp_path)
     assert results, "expected a sessions.live result"
-    stale = results[0]
-    assert stale.ok is False
-    assert stale.level == "warn"
+    pruned = results[0]
+    assert pruned.ok is True
+    assert "pruned 1/2 stale entries" in pruned.detail
+    assert (coord / "sessions.live").read_text(encoding="utf-8") == f"{live_line}\n"
+
+
+def test_sessions_live_busy_lock_warns_without_pruning(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    """Doctor must not rewrite sessions.live while coord-mcp owns the
+    compaction lock."""
+    coord = tmp_path / ".coordination"
+    coord.mkdir()
+    marker = coord / "sessions.live"
+    marker.write_text("sess-b 2147480000 0\n", encoding="utf-8")
+    (coord / ".sessions.live.lock").mkdir()
+    monkeypatch.setattr(mcp_server, "_MARKER_LOCK_TIMEOUT_SECONDS", 0)
+
+    results = cli_doctor._check_sessions_live(tmp_path)
+
+    assert results, "expected a sessions.live result"
+    busy = results[0]
+    assert busy.ok is False
+    assert busy.level == "warn"
+    assert "could not acquire" in busy.detail
+    assert marker.read_text(encoding="utf-8") == "sess-b 2147480000 0\n"

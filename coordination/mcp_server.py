@@ -4,6 +4,7 @@ import atexit
 import os
 import subprocess
 import tempfile
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -113,6 +114,9 @@ def _resolve_session_id() -> str:
 # this constant, so subagents spawned by the same parent are
 # cooperative.
 _SESSION_ID = _resolve_session_id()
+_MARKER_LOCK_TIMEOUT_SECONDS = 1.0
+_MARKER_LOCK_POLL_SECONDS = 0.05
+_MARKER_LOCK_STALE_SECONDS = 30.0
 
 
 @mcp.tool()
@@ -1002,6 +1006,54 @@ def _atomic_write_lines(path: Path, lines: list[str]) -> None:
         raise
 
 
+def _unlink_marker_if_empty(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _acquire_marker_lock(parent: Path) -> Path | None:
+    """Best-effort cross-platform lock for sessions.live rewrites.
+
+    The marker file is runtime hygiene, never a hard dependency for MCP
+    startup. A tiny mkdir lock lets startup compact stale entries without
+    reintroducing the old read/modify/write race. If the lock is contended
+    or unavailable, callers skip the rewrite and leave the next startup or
+    doctor run to try again.
+    """
+    lock = parent / ".sessions.live.lock"
+    deadline = time.monotonic() + _MARKER_LOCK_TIMEOUT_SECONDS
+    while True:
+        try:
+            lock.mkdir()
+            return lock
+        except FileExistsError:
+            try:
+                age = time.time() - lock.stat().st_mtime
+                if age >= _MARKER_LOCK_STALE_SECONDS:
+                    lock.rmdir()
+                    continue
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(_MARKER_LOCK_POLL_SECONDS)
+        except OSError:
+            return None
+
+
+def _release_marker_lock(lock: Path | None) -> None:
+    if lock is None:
+        return
+    try:
+        lock.rmdir()
+    except OSError:
+        pass
+
+
 def _sweep_stale_entries(raw_lines: list[str]) -> list[tuple[str, int, int]]:
     """Filter ``sessions.live`` lines to only those whose PID is live.
 
@@ -1025,19 +1077,57 @@ def _sweep_stale_entries(raw_lines: list[str]) -> list[tuple[str, int, int]]:
     return out
 
 
+def _compact_session_marker(
+    marker: Path,
+    *,
+    add_entry: tuple[str, int, int] | None = None,
+    drop_session_id: str | None = None,
+) -> bool:
+    """Rewrite sessions.live with only live entries.
+
+    Returns True when the caller fully handled the marker file. Returns
+    False when the file could not be read/written; callers treat marker
+    cleanup as best-effort and skip unsafe unlocked writes.
+    """
+    raw: list[str] = []
+    if marker.exists():
+        try:
+            raw = marker.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
+            return False
+
+    kept = [
+        entry
+        for entry in _sweep_stale_entries(raw)
+        if drop_session_id is None or entry[0] != drop_session_id
+    ]
+    if add_entry is not None:
+        kept.append(add_entry)
+
+    if not kept:
+        _unlink_marker_if_empty(marker)
+        return True
+
+    new_lines = [_format_marker_line(s, p, st) for s, p, st in kept]
+    try:
+        _atomic_write_lines(marker, new_lines)
+    except Exception:
+        return False
+    return True
+
+
 def _register_session_marker() -> None:
-    """Append our session line to sessions.live without reading first.
+    """Publish our session line to sessions.live.
 
-    Append-only writes eliminate the read-modify-write race where two
-    coord-mcp processes starting simultaneously both read the same file,
-    sweep independently, and the second writer silently drops the first
-    session's entry. With append-only each process owns exactly its own
-    line; no writer can clobber another's.
+    Registration first tries to compact stale rows under a repo-local lock,
+    then writes the live set plus our row atomically. The lock keeps the old
+    read-modify-write race closed: simultaneous coord-mcp startups serialize
+    their rewrites instead of clobbering each other's session ids.
 
-    Stale entries from SIGKILL/OOM-killed predecessors are swept lazily:
-    _remove_session_marker rewrites the file with only live entries on
-    graceful shutdown, and the pre-push hook skips dead PIDs on every
-    read. The doctor check surfaces the stale count.
+    If the lock cannot be acquired quickly, registration skips the marker
+    rather than appending behind a concurrent compactor. Stale entries from
+    SIGKILL/OOM-killed predecessors are still swept by the next locked
+    registration/removal, and the pre-push hook skips dead PIDs on every read.
 
     No-op when ``.coordination/`` doesn't exist (agent running outside
     a coord-managed repo). Any filesystem error is swallowed so MCP
@@ -1050,8 +1140,16 @@ def _register_session_marker() -> None:
         marker = coord_dir / "sessions.live"
         my_pid = os.getpid()
         my_start = _process_start_time_ns(my_pid)
-        with open(marker, "a", encoding="utf-8") as fh:
-            fh.write(_format_marker_line(_SESSION_ID, my_pid, my_start) + "\n")
+        lock = _acquire_marker_lock(coord_dir)
+        if lock is None:
+            return
+        try:
+            _compact_session_marker(
+                marker,
+                add_entry=(_SESSION_ID, my_pid, my_start),
+            )
+        finally:
+            _release_marker_lock(lock)
     except Exception:
         # Marker is best-effort; never let it break MCP startup.
         pass
@@ -1071,36 +1169,13 @@ def _remove_session_marker() -> None:
         marker = coord_dir / "sessions.live"
         if not marker.exists():
             return
+        lock = _acquire_marker_lock(coord_dir)
+        if lock is None:
+            return
         try:
-            raw = marker.read_text(encoding="utf-8").splitlines()
-        except (OSError, UnicodeDecodeError):
-            return
-        # Parse all entries: drop our own line and also sweep any dead-PID
-        # entries accumulated since this file was last rewritten. With
-        # append-only registration, removal is the natural rewrite point.
-        kept: list[tuple[str, int, int]] = []
-        had_us = False
-        for r in raw:
-            parsed = _parse_marker_entry(r)
-            if parsed is None:
-                continue
-            sid, pid, start = parsed
-            if sid == _SESSION_ID:
-                had_us = True
-                continue
-            # Keep only live entries; drop stale ones from SIGKILL/OOM deaths.
-            if pid > 0 and _is_live_pid(pid, start):
-                kept.append((sid, pid, start))
-        if not had_us:
-            return
-        if not kept:
-            try:
-                marker.unlink()
-            except OSError:
-                pass
-            return
-        new_lines = [_format_marker_line(s, p, st) for s, p, st in kept]
-        _atomic_write_lines(marker, new_lines)
+            _compact_session_marker(marker, drop_session_id=_SESSION_ID)
+        finally:
+            _release_marker_lock(lock)
     except Exception:
         # Marker is best-effort; never let it break MCP shutdown.
         pass

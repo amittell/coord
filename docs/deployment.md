@@ -75,7 +75,7 @@ curl http://127.0.0.1:8080/readyz
 If you want to run the ASGI app on bare metal or inside a different process supervisor, the app object is `coordination.main:app`:
 
 ```bash
-pip install coord-mcp-server
+pip install 'coord-mcp-server[symbols]'
 export COORD_AUTH_TOKEN=replace-me
 export COORD_DATABASE_PATH=/var/lib/coord/coordination.db
 uvicorn coordination.main:app --host 0.0.0.0 --port 8080

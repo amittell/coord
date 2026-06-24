@@ -177,6 +177,26 @@ Symptom: pre-v0.10 hooks passed only `git config user.name` as the engineer to `
 
 Fix in v0.10.0: `coord-mcp` writes its `session_id` to `<repo_root>/.coordination/sessions.live` on startup. The pre-push hook reads every line and forwards each as `&session_id=` to `/conflicts`, which now self-excludes claims matching any of them. Once you've upgraded coord and restarted the parent agent (Claude Code / Codex / Cursor), the hook stops false-positiving. Verify by checking `cat .coordination/sessions.live` -- a fresh hex id means the new MCP child registered itself.
 
+## `coord doctor` reports stale `sessions.live` rows
+
+`sessions.live` is local runtime state used by the pre-push hook to identify the current MCP session. Older coord versions could leave a dead-PID row behind when an agent process was killed instead of exiting cleanly.
+
+Fix in v0.33.1: coord now compacts `sessions.live` under a repo-local lock when `coord-mcp` starts or exits, and `coord doctor` prunes stale rows immediately when it can rewrite the file. If doctor still warns, inspect permissions on `.coordination/sessions.live`; the pre-push hook still skips dead PIDs, so the warning is hygiene rather than a coordination break.
+
+## `coord doctor` reports regex fallback for symbol parsers
+
+Symbol claims still work through regex fallback, but tree-sitter parser wheels are stricter and support nested symbols more accurately. Install or refresh the optional parser extra in the same environment that provides `coord-mcp`:
+
+```bash
+python -m pip install --upgrade 'coord-mcp-server[symbols]'
+```
+
+For pipx installs:
+
+```bash
+pipx inject coord-mcp-server 'coord-mcp-server[symbols]'
+```
+
 ## "Transport closed" error from coord MCP tool (v0.11.0 fix)
 
 Symptom: an agent's tool call to coord (e.g. `coord.release_session`) fails with `tool call error ... Caused by: Transport closed`, and subsequent calls keep failing; the parent (Codex / Claude Code) has a stale stdio handle to a dead MCP child.
