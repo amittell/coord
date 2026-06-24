@@ -142,6 +142,37 @@ def test_script_passes_repo_id_to_conflicts_endpoint() -> None:
     assert "&repo=" in PRE_PUSH_SCRIPT
 
 
+def test_script_passes_branch_to_conflicts_endpoint() -> None:
+    # v0.34: the hook must forward the pushing branch as &branch=<branch>
+    # on the /conflicts query so a bounced push can be surfaced as a
+    # comment on the corresponding open PR. The branch is built into a
+    # BRANCH_QS fragment (mirroring REPO_QS) that is only non-empty when
+    # BRANCH is set, and is interpolated onto the curl URL after
+    # ${SESSION_QS}. Without this, the server never learns which branch
+    # bounced and cannot resolve the PR to comment on.
+    assert 'BRANCH_QS=""' in PRE_PUSH_SCRIPT
+    assert "&branch=" in PRE_PUSH_SCRIPT
+    # The conditional must gate on a non-empty BRANCH and exclude the
+    # detached-HEAD sentinel ("HEAD") so a detached checkout does not
+    # append a useless "&branch=HEAD" (which the server cannot resolve a
+    # PR for anyway).
+    assert 'if [[ -n "${BRANCH}" && "${BRANCH}" != "HEAD" ]]; then' in PRE_PUSH_SCRIPT
+    # The curl URL must interpolate ${BRANCH_QS} right after the session
+    # query string so all three optional segments compose cleanly.
+    assert "${REPO_QS}${SESSION_QS}${BRANCH_QS}" in PRE_PUSH_SCRIPT
+
+
+def test_script_branch_qs_url_encoded_via_urllib() -> None:
+    # The branch value must be URL-encoded with the same python3 -c
+    # urllib.parse.quote idiom used for ENGINEER / REPO_ID / SESSION_ID
+    # so a branch name with slashes or other reserved characters does
+    # not corrupt the query string.
+    assert (
+        '&branch=$(python3 -c "import urllib.parse,sys; '
+        'print(urllib.parse.quote(sys.argv[1]))" "${BRANCH}")'
+    ) in PRE_PUSH_SCRIPT
+
+
 def test_script_references_sessions_live_file() -> None:
     # v0.10.0: coord-mcp writes its session_id to .coordination/sessions.live
     # on startup so the pre-push hook can hand the active session ids to

@@ -81,6 +81,18 @@ class Settings(BaseSettings):
     webhook_max_retries: int = 5
     webhook_retry_backoff_sec: int = 60
     webhook_delivery_interval_sec: int = 5
+    # v0.34 GitHub PR-comment integration. When ``github_token`` is
+    # set, ``push_bounced`` events are routed through the webhook
+    # outbox (kind='github') and the delivery loop posts (or updates)
+    # a de-duplicated comment on the open PR for the pushing branch
+    # instead of POSTing to ``webhook_url``. Empty token disables the
+    # feature: no github outbox row is enqueued and the whole path is
+    # a no-op, mirroring how ``webhook_url`` gates webhooks.
+    # ``github_api_base`` lets self-hosted GitHub Enterprise installs
+    # point at ``https://github.example.com/api/v3``; it defaults to
+    # the public REST API host.
+    github_token: str = ""
+    github_api_base: str = "https://api.github.com"
     # v0.28 queue ordering refinements (queue QoS, low-hanging from the
     # roadmap v0.29 section pulled forward).
     #

@@ -141,7 +141,7 @@ CREATE INDEX IF NOT EXISTS idx_claims_engineer ON claims (engineer);
 """
 
 
-CURRENT_SCHEMA_VERSION = 16
+CURRENT_SCHEMA_VERSION = 17
 
 
 # v0.28 fairness pass: per-blocking-claim counter that
@@ -569,6 +569,20 @@ MIGRATIONS: list[tuple[int, str]] = [
         ");\n"
         "CREATE INDEX idx_claim_symbol_renames_claim_id "
         "ON claim_symbol_renames (claim_id);",
+    ),
+    # v17: GitHub PR-comment integration (v0.34). The webhook_outbox
+    # gains a ``kind`` discriminator so the delivery loop can route a
+    # row to the right transport: 'webhook' (the v0.27 default) POSTs
+    # the payload to ``COORD_WEBHOOK_URL`` with the HMAC header, while
+    # 'github' hands the row's ``detail`` to the GitHub adapter, which
+    # finds-or-updates a de-duplicated comment on the open PR for the
+    # pushing branch. The DEFAULT keeps every pre-v17 row (and every
+    # existing INSERT that omits the column) behaving exactly as a
+    # webhook row, so the migration is transparent to legacy callers.
+    (
+        17,
+        "ALTER TABLE webhook_outbox ADD COLUMN "
+        "kind TEXT NOT NULL DEFAULT 'webhook';",
     ),
 ]
 
@@ -1919,6 +1933,7 @@ class Database:
         payload_json: str,
         hmac_signature: str,
         next_attempt_at: str | None = None,
+        kind: str = "webhook",
     ) -> str:
         """v0.27: insert a row into ``webhook_outbox`` for the
         background delivery loop to POST. Returns the new row id.
@@ -1926,6 +1941,10 @@ class Database:
         ``next_attempt_at`` defaults to now -- the loop picks it up
         on its next tick. Callers don't need to know the retry
         schedule; mark_webhook_failed advances it.
+
+        ``kind`` (v0.34) discriminates the delivery transport:
+        'webhook' (default) POSTs to ``url`` with the HMAC header;
+        'github' routes the row's ``detail`` to the GitHub adapter.
         """
         await self.init()
         new_id = str(uuid4())
@@ -1936,10 +1955,10 @@ class Database:
             await conn.execute(
                 "INSERT INTO webhook_outbox "
                 "(id, url, event_type, payload_json, hmac_signature, "
-                " status, retry_count, next_attempt_at, created_at) "
-                "VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?)",
+                " status, retry_count, next_attempt_at, created_at, kind) "
+                "VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)",
                 (new_id, url, event_type, payload_json,
-                 hmac_signature, next_iso, now_iso),
+                 hmac_signature, next_iso, now_iso, kind),
             )
             await conn.commit()
         return new_id

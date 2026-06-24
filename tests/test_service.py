@@ -1250,3 +1250,117 @@ async def test_symbol_claim_without_repo_root_has_null_spans(
     assert row["end_line"] is None
     assert row["end_col"] is None
     assert row["resolved_by"] is None
+
+
+# --- v0.34: push_bounced GitHub outbox emission -----------------------------
+#
+# When COORD_GITHUB_TOKEN is set, a bounced conflict check enqueues exactly
+# one kind='github' push_bounced row carrying the holder metadata so the
+# delivery loop can comment on the open PR. When the token is empty the whole
+# path is a no-op: no outbox row at all, and the conflict response is
+# byte-identical to pre-v0.34.
+
+
+async def _github_conflict_service(tmp_path: Path) -> CoordinationService:
+    """Service with github_token set and no repo_root, so the conflict
+    path runs and the github emit fires. webhook_url is intentionally
+    unset to prove the github gate is github_token, not webhook_url."""
+    db_path = tmp_path / "gh_trigger.sqlite"
+    db = Database(db_path)
+    await db.init()
+    settings = Settings(
+        database_path=db_path,
+        allow_insecure_no_auth=True,
+        repo_root=None,
+        github_token="ghp_trigger",
+    )
+    return CoordinationService(db=db, settings=settings)
+
+
+@pytest.mark.asyncio
+async def test_check_conflicts_enqueues_github_push_bounced(
+    tmp_path: Path,
+) -> None:
+    import json
+
+    svc = await _github_conflict_service(tmp_path)
+    await svc.db.insert_claims_batch(
+        engineer="bob",
+        branch="feature/y",
+        description="auth refactor",
+        items=[
+            ("cid_gh", "module", "src/auth/**", "soft", "2099-01-01T00:00:00Z")
+        ],
+        repo="octo/widgets",
+    )
+
+    resp = await svc.check_conflicts(
+        patterns=["src/auth/**"],
+        engineer="alice",
+        repo="octo/widgets",
+        pushing_branch="feature/x",
+    )
+    # Conflict response shape is unaffected by the github emit.
+    assert resp.has_conflicts is True
+    assert len(resp.conflicts) == 1
+
+    rows = await svc.db.list_pending_webhooks()
+    github_rows = [r for r in rows if r["kind"] == "github"]
+    assert len(github_rows) == 1
+    row = github_rows[0]
+    assert row["event_type"] == "push_bounced"
+
+    payload = json.loads(row["payload_json"])
+    assert payload["event_type"] == "push_bounced"
+    detail = payload["detail"]
+    assert detail["repo"] == "octo/widgets"
+    assert detail["pushing_engineer"] == "alice"
+    assert detail["pushing_branch"] == "feature/x"
+    assert len(detail["bounced"]) == 1
+    bounced = detail["bounced"][0]
+    assert bounced["holder_engineer"] == "bob"
+    assert bounced["holder_branch"] == "feature/y"
+    assert bounced["holder_pattern"] == "src/auth/**"
+    assert bounced["holder_description"] == "auth refactor"
+    # Heuristic overlap (no repo_root) yields the sentinel file token; the
+    # files list is always present and non-empty for a real conflict.
+    assert bounced["files"]
+
+
+@pytest.mark.asyncio
+async def test_check_conflicts_no_github_token_enqueues_nothing(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "gh_off.sqlite"
+    db = Database(db_path)
+    await db.init()
+    settings = Settings(
+        database_path=db_path,
+        allow_insecure_no_auth=True,
+        repo_root=None,
+        github_token="",
+    )
+    svc = CoordinationService(db=db, settings=settings)
+    await svc.db.insert_claims_batch(
+        engineer="bob",
+        branch="feature/y",
+        description="auth refactor",
+        items=[
+            ("cid_off", "module", "src/auth/**", "soft", "2099-01-01T00:00:00Z")
+        ],
+        repo="octo/widgets",
+    )
+
+    resp = await svc.check_conflicts(
+        patterns=["src/auth/**"],
+        engineer="alice",
+        repo="octo/widgets",
+        pushing_branch="feature/x",
+    )
+    # Still a real conflict, response identical to the pre-v0.34 shape.
+    assert resp.has_conflicts is True
+    assert len(resp.conflicts) == 1
+
+    # No outbox row of any kind: the github path is a complete no-op.
+    rows = await svc.db.list_pending_webhooks()
+    assert rows == []
