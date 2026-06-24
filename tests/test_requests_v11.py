@@ -27,7 +27,9 @@ from uuid import uuid4
 import aiosqlite
 import pytest
 
-from coordination.db import Database
+from coordination.config import Settings
+from coordination.db import Database, _configure_sqlite
+from coordination.service import CoordinationService
 
 
 @pytest.fixture()
@@ -742,3 +744,561 @@ async def test_denied_resets_ttl_shortened(db: Database) -> None:
     assert row is not None
     assert row["ttl_shortened"] == 0, "denied must reset ttl_shortened"
     assert row["expires_at"] == original_exp, "denied must restore original TTL"
+
+
+# --- v0.35: symbol-scoped coexist -------------------------------------------
+
+
+async def _seed_symbol_claim(
+    db: Database,
+    *,
+    engineer: str,
+    pattern: str,
+    symbols: list[str],
+    repo: str = "amittell/coord",
+    session_id: str | None = "sym-sess",
+    ttl_hours: int = 4,
+) -> str:
+    """Insert a symbol-scope claim: a file row flipped to
+    scope_type='symbol' plus one claim_symbols row per symbol path. The
+    "Parent::child" notation is split into (parent_symbol, symbol_name)
+    exactly as the production insert path does."""
+    cid = await _seed_claim(
+        db,
+        engineer=engineer,
+        pattern=pattern,
+        repo=repo,
+        session_id=session_id,
+        branch=None,
+        description="symbol holder",
+        ttl_hours=ttl_hours,
+    )
+    async with aiosqlite.connect(db.path) as conn:
+        await _configure_sqlite(conn)
+        await conn.execute(
+            "UPDATE claims SET scope_type = 'symbol', narrowable = 0 WHERE id = ?",
+            (cid,),
+        )
+        await conn.commit()
+    rows: list[tuple[str, str, str, str, str, str | None]] = []
+    for raw in symbols:
+        if "::" in raw:
+            parent, _, leaf = raw.rpartition("::")
+        else:
+            parent, leaf = None, raw
+        rows.append((str(uuid4()), cid, pattern, leaf, "unknown", parent))
+    await db.insert_claim_symbols(rows=rows)
+    return cid
+
+
+def _service(db: Database) -> CoordinationService:
+    return CoordinationService(db=db, settings=Settings())
+
+
+async def _symbol_claims_for(db: Database, claim_id: str) -> set[str]:
+    """Return the set of canonical symbol paths recorded for a claim."""
+    rows = await db.get_claim_symbols(claim_id)
+    out: set[str] = set()
+    for r in rows:
+        parent = r.get("parent_symbol")
+        name = str(r["symbol_name"])
+        out.add(f"{parent}::{name}" if parent else name)
+    return out
+
+
+@pytest.mark.asyncio
+async def test_symbol_coexist_disjoint_grants_symbol_claim(db: Database) -> None:
+    """A symbol coexist with disjoint symbols succeeds: both claims stay
+    active and mutually linked, and the requester's new claim is
+    symbol-scoped carrying exactly the granted claim_symbols."""
+    holder_cid = await _seed_symbol_claim(
+        db,
+        engineer="alice",
+        pattern="src/auth/login.ts",
+        symbols=["Login::handleLogin"],
+    )
+    # Requester already holds a disjoint symbol claim on the same file.
+    await _seed_symbol_claim(
+        db,
+        engineer="bob",
+        pattern="src/auth/login.ts",
+        symbols=["Login::validateCredentials", "Login::logSignin"],
+        session_id="bob-sess",
+    )
+    req = await _file_request(
+        db, claim_id=holder_cid, requested_pattern="src/auth/login.ts"
+    )
+
+    svc = _service(db)
+    result = await svc.respond_to_request(
+        request_id=req["id"],
+        decision="coexist",
+        actor_engineer="alice",
+        actor_session_id="holder-sess",
+        coexist_symbols={"src/auth/login.ts": ["Login::validateCredentials"]},
+    )
+    assert result is not None
+    assert result["decision"] == "coexist"
+
+    active = await db.list_active_claims_rows()
+    by_id = {c["id"]: c for c in active}
+    assert holder_cid in by_id, "holder claim must remain active"
+    # The new coexist sibling is the bob claim that is symbol-scoped and
+    # linked to the holder.
+    grant = next(
+        c
+        for c in active
+        if c["engineer"] == "bob"
+        and holder_cid in (json.loads(c["coexists_with"]) if c["coexists_with"] else [])
+    )
+    assert grant["scope_type"] == "symbol"
+    assert await _symbol_claims_for(db, grant["id"]) == {"Login::validateCredentials"}
+
+    # Mutual coexists_with linkage.
+    holder_partners = json.loads(by_id[holder_cid]["coexists_with"])
+    assert grant["id"] in holder_partners
+    assert holder_cid in json.loads(grant["coexists_with"])
+
+
+@pytest.mark.asyncio
+async def test_symbol_coexist_rejects_file_outside_holder_claim(db: Database) -> None:
+    """A holder cannot grant a symbol coexist on a file outside this
+    request's subject -- e.g. an unrelated claim the requester also holds
+    on a different file. The grant is restricted to files the holder
+    actually claims, closing the cross-file consent hole."""
+    holder_cid = await _seed_symbol_claim(
+        db,
+        engineer="alice",
+        pattern="src/auth/login.ts",
+        symbols=["Login::handleLogin"],
+    )
+    # Bob holds the on-subject claim on login.ts ...
+    await _seed_symbol_claim(
+        db,
+        engineer="bob",
+        pattern="src/auth/login.ts",
+        symbols=["Login::validateCredentials"],
+        session_id="bob-sess",
+    )
+    # ... and a completely unrelated symbol claim on another file.
+    await _seed_symbol_claim(
+        db,
+        engineer="bob",
+        pattern="src/billing/charge.ts",
+        symbols=["Charge::run"],
+        session_id="bob-sess",
+    )
+    req = await _file_request(
+        db, claim_id=holder_cid, requested_pattern="src/auth/login.ts"
+    )
+
+    svc = _service(db)
+    # The holder claims nothing on charge.ts, so granting a sibling there
+    # (borrowing bob's unrelated claim) must be refused.
+    with pytest.raises(ValueError, match="holder's symbol claim"):
+        await svc.respond_to_request(
+            request_id=req["id"],
+            decision="coexist",
+            actor_engineer="alice",
+            actor_session_id="holder-sess",
+            coexist_symbols={"src/billing/charge.ts": ["Charge::run"]},
+        )
+    # No sibling was minted on the unrelated file.
+    active = await db.list_active_claims_rows()
+    charge_grants = [
+        c
+        for c in active
+        if c["engineer"] == "bob"
+        and "charge.ts" in str(c["pattern"])
+        and c["coexists_with"]
+    ]
+    assert charge_grants == []
+
+
+@pytest.mark.asyncio
+async def test_symbol_coexist_overlapping_symbols_rejected(db: Database) -> None:
+    """When the granted symbols overlap the holder's claimed symbols
+    under the prefix rule, the grant is refused (400) so a coexist
+    cannot hide a real symbol conflict."""
+    holder_cid = await _seed_symbol_claim(
+        db,
+        engineer="alice",
+        pattern="src/auth/login.ts",
+        symbols=["Login"],  # whole class covers every method
+    )
+    await _seed_symbol_claim(
+        db,
+        engineer="bob",
+        pattern="src/auth/login.ts",
+        symbols=["Login::handleLogin"],
+        session_id="bob-sess",
+    )
+    req = await _file_request(
+        db, claim_id=holder_cid, requested_pattern="src/auth/login.ts"
+    )
+
+    svc = _service(db)
+    with pytest.raises(ValueError, match="overlaps"):
+        await svc.respond_to_request(
+            request_id=req["id"],
+            decision="coexist",
+            actor_engineer="alice",
+            actor_session_id="holder-sess",
+            coexist_symbols={"src/auth/login.ts": ["Login::handleLogin"]},
+        )
+
+
+@pytest.mark.asyncio
+async def test_symbol_coexist_requires_subset_of_requester_claim(
+    db: Database,
+) -> None:
+    """A symbol that the requester never claimed cannot be granted."""
+    holder_cid = await _seed_symbol_claim(
+        db,
+        engineer="alice",
+        pattern="src/auth/login.ts",
+        symbols=["Login::handleLogin"],
+    )
+    await _seed_symbol_claim(
+        db,
+        engineer="bob",
+        pattern="src/auth/login.ts",
+        symbols=["Login::validateCredentials"],
+        session_id="bob-sess",
+    )
+    req = await _file_request(
+        db, claim_id=holder_cid, requested_pattern="src/auth/login.ts"
+    )
+
+    svc = _service(db)
+    with pytest.raises(ValueError, match="not within the requester"):
+        await svc.respond_to_request(
+            request_id=req["id"],
+            decision="coexist",
+            actor_engineer="alice",
+            actor_session_id="holder-sess",
+            # bob never claimed logSignin.
+            coexist_symbols={"src/auth/login.ts": ["Login::logSignin"]},
+        )
+
+
+@pytest.mark.asyncio
+async def test_symbol_coexist_rejected_when_holder_is_file_scoped(
+    db: Database,
+) -> None:
+    """coexist_symbols against a file-scoped holder is a contract
+    violation (400): symbol coexist needs both sides symbol-scoped."""
+    holder_cid = await _seed_claim(
+        db, engineer="alice", pattern="src/auth/login.ts"
+    )
+    await _seed_symbol_claim(
+        db,
+        engineer="bob",
+        pattern="src/auth/login.ts",
+        symbols=["Login::validateCredentials"],
+        session_id="bob-sess",
+    )
+    req = await _file_request(
+        db, claim_id=holder_cid, requested_pattern="src/auth/login.ts"
+    )
+
+    svc = _service(db)
+    with pytest.raises(ValueError, match="symbol-scoped"):
+        await svc.respond_to_request(
+            request_id=req["id"],
+            decision="coexist",
+            actor_engineer="alice",
+            actor_session_id="holder-sess",
+            coexist_symbols={"src/auth/login.ts": ["Login::validateCredentials"]},
+        )
+
+
+@pytest.mark.asyncio
+async def test_symbol_coexist_rejected_when_requester_not_symbol_scoped(
+    db: Database,
+) -> None:
+    """The requester must hold an active symbol-scoped claim; a bare
+    file-scope requester cannot receive a symbol coexist grant."""
+    holder_cid = await _seed_symbol_claim(
+        db,
+        engineer="alice",
+        pattern="src/auth/login.ts",
+        symbols=["Login::handleLogin"],
+    )
+    # bob holds only a file-scope claim elsewhere.
+    await _seed_claim(
+        db, engineer="bob", pattern="src/other.ts", session_id="bob-sess"
+    )
+    req = await _file_request(
+        db, claim_id=holder_cid, requested_pattern="src/auth/login.ts"
+    )
+
+    svc = _service(db)
+    with pytest.raises(ValueError, match="symbol-scoped claim"):
+        await svc.respond_to_request(
+            request_id=req["id"],
+            decision="coexist",
+            actor_engineer="alice",
+            actor_session_id="holder-sess",
+            coexist_symbols={"src/auth/login.ts": ["Login::handleLogin"]},
+        )
+
+
+@pytest.mark.asyncio
+async def test_symbol_coexist_audit_event_records_coexist_symbols(
+    db: Database,
+) -> None:
+    """The responded audit event and the request row both carry the
+    granted coexist_symbols for the operator timeline."""
+    holder_cid = await _seed_symbol_claim(
+        db,
+        engineer="alice",
+        pattern="src/auth/login.ts",
+        symbols=["Login::handleLogin"],
+    )
+    await _seed_symbol_claim(
+        db,
+        engineer="bob",
+        pattern="src/auth/login.ts",
+        symbols=["Login::validateCredentials"],
+        session_id="bob-sess",
+    )
+    req = await _file_request(
+        db, claim_id=holder_cid, requested_pattern="src/auth/login.ts"
+    )
+    grant = {"src/auth/login.ts": ["Login::validateCredentials"]}
+
+    svc = _service(db)
+    await svc.respond_to_request(
+        request_id=req["id"],
+        decision="coexist",
+        actor_engineer="alice",
+        actor_session_id="holder-sess",
+        coexist_symbols=grant,
+    )
+
+    events = await db.list_request_events(req["id"])
+    responded = next(e for e in events if e["event_type"] == "responded")
+    detail = json.loads(responded["detail"])
+    assert detail["decision"] == "coexist"
+    assert detail["coexist_symbols"] == grant
+    assert detail["holder_claim_id"] == holder_cid
+
+    # Round-trips on the request row too.
+    fresh = await db.get_request(req["id"])
+    assert fresh is not None
+    assert json.loads(fresh["coexist_symbols"]) == grant
+
+
+@pytest.mark.asyncio
+async def test_file_scope_coexist_pattern_still_works_unchanged(
+    db: Database,
+) -> None:
+    """File-scope coexist (coexist_pattern, no coexist_symbols) is
+    byte-identical to pre-v0.35: a file-scoped sibling claim, no
+    claim_symbols, and no coexist_symbols on the request row."""
+    holder_cid = await _seed_claim(
+        db, engineer="alice", pattern="src/api/handlers.py"
+    )
+    req = await _file_request(db, claim_id=holder_cid)
+
+    result = await db.respond_to_request(
+        request_id=req["id"],
+        decision="coexist",
+        actor_engineer="alice",
+        actor_session_id="holder-sess",
+        coexist_pattern="src/api/handlers.py",
+    )
+    assert result is not None
+    assert result["decision"] == "coexist"
+
+    active = await db.list_active_claims_rows()
+    bob_claims = [c for c in active if c["engineer"] == "bob"]
+    assert len(bob_claims) == 1
+    assert bob_claims[0]["scope_type"] == "file"
+    assert await _symbol_claims_for(db, bob_claims[0]["id"]) == set()
+
+    fresh = await db.get_request(req["id"])
+    assert fresh is not None
+    assert fresh["coexist_symbols"] is None
+
+    events = await db.list_request_events(req["id"])
+    responded = next(e for e in events if e["event_type"] == "responded")
+    detail = json.loads(responded["detail"])
+    assert detail["coexist_pattern"] == "src/api/handlers.py"
+    assert "coexist_symbols" not in detail
+
+
+# --- v0.35 conflict-engine: symbol-aware partner exclusion ------------------
+#
+# Two symbol-scoped claims that coexist on a file share that file only on
+# DISJOINT symbols. A later THIRD claim from one partner's own session must
+# therefore be judged against the OTHER partner's granted symbols via the
+# normal symbol-overlap path -- it 409s when it hits them and auto-coexists
+# when it doesn't. A file-scoped coexist partner keeps the legacy
+# blanket-skip (the pair agreed to share the whole file).
+
+
+async def _seed_symbol_coexist_pair(db: Database) -> tuple[str, str, str]:
+    """Set up a symbol coexist pair on ``src/auth/login.ts``:
+
+    - alice (session 'holder-sess') holds ``Login::handleLogin``.
+    - bob (session 'bob-sess') holds ``Login::validateCredentials``.
+    - alice grants bob a symbol coexist on ``Login::validateCredentials``.
+
+    Returns ``(alice_claim_id, bob_original_claim_id, bob_coexist_claim_id)``.
+    After this, bob's session has alice's claim as a symbol-scoped coexist
+    partner -- the row that v0.35 must NOT blanket-skip on bob's next claim.
+    """
+    alice_cid = await _seed_symbol_claim(
+        db,
+        engineer="alice",
+        pattern="src/auth/login.ts",
+        symbols=["Login::handleLogin"],
+        session_id="holder-sess",
+    )
+    bob_cid = await _seed_symbol_claim(
+        db,
+        engineer="bob",
+        pattern="src/auth/login.ts",
+        symbols=["Login::validateCredentials"],
+        session_id="bob-sess",
+    )
+    req = await _file_request(
+        db,
+        claim_id=alice_cid,
+        requester_session_id="bob-sess",
+        requested_pattern="src/auth/login.ts",
+    )
+    svc = _service(db)
+    result = await svc.respond_to_request(
+        request_id=req["id"],
+        decision="coexist",
+        actor_engineer="alice",
+        actor_session_id="holder-sess",
+        coexist_symbols={"src/auth/login.ts": ["Login::validateCredentials"]},
+    )
+    assert result is not None and result["decision"] == "coexist"
+    active = await db.list_active_claims_rows()
+    bob_grant = next(
+        c
+        for c in active
+        if c["engineer"] == "bob"
+        and alice_cid in (json.loads(c["coexists_with"]) if c["coexists_with"] else [])
+    )
+    return alice_cid, bob_cid, str(bob_grant["id"])
+
+
+@pytest.mark.asyncio
+async def test_third_claim_409s_against_symbol_coexist_partner(
+    db: Database,
+) -> None:
+    """A third claim by bob's session that hits alice's granted symbol must
+    409: a symbol-scoped coexist partner is re-evaluated, not blanket-skipped,
+    so the real collision surfaces."""
+    from coordination.schemas import ClaimItem, CreateClaimsRequest
+
+    alice_cid, _bob_cid, _bob_grant = await _seed_symbol_coexist_pair(db)
+
+    svc = _service(db)
+    result = await svc.create_claims(
+        CreateClaimsRequest(
+            engineer="bob",
+            session_id="bob-sess",
+            repo="amittell/coord",
+            claims=[
+                ClaimItem(
+                    type="file",
+                    pattern="src/auth/login.ts",
+                    symbols=["Login::handleLogin"],
+                )
+            ],
+        )
+    )
+    assert result.claim_ids == [], "collision with partner's symbol must 409"
+    assert result.conflicts, "expected a conflict entry against alice's symbol"
+    entry = result.conflicts[0]
+    assert str(entry.conflicting_claim.id) == alice_cid
+    so = entry.symbol_overlap
+    assert so and "Login::handleLogin" in so[0].symbols
+
+
+@pytest.mark.asyncio
+async def test_third_claim_auto_coexists_when_disjoint_from_partner(
+    db: Database,
+) -> None:
+    """A third claim by bob's session on a symbol disjoint from BOTH the
+    partner's and bob's own symbols auto-coexists (no 409): the symbol-scoped
+    partner stays visible but the overlap engine finds them disjoint."""
+    from coordination.schemas import ClaimItem, CreateClaimsRequest
+
+    await _seed_symbol_coexist_pair(db)
+
+    svc = _service(db)
+    result = await svc.create_claims(
+        CreateClaimsRequest(
+            engineer="bob",
+            session_id="bob-sess",
+            repo="amittell/coord",
+            claims=[
+                ClaimItem(
+                    type="file",
+                    pattern="src/auth/login.ts",
+                    symbols=["Login::logout"],
+                )
+            ],
+        )
+    )
+    assert result.conflicts == [], "disjoint symbol must not 409"
+    assert result.claim_ids, "disjoint third claim should be granted"
+    new_cid = result.claim_ids[0]
+    assert await _symbol_claims_for(db, new_cid) == {"Login::logout"}
+
+
+@pytest.mark.asyncio
+async def test_file_scope_coexist_partner_still_blanket_skipped(
+    db: Database,
+) -> None:
+    """Regression: a FILE-scoped coexist partner keeps the pre-v0.35
+    blanket-skip. After alice and bob file-coexist on a whole file, bob's
+    next claim on that same file does NOT 409 against alice."""
+    from coordination.schemas import ClaimItem, CreateClaimsRequest
+
+    alice_cid = await _seed_claim(
+        db,
+        engineer="alice",
+        pattern="src/api/handlers.py",
+        session_id="holder-sess",
+    )
+    # bob requests from his own session so the granted file sibling lands
+    # in 'bob-sess' -- the real coexist flow -- making alice's claim bob's
+    # file-scoped coexist partner.
+    req = await _file_request(
+        db,
+        claim_id=alice_cid,
+        requester_session_id="bob-sess",
+        requested_pattern="src/api/handlers.py",
+    )
+    svc = _service(db)
+    granted = await svc.respond_to_request(
+        request_id=req["id"],
+        decision="coexist",
+        actor_engineer="alice",
+        actor_session_id="holder-sess",
+        coexist_pattern="src/api/handlers.py",
+    )
+    assert granted is not None and granted["decision"] == "coexist"
+
+    # bob's next whole-file claim must be invisible to alice's file partner.
+    result = await svc.create_claims(
+        CreateClaimsRequest(
+            engineer="bob",
+            session_id="bob-sess",
+            repo="amittell/coord",
+            claims=[ClaimItem(type="file", pattern="src/api/handlers.py")],
+        )
+    )
+    assert result.conflicts == [], (
+        "file-scoped coexist partner must stay blanket-skipped"
+    )
+    assert result.claim_ids, "bob's file claim should be granted"

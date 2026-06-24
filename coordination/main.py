@@ -1912,10 +1912,17 @@ async def respond_to_request(
             status_code=400,
             detail="decision='narrowed' requires a non-empty 'narrowed_pattern'",
         )
-    if body.decision == "coexist" and not body.coexist_pattern:
+    if (
+        body.decision == "coexist"
+        and not body.coexist_pattern
+        and not body.coexist_symbols
+    ):
         raise HTTPException(
             status_code=400,
-            detail="decision='coexist' requires a non-empty 'coexist_pattern'",
+            detail=(
+                "decision='coexist' requires a non-empty 'coexist_pattern' "
+                "or 'coexist_symbols'"
+            ),
         )
     try:
         result = await get_service().respond_to_request(
@@ -1926,6 +1933,7 @@ async def respond_to_request(
             note=body.note,
             narrowed_pattern=body.narrowed_pattern,
             coexist_pattern=body.coexist_pattern,
+            coexist_symbols=body.coexist_symbols,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

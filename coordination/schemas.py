@@ -273,6 +273,23 @@ class RespondToRequestRequest(BaseModel):
             "different functions in the same file."
         ),
     )
+    coexist_symbols: dict[str, list[str]] | None = Field(
+        default=None,
+        description=(
+            "v0.35 symbol-scoped alternative to coexist_pattern. A dict "
+            "mapping file_path -> list of symbol-path strings "
+            "(e.g. {'src/auth.py': ['Login::handle']}) the requester is "
+            "being granted a sibling claim on. The requester's new claim "
+            "is created scope_type='symbol' with exactly these symbols, "
+            "so a later third claim collides only on the granted symbols "
+            "and auto-coexists elsewhere. Valid only when BOTH the "
+            "holder's claim and the requester's original claim are "
+            "symbol-scoped; the granted symbols must be a subset of the "
+            "requester's claimed symbols and disjoint from the holder's "
+            "(else 400). decision='coexist' requires coexist_pattern OR "
+            "coexist_symbols."
+        ),
+    )
 
 
 class PromoteHotspotRequest(BaseModel):
