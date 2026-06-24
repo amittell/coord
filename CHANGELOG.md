@@ -9,6 +9,29 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.35.0] - 2026-06-24
+
+### Added
+
+- Symbol-level coexist. The ``coexist`` decision on
+  ``respond_to_request`` now accepts a ``coexist_symbols`` dict
+  (file -> list of symbol paths) so a holder can grant a requester
+  specific disjoint symbols within a contested file, generalizing the
+  file-scope ``coexist_pattern``. Validation happens at respond time
+  (the holder is the trust boundary): both claims must be symbol-scoped,
+  the granted symbols must be a subset of the requester's claim and
+  DISJOINT from the holder's symbols (via the existing
+  ``symbol_paths_overlap`` prefix rule), and the granted files must be
+  files the holder actually claims -- so a coexist can neither hide a
+  real symbol conflict nor reach outside the request's subject. The
+  grant mints the requester a real symbol-scoped sibling claim with
+  ``claim_symbols`` rows, and the conflict engine now evaluates a later
+  third claim against a symbol-coexisting partner's granted symbols
+  (409 on collision, auto-coexist when disjoint) instead of
+  blanket-skipping the partner. File-scope ``coexist_pattern`` is
+  unchanged. Schema v18 adds the nullable ``requests.coexist_symbols``
+  column.
+
 ## [0.34.0] - 2026-06-24
 
 ### Added
