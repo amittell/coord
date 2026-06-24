@@ -152,9 +152,11 @@ def test_script_passes_branch_to_conflicts_endpoint() -> None:
     # bounced and cannot resolve the PR to comment on.
     assert 'BRANCH_QS=""' in PRE_PUSH_SCRIPT
     assert "&branch=" in PRE_PUSH_SCRIPT
-    # The conditional must gate on a non-empty BRANCH so a detached HEAD
-    # does not append a literal trailing "&branch=".
-    assert 'if [[ -n "${BRANCH}" ]]; then' in PRE_PUSH_SCRIPT
+    # The conditional must gate on a non-empty BRANCH and exclude the
+    # detached-HEAD sentinel ("HEAD") so a detached checkout does not
+    # append a useless "&branch=HEAD" (which the server cannot resolve a
+    # PR for anyway).
+    assert 'if [[ -n "${BRANCH}" && "${BRANCH}" != "HEAD" ]]; then' in PRE_PUSH_SCRIPT
     # The curl URL must interpolate ${BRANCH_QS} right after the session
     # query string so all three optional segments compose cleanly.
     assert "${REPO_QS}${SESSION_QS}${BRANCH_QS}" in PRE_PUSH_SCRIPT

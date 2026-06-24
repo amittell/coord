@@ -15,7 +15,11 @@ branch from accumulating one bounce comment per push.
 
 Network failures raise so the outbox retry/backoff path applies. A
 branch with no open PR is not an error -- it is logged and treated as a
-no-op (there is simply nowhere to comment).
+no-op (there is simply nowhere to comment). PRs opened from a fork are
+not matched: the head filter is qualified with the base repo owner
+(``head={owner}:{branch}``), so a fork-origin branch resolves to no open
+PR and falls through to that same no-op. This is intentional -- coord's
+worktree/agent workflow pushes same-repo branches.
 """
 
 from __future__ import annotations

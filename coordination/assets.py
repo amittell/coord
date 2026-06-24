@@ -265,7 +265,7 @@ fi
 # HEAD (BRANCH="HEAD") still leaves a clean URL without a literal
 # trailing "&branch=".
 BRANCH_QS=""
-if [[ -n "${BRANCH}" ]]; then
+if [[ -n "${BRANCH}" && "${BRANCH}" != "HEAD" ]]; then
   BRANCH_QS="&branch=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${BRANCH}")"
 fi
 

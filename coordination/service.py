@@ -716,6 +716,19 @@ class CoordinationService:
         # is False, no row is built or enqueued, and the whole feature is
         # a no-op. The conflict response below is unchanged either way.
         if github_enabled and not safe:
+            # Merge holder sections so a holder overlapping via multiple
+            # pushed patterns renders once with the union of bounced files.
+            merged: dict[tuple, dict] = {}
+            for b in bounced:
+                key = (b["holder_engineer"], b["holder_pattern"], b["holder_branch"])
+                if key in merged:
+                    files = merged[key]["files"]
+                    for f in b["files"]:
+                        if f not in files:
+                            files.append(f)
+                else:
+                    merged[key] = {**b, "files": list(b["files"])}
+            bounced = list(merged.values())
             detail = {
                 "repo": repo or "",
                 "pushing_engineer": engineer,
