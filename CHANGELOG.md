@@ -9,6 +9,27 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.34.0] - 2026-06-24
+
+### Added
+
+- GitHub PR-comment integration. When a pre-push conflict (409) bounces
+  a push, coord posts or updates a single de-duplicated comment on the
+  pushing branch's open GitHub PR, naming the files that bounced and
+  which engineer holds them, closing the "why is my push blocked" gap.
+  The pushing branch is now forwarded from the pre-push hook to
+  ``/conflicts`` and threaded into ``check_conflicts``. The bounce is
+  emitted as a ``push_bounced`` event through the existing v0.27 webhook
+  outbox, which gained a ``kind`` column (schema v17): the delivery loop
+  dispatches ``kind='github'`` rows to a new ``github_adapter`` that
+  resolves the branch to its open PR and find-or-updates a comment keyed
+  by a hidden ``<!-- coord-bounce -->`` marker, reusing the outbox
+  retry/backoff. Disabled by default: a complete no-op (no outbox row,
+  no network, byte-identical ``/conflicts`` response) unless
+  ``COORD_GITHUB_TOKEN`` is set, mirroring how ``COORD_WEBHOOK_URL``
+  gates webhooks. New settings ``COORD_GITHUB_TOKEN`` /
+  ``COORD_GITHUB_API_BASE`` (the latter for GitHub Enterprise).
+
 ## [0.33.0] - 2026-06-20
 
 ### Added
