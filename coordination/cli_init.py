@@ -372,10 +372,55 @@ def _update_codex_config(path: Path) -> None:
     path.write_text("".join(parts), encoding="utf-8")
 
 
+def _git_hook_path(repo_root: Path) -> Path | None:
+    """Resolve the path of the ``pre-push`` git hook for ``repo_root``.
+
+    A normal main worktree keeps hooks under ``<repo_root>/.git/hooks`` and
+    is returned directly (unchanged legacy behaviour). A LINKED git worktree
+    has ``<repo_root>/.git`` as a file (a gitdir pointer), not a directory,
+    so the legacy ``<repo_root>/.git/hooks/pre-push`` path crashed
+    ``coord init`` / ``coord upgrade`` with ``NotADirectoryError``; there we
+    ask git for the real (shared) hooks path instead. Returns ``None`` when
+    ``repo_root`` is not inside a git work tree, so the caller can skip the
+    shim instead of raising.
+    """
+    dot_git = repo_root / ".git"
+    if dot_git.is_dir():
+        return dot_git / "hooks" / "pre-push"
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--git-path", "hooks/pre-push"],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (FileNotFoundError, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    raw = result.stdout.strip()
+    if not raw:
+        return None
+    path = Path(raw)
+    if not path.is_absolute():
+        path = (repo_root / path).resolve()
+    return path
+
+
 def _install_hook(repo_root: Path, force: bool) -> None:
     managed_hook = repo_root / ".coordination" / "hooks" / "pre-push"
     write_executable(managed_hook, PRE_PUSH_SCRIPT)
-    git_hook = repo_root / ".git" / "hooks" / "pre-push"
+    git_hook = _git_hook_path(repo_root)
+    if git_hook is None:
+        print(
+            "Note: could not locate the git hooks directory (is this inside a "
+            "git work tree?); skipping the .git/hooks/pre-push shim. The "
+            "managed helper at .coordination/hooks/pre-push was still written.",
+            file=sys.stderr,
+        )
+        return
+    git_hook.parent.mkdir(parents=True, exist_ok=True)
     shim = (
         "#!/usr/bin/env bash\n"
         "# Resolve coord's managed pre-push helper relative to the MAIN\n"

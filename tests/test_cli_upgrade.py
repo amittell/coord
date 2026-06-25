@@ -103,6 +103,33 @@ def test_upgrade_refreshes_pre_push_hook_content(tmp_path: Path) -> None:
     assert "rev-parse --show-toplevel)" not in shim
 
 
+def test_upgrade_runs_from_a_linked_worktree(tmp_path: Path) -> None:
+    """coord upgrade must work when run from a LINKED git worktree, where
+    ``<root>/.git`` is a file (a gitdir pointer), not a directory.
+    _install_hook previously assumed ``<root>/.git/hooks/`` and crashed with
+    NotADirectoryError there. The shim must land in the shared common hooks
+    dir instead (the v0.35.2 fix)."""
+    main = tmp_path / "main"
+    main.mkdir()
+    _seed_initialised_repo(main)
+    # Commit so a worktree can be added and so the linked checkout carries
+    # the tracked .coordination/ config -- the scenario where upgrade runs.
+    _git(main, "add", "-A")
+    _git(main, "commit", "-q", "-m", "init coord")
+    linked = tmp_path / "linked"
+    _git(main, "worktree", "add", "-q", str(linked))
+    assert (linked / ".git").is_file()  # gitdir pointer, not a directory
+
+    rc = cli_upgrade.run_upgrade(_make_args(linked))
+    assert rc == 0
+
+    # The shim landed in the SHARED common hooks dir (main/.git/hooks),
+    # worktree-aware, not under a (nonexistent) linked/.git/hooks.
+    shim = (main / ".git" / "hooks" / "pre-push").read_text(encoding="utf-8")
+    assert "git rev-parse --git-common-dir" in shim
+    assert not (linked / ".git" / "hooks").exists()
+
+
 def test_upgrade_preserves_owners_yaml(tmp_path: Path) -> None:
     custom_owners = (
         "# Hand-tuned by the team\n"

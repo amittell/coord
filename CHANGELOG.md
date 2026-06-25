@@ -9,6 +9,24 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.35.2] - 2026-06-24
+
+### Fixed
+
+- ``coord init`` / ``coord upgrade`` no longer crash with
+  ``NotADirectoryError`` when run from a LINKED git worktree. ``_install_hook``
+  assumed the hook lived at ``<root>/.git/hooks/pre-push``, but in a linked
+  worktree ``<root>/.git`` is a file (a gitdir pointer), not a directory.
+  It now resolves the hook path via ``git rev-parse --git-path
+  hooks/pre-push`` (the shared common hooks dir) when ``.git`` is not a
+  directory, and skips the shim with a note rather than raising when the
+  directory is not a git work tree. Normal main-worktree behavior is
+  unchanged. Completes the linked-worktree support started in v0.33.0 (the
+  hook shim was already worktree-aware; this fixes the tool that installs
+  it). The operator-facing webhook outbox CLI (``coord outbox stats`` /
+  ``coord outbox retry --exhausted``), the other half of the planned
+  v0.33.1, already shipped.
+
 ## [0.35.1] - 2026-06-24
 
 ### Fixed
