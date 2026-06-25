@@ -50,7 +50,7 @@ jobs:
       version-tag: ${{ steps.version.outputs.tag }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Set up QEMU (multi-arch emulation)
         uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3  # v4.1.0
@@ -222,7 +222,7 @@ jobs:
       contents: read        # required for checkout
     steps:
       - name: Check out repository
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
@@ -274,7 +274,7 @@ jobs:
       contents: write
     steps:
       - name: Check out main
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           # Land the bump on main, not on the tag ref. The tag is
           # immutable; what ArgoCD watches is the moving main branch.
