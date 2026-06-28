@@ -47,6 +47,27 @@ def test_check_service_with_token_sends_bearer(monkeypatch, tmp_path):
     assert claims_request.headers["authorization"] == "Bearer abc123"
 
 
+def test_load_token_strips_surrounding_quotes(tmp_path):
+    """coord's local.env template ships COORD_AUTH_TOKEN="set-me" quoted, so a
+    user who replaces only the value keeps the quotes. _load_token must strip
+    them (matching the MCP reader at mcp_server.py and the bash `source` in
+    the pre-push hook) -- otherwise the doctor sends a literal `"coordt_..."`
+    and 401s on a token that works everywhere else."""
+    coord = tmp_path / ".coordination"
+    coord.mkdir()
+    for raw in (
+        '"coordt_abc123"',
+        "'coordt_abc123'",
+        "coordt_abc123",
+        '  "coordt_abc123"  ',
+    ):
+        (coord / "local.env").write_text(
+            f"COORD_API_URL=https://coord.example\nCOORD_AUTH_TOKEN={raw}\n",
+            encoding="utf-8",
+        )
+        assert cli_doctor._load_token(tmp_path, _config(tmp_path)) == "coordt_abc123"
+
+
 def test_check_service_without_token_omits_header(monkeypatch, tmp_path):
     captured: list[httpx.Request] = []
     transport = _mock_transport(captured, {"/readyz": 200, "/claims": 200})
