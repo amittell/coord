@@ -9,6 +9,25 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.35.3] - 2026-06-28
+
+### Fixed
+
+- Robust ``.coordination/local.env`` parsing, shared by every consumer.
+  Three readers previously disagreed: the MCP server's loader stripped
+  surrounding quotes, ``coord doctor``'s ``_load_token`` did not (and
+  returned the FIRST match), and the pre-push hook just ``source``-d the
+  file in bash (last assignment wins, quotes stripped). So a token that
+  was quoted (coord's own template ships ``COORD_AUTH_TOKEN="set-me"``),
+  indented, ``export``-ed, duplicated, or separated by a blank line could
+  authenticate everywhere except ``coord doctor`` -- a baffling "auth
+  token works (status 401)" while the dashboard and MCP worked. A new
+  ``coordination.envfile.parse_env`` parser (matching shell ``source``
+  semantics: last-assignment-wins, ``export`` prefix, surrounding
+  whitespace + one layer of matching quotes stripped, blank/comment lines
+  ignored) is now used by both the doctor and the MCP server, so all
+  readers agree.
+
 ## [0.35.2] - 2026-06-24
 
 ### Fixed

@@ -41,11 +41,16 @@ class CheckResult:
 
 def _load_token(repo_root: Path, config: RepoConfig) -> str:
     env_path = repo_root / config.local_env_file
-    if env_path.exists():
-        for line in env_path.read_text(encoding="utf-8").splitlines():
-            if line.startswith("COORD_AUTH_TOKEN="):
-                return line.split("=", 1)[1].strip()
-    return ""
+    # Use the shared robust parser (coordination.envfile) so the doctor
+    # reads COORD_AUTH_TOKEN exactly the way the MCP server and the
+    # pre-push hook's bash `source` do: surrounding whitespace and a layer
+    # of matching quotes stripped, `export `/comment/blank lines tolerated,
+    # and the LAST assignment winning. coord's local.env template ships
+    # COORD_AUTH_TOKEN="set-me" quoted, so without this the doctor would
+    # 401 on a quoted/indented/duplicated token that works everywhere else.
+    from coordination.envfile import read_env_file
+
+    return read_env_file(env_path).get("COORD_AUTH_TOKEN", "")
 
 
 def _user_scoped_coord_mcp() -> bool:

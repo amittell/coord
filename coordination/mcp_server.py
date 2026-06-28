@@ -62,15 +62,11 @@ def _load_local_env(start: Path | None = None) -> Path | None:
             text = env_file.read_text(encoding="utf-8")
         except OSError:
             return None
-        for raw in text.splitlines():
-            line = raw.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, val = line.partition("=")
-            key = key.strip()
+        from coordination.envfile import parse_env
+
+        for key, val in parse_env(text).items():
             if key not in _LOCAL_ENV_KEYS:
                 continue
-            val = val.strip().strip('"').strip("'")
             existing = os.environ.get(key, "")
             if existing and existing not in _PLACEHOLDER_VALUES:
                 continue
