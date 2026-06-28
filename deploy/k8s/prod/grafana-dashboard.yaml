@@ -1,0 +1,110 @@
+# Grafana dashboard for coord, auto-imported by the kube-prometheus-stack
+# Grafana dashboard sidecar (it watches all namespaces for ConfigMaps labelled
+# grafana_dashboard="1"). Panels are driven by the Prometheus metrics coord
+# exposes on /metrics: claims_created_total, claims_conflicts_total,
+# claims_released_total, auth_failures_total, http_requests_total, build_info.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coord-dashboard
+  namespace: coord
+  labels:
+    grafana_dashboard: "1"
+data:
+  coord.json: |
+    {
+      "uid": "coord-overview",
+      "title": "coord",
+      "tags": ["coord", "coordination"],
+      "timezone": "browser",
+      "schemaVersion": 39,
+      "version": 1,
+      "refresh": "30s",
+      "time": {"from": "now-6h", "to": "now"},
+      "templating": {
+        "list": [
+          {
+            "name": "datasource",
+            "label": "Data source",
+            "type": "datasource",
+            "query": "prometheus",
+            "current": {},
+            "hide": 0
+          }
+        ]
+      },
+      "panels": [
+        {
+          "id": 1,
+          "title": "Version",
+          "type": "stat",
+          "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+          "datasource": {"type": "prometheus", "uid": "${datasource}"},
+          "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "textMode": "name", "colorMode": "none"},
+          "targets": [
+            {"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "build_info", "legendFormat": "{{version}}", "instant": true}
+          ]
+        },
+        {
+          "id": 2,
+          "title": "Auth failures (per second)",
+          "type": "timeseries",
+          "gridPos": {"h": 4, "w": 18, "x": 6, "y": 0},
+          "datasource": {"type": "prometheus", "uid": "${datasource}"},
+          "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 20}, "color": {"mode": "fixed", "fixedColor": "red"}}, "overrides": []},
+          "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+          "targets": [
+            {"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum(rate(auth_failures_total[5m]))", "legendFormat": "rejected (missing/invalid token)"}
+          ]
+        },
+        {
+          "id": 3,
+          "title": "Claims created (per second, by severity)",
+          "type": "timeseries",
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+          "datasource": {"type": "prometheus", "uid": "${datasource}"},
+          "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 10, "stacking": {"mode": "normal"}}}, "overrides": []},
+          "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+          "targets": [
+            {"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum(rate(claims_created_total[5m])) by (severity)", "legendFormat": "{{severity}}"}
+          ]
+        },
+        {
+          "id": 4,
+          "title": "Conflicts vs releases (per second)",
+          "type": "timeseries",
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+          "datasource": {"type": "prometheus", "uid": "${datasource}"},
+          "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 10}}, "overrides": []},
+          "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+          "targets": [
+            {"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum(rate(claims_conflicts_total[5m]))", "legendFormat": "conflicts (409)"},
+            {"refId": "B", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum(rate(claims_released_total[5m]))", "legendFormat": "released"}
+          ]
+        },
+        {
+          "id": 5,
+          "title": "HTTP requests (per second, by status)",
+          "type": "timeseries",
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+          "datasource": {"type": "prometheus", "uid": "${datasource}"},
+          "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 10, "stacking": {"mode": "normal"}}}, "overrides": []},
+          "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+          "targets": [
+            {"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "sum(rate(http_requests_total[5m])) by (status)", "legendFormat": "{{status}}"}
+          ]
+        },
+        {
+          "id": 6,
+          "title": "HTTP requests (per second, by path)",
+          "type": "timeseries",
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+          "datasource": {"type": "prometheus", "uid": "${datasource}"},
+          "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 10}}, "overrides": []},
+          "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+          "targets": [
+            {"refId": "A", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "expr": "topk(10, sum(rate(http_requests_total[5m])) by (path))", "legendFormat": "{{path}}"}
+          ]
+        }
+      ]
+    }

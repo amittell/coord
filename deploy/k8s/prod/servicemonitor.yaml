@@ -1,0 +1,27 @@
+# Prometheus scrape config for coord's /metrics endpoint.
+#
+# coord exposes a Prometheus-format /metrics endpoint (unauthenticated, like
+# /readyz and /health) on the API port. The kube-prometheus-stack operator in
+# the `monitoring` namespace selects ServiceMonitors cluster-wide
+# (serviceMonitorSelector + serviceMonitorNamespaceSelector are both empty =
+# match-all), so this is all that is needed to start scraping coord into
+# Prometheus. The companion Grafana dashboard ships in grafana-dashboard.yaml.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: coord
+  namespace: coord
+  labels:
+    app.kubernetes.io/name: coord
+    app.kubernetes.io/component: api
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: coord
+      app.kubernetes.io/component: api
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      honorLabels: true
