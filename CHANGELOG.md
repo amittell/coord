@@ -9,6 +9,42 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.36.0] - 2026-06-28
+
+### Added
+
+- Dashboard redesign and utility pass. The operator dashboard keeps its
+  terminal aesthetic but executes it properly and, more importantly,
+  leads with the live operational picture instead of retrospective
+  analytics:
+  - Live-first hero stats: the four headline numbers are now ``active
+    claims`` / ``blocked now`` / ``waiting`` / ``repos``, colour-coded by
+    status (green when clear, amber/red when they want eyes). The static
+    ``idle-timeout`` value moved to the status bar, freeing a hero slot
+    for a number an operator actually acts on.
+  - "Needs attention" rollup: a one-line, at-a-glance summary of
+    everything actionable right now (blocked claims, queued waiters,
+    pending release requests, stale holders), or a calm "all clear".
+  - Panel reorder: active claims, release requests and the pending queue
+    lead the page; retrospective analytics (module/auto-resolution
+    heatmaps, hotspots, webhooks) and admin (engineer tokens) follow.
+  - Contention flags: held claims are tagged ``contended`` when more than
+    one engineer holds the same ``(repo, pattern)`` at once, and ``release
+    asked`` when a pending release request targets them, with an accent on
+    the row.
+  - Auto-refresh: a small progressive-enhancement script keeps the "right
+    now" view current (default 20s), pausing while a form field is focused
+    or the tab is hidden and preserving scroll position across reloads,
+    with a live/pause toggle in the status bar.
+
+### Fixed
+
+- Several dashboard panels (auto-resolution heatmap, hotspots, pending
+  queue, webhook delivery) referenced ``var(--mono)`` and ``var(--text)``
+  CSS variables that were never declared, so their intended monospace
+  font and text colour silently fell back to defaults. Both variables are
+  now defined.
+
 ## [0.35.3] - 2026-06-28
 
 ### Fixed

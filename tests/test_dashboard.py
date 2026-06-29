@@ -495,14 +495,17 @@ async def test_dashboard_renders_recent_activity_panel(svc: CoordinationService)
     assert "conflicts 24h" in html_out
 
     stats_start = html_out.index('class="stats"')
-    stats_end = html_out.index('class="row split-7-5"')
+    # v0.36 reordered the hero row and inserted the "needs attention"
+    # rollup immediately after it; slice up to that banner.
+    stats_end = html_out.index('class="attention')
     stats = html_out[stats_start:stats_end]
     # 2 claims created in the window, 2 distinct engineers, 1 conflict.
     # The delta text reads "<N> engineers active 24h" / "<N> created 24h".
     assert "2 engineers active 24h" in stats
     assert "2 created 24h" in stats
-    # Conflict count is the numeric value in the amber cell.
-    assert 'class="num amber">1<' in stats
+    # v0.36: the 24h conflict count moved from an amber hero number to the
+    # delta line under the "blocked now" stat.
+    assert "1 conflicts 24h" in stats
 
     # Top-modules panel renders as a <ul class="top-modules">. Slice
     # from the <ul> tag itself, not the literal class name (which also
@@ -601,7 +604,9 @@ async def test_dashboard_recent_activity_excludes_old_claims(svc: CoordinationSe
     # Stats block + top-modules region: anything from > 24h ago must
     # not surface there.
     stats_start = html_out.index('class="stats"')
-    activity_end = html_out.lower().index("active claims", stats_start)
+    # v0.36: slice the hero stats block (it now ends at the "needs
+    # attention" rollup that follows it).
+    activity_end = html_out.index('class="attention')
     activity_region = html_out[stats_start:activity_end]
     assert "ancient-agent" not in activity_region
     # The big claims-24h number must be 0 (rendered as ">0<").
@@ -1011,8 +1016,9 @@ async def test_dashboard_renders_auto_resolutions_panel_with_counts(
     assert "auto-resolutions (24h)" in html_out.lower()
 
     start = html_out.lower().index("auto-resolutions (24h)")
-    # The panel ends before the repos panel header.
-    end = html_out.lower().index("repositories", start)
+    # v0.36 reorder moved this panel below repositories, so bound it by
+    # its own closing </section> rather than the next panel header.
+    end = html_out.index("</section>", start)
     panel = html_out[start:end]
     # Breakdown text shows 2 coexist + 1 narrow.
     assert ">2</strong> coexist" in panel
@@ -1133,17 +1139,21 @@ async def test_dashboard_hotspot_action_link_present(
 
     html_out = await render_dashboard()
 
-    # Promote.ts row carries an apply link with the right action.
+    # v0.36 reorder put the active-claims panel above hotspots, and these
+    # files are also held as active claims, so scope the search to the
+    # hotspots panel to find the hotspot row (not the claim row).
     assert "src/promote.ts" in html_out
-    promote_idx = html_out.index("src/promote.ts")
-    promote_row = html_out[promote_idx:promote_idx + 800]
+    hotspots_panel = html_out[html_out.index("hotspot files (30d)"):]
+    # Promote.ts row carries an apply link with the right action.
+    promote_idx = hotspots_panel.index("src/promote.ts")
+    promote_row = hotspots_panel[promote_idx:promote_idx + 800]
     assert 'class="hsapply"' in promote_row
     assert 'data-action="shared_file"' in promote_row
 
     # Monitor.ts row exists but has NO apply link in its row slice.
     assert "src/monitor.ts" in html_out
-    monitor_idx = html_out.index("src/monitor.ts")
-    monitor_row = html_out[monitor_idx:monitor_idx + 800]
+    monitor_idx = hotspots_panel.index("src/monitor.ts")
+    monitor_row = hotspots_panel[monitor_idx:monitor_idx + 800]
     # The row must end before the next .hsrow div opens; scope the
     # apply-check to the cell containing this row's pattern.
     next_row_start = monitor_row.find('<div class="hsrow"', 1)
@@ -1275,9 +1285,10 @@ async def test_dashboard_renders_webhook_delivery_panel(
     assert "webhook delivery (24h)" in html_out.lower()
 
     # Slice the panel: anchor on the <h2> so the CSS comment cannot
-    # match. The next panel after webhooks is "repositories".
+    # match. v0.36 reorder moved webhooks below repositories, so bound the
+    # panel by its own closing </section>.
     start = html_out.lower().index("<h2>webhook delivery (24h)</h2>")
-    end = html_out.lower().index("repositories", start)
+    end = html_out.index("</section>", start)
     panel = html_out[start:end]
 
     # All three event types appear as rows.
@@ -1377,4 +1388,109 @@ async def test_dashboard_renders_stale_engineers_panel(
     assert "fresh-engineer" not in panel
     # Active claim count surfaces as a numeric cell.
     assert ">1<" in panel
+
+
+# ---------------------------------------------------------------------------
+# v0.36: live-first hero stats, needs-attention rollup, contention flags,
+# auto-refresh
+# ---------------------------------------------------------------------------
+
+
+async def test_dashboard_hero_stats_are_live_first(svc: CoordinationService) -> None:
+    """The hero row leads with the live operational picture (active claims,
+    blocked now, waiting, repos) and no longer spends a slot on the static
+    idle-timeout constant -- that moves to the status bar."""
+    html_out = await render_dashboard()
+    stats = html_out[
+        html_out.index('class="stats"') : html_out.index('class="attention')
+    ]
+    for label in ("active claims", "blocked now", "waiting", "repos"):
+        assert f">{label}</span>" in stats
+    # idle-timeout is no longer a hero stat; it now lives in the status bar.
+    assert "idle-timeout" not in stats
+    assert "idle 30m" in html_out  # status-bar segment (default 1800s)
+
+
+async def test_dashboard_attention_all_clear_when_idle(
+    svc: CoordinationService,
+) -> None:
+    """With nothing blocked, queued, or awaiting a decision the rollup
+    renders the calm 'all clear' state, not the alert state."""
+    html_out = await render_dashboard()
+    assert 'class="attention clear"' in html_out
+    assert "all clear" in html_out
+    assert "needs attention" not in html_out
+
+
+async def test_dashboard_attention_alert_lists_actionable_signals(
+    svc: CoordinationService,
+) -> None:
+    """A filed (pending) release request flips the rollup to the alert
+    state and is summarised in the at-a-glance line."""
+    now = datetime.now(UTC)
+    cid = await _insert_claim_raw(
+        svc,
+        engineer="holder-alice",
+        pattern="src/auth/login.py",
+        created_at=_iso(now - timedelta(minutes=10)),
+        expires_at=_iso(now + timedelta(hours=1)),
+    )
+    await svc.file_request(
+        claim_id=cid,
+        requester="bob",
+        requester_session_id=None,
+        reason="need it",
+        urgency="high",
+    )
+    html_out = await render_dashboard()
+    assert 'class="attention alert"' in html_out
+    assert "needs attention" in html_out
+    assert "1 release request pending" in html_out
+
+
+async def test_dashboard_flags_contended_and_release_asked_claims(
+    svc: CoordinationService,
+) -> None:
+    """Two engineers holding the same (repo, pattern) are both flagged
+    'contended'; a held claim that is a pending release-request target is
+    flagged 'release asked'."""
+    now = datetime.now(UTC)
+    fresh = _iso(now - timedelta(minutes=5))
+    future = _iso(now + timedelta(hours=2))
+    # Two active claims on the same pattern by different engineers.
+    await _insert_claim_raw(
+        svc, engineer="alice", pattern="services/shared.py",
+        created_at=fresh, expires_at=future,
+    )
+    await _insert_claim_raw(
+        svc, engineer="bob", pattern="services/shared.py",
+        created_at=fresh, expires_at=future,
+    )
+    # A third active claim that someone files a release request against.
+    cid = await _insert_claim_raw(
+        svc, engineer="carol", pattern="services/lonely.py",
+        created_at=fresh, expires_at=future,
+    )
+    await svc.file_request(
+        claim_id=cid, requester="dave", requester_session_id=None,
+        reason="hot", urgency="normal",
+    )
+    html_out = await render_dashboard()
+    # Scope to the active-claims panel.
+    start = html_out.index("<h2>active claims</h2>")
+    panel = html_out[start : html_out.index("</section>", start)]
+    assert panel.count('class="pill contended"') == 2
+    assert 'class="pill release-asked"' in panel
+    assert 'class="attn"' in panel
+
+
+async def test_dashboard_includes_auto_refresh_script(
+    svc: CoordinationService,
+) -> None:
+    """The page ships the progressive-enhancement auto-refresh script and
+    the status-bar toggle it drives."""
+    html_out = await render_dashboard()
+    assert 'id="refresh-toggle"' in html_out
+    assert "auto-refresh" in html_out
+    assert "sessionStorage" in html_out  # scroll-position preservation
 
