@@ -224,20 +224,30 @@ _CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Major+Mono+Display&family=JetBrains+Mono:wght@300;400;500;700&display=swap');
 
 :root {
-  --bg: #0a0a08;
-  --surface: #15140f;
-  --surface-2: #1c1b15;
-  --hairline: #2a2820;
-  --hairline-bright: #3a382f;
-  --fg: #dcd6c1;
-  --fg-bright: #f4eed8;
-  --muted: #7a7560;
-  --muted-2: #5a5a52;
-  --phosphor: #7fffa1;
-  --amber: #ffba4d;
-  --red: #ff5e5e;
+  --bg: #0a0806;
+  --bg-2: #0f0c08;
+  --surface: #14120d;
+  --surface-2: #1b1813;
+  --surface-3: #232017;
+  --hairline: #2c281f;
+  --hairline-bright: #443f30;
+  --fg: #e6dec6;
+  --fg-bright: #fdf6df;
+  --muted: #9b9173;
+  --muted-2: #6b6450;
+  --phosphor: #7dffa6;
+  --phosphor-dim: #36b074;
+  --amber: #ffc257;
+  --red: #ff6a6a;
   --cyan: #6cf0ff;
+  --mono: 'JetBrains Mono', ui-monospace, monospace;
+  --display: 'Major Mono Display', monospace;
+  --text: var(--fg);
   --grid: 8px;
+  --rail: 3px;
+  --glow-green: 0 0 14px rgba(125, 255, 166, 0.40);
+  --glow-amber: 0 0 14px rgba(255, 194, 87, 0.32);
+  --glow-red: 0 0 14px rgba(255, 106, 106, 0.35);
 }
 
 * { box-sizing: border-box; }
@@ -247,11 +257,21 @@ html, body {
   padding: 0;
   background: var(--bg);
   color: var(--fg);
-  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-family: var(--mono);
   font-size: 13px;
   line-height: 1.55;
   font-feature-settings: 'liga' 0, 'calt' 0;
   -webkit-font-smoothing: antialiased;
+}
+
+/* Atmosphere: a faint phosphor bloom from the top and a warm amber wash
+   from below, so the canvas reads as a powered-on screen, not flat paint. */
+body {
+  min-height: 100vh;
+  background:
+    radial-gradient(130% 90% at 50% -15%, rgba(125, 255, 166, 0.055), transparent 60%),
+    radial-gradient(120% 70% at 50% 118%, rgba(255, 194, 87, 0.035), transparent 55%),
+    var(--bg);
 }
 
 /* Subtle film-grain noise overlay -- adds tactile depth without dominating.
@@ -262,9 +282,31 @@ body::before {
   inset: 0;
   pointer-events: none;
   z-index: 1000;
-  opacity: 0.05;
+  opacity: 0.055;
   mix-blend-mode: overlay;
   background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='200' height='200'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/></filter><rect width='100%25' height='100%25' filter='url(%23n)' opacity='0.6'/></svg>");
+}
+
+/* CRT scanlines + corner vignette -- fine horizontal raster lines plus a
+   darkened frame edge sell the phosphor-screen feel. Multiply keeps it from
+   washing out the content beneath. */
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1001;
+  opacity: 0.5;
+  mix-blend-mode: multiply;
+  background:
+    repeating-linear-gradient(
+      0deg,
+      rgba(0, 0, 0, 0.16) 0,
+      rgba(0, 0, 0, 0.16) 1px,
+      transparent 1px,
+      transparent 3px
+    ),
+    radial-gradient(135% 130% at 50% 50%, transparent 60%, rgba(0, 0, 0, 0.6) 100%);
 }
 
 main {
@@ -281,7 +323,9 @@ main {
   gap: calc(var(--grid) * 2);
   padding: calc(var(--grid) * 1.5) calc(var(--grid) * 2);
   border: 1px solid var(--hairline-bright);
-  background: var(--surface);
+  border-left: var(--rail) solid var(--phosphor-dim);
+  background: linear-gradient(180deg, var(--surface-2), var(--surface));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.025), 0 8px 28px rgba(0, 0, 0, 0.35);
   margin-bottom: calc(var(--grid) * 4);
   font-size: 12px;
   color: var(--muted);
@@ -308,13 +352,26 @@ main {
 /* ----- Title ------------------------------------------------------------ */
 
 .title {
-  font-family: 'Major Mono Display', monospace;
-  font-size: 28px;
+  font-family: var(--display);
+  font-size: 30px;
   font-weight: 400;
-  letter-spacing: 0.02em;
+  letter-spacing: 0.01em;
   color: var(--fg-bright);
   margin: 0 0 calc(var(--grid) * 0.5);
   text-transform: lowercase;
+  text-shadow: 0 0 26px rgba(125, 255, 166, 0.18), 0 0 2px rgba(253, 246, 223, 0.35);
+}
+.title::after {
+  content: '_';
+  color: var(--phosphor);
+  margin-left: 0.12em;
+  text-shadow: var(--glow-green);
+  animation: blink 1.1s steps(1) infinite;
+}
+
+@keyframes blink {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
 }
 
 .subtitle {
@@ -333,16 +390,38 @@ main {
   gap: 1px;
   background: var(--hairline);
   border: 1px solid var(--hairline-bright);
+  box-shadow: 0 10px 38px rgba(0, 0, 0, 0.35);
   margin-bottom: calc(var(--grid) * 4);
 }
 
 .stats .block {
-  background: var(--surface);
+  position: relative;
+  overflow: hidden;
+  background: linear-gradient(180deg, var(--surface-2), var(--surface));
   padding: calc(var(--grid) * 2.5) calc(var(--grid) * 2);
   display: flex;
   flex-direction: column;
   gap: calc(var(--grid) * 0.5);
+  transition: background 200ms ease;
   animation: panel-in 700ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+.stats .block::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 2px;
+  width: 100%;
+  transform: scaleX(0);
+  transform-origin: left;
+  background: var(--phosphor-dim);
+  box-shadow: var(--glow-green);
+  animation: rail-in 1000ms cubic-bezier(0.2, 0.7, 0.2, 1) 300ms both;
+}
+.stats .block:hover { background: linear-gradient(180deg, var(--surface-3), var(--surface-2)); }
+@keyframes rail-in {
+  from { transform: scaleX(0); }
+  to { transform: scaleX(1); }
 }
 .stats .block:nth-child(1) { animation-delay: 60ms; }
 .stats .block:nth-child(2) { animation-delay: 120ms; }
@@ -357,17 +436,18 @@ main {
   text-transform: lowercase;
 }
 .stats .block .num {
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 36px;
+  font-family: var(--mono);
+  font-size: 40px;
   font-weight: 300;
   color: var(--fg-bright);
   letter-spacing: -0.02em;
   font-variant-numeric: tabular-nums;
   line-height: 1;
+  margin: calc(var(--grid) * 0.25) 0;
 }
-.stats .block .num.phosphor { color: var(--phosphor); text-shadow: 0 0 16px rgba(127, 255, 161, 0.25); }
-.stats .block .num.amber { color: var(--amber); }
-.stats .block .num.red { color: var(--red); }
+.stats .block .num.phosphor { color: var(--phosphor); text-shadow: var(--glow-green); }
+.stats .block .num.amber { color: var(--amber); text-shadow: var(--glow-amber); }
+.stats .block .num.red { color: var(--red); text-shadow: var(--glow-red); }
 .stats .block .delta {
   font-size: 11px;
   color: var(--muted);
@@ -378,10 +458,14 @@ main {
 
 .panel {
   border: 1px solid var(--hairline-bright);
+  border-left: var(--rail) solid var(--hairline-bright);
   background: var(--surface);
   margin-bottom: calc(var(--grid) * 4);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.28);
+  transition: border-left-color 220ms ease;
   animation: panel-in 700ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
 }
+.panel:hover { border-left-color: var(--phosphor-dim); }
 .panel:nth-of-type(1) { animation-delay: 100ms; }
 .panel:nth-of-type(2) { animation-delay: 160ms; }
 .panel:nth-of-type(3) { animation-delay: 220ms; }
@@ -395,7 +479,7 @@ main {
   justify-content: space-between;
   padding: calc(var(--grid) * 1.5) calc(var(--grid) * 2);
   border-bottom: 1px solid var(--hairline);
-  background: var(--surface-2);
+  background: linear-gradient(180deg, var(--surface-3), var(--surface-2));
 }
 .panel header h2 {
   font-family: 'Major Mono Display', monospace;
@@ -485,12 +569,26 @@ tbody td .heat {
   font-feature-settings: 'tnum';
 }
 tbody tr:last-child td { border-bottom: 0; }
-tbody tr:hover td { background: rgba(127, 255, 161, 0.04); }
-tbody tr td.empty {
+tbody tr:nth-child(even) td { background: rgba(255, 255, 255, 0.012); }
+tbody tr:hover td {
+  background: rgba(125, 255, 166, 0.05);
+  box-shadow: inset var(--rail) 0 0 var(--phosphor-dim);
+}
+
+/* Empty / nominal states. Zero claims, zero conflicts and "(good!)" all read
+   as a calm "standing by" line, not a broken void: centered, dimmed, with a
+   soft phosphor prompt glyph so the operator sees the panel is alive. */
+.empty {
   color: var(--muted);
   font-style: normal;
   text-align: center;
-  padding: calc(var(--grid) * 3);
+  letter-spacing: 0.04em;
+}
+tbody tr td.empty { padding: calc(var(--grid) * 3); }
+.empty::before {
+  content: '> ';
+  color: var(--phosphor-dim);
+  text-shadow: var(--glow-green);
 }
 
 /* Status pill -- sharp rectangle with accent border, no rounded fills */
@@ -498,11 +596,15 @@ tbody tr td.empty {
   display: inline-block;
   padding: 1px 8px;
   border: 1px solid currentColor;
+  background: color-mix(in srgb, currentColor 12%, transparent);
   font-size: 10px;
   letter-spacing: 0.08em;
   text-transform: lowercase;
-  font-family: 'Major Mono Display', monospace;
+  font-family: var(--display);
   white-space: nowrap;
+}
+.pill.blocked, .pill.severity-hard, .pill.denied, .pill.urgency-blocking {
+  box-shadow: 0 0 10px color-mix(in srgb, currentColor 35%, transparent);
 }
 .pill.blocked { color: var(--red); }
 .pill.stale { color: var(--amber); }
@@ -814,6 +916,96 @@ tbody tr td.empty {
 }
 .tokcreate .tokself { color: var(--cyan); }
 .logoutform { display: inline; margin: 0 0 0 auto; }
+
+/* v0.36 needs-attention rollup -- one-line answer to "anything for me?" */
+.attention {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--grid) * 1.5);
+  padding: calc(var(--grid) * 1.5) calc(var(--grid) * 2);
+  margin-bottom: calc(var(--grid) * 4);
+  border: 1px solid var(--hairline-bright);
+  border-left: var(--rail) solid var(--hairline-bright);
+  background: var(--surface);
+  color: var(--fg);
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.28);
+  animation: panel-in 700ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+.attention .atag {
+  font-family: var(--display);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: lowercase;
+  padding: 2px 8px;
+  border: 1px solid currentColor;
+  white-space: nowrap;
+}
+.attention.alert {
+  border-left-color: var(--amber);
+  background: color-mix(in srgb, var(--amber) 6%, var(--surface));
+}
+.attention.alert .atag {
+  color: var(--amber);
+  box-shadow: 0 0 10px color-mix(in srgb, var(--amber) 30%, transparent);
+}
+.attention.clear .atag { color: var(--phosphor); }
+.attention.clear .abody { color: var(--muted); }
+
+/* v0.36 contention flags in the active-claims table */
+.pill.contended { color: var(--cyan); }
+.pill.release-asked {
+  color: var(--amber);
+  box-shadow: 0 0 10px color-mix(in srgb, var(--amber) 35%, transparent);
+}
+tbody tr.attn td { background: color-mix(in srgb, var(--amber) 7%, transparent); }
+tbody tr.attn td:first-child { box-shadow: inset var(--rail) 0 0 var(--amber); }
+tbody tr.attn:hover td { background: color-mix(in srgb, var(--amber) 12%, transparent); }
+
+/* v0.36 auto-refresh indicator in the status bar */
+.statusbar .refresh { margin-left: auto; color: var(--muted); }
+.statusbar .refresh a { text-decoration: none; color: var(--phosphor); }
+.statusbar .refresh a.rlive { text-shadow: var(--glow-green); }
+.statusbar .refresh a.rpaused { color: var(--amber); text-shadow: none; }
+.statusbar .refresh #refresh-count {
+  color: var(--fg-bright);
+  font-variant-numeric: tabular-nums;
+}
+"""
+
+
+REFRESH_SCRIPT = """
+(function () {
+  var SECS = 20, paused = false, left = SECS;
+  try {
+    var y = sessionStorage.getItem('coord_scroll');
+    if (y) window.scrollTo(0, parseInt(y, 10));
+  } catch (e) {}
+  window.addEventListener('beforeunload', function () {
+    try { sessionStorage.setItem('coord_scroll', String(window.scrollY)); } catch (e) {}
+  });
+  var toggle = document.getElementById('refresh-toggle');
+  var counter = document.getElementById('refresh-count');
+  if (toggle) {
+    toggle.addEventListener('click', function (e) {
+      e.preventDefault();
+      paused = !paused;
+      left = SECS;
+      toggle.textContent = paused ? 'paused' : 'live';
+      toggle.className = paused ? 'rpaused' : 'rlive';
+      if (counter) counter.textContent = paused ? '--' : (SECS + 's');
+    });
+  }
+  setInterval(function () {
+    if (paused || document.hidden) return;
+    var ae = document.activeElement;
+    if (ae && /^(INPUT|TEXTAREA|BUTTON|SELECT)$/.test(ae.tagName)) return;
+    left -= 1;
+    if (counter) counter.textContent = left + 's';
+    if (left <= 0) window.location.reload();
+  }, 1000);
+})();
 """
 
 
@@ -886,20 +1078,75 @@ async def render_dashboard(
         )[0]
         == "blocked"
     )
+    # v0.36: lead the hero row with the live operational picture -- what is
+    # blocked, who is waiting, what needs a decision -- rather than
+    # retrospective counts or a static config value. ``waiting_total`` is the
+    # FIFO queue depth; ``pending_requests`` is the count of filed release
+    # requests still awaiting a holder decision.
+    waiting_total = len(queued_rows)
+    pending_requests = sum(
+        1 for rq in requests if str(rq.get("decision") or "pending") == "pending"
+    )
+    # Cross-reference for the active-claims table: which held claims are a
+    # pending release-request target, and which (repo, pattern) pairs are held
+    # by more than one engineer at once (legitimate symbol-level coexistence,
+    # but worth flagging so the operator can see the friction at a glance).
+    release_targets: set[tuple[str, str]] = {
+        (str(rq.get("holder_engineer") or ""), str(rq.get("requested_pattern") or ""))
+        for rq in requests
+        if str(rq.get("decision") or "pending") == "pending"
+    }
+    pattern_holders: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for _claim in rows:
+        pattern_holders[
+            (str(_claim.get("repo") or ""), str(_claim.get("pattern") or ""))
+        ].add(str(_claim.get("engineer") or ""))
+
+    blocked_class = "red" if open_conflicts else "phosphor"
+    waiting_class = "amber" if (waiting_total or pending_requests) else "phosphor"
     stats_html = (
-        f'<div class="block"><span class="label">repos</span>'
-        f'<span class="num phosphor">{len(repos)}</span>'
-        f'<span class="delta">{activity["engineers"]} engineers active 24h</span></div>'
         f'<div class="block"><span class="label">active claims</span>'
         f'<span class="num">{len(rows)}</span>'
         f'<span class="delta">{activity["claims"]} created 24h</span></div>'
-        f'<div class="block"><span class="label">conflicts 24h</span>'
-        f'<span class="num amber">{activity["conflicts"]}</span>'
-        f'<span class="delta">{open_conflicts} still blocked</span></div>'
-        f'<div class="block"><span class="label">idle-timeout</span>'
-        f'<span class="num">{idle_timeout_sec // 60}m</span>'
-        f'<span class="delta">session auto-release</span></div>'
+        f'<div class="block"><span class="label">blocked now</span>'
+        f'<span class="num {blocked_class}">{open_conflicts}</span>'
+        f'<span class="delta">{activity["conflicts"]} conflicts 24h</span></div>'
+        f'<div class="block"><span class="label">waiting</span>'
+        f'<span class="num {waiting_class}">{waiting_total}</span>'
+        f'<span class="delta">{pending_requests} release requests pending</span></div>'
+        f'<div class="block"><span class="label">repos</span>'
+        f'<span class="num phosphor">{len(repos)}</span>'
+        f'<span class="delta">{activity["engineers"]} engineers active 24h</span></div>'
     )
+
+    # v0.36: at-a-glance "needs attention" rollup -- only the non-zero,
+    # actionable signals, so an operator gets a one-line answer to "is there
+    # anything for me to do right now?".
+    attn_parts: list[str] = []
+    if open_conflicts:
+        attn_parts.append(f"{open_conflicts} blocked")
+    if waiting_total:
+        attn_parts.append(f"{waiting_total} waiting in queue")
+    if pending_requests:
+        _noun = "request" if pending_requests == 1 else "requests"
+        attn_parts.append(f"{pending_requests} release {_noun} pending")
+    if stale_engineers:
+        _noun = "holder" if len(stale_engineers) == 1 else "holders"
+        attn_parts.append(f"{len(stale_engineers)} stale {_noun}")
+    if attn_parts:
+        attention_html = (
+            '<div class="attention alert">'
+            '<span class="atag">needs attention</span>'
+            f'<span class="abody">{" · ".join(_esc(p) for p in attn_parts)}</span>'
+            "</div>"
+        )
+    else:
+        attention_html = (
+            '<div class="attention clear">'
+            '<span class="atag">all clear</span>'
+            '<span class="abody">nothing is blocked, queued, or awaiting a '
+            "decision</span></div>"
+        )
 
     # ---- repos table ------------------------------------------------------
     if repos:
@@ -1023,11 +1270,27 @@ async def render_dashboard(
             else:
                 scope_cell = "<td class='muted'>file</td>"
 
+            # v0.36: contention flags. A held claim is flagged when a pending
+            # release request targets it, or when another engineer holds the
+            # same (repo, pattern) at the same time.
+            _key = (str(r.get("repo") or ""), str(r.get("pattern") or ""))
+            _contended = len(pattern_holders.get(_key, set())) > 1
+            _release_asked = (
+                str(r.get("engineer") or ""),
+                str(r.get("pattern") or ""),
+            ) in release_targets
+            flags = ""
+            if _release_asked:
+                flags += '<span class="pill release-asked">release asked</span> '
+            if _contended:
+                flags += '<span class="pill contended">contended</span> '
+            tr_open = '<tr class="attn">' if (_release_asked or _contended) else "<tr>"
+
             rows_html += (
-                "<tr>"
+                f"{tr_open}"
                 f"<td>{_esc(r.get('engineer'))}</td>"
                 f"<td>{_esc(r.get('repo')) or '<span class=muted>—</span>'}</td>"
-                f"<td><span class='pattern'>{_esc(r.get('pattern'))}</span></td>"
+                f"<td><span class='pattern'>{_esc(r.get('pattern'))}</span> {flags}</td>"
                 f"{scope_cell}"
                 f"<td class='muted'>{_esc(r.get('description'))}</td>"
                 f"<td class='{rem_class}'>{_esc(rem)}</td>"
@@ -1679,6 +1942,9 @@ async def render_dashboard(
       <span class="seg">{len(rows)} active claims</span>
       <span class="sep">│</span>
       <span class="seg">{open_conflicts} blocked</span>
+      <span class="sep">│</span>
+      <span class="seg">idle {idle_timeout_sec // 60}m</span>
+      <span class="seg refresh">auto-refresh <a href="#" id="refresh-toggle" class="rlive">live</a> · <span id="refresh-count">20s</span></span>
       {logout_html}
     </div>
 
@@ -1689,19 +1955,47 @@ async def render_dashboard(
       {stats_html}
     </div>
 
-    {auto_resolutions_html}
+    {attention_html}
 
-    {heatmap_html}
+    <section class="panel">
+      <header><h2>active claims</h2><span class="meta">{len(rows)} held</span></header>
+      <table>
+        <thead>
+          <tr>
+            <th>engineer</th>
+            <th>repo</th>
+            <th>pattern</th>
+            <th>scope</th>
+            <th>description</th>
+            <th>time left</th>
+            <th>severity</th>
+            <th>session</th>
+          </tr>
+        </thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </section>
 
-    {hotspots_html}
+    <section class="panel">
+      <header><h2>release requests</h2><span class="meta">{requests_meta}</span></header>
+      <table>
+        <thead>
+          <tr>
+            <th>when</th>
+            <th>requester</th>
+            <th>their pattern</th>
+            <th>scope</th>
+            <th>holder</th>
+            <th>urgency</th>
+            <th>decision</th>
+            <th>latency</th>
+          </tr>
+        </thead>
+        <tbody>{req_html}</tbody>
+      </table>
+    </section>
 
     {queue_html}
-
-    {stale_html}
-
-    {webhooks_html}
-
-    {tokens_html}
 
     <div class="row split-7-5">
       <section class="panel">
@@ -1725,25 +2019,6 @@ async def render_dashboard(
         <ul class="top-modules">{top_modules_html}</ul>
       </section>
     </div>
-
-    <section class="panel">
-      <header><h2>active claims</h2><span class="meta">{len(rows)} held</span></header>
-      <table>
-        <thead>
-          <tr>
-            <th>engineer</th>
-            <th>repo</th>
-            <th>pattern</th>
-            <th>scope</th>
-            <th>description</th>
-            <th>time left</th>
-            <th>severity</th>
-            <th>session</th>
-          </tr>
-        </thead>
-        <tbody>{rows_html}</tbody>
-      </table>
-    </section>
 
     <div class="row split-1-1">
       <section class="panel">
@@ -1773,24 +2048,17 @@ async def render_dashboard(
       </section>
     </div>
 
-    <section class="panel">
-      <header><h2>release requests</h2><span class="meta">{requests_meta}</span></header>
-      <table>
-        <thead>
-          <tr>
-            <th>when</th>
-            <th>requester</th>
-            <th>their pattern</th>
-            <th>scope</th>
-            <th>holder</th>
-            <th>urgency</th>
-            <th>decision</th>
-            <th>latency</th>
-          </tr>
-        </thead>
-        <tbody>{req_html}</tbody>
-      </table>
-    </section>
+    {hotspots_html}
+
+    {auto_resolutions_html}
+
+    {heatmap_html}
+
+    {stale_html}
+
+    {webhooks_html}
+
+    {tokens_html}
 
     <section class="panel">
       <header><h2>claim timeline</h2><span class="meta">most recent 50</span></header>
@@ -1814,5 +2082,6 @@ async def render_dashboard(
       <span>rendered {_esc(now_label)}</span>
     </footer>
   </main>
+  <script>{REFRESH_SCRIPT}</script>
 </body>
 </html>"""
