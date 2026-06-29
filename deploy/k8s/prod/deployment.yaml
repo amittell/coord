@@ -51,6 +51,17 @@ spec:
             # when this flag is set.
             - name: COORD_REQUIRE_PER_ENGINEER_TOKEN
               value: "true"
+            # v0.38: optional OpenTelemetry tracing. The image bundles the
+            # OTel stack (requirements-otel.txt), so enabling it in prod is
+            # just these env vars; spans export over OTLP/HTTP to Tempo.
+            # Tracing fails open -- a Tempo outage never affects coord's
+            # own startup or request handling.
+            - name: COORD_OTEL_ENABLED
+              value: "true"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://tempo.tempo.svc.cluster.local:4318"
+            - name: OTEL_SERVICE_NAME
+              value: "coord"
           envFrom:
             - secretRef:
                 name: coord-auth
