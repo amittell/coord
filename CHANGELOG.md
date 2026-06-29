@@ -9,6 +9,28 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.38.0] - 2026-06-28
+
+### Added
+
+- Optional OpenTelemetry distributed tracing, disabled by default and a
+  complete no-op unless ``COORD_OTEL_ENABLED=true``. When enabled it lazily
+  imports the OpenTelemetry SDK, installs a ``TracerProvider`` exporting
+  spans over OTLP/HTTP (endpoint via the standard
+  ``OTEL_EXPORTER_OTLP_ENDPOINT`` / ``OTEL_SERVICE_NAME`` env vars), and
+  instruments inbound FastAPI requests and outbound httpx calls. The whole
+  setup is fail-open: a missing SDK, bad endpoint, or instrumentation error
+  is logged and swallowed so tracing misconfiguration can never break
+  startup. If a tracer provider is already installed (another library or
+  auto-instrumentation), coord attaches its OTLP exporter to it rather than
+  silently failing to replace the set-once global.
+  - The OpenTelemetry dependency stack is pinned in a separate
+    ``requirements-otel.txt`` (kept out of the base ``requirements.txt``);
+    the container image installs it so tracing can be toggled at runtime,
+    and PyPI users opt in via the ``[otel]`` extra
+    (``pip install coord-mcp-server[otel]``). A dedicated CI job installs
+    the stack so the enabled-path tracing tests run on every change.
+
 ## [0.37.0] - 2026-06-28
 
 ### Added

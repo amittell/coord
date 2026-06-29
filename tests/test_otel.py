@@ -33,7 +33,44 @@ from coordination.otel import setup_tracing
 # that need it are skipped when it is not installed so the suite stays
 # green in a bare environment; the disabled-path and fail-open tests
 # run regardless because they never require the SDK.
-_HAS_OTEL = importlib.util.find_spec("opentelemetry.sdk.trace") is not None
+# find_spec raises ModuleNotFoundError (rather than returning None) when the
+# top-level ``opentelemetry`` package is absent entirely, which is the case in
+# the base [dev] test matrix. Guard it so this module still collects there --
+# the disabled / fail-open tests run, and the enabled-path tests skip.
+try:
+    _HAS_OTEL = importlib.util.find_spec("opentelemetry.sdk.trace") is not None
+except ModuleNotFoundError:
+    _HAS_OTEL = False
+
+
+@pytest.fixture()
+def isolated_tracer_provider():
+    """Isolate the process-global OTel tracer provider for one test.
+
+    OpenTelemetry installs the tracer provider as set-once process-global
+    state; without isolation an enabled-path test would leak its provider
+    (and its background BatchSpanProcessor/exporter) into the rest of the
+    suite and become order-dependent. Reset to a pristine state before the
+    test and restore + shut down afterwards.
+    """
+    import opentelemetry.trace as _t
+    from opentelemetry.util._once import Once
+
+    saved_provider = _t._TRACER_PROVIDER
+    saved_once = _t._TRACER_PROVIDER_SET_ONCE
+    _t._TRACER_PROVIDER = None
+    _t._TRACER_PROVIDER_SET_ONCE = Once()
+    try:
+        yield
+    finally:
+        installed = _t._TRACER_PROVIDER
+        if installed is not None and hasattr(installed, "shutdown"):
+            try:
+                installed.shutdown()
+            except Exception:
+                pass
+        _t._TRACER_PROVIDER = saved_provider
+        _t._TRACER_PROVIDER_SET_ONCE = saved_once
 
 
 def test_otel_enabled_defaults_false() -> None:
@@ -121,13 +158,19 @@ def test_setup_tracing_fails_open_on_bad_endpoint(
 
 @pytest.mark.skipif(not _HAS_OTEL, reason="opentelemetry SDK not installed")
 def test_setup_tracing_instruments_app_when_enabled(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, isolated_tracer_provider: None
 ) -> None:
     """Enabled + deps present: app is instrumented, provider installed."""
     from opentelemetry import trace
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+        OTLPSpanExporter,
+    )
     from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
     from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
     from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+    from coordination import __version__
 
     # Point at a plausible (unreachable) collector; the BatchSpanProcessor
     # exports in the background and never blocks setup, so an unreachable
@@ -149,13 +192,82 @@ def test_setup_tracing_instruments_app_when_enabled(
         provider = trace.get_tracer_provider()
         assert isinstance(provider, TracerProvider)
 
+        # The resource carries our service identity: the OTEL_SERVICE_NAME
+        # override and coord's own version (not the SDK's unknown_service).
+        attrs = dict(provider.resource.attributes)
+        assert attrs.get("service.name") == "coord-test"
+        assert attrs.get("service.version") == __version__
+
+        # A BatchSpanProcessor exporting over OTLP/HTTP is wired up -- this
+        # would fail if the exporter or processor line were dropped.
+        processors = getattr(
+            provider._active_span_processor, "_span_processors", ()
+        )
+        assert any(
+            isinstance(p, BatchSpanProcessor)
+            and isinstance(p.span_exporter, OTLPSpanExporter)
+            for p in processors
+        ), "expected a BatchSpanProcessor exporting via OTLP"
+
         # FastAPIInstrumentor recorded the app as instrumented.
         assert FastAPIInstrumentor._is_instrumented_by_opentelemetry or getattr(
             app, "_is_instrumented_by_opentelemetry", False
         )
+
+        # httpx client instrumentation is active too (outbound spans) --
+        # this would fail if the HTTPXClientInstrumentor().instrument() line
+        # were removed.
+        assert HTTPXClientInstrumentor()._is_instrumented_by_opentelemetry
     finally:
         # Clean up global httpx instrumentation so it does not leak into
         # other tests that build httpx clients.
+        try:
+            HTTPXClientInstrumentor().uninstrument()
+        except Exception:
+            pass
+        try:
+            FastAPIInstrumentor.uninstrument_app(app)
+        except Exception:
+            pass
+
+
+@pytest.mark.skipif(not _HAS_OTEL, reason="opentelemetry SDK not installed")
+def test_setup_tracing_attaches_to_existing_provider(
+    monkeypatch: pytest.MonkeyPatch, isolated_tracer_provider: None
+) -> None:
+    """If a real TracerProvider is already installed (a foreign library, auto-
+    instrumentation, or an earlier call), setup_tracing attaches its OTLP
+    exporter to that provider rather than silently failing to replace the
+    set-once global."""
+    from opentelemetry import trace
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+        OTLPSpanExporter,
+    )
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+    from opentelemetry.sdk.resources import Resource
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+    foreign = TracerProvider(resource=Resource.create({"service.name": "foreign"}))
+    trace.set_tracer_provider(foreign)
+    before = len(foreign._active_span_processor._span_processors)
+
+    app = FastAPI()
+    try:
+        setup_tracing(app, Settings(otel_enabled=True))
+
+        # The foreign provider is kept (not replaced) and gains exactly one
+        # OTLP-exporting processor.
+        assert trace.get_tracer_provider() is foreign
+        procs = foreign._active_span_processor._span_processors
+        assert len(procs) == before + 1
+        assert any(
+            isinstance(p, BatchSpanProcessor)
+            and isinstance(p.span_exporter, OTLPSpanExporter)
+            for p in procs
+        ), "expected our OTLP exporter attached to the existing provider"
+    finally:
         try:
             HTTPXClientInstrumentor().uninstrument()
         except Exception:

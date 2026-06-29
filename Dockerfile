@@ -15,9 +15,12 @@ RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 # Install pinned runtime dependencies first for better layer caching.
-COPY requirements.txt /build/requirements.txt
+# requirements-otel.txt bundles the OPTIONAL OpenTelemetry tracing stack so
+# COORD_OTEL_ENABLED can be toggled at runtime without rebuilding; drop that
+# second -r for a slimmer, tracing-less image.
+COPY requirements.txt requirements-otel.txt /build/
 RUN pip install --upgrade pip && \
-    pip install -r /build/requirements.txt
+    pip install -r /build/requirements.txt -r /build/requirements-otel.txt
 
 # Install the app itself with no deps - they are already pinned above.
 COPY pyproject.toml README.md /build/

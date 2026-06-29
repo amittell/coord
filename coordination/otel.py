@@ -90,22 +90,39 @@ def setup_tracing(app: "FastAPI", settings: "Settings") -> None:
         # the environment itself; we do not pass an endpoint so the
         # standard OTel env config (and its sensible localhost default)
         # stays in force.
-        provider = TracerProvider(resource=resource)
-        provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
-        trace.set_tracer_provider(provider)
+        exporter = OTLPSpanExporter()
+        current = trace.get_tracer_provider()
+        if isinstance(current, TracerProvider):
+            # A real SDK TracerProvider is already installed -- by another
+            # library, auto-instrumentation, or an earlier call.
+            # ``set_tracer_provider`` only takes effect once, so replacing it
+            # would silently no-op and our exporter would never be wired in.
+            # Attach our OTLP exporter to the existing provider instead so
+            # coord's spans still flow (under that provider's resource),
+            # rather than fighting the process-global and quietly losing.
+            provider = current
+            provider.add_span_processor(BatchSpanProcessor(exporter))
+            logger.info(
+                "OpenTelemetry: attached OTLP span exporter to the existing "
+                "TracerProvider (service=%s)",
+                service_name,
+            )
+        else:
+            provider = TracerProvider(resource=resource)
+            provider.add_span_processor(BatchSpanProcessor(exporter))
+            trace.set_tracer_provider(provider)
+            endpoint = (
+                os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+                or "OTLP default (http://localhost:4318)"
+            )
+            logger.info(
+                "OpenTelemetry tracing enabled: service=%s exporting to %s",
+                service_name,
+                endpoint,
+            )
 
         FastAPIInstrumentor.instrument_app(app)
         HTTPXClientInstrumentor().instrument()
-
-        endpoint = (
-            os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
-            or "OTLP default (http://localhost:4318)"
-        )
-        logger.info(
-            "OpenTelemetry tracing enabled: service=%s exporting to %s",
-            service_name,
-            endpoint,
-        )
     except ImportError:
         logger.warning(
             "COORD_OTEL_ENABLED is set but the OpenTelemetry SDK is not "

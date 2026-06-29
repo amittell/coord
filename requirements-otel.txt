@@ -1,0 +1,34 @@
+# Pinned dependencies for the OPTIONAL OpenTelemetry tracing stack
+# (coordination/otel.py, gated on COORD_OTEL_ENABLED).
+#
+# Kept out of the base requirements.txt so a non-tracing install/build
+# carries no OpenTelemetry dependency. The container image installs this
+# layer on top of requirements.txt (see Dockerfile) so tracing can be
+# turned on at runtime via COORD_OTEL_ENABLED without rebuilding; omit
+# this file from the build for a slimmer, tracing-less image. PyPI users
+# get the unpinned equivalents via the project's [otel] extra
+# (pip install coord-mcp-server[otel]).
+#
+# Regenerate by diffing a clean `pip install .[otel]` freeze against
+# requirements.txt:
+#   python3.12 -m venv /tmp/coord-otel
+#   /tmp/coord-otel/bin/pip install '.[otel]'
+#   /tmp/coord-otel/bin/pip freeze | grep -vxF -f requirements.txt
+asgiref==3.11.1
+charset-normalizer==3.4.7
+googleapis-common-protos==1.75.0
+opentelemetry-api==1.43.0
+opentelemetry-exporter-otlp-proto-common==1.43.0
+opentelemetry-exporter-otlp-proto-http==1.43.0
+opentelemetry-instrumentation==0.64b0
+opentelemetry-instrumentation-asgi==0.64b0
+opentelemetry-instrumentation-fastapi==0.64b0
+opentelemetry-instrumentation-httpx==0.64b0
+opentelemetry-proto==1.43.0
+opentelemetry-sdk==1.43.0
+opentelemetry-semantic-conventions==0.64b0
+opentelemetry-util-http==0.64b0
+protobuf==7.35.1
+requests==2.34.2
+urllib3==2.7.0
+wrapt==2.2.2
