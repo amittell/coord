@@ -6,6 +6,12 @@
 #   /tmp/coord-scratch/bin/pip freeze
 # then drop the "multi-agent-coordination" self-reference line and
 # copy the rest here.
+#
+# The OPTIONAL OpenTelemetry tracing stack is pinned separately in
+# requirements-otel.txt so this base lockfile carries no tracing
+# dependency; the container image installs both (see Dockerfile) so
+# COORD_OTEL_ENABLED can be toggled at runtime, but a slimmer build can
+# omit the otel layer.
 aiosqlite==0.22.1
 annotated-doc==0.0.4
 annotated-types==0.7.0

@@ -264,6 +264,20 @@ class Settings(BaseSettings):
     lsp_command_kotlin: str = "kotlin-language-server"
     lsp_command_swift: str = "sourcekit-lsp"
     lsp_command_scala: str = "metals"
+    # v0.32 optional OpenTelemetry distributed tracing. When True (env
+    # ``COORD_OTEL_ENABLED=true``), ``coordination.otel.setup_tracing``
+    # lazily imports the OpenTelemetry SDK, installs a TracerProvider
+    # exporting spans over OTLP/HTTP, and instruments the FastAPI app and
+    # outbound httpx clients. Default False: the SDK is never imported,
+    # no provider is installed, and behaviour is byte-identical to a
+    # build without tracing -- coord takes no hard dependency on
+    # OpenTelemetry being importable. The collector endpoint and service
+    # name are NOT coord settings; the SDK reads the standard
+    # ``OTEL_EXPORTER_OTLP_ENDPOINT`` / ``OTEL_SERVICE_NAME`` env vars
+    # directly. Setup fails open: any error (missing extra, bad endpoint)
+    # logs a warning and leaves coord running untraced rather than
+    # breaking startup, mirroring the webhook/github opt-in gates.
+    otel_enabled: bool = False
 
     @property
     def oidc_enabled(self) -> bool:

@@ -31,6 +31,7 @@ from coordination.db import acquire_instance_lock
 from coordination.deps import get_service
 from coordination.tokens import generate_raw_token, sha256_token
 from coordination.logging import ACCESS_LOGGER_NAME, configure_logging, request_id_var
+from coordination.otel import setup_tracing
 from coordination.ownership import parse_ownership_yaml
 from coordination.service import LspUnavailable, RateLimitExceeded
 from coordination.schemas import (
@@ -173,6 +174,10 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Multi-Agent Coordination", version=__version__, lifespan=lifespan)
+
+# Optional OpenTelemetry tracing. No-op unless COORD_OTEL_ENABLED=true;
+# fails open so a tracing misconfiguration never breaks startup.
+setup_tracing(app, get_settings())
 
 
 @app.middleware("http")
