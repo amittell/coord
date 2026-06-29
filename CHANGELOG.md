@@ -9,6 +9,28 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.37.0] - 2026-06-28
+
+### Added
+
+- ``coord mcp install``: register the coord MCP server into your AI coding
+  tools so you never hand-edit a tool config file. Auto-detects which
+  supported tools are installed (Claude Code, Claude Desktop, Codex,
+  Cursor), fills the connection env (``COORD_API_URL``,
+  ``COORD_AUTH_TOKEN``, ``COORD_REPO_ID``) from the repo's
+  ``.coordination/local.env``, and is idempotent: an existing coord entry
+  is updated in place, never duplicated, converging to the same config on
+  every re-run. Supports ``--tool`` (repeatable), ``--all``, ``--root``,
+  and ``--dry-run``. A config holding invalid JSON/TOML is reported, never
+  clobbered.
+  - The Codex ``config.toml`` updater recognises non-canonical existing
+    coord tables (quoted keys, trailing comments, descendant tables) and
+    re-parses the rewritten document before writing, so any form its block
+    surgery cannot cleanly converge fails closed instead of corrupting the
+    file. Auto-detect with no installed tool exits non-zero with an
+    actionable message; a config whose ``mcpServers`` is a non-object is
+    refused rather than silently discarded.
+
 ## [0.36.0] - 2026-06-28
 
 ### Added

@@ -12,6 +12,8 @@ defaults, choices) is part of what these tests pin down.
 from __future__ import annotations
 
 import json
+import os
+import sys
 import tomllib
 from pathlib import Path
 
@@ -59,6 +61,9 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     monkeypatch.setenv("HOME", str(fake_home))
+    # Path.home() consults USERPROFILE on Windows, not HOME, so redirect it
+    # too -- otherwise the config paths resolve to the real home there.
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
     monkeypatch.setenv("APPDATA", str(fake_home / "AppData" / "Roaming"))
     return fake_home
 
@@ -353,3 +358,212 @@ def test_optional_env_keys_omitted_when_absent(
     assert _run(root, "--tool", "claude-code") == 0
     cfg = _read_json(home / ".claude.json")
     assert cfg["mcpServers"]["coord"]["env"] == {"COORD_AUTH_TOKEN": "only-token"}
+
+
+# ---------------------------------------------------------------------------
+# Codex TOML: non-canonical existing coord tables are still collapsed, and
+# anything the surgery cannot safely converge fails closed (never corrupts)
+# ---------------------------------------------------------------------------
+
+
+def test_codex_collapses_quoted_coord_table(repo_root: Path, home: Path) -> None:
+    """An existing coord table written with a quoted key
+    (``[mcp_servers."coord"]``) is recognised, removed, and replaced by the
+    single canonical table -- not left in place beside a duplicate."""
+    path = home / ".codex" / "config.toml"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        'model = "gpt-5"\n'
+        "\n"
+        '[mcp_servers."coord"]\n'
+        'command = "coord-mcp"\n'
+        "args = []\n"
+        "\n"
+        '[mcp_servers."coord".env]\n'
+        'COORD_AUTH_TOKEN = "stale-token"\n',
+        encoding="utf-8",
+    )
+    assert _run(repo_root, "--tool", "codex") == 0
+    text = path.read_text(encoding="utf-8")
+    parsed = tomllib.loads(text)  # must still be valid TOML
+    # Exactly one coord table, carrying the fresh token; model preserved.
+    assert parsed["model"] == "gpt-5"
+    assert parsed["mcp_servers"]["coord"]["env"]["COORD_AUTH_TOKEN"] == "tok-abc123"
+    assert '[mcp_servers."coord"]' not in text
+    assert text.count("[mcp_servers.coord]") == 1
+
+
+def test_codex_collapses_coord_table_with_trailing_comment(
+    repo_root: Path, home: Path
+) -> None:
+    """A coord header carrying a trailing comment
+    (``[mcp_servers.coord]  # ...``) is recognised and collapsed."""
+    path = home / ".codex" / "config.toml"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        "[mcp_servers.coord]  # installed by hand last week\n"
+        'command = "coord-mcp"\n'
+        "args = []\n"
+        "\n"
+        "[mcp_servers.coord.env]\n"
+        'COORD_AUTH_TOKEN = "stale-token"\n',
+        encoding="utf-8",
+    )
+    assert _run(repo_root, "--tool", "codex") == 0
+    text = path.read_text(encoding="utf-8")
+    parsed = tomllib.loads(text)
+    assert parsed["mcp_servers"]["coord"]["env"]["COORD_AUTH_TOKEN"] == "tok-abc123"
+    # Exactly the two canonical coord table headers survive -- the old
+    # commented header did not leak a duplicate.
+    coord_headers = [
+        line.rstrip()
+        for line in text.splitlines()
+        if (m := cli_mcp._TABLE_HEADER_RE.match(line))
+        and cli_mcp._is_coord_table_header(m.group(1), {"coord"})
+    ]
+    assert coord_headers == ["[mcp_servers.coord]", "[mcp_servers.coord.env]"]
+
+
+def test_codex_refuses_when_surgery_cannot_converge(
+    repo_root: Path, home: Path, capsys
+) -> None:
+    """A coord entry written as a top-level dotted key (which the block
+    surgery cannot remove) would collide with the appended table. Rather
+    than emit invalid/duplicate TOML, the writer refuses and leaves the
+    original file untouched."""
+    path = home / ".codex" / "config.toml"
+    path.parent.mkdir(parents=True)
+    original = 'mcp_servers.coord.command = "coord-mcp"\n'
+    path.write_text(original, encoding="utf-8")
+    rc = _run(repo_root, "--tool", "codex")
+    assert rc == 1
+    # File left byte-for-byte untouched.
+    assert path.read_text(encoding="utf-8") == original
+    err = capsys.readouterr().err
+    assert "codex: error" in err
+
+
+def test_codex_refuses_coord_under_noncanonical_key(
+    repo_root: Path, home: Path, capsys
+) -> None:
+    """A coord server stored under a non-coord key via dotted keys (which the
+    block surgery cannot remove) would survive beside the appended canonical
+    table -- two coord servers. The writer detects this and refuses, leaving
+    the original file untouched."""
+    path = home / ".codex" / "config.toml"
+    path.parent.mkdir(parents=True)
+    original = 'mcp_servers.legacy.command = "coord-mcp"\n'
+    path.write_text(original, encoding="utf-8")
+    rc = _run(repo_root, "--tool", "codex")
+    assert rc == 1
+    assert path.read_text(encoding="utf-8") == original
+    err = capsys.readouterr().err
+    assert "another key" in err and "legacy" in err
+
+
+def test_invalid_codex_toml_not_clobbered(
+    repo_root: Path, home: Path, capsys
+) -> None:
+    """An existing config that is not valid TOML is reported, never
+    overwritten."""
+    path = home / ".codex" / "config.toml"
+    path.parent.mkdir(parents=True)
+    path.write_text("this is = = not toml\n", encoding="utf-8")
+    rc = _run(repo_root, "--tool", "codex")
+    assert rc == 1
+    assert path.read_text(encoding="utf-8") == "this is = = not toml\n"
+    err = capsys.readouterr().err
+    assert "not valid TOML" in err
+
+
+# ---------------------------------------------------------------------------
+# auto-detect with nothing installed must error, not no-op to success
+# ---------------------------------------------------------------------------
+
+
+def test_autodetect_no_tools_errors(
+    repo_root: Path, home: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """With no --tool/--all and no detectable tool (no CLI on PATH, no config
+    dirs), the command exits non-zero with an actionable message rather than
+    silently succeeding."""
+    monkeypatch.setattr(cli_mcp.shutil, "which", lambda _name: None)
+    # Fresh home fixture has no tool config dirs/files, so nothing detects.
+    rc = _run(repo_root)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "No supported AI coding tools detected" in err
+    assert "--tool" in err and "--all" in err
+    assert not (home / ".claude.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# malformed JSON shapes are refused, not silently clobbered
+# ---------------------------------------------------------------------------
+
+
+def test_json_non_object_mcpservers_refused(
+    repo_root: Path, home: Path, capsys
+) -> None:
+    """An existing config whose ``mcpServers`` is not an object would be
+    silently discarded by a naive writer; instead it is refused so the user
+    can inspect their unexpected config."""
+    path = home / ".claude.json"
+    original = json.dumps({"mcpServers": "oops-not-an-object"})
+    path.write_text(original, encoding="utf-8")
+    rc = _run(repo_root, "--tool", "claude-code")
+    assert rc == 1
+    assert path.read_text(encoding="utf-8") == original
+    err = capsys.readouterr().err
+    assert "non-object" in err
+
+
+# ---------------------------------------------------------------------------
+# coord-mcp detection is exact-basename, not substring
+# ---------------------------------------------------------------------------
+
+
+def test_unrelated_substring_command_preserved(repo_root: Path, home: Path) -> None:
+    """A server whose command merely CONTAINS 'coord-mcp' as a substring
+    (e.g. 'my-coord-mcp-helper') is unrelated and must be preserved, not
+    collapsed onto the coord key."""
+    path = home / ".claude.json"
+    path.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "helper": {"command": "my-coord-mcp-helper", "args": []},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert _run(repo_root, "--tool", "claude-code") == 0
+    cfg = _read_json(path)
+    # The unrelated helper survives; coord is added alongside it.
+    assert cfg["mcpServers"]["helper"] == {
+        "command": "my-coord-mcp-helper",
+        "args": [],
+    }
+    assert cfg["mcpServers"]["coord"]["command"] == "coord-mcp"
+
+
+# ---------------------------------------------------------------------------
+# token-bearing config files are written owner-only (0600)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith(("linux", "darwin")),
+    reason="POSIX file modes only",
+)
+def test_created_config_is_owner_only(repo_root: Path, home: Path) -> None:
+    """A freshly written config embeds COORD_AUTH_TOKEN, so it must land
+    0600 rather than at the process umask default."""
+    assert _run(repo_root, "--tool", "claude-code") == 0
+    mode = os.stat(home / ".claude.json").st_mode & 0o777
+    assert mode == 0o600
+    # Codex's TOML config carries the token too.
+    assert _run(repo_root, "--tool", "codex") == 0
+    mode_toml = os.stat(home / ".codex" / "config.toml").st_mode & 0o777
+    assert mode_toml == 0o600

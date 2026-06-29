@@ -28,6 +28,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import tomllib
 from pathlib import Path
 
@@ -113,6 +114,42 @@ def _server_entry(coord_env: dict[str, str]) -> dict[str, object]:
     return {"command": _MCP_COMMAND, "args": [], "env": dict(coord_env)}
 
 
+def _atomic_write_private(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` atomically with owner-only permissions.
+
+    These tool configs embed ``COORD_AUTH_TOKEN``, so the write is hardened
+    two ways: it lands in a same-directory temp file created ``0600`` and is
+    ``os.replace``-d into place (an interrupted run never leaves a
+    half-written or truncated config, and the token is never briefly visible
+    in a world-readable temp file), and the final file ends up ``0600`` so
+    the token is not group/world readable. The chmod is best-effort -- a
+    no-op on platforms without POSIX file modes. Raises
+    :class:`McpConfigError` on any OS error so the per-tool handler reports
+    it without a traceback.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # mkstemp creates the temp 0600 in the target directory; os.fdopen with
+    # newline="" keeps our explicit "\n" line endings on every platform.
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f"{path.name}.", suffix=".coord-tmp"
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+    except OSError as exc:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise McpConfigError(f"cannot write {path}: {exc}") from exc
+
+
 # ---------------------------------------------------------------------------
 # tool detection + config paths
 # ---------------------------------------------------------------------------
@@ -172,6 +209,20 @@ def _is_detected(tool: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _command_is_coord(command: object) -> bool:
+    """True when an MCP server ``command`` launches the coord-mcp binary.
+
+    Matches the executable's basename exactly (allowing a Windows ``.exe``
+    suffix) rather than a substring, so an unrelated server such as
+    ``my-coord-mcp-helper`` or ``/opt/tools/not-coord-mcp`` is never
+    mistaken for coord and clobbered/refused.
+    """
+    if not isinstance(command, str):
+        return False
+    name = Path(command).name
+    return name == _MCP_COMMAND or name == f"{_MCP_COMMAND}.exe"
+
+
 def _is_coord_server(name: str, value: object) -> bool:
     """True when an mcpServers entry is coord's.
 
@@ -182,9 +233,7 @@ def _is_coord_server(name: str, value: object) -> bool:
     if name == "coord":
         return True
     if isinstance(value, dict):
-        command = value.get("command")
-        if isinstance(command, str) and _MCP_COMMAND in command:
-            return True
+        return _command_is_coord(value.get("command"))
     return False
 
 
@@ -218,8 +267,14 @@ def _write_json_config(
     else:
         data = {}
 
-    servers = data.get("mcpServers")
-    if not isinstance(servers, dict):
+    if "mcpServers" in data:
+        servers = data["mcpServers"]
+        if not isinstance(servers, dict):
+            raise McpConfigError(
+                f'{path} has a non-object "mcpServers"; refusing to overwrite '
+                "it. Fix or remove the file and re-run."
+            )
+    else:
         servers = {}
     # Drop any existing coord server (the "coord" key or a coord-mcp command
     # under any key) so the rewrite converges onto a single entry.
@@ -231,8 +286,7 @@ def _write_json_config(
     if dry_run:
         return "updated" if existed else "created"
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    _atomic_write_private(path, json.dumps(data, indent=2) + "\n")
     return "updated" if existed else "created"
 
 
@@ -269,33 +323,81 @@ def _codex_coord_block(coord_env: dict[str, str]) -> str:
     return "\n".join(lines) + "\n"
 
 
-_TABLE_HEADER_RE = re.compile(r"^\s*\[([^\]]+)\]\s*$")
+# A TOML table header, allowing leading indentation and a trailing comment:
+# ``[a.b.c]`` and ``[a."b".c]  # note`` both match, capturing the key path.
+_TABLE_HEADER_RE = re.compile(r"^\s*\[([^\[\]]+)\]\s*(?:#.*)?$")
+
+
+def _split_toml_key_path(path: str) -> list[str]:
+    """Split a dotted TOML key path into normalised segments.
+
+    ``mcp_servers."coord".env`` -> ``["mcp_servers", "coord", "env"]``. A
+    quoted segment is consumed as a unit (so a dot inside quotes does not
+    split) and its surrounding quotes are stripped, so the *logical* key is
+    compared, not its surface syntax; whitespace around segments
+    (``[ a . b ]``) is trimmed. This lets the strip pass recognise coord's
+    table across quoted, commented, and padded spellings.
+    """
+    segments: list[str] = []
+    buf = ""
+    quote = ""
+    for ch in path:
+        if quote:
+            buf += ch
+            if ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+            buf += ch
+        elif ch == ".":
+            segments.append(buf)
+            buf = ""
+        else:
+            buf += ch
+    segments.append(buf)
+
+    normalised: list[str] = []
+    for seg in segments:
+        seg = seg.strip()
+        if len(seg) >= 2 and seg[0] in "\"'" and seg[-1] == seg[0]:
+            seg = seg[1:-1]
+        normalised.append(seg)
+    return normalised
+
+
+def _is_coord_table_header(header: str, coord_keys: set[str]) -> bool:
+    """True when a ``[header]`` table belongs to coord.
+
+    Matches coord's ``mcp_servers.<key>`` table and every descendant table
+    (``mcp_servers.<key>.env`` and anything deeper) for a key in
+    ``coord_keys``, across quoted and whitespace-padded spellings.
+    """
+    segs = _split_toml_key_path(header)
+    return len(segs) >= 2 and segs[0] == "mcp_servers" and segs[1] in coord_keys
 
 
 def _strip_codex_coord_tables(text: str, coord_keys: set[str]) -> str:
     """Remove coord's TOML tables from ``text`` by block surgery.
 
-    Splits ``text`` into blocks at top-level ``[header]`` lines and drops any
-    block whose header is ``[mcp_servers.<key>]`` or
-    ``[mcp_servers.<key>.env]`` for a key in ``coord_keys``. Every other
-    block -- including unrelated servers, comments, and top-level keys -- is
-    preserved verbatim. Using text surgery (rather than re-serialising the
-    parsed dict) is what keeps the rest of the operator's config byte-for-
-    byte intact without pulling in a TOML writer dependency.
+    Splits ``text`` into blocks at ``[header]`` lines and drops any block
+    whose header is coord's ``mcp_servers.<key>`` table or one of its
+    descendant tables (e.g. ``.env``), for a key in ``coord_keys`` --
+    recognising quoted keys (``[mcp_servers."coord"]``), trailing comments
+    (``[mcp_servers.coord] # note``), and padded spellings. Every other
+    block -- unrelated servers, comments, top-level keys -- is preserved
+    verbatim. Text surgery (rather than re-serialising the parsed dict)
+    keeps the rest of the operator's config byte-for-byte intact without a
+    TOML writer dependency. The caller re-parses the reassembled document
+    before writing, so any exotic form this misses fails safe rather than
+    corrupting the file.
     """
-    drop_headers = set()
-    for key in coord_keys:
-        drop_headers.add(f"mcp_servers.{key}")
-        drop_headers.add(f"mcp_servers.{key}.env")
-
     lines = text.splitlines(keepends=True)
     out: list[str] = []
     dropping = False
     for line in lines:
         match = _TABLE_HEADER_RE.match(line)
         if match is not None:
-            header = match.group(1).strip()
-            dropping = header in drop_headers
+            dropping = _is_coord_table_header(match.group(1), coord_keys)
             if dropping:
                 continue
         if dropping:
@@ -315,10 +417,8 @@ def _codex_coord_keys(parsed: dict[str, object]) -> set[str]:
     servers = parsed.get("mcp_servers")
     if isinstance(servers, dict):
         for name, value in servers.items():
-            if isinstance(value, dict):
-                command = value.get("command")
-                if isinstance(command, str) and _MCP_COMMAND in command:
-                    keys.add(name)
+            if isinstance(value, dict) and _command_is_coord(value.get("command")):
+                keys.add(name)
     return keys
 
 
@@ -356,11 +456,52 @@ def _write_codex_config(
     body = stripped.rstrip("\n")
     new_text = f"{body}\n\n{block}" if body else block
 
+    # Fail-safe: never write TOML we cannot parse back, and never write a
+    # document where a non-canonical pre-existing coord entry survived the
+    # strip and now collides with the table we appended (tomllib rejects a
+    # key/table defined twice). Either means the surgery could not cleanly
+    # converge; refuse rather than corrupt the operator's file.
+    try:
+        reparsed = tomllib.loads(new_text)
+    except tomllib.TOMLDecodeError as exc:
+        raise McpConfigError(
+            f"updating {path} would produce invalid TOML ({exc}); refusing to "
+            "write. Remove the existing coord entry from the file by hand and "
+            "re-run."
+        ) from exc
+    servers_after = reparsed.get("mcp_servers")
+    if not (
+        isinstance(servers_after, dict)
+        and isinstance(servers_after.get("coord"), dict)
+    ):
+        raise McpConfigError(
+            f"updating {path} did not converge on a single coord server; "
+            "refusing to write. Remove the existing coord entry from the file "
+            "by hand and re-run."
+        )
+    # A coord server stored under a non-canonical key via an inline table or
+    # dotted keys (``mcp_servers.foo.command = "coord-mcp"``) has no
+    # ``[mcp_servers.foo]`` block for the surgery to remove, so it would
+    # survive beside the canonical table -- two coord servers, never
+    # converging. Detect that and fail closed rather than write duplicates.
+    leftover = sorted(
+        name
+        for name, value in servers_after.items()
+        if name != "coord"
+        and isinstance(value, dict)
+        and _command_is_coord(value.get("command"))
+    )
+    if leftover:
+        raise McpConfigError(
+            f"updating {path} left a coord server under another key "
+            f"({', '.join(leftover)}); refusing to write. Remove it from the "
+            "file by hand and re-run."
+        )
+
     if dry_run:
         return "updated" if existed else "created"
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(new_text, encoding="utf-8")
+    _atomic_write_private(path, new_text)
     return "updated" if existed else "created"
 
 
@@ -429,10 +570,11 @@ def run_mcp(args: argparse.Namespace) -> int:
     coord_env = _coord_env(local_env)
     targets, skipped = _select_tools(args)
 
-    if not targets and not skipped:
-        # --tool with no valid choice cannot happen (argparse validates
-        # choices) and --all always yields targets; this only triggers when
-        # auto-detect found nothing.
+    if not targets:
+        # Nothing to act on. --tool's values are argparse-validated and --all
+        # always yields targets, so in practice this is auto-detect finding no
+        # supported tool installed -- surface it as an actionable error rather
+        # than exiting 0 having silently done nothing.
         print(
             "No supported AI coding tools detected "
             f"({', '.join(TOOLS)}). Pass --tool or --all to force a target.",
