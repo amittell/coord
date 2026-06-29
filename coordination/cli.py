@@ -6,6 +6,7 @@ from coordination import BANNER, __version__
 from coordination.cli_doctor import run_doctor
 from coordination.cli_engineers import add_engineers_subparser
 from coordination.cli_init import run_init
+from coordination.cli_mcp import add_mcp_subparser
 from coordination.cli_ops import run_claims, run_release, run_status, run_stop
 from coordination.cli_outbox import add_outbox_subparser
 from coordination.cli_tokens import add_tokens_subparser
@@ -26,6 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  coord start       Run the service locally (preferred entry point)\n"
             "  coord stop        Stop a background service started by 'coord start'\n"
             "  coord init        Wire the current repo for Claude Code, Codex, or Cursor\n"
+            "  coord mcp install Register the coord MCP server into your AI coding tools\n"
             "  coord upgrade     Refresh managed artefacts after pulling a new coord version\n"
             "  coord doctor      Verify repo wiring and service connectivity\n"
             "  coord status      Print health of the configured service\n"
@@ -226,6 +228,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_outbox_subparser(sub)
     add_engineers_subparser(sub)
     add_tokens_subparser(sub)
+    add_mcp_subparser(sub)
 
     internal = sub.add_parser("_serve")
     internal.set_defaults(func=lambda _: _run_internal_server())
