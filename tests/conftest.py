@@ -25,10 +25,34 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
+
 _PG_URL = os.environ.get("COORD_DATABASE_URL", "")
 _PG_SELECTED = _PG_URL.startswith("postgresql://") or _PG_URL.startswith(
     "postgres://"
 )
+
+
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
+    """Skip ``@pytest.mark.sqlite_only`` tests when running against Postgres.
+
+    Those tests exercise SQLite-internal mechanics the PG backend replaces by
+    design (the migrations chain -> a consolidated v1 schema; flock/subprocess
+    single-writer -> PG advisory locks; design Sections 7 / 7.4). They are not
+    meaningful on PG and reaching into the empty local SQLite file would only
+    produce noise. Inert in the default SQLite suite, where these tests run and
+    must pass."""
+    if not _PG_SELECTED:
+        return
+    skip_pg = pytest.mark.skip(
+        reason="sqlite_only: SQLite-internal mechanics (migrations chain / "
+        "flock single-writer) replaced by design on the Postgres backend"
+    )
+    for item in items:
+        if "sqlite_only" in item.keywords:
+            item.add_marker(skip_pg)
 
 
 if _PG_SELECTED:

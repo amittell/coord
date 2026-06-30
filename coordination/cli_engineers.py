@@ -8,11 +8,13 @@ lists the engineers, and ``--release`` drops every active claim they
 own.
 
 The module mirrors the ``cli_outbox`` shape (v0.27.1): a sync top-level
-that wraps the one ``Database`` helper we need (``list_stale_engineers``)
-in ``asyncio.run`` and falls back to direct sqlite3 for the release
-write path. The CLI is invoked from shells, not from a hot loop, so
-event-loop overhead is irrelevant; the value of the sqlite3 path is
-that the SQL we run stays visible at the call site.
+that wraps the ``Database`` helpers it needs (``list_stale_engineers`` for
+the listing, ``release_active_claims_for_engineers`` for the release write
+path) in ``asyncio.run``. The CLI is invoked from shells, not from a hot
+loop, so the per-call event-loop setup is irrelevant -- and routing both
+paths through ``Database`` honours the backend selected by
+``COORD_DATABASE_URL`` (SQLite by default, PostgresStore for a
+``postgresql://`` DSN) rather than a raw ``sqlite3`` connection.
 
 Exit codes follow the project convention:
     0 -- success (including empty results)
@@ -25,7 +27,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import sqlite3
+import os
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -78,13 +80,27 @@ def _db_path() -> Path:
     return Path(get_settings().database_path)
 
 
-def _ensure_db(path: Path) -> None:
-    """Refuse to operate on a missing database file.
+def _postgres_selected() -> bool:
+    """True when ``COORD_DATABASE_URL`` selects the Postgres backend.
 
-    Exits with code 2 so the operator sees a clear message instead of
-    an opaque ``OperationalError: unable to open database file`` from
-    the next sqlite3 call.
+    The missing-file guard below is a SQLite-only safety net (the PG
+    backend keeps its data in a schema, not the ``database_path`` file),
+    so it is skipped in PG mode.
     """
+    url = os.environ.get("COORD_DATABASE_URL", "")
+    return url.startswith("postgresql://") or url.startswith("postgres://")
+
+
+def _ensure_db(path: Path) -> None:
+    """Refuse to operate on a missing SQLite database file.
+
+    Exits with code 2 so the operator sees a clear message instead of an
+    opaque ``unable to open database file`` on the next read. Inert under
+    Postgres, where the data lives in a PG schema rather than the
+    ``database_path`` file.
+    """
+    if _postgres_selected():
+        return
     if not path.exists():
         print(
             f"Database not found at {path}. Set COORD_DATABASE_PATH or run "
@@ -92,13 +108,6 @@ def _ensure_db(path: Path) -> None:
             file=sys.stderr,
         )
         raise SystemExit(2)
-
-
-def _connect(path: Path) -> sqlite3.Connection:
-    """Open a sync sqlite3 connection with ``Row`` access for ergonomic reads."""
-    conn = sqlite3.connect(str(path))
-    conn.row_factory = sqlite3.Row
-    return conn
 
 
 def _confirm(prompt: str) -> bool:
@@ -169,7 +178,7 @@ def _run_stale(args: argparse.Namespace) -> int:
         engineers = asyncio.run(
             Database(path).list_stale_engineers(days=days, now=now)
         )
-    except sqlite3.Error as exc:
+    except Exception as exc:
         print(f"Database error: {exc}", file=sys.stderr)
         return 2
 
@@ -187,16 +196,38 @@ def _run_stale(args: argparse.Namespace) -> int:
                     "repos": e["repos"],
                 }
             )
-        print(
-            json.dumps(
-                {"days": days, "engineers": payload}, sort_keys=True
-            )
-        )
-        # --release on top of --json still runs; we just emit the
-        # listing as JSON first, then perform the writes silently. The
-        # JSON view is the authoritative record.
+        result: dict[str, object] = {"days": days, "engineers": payload}
+        # --release on top of --json emits ONE combined JSON object (never
+        # human text mixed into the stream). JSON/automation mode has no
+        # interactive prompt, so a release requires --yes explicitly.
         if args.release:
-            return _release_engineers(path, engineers, assume_yes=args.yes)
+            if not args.yes:
+                print(
+                    json.dumps(
+                        {"error": "release in --json mode requires --yes"},
+                        sort_keys=True,
+                    )
+                )
+                return 1
+            now_iso = _utcnow()
+            try:
+                released_per_engineer = asyncio.run(
+                    Database(path).release_active_claims_for_engineers(
+                        [str(e["engineer"]) for e in engineers], now_iso=now_iso
+                    )
+                )
+            except Exception as exc:
+                print(
+                    json.dumps(
+                        {"error": f"database error: {exc}"}, sort_keys=True
+                    )
+                )
+                return 2
+            result["release"] = {
+                "released_total": sum(released_per_engineer.values()),
+                "released_per_engineer": released_per_engineer,
+            }
+        print(json.dumps(result, sort_keys=True))
         return 0
 
     if not engineers:
@@ -255,19 +286,13 @@ def _release_engineers(
             return 1
 
     now_iso = _utcnow()
-    released_per_engineer: dict[str, int] = {}
     try:
-        with _connect(path) as conn:
-            for e in engineers:
-                engineer = str(e["engineer"])
-                cur = conn.execute(
-                    "UPDATE claims SET released_at = ? "
-                    "WHERE engineer = ? AND released_at IS NULL",
-                    (now_iso, engineer),
-                )
-                released_per_engineer[engineer] = int(cur.rowcount or 0)
-            conn.commit()
-    except sqlite3.Error as exc:
+        released_per_engineer = asyncio.run(
+            Database(path).release_active_claims_for_engineers(
+                [str(e["engineer"]) for e in engineers], now_iso=now_iso
+            )
+        )
+    except Exception as exc:
         print(f"Database error: {exc}", file=sys.stderr)
         return 2
 

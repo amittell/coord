@@ -167,4 +167,5 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
     "integration: end-to-end tests that spawn real processes (deselect with -m 'not integration')",
+    "sqlite_only: tests that exercise SQLite-internal mechanics (the migrations chain, flock/subprocess single-writer) that the Postgres backend replaces by design (consolidated v1 schema, advisory locks); skipped when COORD_DATABASE_URL selects Postgres",
 ]

@@ -2319,6 +2319,86 @@ class Database:
             })[st] = int(r["n"] or 0)
         return out
 
+    async def recent_webhook_outbox(
+        self, *, limit: int
+    ) -> list[dict[str, Any]]:
+        """v0.27.1 (HA port): return the ``limit`` most recent outbox rows,
+        newest-first (created_at DESC, id DESC). ``coord outbox tail`` reverses
+        the slice for oldest-first display. Only the columns the CLI renders
+        are selected, so the operator path stays on the backend abstraction
+        instead of opening a raw sqlite3 connection."""
+        await self.init()
+        async with self._connect() as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                "SELECT id, status, event_type, created_at, last_error, "
+                "retry_count, next_attempt_at FROM webhook_outbox "
+                "ORDER BY datetime(created_at) DESC, id DESC LIMIT ?",
+                (limit,),
+            )
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+    async def count_webhook_outbox(self, statuses: list[str]) -> int:
+        """v0.27.1 (HA port): count outbox rows whose ``status`` is in
+        ``statuses``. Backs the row-count message and the ``--dry-run``
+        preview of ``coord outbox retry`` / ``purge``."""
+        if not statuses:
+            return 0
+        await self.init()
+        placeholders = ",".join(["?"] * len(statuses))
+        async with self._connect() as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                f"SELECT COUNT(*) AS n FROM webhook_outbox "
+                f"WHERE status IN ({placeholders})",
+                statuses,
+            )
+            row = await cur.fetchone()
+            return int(row["n"]) if row else 0
+
+    async def reset_webhook_outbox(
+        self, statuses: list[str], *, now_iso: str | None = None
+    ) -> int:
+        """v0.27.1 (HA port): reset every outbox row in ``statuses`` back to
+        'pending' with retry_count=0, next_attempt_at=now and last_error
+        cleared so the delivery loop re-tries it. Returns the rows reset.
+        Backs ``coord outbox retry``."""
+        if not statuses:
+            return 0
+        await self.init()
+        now = now_iso or _utcnow()
+        placeholders = ",".join(["?"] * len(statuses))
+        async with self._connect() as conn:
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                f"UPDATE webhook_outbox SET status='pending', retry_count=0, "
+                f"next_attempt_at=?, last_error=NULL "
+                f"WHERE status IN ({placeholders})",
+                [now, *statuses],
+            )
+            await conn.commit()
+            return int(cur.rowcount or 0)
+
+    async def delete_webhook_outbox(self, statuses: list[str]) -> int:
+        """v0.27.1 (HA port): DELETE every outbox row whose ``status`` is in
+        ``statuses`` (terminal states only -- enforced by the caller).
+        Returns the rows removed. Backs ``coord outbox purge``."""
+        if not statuses:
+            return 0
+        await self.init()
+        placeholders = ",".join(["?"] * len(statuses))
+        async with self._connect() as conn:
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                f"DELETE FROM webhook_outbox WHERE status IN ({placeholders})",
+                statuses,
+            )
+            await conn.commit()
+            return int(cur.rowcount or 0)
+
     async def create_engineer_token(
         self,
         engineer: str,
@@ -2818,6 +2898,32 @@ class Database:
                 cid, release_kind="voluntary", actor_engineer=engineer
             )
         return n
+
+    async def release_active_claims_for_engineers(
+        self, engineers: list[str], *, now_iso: str | None = None
+    ) -> dict[str, int]:
+        """v0.28 (HA port): release every active (unreleased) claim owned by
+        each engineer in ``engineers`` by stamping ``released_at=now``.
+
+        Returns ``{engineer: rows_released}`` preserving the input order so
+        ``coord engineers stale --release`` can report a per-engineer
+        breakdown. This is the backend-abstraction replacement for the CLI's
+        former raw ``sqlite3`` UPDATE; it deliberately mirrors that bulk
+        UPDATE (no cascade-resolve) to keep the operator output identical."""
+        await self.init()
+        now = now_iso or _utcnow()
+        released: dict[str, int] = {}
+        async with self._connect() as conn:
+            await _configure_sqlite(conn)
+            for engineer in engineers:
+                cur = await conn.execute(
+                    "UPDATE claims SET released_at = ? "
+                    "WHERE engineer = ? AND released_at IS NULL",
+                    (now, engineer),
+                )
+                released[engineer] = int(cur.rowcount or 0)
+            await conn.commit()
+        return released
 
     async def extend_claim(self, claim_id: str, engineer: str, new_expires_at: str) -> bool:
         await self.init()

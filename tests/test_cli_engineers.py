@@ -1,9 +1,11 @@
 """Tests for the v0.28 ``coord engineers`` operator CLI.
 
 Each test seeds claims into a tmp database via ``insert_claims_batch``
-plus a direct sqlite3 UPDATE to backdate ``last_activity`` (the helper
+plus an ``aiosqlite`` UPDATE to backdate ``last_activity`` (the helper
 always stamps "now" when ``session_id`` is set; we need older values to
-exercise the staleness threshold). The tmp database path is plumbed
+exercise the staleness threshold). The ``aiosqlite`` seam is the one the
+PG test harness redirects to the Postgres schema, so the backdate lands
+in whichever backend the suite runs. The tmp database path is plumbed
 through ``COORD_DATABASE_PATH`` so ``cli_engineers`` resolves it via
 ``Settings`` like every other coord subprocess does.
 
@@ -13,10 +15,10 @@ surface itself is part of the contract under test.
 
 from __future__ import annotations
 
+import aiosqlite
 import asyncio
 import io
 import json
-import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -82,24 +84,34 @@ def _seed_claim(
     backdated = _iso(
         datetime.now(UTC) - timedelta(days=last_activity_days_ago)
     )
-    with sqlite3.connect(str(path)) as conn:
-        conn.execute(
-            "UPDATE claims SET last_activity = ? WHERE id = ?",
-            (backdated, cid),
-        )
-        conn.commit()
+
+    async def _backdate() -> None:
+        # aiosqlite.connect is redirected to the Postgres schema by the PG
+        # test harness, so the backdate lands in whichever backend runs.
+        async with aiosqlite.connect(str(path)) as conn:
+            await conn.execute(
+                "UPDATE claims SET last_activity = ? WHERE id = ?",
+                (backdated, cid),
+            )
+            await conn.commit()
+
+    asyncio.run(_backdate())
     return cid
 
 
 def _count_active(path: Path, engineer: str) -> int:
     """Count engineer's still-open claim rows (``released_at IS NULL``)."""
-    with sqlite3.connect(str(path)) as conn:
-        cur = conn.execute(
-            "SELECT COUNT(*) FROM claims "
-            "WHERE engineer = ? AND released_at IS NULL",
-            (engineer,),
-        )
-        return int(cur.fetchone()[0])
+    async def _go() -> int:
+        async with aiosqlite.connect(str(path)) as conn:
+            cur = await conn.execute(
+                "SELECT COUNT(*) FROM claims "
+                "WHERE engineer = ? AND released_at IS NULL",
+                (engineer,),
+            )
+            row = await cur.fetchone()
+            return int(row[0])
+
+    return asyncio.run(_go())
 
 
 def _run(argv: list[str]) -> int:

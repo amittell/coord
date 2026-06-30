@@ -5,17 +5,16 @@ delivery loop (see ``service.deliver_pending_webhooks``). v0.27.1 layers
 the operator UX on top: stats, tail, retry, and purge subcommands that
 run against the local database without going through the HTTP API.
 
-The CLI is intentionally sync. The single async helper we lean on
-(``Database.webhook_delivery_stats``) is wrapped in ``asyncio.run`` so
-the surrounding command stays a plain procedure call -- ``coord outbox``
-is invoked from shells and is not in any hot path where event-loop
-overhead would matter.
-
-Database access for the read-only inspection paths (``tail``) and the
-small mutators (``retry``, ``purge``) goes through ``sqlite3`` directly.
-That keeps the CLI module dependency-free relative to the async stack
-and keeps the SQL it runs visible at the call site for an operator
-reading the source.
+The CLI is intentionally sync, but every database access now goes
+through the async ``Database`` / store abstraction (``recent_webhook_outbox``,
+``count_webhook_outbox``, ``reset_webhook_outbox``, ``delete_webhook_outbox``
+and ``webhook_delivery_stats``), each wrapped in ``asyncio.run`` so the
+surrounding command stays a plain procedure call. ``coord outbox`` is
+invoked from shells, not a hot path, so the per-call event-loop setup is
+irrelevant -- and routing through ``Database`` means the backend selected
+by ``COORD_DATABASE_URL`` (SQLite by default, PostgresStore for a
+``postgresql://`` DSN) is honoured, instead of a raw ``sqlite3`` connection
+that only ever saw the local SQLite file.
 """
 
 from __future__ import annotations
@@ -23,13 +22,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import sqlite3
+import os
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
 from coordination.config import get_settings
-from coordination.db import Database, _utcnow
+from coordination.db import Database
 
 
 # ---------------------------------------------------------------------------
@@ -85,13 +84,27 @@ def _db_path() -> Path:
     return Path(get_settings().database_path)
 
 
+def _postgres_selected() -> bool:
+    """True when ``COORD_DATABASE_URL`` selects the Postgres backend.
+
+    The missing-file guard below is a SQLite-only safety net (the PG
+    backend keeps its data in a schema, not the ``database_path`` file),
+    so it is skipped in PG mode.
+    """
+    url = os.environ.get("COORD_DATABASE_URL", "")
+    return url.startswith("postgresql://") or url.startswith("postgres://")
+
+
 def _ensure_db(path: Path) -> None:
-    """Refuse to operate on a database file that does not exist.
+    """Refuse to operate on a SQLite database file that does not exist.
 
     Exits with code 2 (database error) so the operator gets a clear
-    message instead of an opaque ``OperationalError: unable to open
-    database file`` from sqlite3 on the next read.
+    message instead of an opaque ``unable to open database file`` on the
+    next read. Inert under Postgres, where the data lives in a PG schema
+    rather than the ``database_path`` file.
     """
+    if _postgres_selected():
+        return
     if not path.exists():
         print(
             f"Database not found at {path}. Set COORD_DATABASE_PATH or run "
@@ -99,13 +112,6 @@ def _ensure_db(path: Path) -> None:
             file=sys.stderr,
         )
         raise SystemExit(2)
-
-
-def _connect(path: Path) -> sqlite3.Connection:
-    """Open a sync sqlite3 connection with ``Row`` access for ergonomic reads."""
-    conn = sqlite3.connect(str(path))
-    conn.row_factory = sqlite3.Row
-    return conn
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +135,7 @@ def _run_stats(args: argparse.Namespace) -> int:
         stats = asyncio.run(
             Database(path).webhook_delivery_stats(window_hours=hours)
         )
-    except sqlite3.Error as exc:
+    except Exception as exc:
         print(f"Database error: {exc}", file=sys.stderr)
         return 2
 
@@ -180,15 +186,8 @@ def _run_tail(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        with _connect(path) as conn:
-            cur = conn.execute(
-                "SELECT id, status, event_type, created_at, last_error, "
-                "retry_count, next_attempt_at FROM webhook_outbox "
-                "ORDER BY datetime(created_at) DESC, id DESC LIMIT ?",
-                (n,),
-            )
-            rows = [dict(r) for r in cur.fetchall()]
-    except sqlite3.Error as exc:
+        rows = asyncio.run(Database(path).recent_webhook_outbox(limit=n))
+    except Exception as exc:
         print(f"Database error: {exc}", file=sys.stderr)
         return 2
 
@@ -285,30 +284,17 @@ def _run_retry(args: argparse.Namespace) -> int:
     if statuses is None:
         return 1
 
-    placeholders = ",".join(["?"] * len(statuses))
-    now = _utcnow()
     try:
-        with _connect(path) as conn:
-            cur = conn.execute(
-                f"SELECT COUNT(*) FROM webhook_outbox WHERE status IN ({placeholders})",
-                statuses,
+        db = Database(path)
+        if args.dry_run:
+            count = asyncio.run(db.count_webhook_outbox(statuses))
+            print(
+                f"DRY RUN: would reset {count} row(s) "
+                f"(statuses={','.join(statuses)})."
             )
-            count = int(cur.fetchone()[0])
-            if args.dry_run:
-                print(
-                    f"DRY RUN: would reset {count} row(s) "
-                    f"(statuses={','.join(statuses)})."
-                )
-                return 0
-            if count:
-                conn.execute(
-                    f"UPDATE webhook_outbox SET status='pending', "
-                    f"retry_count=0, next_attempt_at=?, last_error=NULL "
-                    f"WHERE status IN ({placeholders})",
-                    [now, *statuses],
-                )
-                conn.commit()
-    except sqlite3.Error as exc:
+            return 0
+        count = asyncio.run(db.reset_webhook_outbox(statuses))
+    except Exception as exc:
         print(f"Database error: {exc}", file=sys.stderr)
         return 2
 
@@ -355,27 +341,17 @@ def _run_purge(args: argparse.Namespace) -> int:
     if statuses is None:
         return 1
 
-    placeholders = ",".join(["?"] * len(statuses))
     try:
-        with _connect(path) as conn:
-            cur = conn.execute(
-                f"SELECT COUNT(*) FROM webhook_outbox WHERE status IN ({placeholders})",
-                statuses,
+        db = Database(path)
+        if args.dry_run:
+            count = asyncio.run(db.count_webhook_outbox(statuses))
+            print(
+                f"DRY RUN: would remove {count} row(s) "
+                f"(statuses={','.join(statuses)})."
             )
-            count = int(cur.fetchone()[0])
-            if args.dry_run:
-                print(
-                    f"DRY RUN: would remove {count} row(s) "
-                    f"(statuses={','.join(statuses)})."
-                )
-                return 0
-            if count:
-                conn.execute(
-                    f"DELETE FROM webhook_outbox WHERE status IN ({placeholders})",
-                    statuses,
-                )
-                conn.commit()
-    except sqlite3.Error as exc:
+            return 0
+        count = asyncio.run(db.delete_webhook_outbox(statuses))
+    except Exception as exc:
         print(f"Database error: {exc}", file=sys.stderr)
         return 2
 
