@@ -9,6 +9,14 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.40.1] - 2026-06-30
+
+### Fixed
+
+- JSON log lines no longer carry uvicorn's ``color_message`` field (the
+  ANSI-coloured duplicate of ``msg`` that uvicorn attaches to its records),
+  which was terminal noise in structured output.
+
 ## [0.40.0] - 2026-06-29
 
 ### Changed
