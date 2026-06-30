@@ -11,10 +11,12 @@ Two concerns live together here because they share a context variable:
    :class:`logging.LogRecord` to a one-line JSON object, including the
    request ID when one is bound.
 
-JSON output is opt-in: :func:`configure_logging` only installs the JSON
-formatter when ``COORD_LOG_JSON`` is truthy. Otherwise it configures a
-plain human-readable formatter so local development keeps its familiar
-unstructured output.
+JSON output is the default: :func:`configure_logging` installs the JSON
+formatter unless ``COORD_LOG_JSON`` is explicitly set to a falsy value
+(``0``/``false``/``no``/``off``), in which case it falls back to a plain
+human-readable formatter -- convenient for local development. Structured
+JSON is the right default for the deployments coord runs in (a log
+aggregator like Loki ingests the container stream).
 """
 
 from __future__ import annotations
@@ -114,16 +116,30 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, separators=(",", ":"))
 
 
-def _env_truthy(name: str) -> bool:
-    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
+def _env_flag(name: str, *, default: bool) -> bool:
+    """Read a boolean env flag, falling back to ``default``.
+
+    Truthy: ``1``/``true``/``yes``/``on``. Falsy: ``0``/``false``/``no``/
+    ``off``. Unset or unrecognised returns ``default``.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    val = raw.strip().lower()
+    if val in {"1", "true", "yes", "on"}:
+        return True
+    if val in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 def configure_logging() -> None:
     """Configure the ``coordination`` logger namespace.
 
-    Reads ``COORD_LOG_LEVEL`` (default ``INFO``) for the level, and
-    ``COORD_LOG_JSON`` to decide between :class:`JsonFormatter` and
-    a human-readable default. This only configures the ``coordination``
+    Reads ``COORD_LOG_LEVEL`` (default ``INFO``) for the level. Logs are
+    structured one-line JSON by default (best for log aggregators such as
+    Loki); set ``COORD_LOG_JSON=false`` to fall back to a plain
+    human-readable formatter. This only configures the ``coordination``
     logger so uvicorn's own access logs keep their existing formatting.
     """
     level_name = os.environ.get("COORD_LOG_LEVEL", "INFO").upper()
@@ -132,7 +148,7 @@ def configure_logging() -> None:
         level = logging.INFO
 
     handler = logging.StreamHandler(stream=sys.stderr)
-    if _env_truthy("COORD_LOG_JSON"):
+    if _env_flag("COORD_LOG_JSON", default=True):
         handler.setFormatter(JsonFormatter())
     else:
         handler.setFormatter(

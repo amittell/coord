@@ -62,7 +62,7 @@ def test_configure_logging_uses_env_level(monkeypatch: pytest.MonkeyPatch) -> No
     assert logging.getLogger("coordination").level == logging.WARNING
 
 
-def test_configure_logging_json_mode_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_configure_logging_json_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("COORD_LOG_JSON", "true")
     monkeypatch.setenv("COORD_LOG_LEVEL", "INFO")
     coord_logging.configure_logging()
@@ -71,8 +71,19 @@ def test_configure_logging_json_mode_opt_in(monkeypatch: pytest.MonkeyPatch) -> 
     assert any(isinstance(h.formatter, coord_logging.JsonFormatter) for h in handlers)
 
 
-def test_configure_logging_defaults_to_plain(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_configure_logging_defaults_to_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    """JSON is the default when COORD_LOG_JSON is unset (best for Loki)."""
     monkeypatch.delenv("COORD_LOG_JSON", raising=False)
+    monkeypatch.setenv("COORD_LOG_LEVEL", "INFO")
+    coord_logging.configure_logging()
+    handlers = logging.getLogger("coordination").handlers
+    assert handlers
+    assert any(isinstance(h.formatter, coord_logging.JsonFormatter) for h in handlers)
+
+
+def test_configure_logging_plain_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """COORD_LOG_JSON=false opts back out to the plain human-readable formatter."""
+    monkeypatch.setenv("COORD_LOG_JSON", "false")
     monkeypatch.setenv("COORD_LOG_LEVEL", "INFO")
     coord_logging.configure_logging()
     handlers = logging.getLogger("coordination").handlers
