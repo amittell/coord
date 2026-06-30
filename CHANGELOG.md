@@ -9,6 +9,22 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.40.0] - 2026-06-29
+
+### Changed
+
+- The whole server process now emits one consistent log format. uvicorn's
+  own loggers (the startup banner, its error logger, and the access
+  logger) are routed through coord's formatter, so they are JSON when
+  ``COORD_LOG_JSON`` is on (the default) instead of uvicorn's plain text.
+  ``run()`` passes ``log_config=None`` so uvicorn does not reinstall its
+  defaults over coord's. Previously only the ``coordination.*`` loggers
+  honoured the JSON setting; uvicorn's lines stayed plain.
+- uvicorn's per-request access log is disabled (``access_log=False``). The
+  access-log middleware already emits a richer structured line (method,
+  path, status, ``duration_ms``, ``request_id``) for every request, so
+  uvicorn's plain access line was a strict duplicate.
+
 ## [0.39.0] - 2026-06-29
 
 ### Changed
