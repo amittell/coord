@@ -557,15 +557,14 @@ async def _auto_resolution_event_exists(
     extracted from the JSON detail blob. SQLite's ``json_extract``
     handles the lookup natively when JSON1 is compiled in (default in
     every modern build, including the wheel aiosqlite links against).
+
+    Routed through :meth:`Database._acquire` so that when this check
+    runs inside the claim-grant transaction (the auto-resolution
+    bookkeeping the design folds into the one unit-of-work) it reads
+    through the bound connection and sees that transaction's own writes;
+    outside a transaction it opens its own connection exactly as before.
     """
-    import aiosqlite
-
-    from coordination.db import _configure_sqlite
-
-    await db.init()
-    async with aiosqlite.connect(db.path) as conn:
-        conn.row_factory = aiosqlite.Row
-        await _configure_sqlite(conn)
+    async with db._acquire() as (conn, _owns):
         cur = await conn.execute(
             """
             SELECT 1 FROM request_events

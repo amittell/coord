@@ -27,7 +27,7 @@ from coordination import oidc
 from coordination.cli_shared import parse_duration
 from coordination.config import get_settings
 from coordination.dashboard import render_dashboard
-from coordination.db import acquire_instance_lock
+from coordination.db import _LOCK_SKIPPED, acquire_instance_lock
 from coordination.deps import get_service
 from coordination.tokens import generate_raw_token, sha256_token
 from coordination.logging import (
@@ -77,7 +77,16 @@ async def lifespan(app: FastAPI):
     # Held for the process lifetime; stash the fd on app state so it is
     # not garbage-collected mid-run. fcntl auto-releases the flock when
     # the fd is closed or the process exits.
-    app.state.instance_lock_fd = acquire_instance_lock(settings.database_path)
+    # The flock instance lock detects a second SQLite writer on one file; it
+    # is meaningless across pods sharing a Postgres (design Section 7). In PG
+    # mode bypass it (return the sentinel) -- multiple replicas are expected.
+    if settings.database_url and (
+        settings.database_url.startswith("postgresql://")
+        or settings.database_url.startswith("postgres://")
+    ):
+        app.state.instance_lock_fd = _LOCK_SKIPPED
+    else:
+        app.state.instance_lock_fd = acquire_instance_lock(settings.database_path)
 
     await get_service().db.init()
     metrics.set_build_info(__version__)
@@ -99,14 +108,49 @@ async def lifespan(app: FastAPI):
             await _shutdown_lsp_pool()
         return
 
+    # Single-leader election for the multi-replica background loops
+    # (design Section 6). All three loops below mutate shared DB state
+    # (and webhook delivery POSTs externally), so on Postgres three
+    # replicas running them unguarded would expire/auto-demote in
+    # triplicate and -- worst -- deliver every webhook 3x. The lease lets
+    # exactly one replica (the leader) run the per-DB work. On SQLite
+    # there is a single writer process, so the lease is unconditionally
+    # True and every loop runs exactly as it always has. ``leader_id`` is
+    # minted once per process so the lease is stable across renew ticks;
+    # the TTL bounds how long a dead leader blocks failover.
+    leader_id = uuid4().hex
+    leader_lease_ttl = (
+        max(
+            settings.cleanup_interval_sec,
+            settings.auto_demote_interval_sec,
+            settings.webhook_delivery_interval_sec,
+        )
+        * 3
+        + 5
+    )
+
+    async def _is_background_leader() -> bool:
+        try:
+            return await get_service().db.acquire_leader_lease(
+                lease_name="coord-background-loops",
+                holder_id=leader_id,
+                ttl_sec=leader_lease_ttl,
+            )
+        except Exception:  # pragma: no cover - lease failures must not kill the loop
+            logger.exception("leader lease check failed; skipping this tick")
+            return False
+
     async def cleanup_loop() -> None:
         while True:
-            try:
-                await get_service().db.expire_stale_claims(
-                    idle_timeout_sec=settings.idle_timeout_sec
-                )
-            except Exception:  # pragma: no cover - background cleanup failures are logged
-                logger.exception("Failed to expire stale claims")
+            # Claim expiry mutates the DB -> leader only (design Section 6).
+            leader = await _is_background_leader()
+            if leader:
+                try:
+                    await get_service().db.expire_stale_claims(
+                        idle_timeout_sec=settings.idle_timeout_sec
+                    )
+                except Exception:  # pragma: no cover - background cleanup failures are logged
+                    logger.exception("Failed to expire stale claims")
             # v0.31 wave 2: rename auto-follow sweep piggybacks on the
             # cleanup cadence rather than running its own task -- one
             # background heartbeat, two cheap jobs. Gated on
@@ -114,15 +158,19 @@ async def lifespan(app: FastAPI):
             # no-op; the sweep itself is bounded (max 20 claims per
             # pass) and never raises past this guard.
             if settings.lsp_enabled:
-                try:
-                    await get_service().rename_sweep()
-                except Exception:  # pragma: no cover - background failures are logged
-                    logger.exception("Failed to run rename auto-follow sweep")
+                # The sweep mutates the DB -> leader only.
+                if leader:
+                    try:
+                        await get_service().rename_sweep()
+                    except Exception:  # pragma: no cover - background failures are logged
+                        logger.exception("Failed to run rename auto-follow sweep")
                 # Reap language servers idle past
                 # lsp_idle_shutdown_sec -- this loop is the only
                 # production caller, so without it the reaper would be
                 # dead code and every spawned server would live for
-                # the process lifetime.
+                # the process lifetime. Per-process: every replica owns
+                # the language servers IT spawned, so this runs on every
+                # replica regardless of leadership.
                 try:
                     from coordination.lsp import get_lsp_pool
 
@@ -139,10 +187,12 @@ async def lifespan(app: FastAPI):
         Disabled when the interval is 0 or threshold is 0 (the service
         layer short-circuits the latter)."""
         while True:
-            try:
-                await get_service()._maybe_auto_demote()
-            except Exception:  # pragma: no cover - background failures are logged
-                logger.exception("Failed to run auto-demote sweep")
+            # Auto-demote mutates ownership_config -> leader only.
+            if await _is_background_leader():
+                try:
+                    await get_service()._maybe_auto_demote()
+                except Exception:  # pragma: no cover - background failures are logged
+                    logger.exception("Failed to run auto-demote sweep")
             await asyncio.sleep(settings.auto_demote_interval_sec)
 
     async def webhook_delivery_loop() -> None:
@@ -153,10 +203,14 @@ async def lifespan(app: FastAPI):
         when ``COORD_WEBHOOK_URL`` is configured so deployments that
         don't use webhooks pay no scheduler overhead."""
         while True:
-            try:
-                await get_service().deliver_pending_webhooks()
-            except Exception:  # pragma: no cover - background failures are logged
-                logger.exception("webhook_delivery_loop: tick failed")
+            # Webhook delivery POSTs externally and marks rows delivered;
+            # leader only so the outbox is drained once, not once per
+            # replica (design Section 6 -- at-least-once-once delivery).
+            if await _is_background_leader():
+                try:
+                    await get_service().deliver_pending_webhooks()
+                except Exception:  # pragma: no cover - background failures are logged
+                    logger.exception("webhook_delivery_loop: tick failed")
             await asyncio.sleep(settings.webhook_delivery_interval_sec)
 
     task = asyncio.create_task(cleanup_loop())
