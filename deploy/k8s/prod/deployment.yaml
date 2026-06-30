@@ -7,9 +7,12 @@ metadata:
     app.kubernetes.io/name: coord
     app.kubernetes.io/component: api
 spec:
-  replicas: 1
+  replicas: 3
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: coord
@@ -41,8 +44,14 @@ spec:
               value: "0.0.0.0"
             - name: COORD_PORT
               value: "8080"
-            - name: COORD_DATABASE_PATH
-              value: /data/coordination.db
+            # Stateless HA: coord connects to the in-cluster Postgres primary
+            # (postgres.yaml). COORD_DATABASE_URL takes precedence over the
+            # deprecated COORD_DATABASE_PATH alias, so no PVC is mounted here.
+            - name: COORD_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: coord-pg
+                  key: COORD_DATABASE_URL
             # v0.29: reject the shared COORD_AUTH_TOKEN once every
             # engineer has been migrated to a per-engineer token
             # (via `coord tokens create` against this same db). The
@@ -95,13 +104,8 @@ spec:
               drop:
                 - ALL
           volumeMounts:
-            - name: data
-              mountPath: /data
             - name: tmp
               mountPath: /tmp
       volumes:
-        - name: data
-          persistentVolumeClaim:
-            claimName: coord-data
         - name: tmp
           emptyDir: {}

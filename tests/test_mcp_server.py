@@ -247,9 +247,9 @@ async def test_check_conflicts_passes_params_as_list_of_tuples_preserving_order(
     real_async_client = httpx.AsyncClient
 
     class _RecordingClient(real_async_client):  # type: ignore[misc,valid-type]
-        async def get(self, url, *args, **kwargs):  # type: ignore[no-untyped-def]
+        async def request(self, method, url, *args, **kwargs):  # type: ignore[no-untyped-def]
             captured_params.append(kwargs.get("params"))
-            return await super().get(url, *args, **kwargs)
+            return await super().request(method, url, *args, **kwargs)
 
     def factory(**kwargs: Any) -> httpx.AsyncClient:
         kwargs["transport"] = httpx.MockTransport(

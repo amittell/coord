@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import atexit
 import os
+import random
 import subprocess
 import tempfile
 import time
@@ -127,6 +129,178 @@ _MARKER_LOCK_POLL_SECONDS = 0.05
 _MARKER_LOCK_STALE_SECONDS = 30.0
 
 
+# ---------------------------------------------------------------------------
+# Client-side resilience: retry + idempotency (design Section 10.1)
+#
+# coord sits on the hot path of every edit, behind Cloudflare -> cloudflared
+# -> a ClusterIP Service. Deploy/restart windows and transient gateway blips
+# surface to agents as HTTP 502/503/504 or as connect/read transport failures.
+#
+# For IDEMPOTENT reads (list_claims, check_conflicts, pending_requests,
+# my_requests, the wait_for_request poll, and any other GET) replaying the
+# request is ALWAYS safe -- there is no server-side effect to double-apply --
+# so we retry them with capped exponential backoff + full jitter. That makes a
+# rolling coord restart invisible to a read-mostly agent with no server change.
+#
+# MUTATING operations (claim / refactor / release / respond / cancel) are
+# different: blindly retrying a POST that actually succeeded server-side but
+# whose response was lost in transit would double-create. Safe mutation retry
+# requires server-side request de-duplication keyed on a client-supplied
+# idempotency token; that server support lands with the core HA work and does
+# NOT exist yet. So for every mutation we:
+#   1. ALWAYS attach a stable ``X-Coord-Idempotency-Key`` (uuid4, identical
+#      across retries of the same logical call). The moment the server learns
+#      to dedupe, existing clients already cooperate -- and this is also what
+#      makes the cutover "re-announce" (design Section 8) safe.
+#   2. DO NOT auto-retry by default. Mutation retry is gated behind
+#      COORD_RETRY_MUTATIONS (default OFF) and MUST stay off until server-side
+#      dedup exists, or a lost-response replay can double-grant.
+# ---------------------------------------------------------------------------
+
+# Gateway statuses that mean "transient, try again" rather than a real answer.
+_RETRYABLE_STATUS = frozenset({502, 503, 504})
+
+# Transport-level failures safe to retry for an idempotent op: a connect
+# failure means the request likely never reached the server; a read timeout
+# means the reply was never received. ConnectTimeout is a ConnectError
+# subclass but we name it explicitly for clarity.
+_TRANSIENT_EXC: tuple[type[Exception], ...] = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.ReadTimeout,
+)
+
+# Header carrying the client idempotency token on mutating requests.
+_IDEMPOTENCY_HEADER = "X-Coord-Idempotency-Key"
+
+# Module-level RNG for jitter. A dedicated instance keeps backoff jitter from
+# perturbing (or being perturbed by) any global random.seed() a host sets.
+_RNG = random.Random()
+
+
+def _should_retry_status(status_code: int) -> bool:
+    """True when an HTTP status is a transient gateway error worth retrying."""
+    return status_code in _RETRYABLE_STATUS
+
+
+def _is_transient_exc(exc: BaseException) -> bool:
+    """True when a transport exception is safe to retry for an idempotent op."""
+    return isinstance(exc, _TRANSIENT_EXC)
+
+
+def _retry_settings() -> tuple[int, float, float, bool]:
+    """Read retry tunables from the environment, defensively.
+
+    Returns ``(max_attempts, base_delay, max_delay, retry_mutations)`` where
+    ``max_attempts`` counts the first try plus retries (so ``1`` == no retry).
+    A malformed COORD_* override falls back to its default rather than
+    raising -- a bad env value must never break a tool call.
+    """
+
+    def _int(name: str, default: int) -> int:
+        try:
+            return max(1, int(os.environ.get(name, "").strip() or default))
+        except (TypeError, ValueError):
+            return default
+
+    def _float(name: str, default: float) -> float:
+        try:
+            v = float(os.environ.get(name, "").strip() or default)
+            return v if v >= 0 else default
+        except (TypeError, ValueError):
+            return default
+
+    retry_mutations = os.environ.get("COORD_RETRY_MUTATIONS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    return (
+        _int("COORD_RETRY_MAX_ATTEMPTS", 4),
+        _float("COORD_RETRY_BASE_DELAY", 0.1),
+        _float("COORD_RETRY_MAX_DELAY", 5.0),
+        retry_mutations,
+    )
+
+
+def _backoff_delay(
+    attempt: int,
+    *,
+    base: float,
+    cap: float,
+    rng: random.Random | None = None,
+) -> float:
+    """Capped exponential backoff with full jitter for retry ``attempt``.
+
+    ``attempt`` is 0-based (0 == the delay before the first retry). The
+    uncapped target is ``base * 2**attempt``; it is clamped to ``cap`` and a
+    full-jitter sample in ``[0, capped]`` is returned, so a fleet of ~40
+    agents retrying after the same deploy blip does not thunder in lockstep.
+    """
+    rng = rng or _RNG
+    target = base * (2 ** max(0, attempt))
+    capped = min(target, cap)
+    if capped <= 0:
+        return 0.0
+    return rng.uniform(0.0, capped)
+
+
+async def _request_with_retry(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    *,
+    idempotent: bool,
+    **kwargs: Any,
+) -> httpx.Response:
+    """Send one HTTP request, retrying transient failures when it is safe.
+
+    ``idempotent`` declares whether the operation is safe to replay: ``True``
+    for reads/GETs (retried on 502/503/504 and connect/read failures);
+    ``False`` for mutations. A mutation always receives a stable
+    ``X-Coord-Idempotency-Key`` header (so a future de-duping server can
+    collapse replays) but is auto-retried ONLY when COORD_RETRY_MUTATIONS is
+    enabled -- OFF by default, because lost-response replay can double-grant
+    until server-side dedup exists.
+
+    On exhaustion: a transient exception is re-raised; a retryable status is
+    returned as-is so the caller's existing status handling / raise_for_status
+    runs unchanged.
+    """
+    max_attempts, base, cap, retry_mutations = _retry_settings()
+    headers = dict(kwargs.pop("headers", None) or {})
+    if not idempotent:
+        # Stable across retries of this one logical mutation.
+        headers.setdefault(_IDEMPOTENCY_HEADER, str(uuid.uuid4()))
+    retry_enabled = idempotent or retry_mutations
+
+    last_exc: BaseException | None = None
+    for attempt in range(max_attempts):
+        is_last = attempt + 1 >= max_attempts
+        try:
+            response = await client.request(method, url, headers=headers, **kwargs)
+        except _TRANSIENT_EXC as exc:
+            last_exc = exc
+            if retry_enabled and not is_last:
+                await asyncio.sleep(_backoff_delay(attempt, base=base, cap=cap))
+                continue
+            raise
+        if (
+            retry_enabled
+            and not is_last
+            and _should_retry_status(response.status_code)
+        ):
+            await asyncio.sleep(_backoff_delay(attempt, base=base, cap=cap))
+            continue
+        return response
+
+    # Only reachable if every attempt raised a transient exception while retry
+    # was enabled (the final attempt re-raises above, so this is defensive).
+    assert last_exc is not None
+    raise last_exc
+
+
 @mcp.tool()
 async def list_claims(
     active_only: bool = True,
@@ -155,7 +329,14 @@ async def list_claims(
     # claims should not idle-expire.
     params["session_id"] = _SESSION_ID
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.get(f"{_base_url()}/claims", params=params, headers=_headers())
+        r = await _request_with_retry(
+            client,
+            "GET",
+            f"{_base_url()}/claims",
+            params=params,
+            headers=_headers(),
+            idempotent=True,
+        )
         r.raise_for_status()
         return r.json()
 
@@ -186,7 +367,14 @@ async def check_conflicts(
     # as an activity ping for idle expiration on the server side.
     params.append(("session_id", _SESSION_ID))
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.get(f"{_base_url()}/conflicts", params=params, headers=_headers())
+        r = await _request_with_retry(
+            client,
+            "GET",
+            f"{_base_url()}/conflicts",
+            params=params,
+            headers=_headers(),
+            idempotent=True,
+        )
         r.raise_for_status()
         return r.json()
 
@@ -416,7 +604,14 @@ async def claim_files(
     if urgency is not None:
         body["urgency"] = urgency
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.post(f"{_base_url()}/claims", json=body, headers={**_headers(), "Content-Type": "application/json"})
+        r = await _request_with_retry(
+            client,
+            "POST",
+            f"{_base_url()}/claims",
+            json=body,
+            headers={**_headers(), "Content-Type": "application/json"},
+            idempotent=False,
+        )
         if r.status_code == 429:
             # v0.30 rate limit. Like 400/409 below this is structured
             # data the agent should reason about, not an exception:
@@ -497,10 +692,13 @@ async def claim_refactor(
         body["repo"] = repo_id
     body["session_id"] = _SESSION_ID
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.post(
+        r = await _request_with_retry(
+            client,
+            "POST",
             f"{_base_url()}/claims/refactor",
             json=body,
             headers={**_headers(), "Content-Type": "application/json"},
+            idempotent=False,
         )
         if r.status_code == 503:
             # LSP disabled or unavailable server-side. Structured, not
@@ -525,10 +723,13 @@ async def claim_refactor(
 async def release_claims(claim_ids: list[str], engineer: str | None = None) -> dict[str, Any]:
     """Release claim IDs when work is finished."""
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.post(
+        r = await _request_with_retry(
+            client,
+            "POST",
             f"{_base_url()}/claims/release",
             json={"claim_ids": claim_ids, "engineer": engineer},
             headers={**_headers(), "Content-Type": "application/json"},
+            idempotent=False,
         )
         r.raise_for_status()
         return r.json()
@@ -546,9 +747,12 @@ async def pending_requests(session_id: str | None = None) -> dict[str, Any]:
     """
     sid = session_id if session_id is not None else _SESSION_ID
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.get(
+        r = await _request_with_retry(
+            client,
+            "GET",
             f"{_base_url()}/sessions/{sid}/pending_requests",
             headers=_headers(),
+            idempotent=True,
         )
         r.raise_for_status()
         return r.json()
@@ -605,10 +809,13 @@ async def request_release(
     async with httpx.AsyncClient(
         timeout=max(30.0, wait_seconds + 30.0)
     ) as client:
-        r = await client.post(
+        r = await _request_with_retry(
+            client,
+            "POST",
             f"{_base_url()}/requests",
             json=body,
             headers={**_headers(), "Content-Type": "application/json"},
+            idempotent=False,
         )
         if r.status_code in (404, 409):
             return r.json()
@@ -664,10 +871,13 @@ async def respond_to_request(
     if coexist_symbols:
         body["coexist_symbols"] = coexist_symbols
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.post(
+        r = await _request_with_retry(
+            client,
+            "POST",
             f"{_base_url()}/requests/{request_id}/respond",
             json=body,
             headers={**_headers(), "Content-Type": "application/json"},
+            idempotent=False,
         )
         r.raise_for_status()
         return r.json()
@@ -690,9 +900,12 @@ async def wait_for_request(
     poll_interval = 1.0
     async with httpx.AsyncClient(timeout=10.0) as client:
         while True:
-            r = await client.get(
+            r = await _request_with_retry(
+                client,
+                "GET",
                 f"{_base_url()}/requests/{request_id}",
                 headers=_headers(),
+                idempotent=True,
             )
             if r.status_code == 404:
                 return r.json()
@@ -732,10 +945,13 @@ async def my_requests(
     if queued is not None and queued:
         params["queued"] = "true"
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.get(
+        r = await _request_with_retry(
+            client,
+            "GET",
             f"{_base_url()}/requests",
             params=params,
             headers=_headers(),
+            idempotent=True,
         )
         r.raise_for_status()
         return r.json()
@@ -753,9 +969,12 @@ async def release_session(session_id: str | None = None) -> dict[str, Any]:
     Codex restart whose id was logged elsewhere)."""
     sid = session_id if session_id is not None else _SESSION_ID
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.post(
+        r = await _request_with_retry(
+            client,
+            "POST",
             f"{_base_url()}/sessions/{sid}/release",
             headers=_headers(),
+            idempotent=False,
         )
         r.raise_for_status()
         return r.json()
@@ -776,10 +995,13 @@ async def cancel_queue_request(
         params: dict[str, Any] = {}
         if engineer:
             params["engineer"] = engineer
-        r = await client.delete(
+        r = await _request_with_retry(
+            client,
+            "DELETE",
             f"{_base_url()}/requests/{queue_id}",
             params=params,
             headers=_headers(),
+            idempotent=False,
         )
         r.raise_for_status()
         return r.json()
