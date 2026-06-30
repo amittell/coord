@@ -194,7 +194,7 @@ The shared token has no grace-window mechanism; if you need zero-downtime rotati
 - `/meta`: name, version, auth mode, and whether `COORD_REPO_ROOT` is configured.
 - `/metrics`: Prometheus-style text exposition (`text/plain; version=0.0.4`). Exposed unauthenticated by convention so standard Prometheus scrapers work without custom headers. If you need to restrict it, front the service with a reverse proxy that gates `/metrics` separately from the rest of the API.
 - Per-request IDs: every response carries an `X-Request-ID` header. If the client sends one on the request the service echoes it; otherwise the service mints a 16-character hex id. Use it to correlate a client error with a specific server-side log line.
-- Structured logs (opt-in): set `COORD_LOG_JSON=true` to switch the `coordination.*` loggers to one-line JSON output with `ts`, `level`, `logger`, `msg`, and `request_id` (when set). The default remains human-readable so local development is unaffected.
+- Structured logs (default): the `coordination.*` loggers emit one-line JSON by default (`ts`, `level`, `logger`, `msg`, and `request_id` when set), which a log aggregator such as Loki ingests directly from the container stream. Set `COORD_LOG_JSON=false` to opt back out to a plain human-readable formatter for local development.
 
 ### Metrics surfaced
 

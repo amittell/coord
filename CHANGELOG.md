@@ -9,6 +9,19 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.39.0] - 2026-06-29
+
+### Changed
+
+- Structured JSON logging is now the **default**. The ``coordination.*``
+  loggers emit one-line JSON (``ts``, ``level``, ``logger``, ``msg``, and
+  ``request_id`` when set) unless ``COORD_LOG_JSON`` is explicitly set to a
+  falsy value (``0``/``false``/``no``/``off``), which restores the plain
+  human-readable formatter for local development. Previously JSON was
+  opt-in (off by default). This makes coord's logs ingest cleanly into a
+  log aggregator (e.g. Loki via promtail) out of the box, with no
+  per-deployment env required.
+
 ## [0.38.0] - 2026-06-28
 
 ### Added
