@@ -65,6 +65,12 @@ _NS_SEED = 0
 _POOL: asyncpg.Pool | None = None
 _POOL_LOOP: asyncio.AbstractEventLoop | None = None
 _POOL_DSN: str | None = None
+# Guards pool creation so two concurrent first-requests on the same loop cannot
+# both observe ``_POOL is None`` across the ``await create_pool`` suspension and
+# build (then leak) two pools. Keyed per running loop because an asyncio.Lock is
+# bound to the loop it is used on; the dict insert itself is a synchronous,
+# atomic step on a single-threaded loop so the get-or-create needs no lock.
+_POOL_LOCKS: dict[asyncio.AbstractEventLoop, asyncio.Lock] = {}
 
 
 def terminate_pool() -> None:
@@ -82,33 +88,57 @@ def terminate_pool() -> None:
     _POOL = None
     _POOL_LOOP = None
     _POOL_DSN = None
+    # Drop the per-loop creation locks too; their loops are being torn down and
+    # the next _get_pool rebuilds the lock for whatever loop is then running.
+    _POOL_LOCKS.clear()
+
+
+def _stale(loop: asyncio.AbstractEventLoop, dsn: str) -> bool:
+    return _POOL is not None and (
+        _POOL_LOOP is not loop
+        or _POOL_DSN != dsn
+        or getattr(_POOL, "_closed", False)
+    )
 
 
 async def _get_pool(dsn: str) -> asyncpg.Pool:
     global _POOL, _POOL_LOOP, _POOL_DSN
     loop = asyncio.get_running_loop()
-    if _POOL is not None and (
-        _POOL_LOOP is not loop
-        or _POOL_DSN != dsn
-        or getattr(_POOL, "_closed", False)
-    ):
-        try:
-            _POOL.terminate()
-        except Exception:
-            pass
-        _POOL = None
-    if _POOL is None:
-        _POOL = await asyncpg.create_pool(
-            dsn,
-            min_size=0,
-            max_size=10,
-            # See _PGConnAdapter: we SET search_path per acquire, so a cached
-            # plan prepared under one schema must never be reused under
-            # another. Disabling the statement cache forces re-resolution.
-            statement_cache_size=0,
-        )
-        _POOL_LOOP = loop
-        _POOL_DSN = dsn
+    # Fast path: a live pool on this loop+DSN already exists.
+    if _POOL is not None and not _stale(loop, dsn):
+        return _POOL
+    # Slow path: create (or replace a stale) pool under a per-loop lock so two
+    # concurrent first-requests serialize and exactly one pool is built. The
+    # get-or-create of the lock is synchronous (no await), hence race-free on a
+    # single-threaded loop.
+    lock = _POOL_LOCKS.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _POOL_LOCKS[loop] = lock
+    async with lock:
+        # Re-check under the lock: a peer may have built the pool while we
+        # waited, in which case we must not create (and leak) a second one.
+        if _POOL is not None and not _stale(loop, dsn):
+            return _POOL
+        if _stale(loop, dsn):
+            try:
+                _POOL.terminate()
+            except Exception:
+                pass
+            _POOL = None
+        if _POOL is None:
+            _POOL = await asyncpg.create_pool(
+                dsn,
+                min_size=0,
+                max_size=10,
+                # See _PGConnAdapter: we SET search_path per acquire, so a
+                # cached plan prepared under one schema must never be reused
+                # under another. Disabling the statement cache forces
+                # re-resolution.
+                statement_cache_size=0,
+            )
+            _POOL_LOOP = loop
+            _POOL_DSN = dsn
     return _POOL
 
 
@@ -197,26 +227,55 @@ def _full_schema_sql(body: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _skip_noncode(sql: str, i: int) -> int | None:
+    """If ``sql[i]`` begins a lexical span that must never be rewritten -- a
+    single-quoted string literal (``''`` escape), a double-quoted identifier
+    (``""`` escape), a ``--`` line comment, or a ``/* */`` block comment --
+    return the index just past that span; otherwise return ``None``.
+
+    This is the single shared skip-strings/comments primitive every rewriter
+    (:func:`_replace_calls`, :func:`_convert_placeholders`,
+    :func:`_scan_matching_paren`, :func:`_code_search`) uses, so a ``?``, a
+    function name, or a paren inside a literal/comment/identifier is never
+    mangled. Newlines are left as code (they are plain whitespace), so a line
+    comment ends *at* the newline, not past it."""
+    n = len(sql)
+    c = sql[i]
+    if c == "'" or c == '"':
+        quote = c
+        j = i + 1
+        while j < n:
+            if sql[j] == quote:
+                if j + 1 < n and sql[j + 1] == quote:
+                    j += 2
+                    continue
+                return j + 1
+            j += 1
+        return n
+    if c == "-" and i + 1 < n and sql[i + 1] == "-":
+        nl = sql.find("\n", i)
+        return n if nl < 0 else nl
+    if c == "/" and i + 1 < n and sql[i + 1] == "*":
+        end = sql.find("*/", i + 2)
+        return n if end < 0 else end + 2
+    return None
+
+
 def _scan_matching_paren(sql: str, open_idx: int) -> int:
-    """Index of the ``)`` matching the ``(`` at ``open_idx``, respecting
-    single-quoted string literals (``''`` escape)."""
+    """Index of the ``)`` matching the ``(`` at ``open_idx``, skipping over
+    string literals, quoted identifiers and comments (via
+    :func:`_skip_noncode`) so a paren inside any of those does not throw off
+    the depth count."""
     depth = 0
     i = open_idx
-    in_str = False
     n = len(sql)
     while i < n:
-        c = sql[i]
-        if in_str:
-            if c == "'":
-                if i + 1 < n and sql[i + 1] == "'":
-                    i += 2
-                    continue
-                in_str = False
-            i += 1
+        skip = _skip_noncode(sql, i)
+        if skip is not None:
+            i = skip
             continue
-        if c == "'":
-            in_str = True
-        elif c == "(":
+        c = sql[i]
+        if c == "(":
             depth += 1
         elif c == ")":
             depth -= 1
@@ -265,21 +324,52 @@ def _split_top_level(s: str) -> list[str]:
     return parts
 
 
+def _code_search(sql: str, pattern: re.Pattern[str]) -> re.Match[str] | None:
+    """First match of ``pattern`` that begins in *code* (outside any string
+    literal, quoted identifier or comment). Used by the fail-fast guards."""
+    i = 0
+    n = len(sql)
+    while i < n:
+        skip = _skip_noncode(sql, i)
+        if skip is not None:
+            i = skip
+            continue
+        m = pattern.match(sql, i)
+        if m:
+            return m
+        i += 1
+    return None
+
+
 def _replace_calls(sql: str, func: str, transform) -> str:
     """Replace every ``func(...)`` call (case-insensitive, whole word) with
-    ``transform(inner_args_string)``, handling nested parens."""
+    ``transform(inner_args_string)``, handling nested parens.
+
+    The scan is lexical: it skips string literals, quoted identifiers and
+    comments (via :func:`_skip_noncode`) so a ``func(`` that appears inside a
+    ``'...'`` literal, a ``"..."`` identifier or a ``-- / /* */`` comment is
+    left untouched. Only a real call in code position is rewritten."""
     pattern = re.compile(r"\b" + re.escape(func) + r"\s*\(", re.IGNORECASE)
-    pos = 0
-    while True:
-        m = pattern.search(sql, pos)
-        if not m:
-            return sql
-        open_idx = m.end() - 1
-        close_idx = _scan_matching_paren(sql, open_idx)
-        inner = sql[open_idx + 1 : close_idx]
-        repl = transform(inner)
-        sql = sql[: m.start()] + repl + sql[close_idx + 1 :]
-        pos = m.start() + len(repl)
+    out: list[str] = []
+    i = 0
+    n = len(sql)
+    while i < n:
+        skip = _skip_noncode(sql, i)
+        if skip is not None:
+            out.append(sql[i:skip])
+            i = skip
+            continue
+        m = pattern.match(sql, i)
+        if m:
+            open_idx = m.end() - 1
+            close_idx = _scan_matching_paren(sql, open_idx)
+            inner = sql[open_idx + 1 : close_idx]
+            out.append(transform(inner))
+            i = close_idx + 1
+            continue
+        out.append(sql[i])
+        i += 1
+    return "".join(out)
 
 
 def _ts_expr(expr: str) -> str:
@@ -294,6 +384,16 @@ def _ts_expr(expr: str) -> str:
 
 
 def _t_datetime(inner: str) -> str:
+    # SQLite ``datetime()`` accepts trailing modifier args (e.g.
+    # ``datetime('now','-1 hour')``); none are used in this codebase and the
+    # single-operand ``_ts_expr`` cast cannot express them. Fail fast on the
+    # multi-arg shape so a future caller gets a loud error instead of a
+    # silently mis-evaluated timestamp.
+    parts = _split_top_level(inner)
+    if len(parts) != 1:
+        raise ValueError(
+            f"unsupported datetime() modifier form (arity {len(parts)}): {inner!r}"
+        )
     return _ts_expr(inner)
 
 
@@ -326,8 +426,14 @@ def _t_minmax(name: str, pg_scalar: str):
     Rewrite the 2+-arg scalar form, leave the 1-arg aggregate untouched."""
 
     def transform(inner: str) -> str:
-        if len(_split_top_level(inner)) >= 2:
-            return f"{pg_scalar}({inner})"
+        args = _split_top_level(inner)
+        if len(args) >= 2:
+            # NULL semantics differ: SQLite's scalar MAX/MIN returns NULL if
+            # ANY argument is NULL, but PG GREATEST/LEAST ignore NULLs. Wrap in
+            # a CASE that reproduces SQLite's all-or-nothing behaviour exactly,
+            # regardless of whether the operands are nullable by schema.
+            null_guard = " OR ".join(f"({a.strip()}) IS NULL" for a in args)
+            return f"(CASE WHEN {null_guard} THEN NULL ELSE {pg_scalar}({inner}) END)"
         return f"{name}({inner})"
 
     return transform
@@ -371,6 +477,19 @@ def _translate_insert(sql: str) -> str:
         rest = m.group(3).rstrip().rstrip(";").rstrip()
         cols = [c.strip() for c in cols_raw.split(",")]
         pk = cols[0]
+        # The generic "first column is the conflict key" rule is only valid for
+        # the two singleton-config tables that actually use INSERT OR REPLACE,
+        # whose PK is the leading ``id`` column. Anything else (e.g. a multi-
+        # column or non-leading PK) would upsert on the wrong key. Restrict to
+        # the known-safe shapes and fail fast on anything new.
+        _KNOWN_REPLACE_PK = {"schema_version": "id", "ownership_config": "id"}
+        expected_pk = _KNOWN_REPLACE_PK.get(table)
+        if expected_pk is None or pk != expected_pk:
+            raise ValueError(
+                "INSERT OR REPLACE is only translatable for "
+                f"{sorted(_KNOWN_REPLACE_PK)} on their 'id' PK; got "
+                f"table={table!r} leading_col={pk!r}"
+            )
         updates = ", ".join(f"{c} = excluded.{c}" for c in cols[1:])
         return (
             f"INSERT INTO {table} ({cols_raw}) {rest} "
@@ -381,28 +500,21 @@ def _translate_insert(sql: str) -> str:
 
 def _convert_placeholders(sql: str) -> str:
     """Rewrite SQLite ``?`` positional params to PG ``$1``, ``$2``, ...,
-    skipping any ``?`` inside a single-quoted string literal."""
+    skipping any ``?`` inside a string literal, quoted identifier or comment
+    (via :func:`_skip_noncode`, the same lexical primitive
+    :func:`_replace_calls` uses, so the two rewriters agree on what is code)."""
     out: list[str] = []
     n = 0
     i = 0
-    in_str = False
     length = len(sql)
     while i < length:
-        c = sql[i]
-        if in_str:
-            out.append(c)
-            if c == "'":
-                if i + 1 < length and sql[i + 1] == "'":
-                    out.append("'")
-                    i += 2
-                    continue
-                in_str = False
-            i += 1
+        skip = _skip_noncode(sql, i)
+        if skip is not None:
+            out.append(sql[i:skip])
+            i = skip
             continue
-        if c == "'":
-            in_str = True
-            out.append(c)
-        elif c == "?":
+        c = sql[i]
+        if c == "?":
             n += 1
             out.append(f"${n}")
         else:
@@ -411,8 +523,21 @@ def _convert_placeholders(sql: str) -> str:
     return "".join(out)
 
 
+_UNSUPPORTED_TIME_FUNC = re.compile(r"\b(julianday|unixepoch)\s*\(", re.IGNORECASE)
+
+
 def translate(sql: str) -> str:
     """Full SQLite -> PostgreSQL translation for a single statement."""
+    # Fail fast on SQLite time functions we deliberately do not translate
+    # (julianday, the unixepoch() function form). None are used today; if one
+    # is ever introduced this raises at translate time rather than emitting SQL
+    # that PG silently mis-runs or rejects far from the source. ``datetime`` and
+    # ``strftime`` modifier shapes are rejected in their own transforms.
+    bad = _code_search(sql, _UNSUPPORTED_TIME_FUNC)
+    if bad is not None:
+        raise ValueError(
+            f"unsupported SQLite time function {bad.group(0)!r} in: {sql!r}"
+        )
     sql = _translate_insert(sql)
     sql = _replace_calls(sql, "json_extract", _t_json_extract)
     sql = _replace_calls(sql, "strftime", _t_strftime)
@@ -712,10 +837,34 @@ class PostgresStore(Database):
 
     # -- locking (design 5.3, 5.4) ----------------------------------------
 
+    @staticmethod
+    async def _require_open_tx(conn, who: str) -> None:
+        """Guarantee an open transaction on ``conn`` before a
+        ``pg_advisory_xact_lock`` is issued on it.
+
+        A transaction-scoped advisory lock only serializes if a transaction is
+        actually open: issued outside one, asyncpg autocommits the SELECT in
+        its own single-statement transaction and the lock is released the
+        instant that statement returns -- leaving the overlap re-check + insert
+        UNLOCKED (silent double-grant). Grants always run inside
+        :meth:`transaction` (``managed=True``, txn already started); we
+        ``_ensure_tx`` defensively (a no-op for the managed adapter, opens the
+        lazy txn for an unmanaged one) and then hard-assert the connection is
+        in a transaction so a future caller fails loudly instead of running
+        unserialized."""
+        await conn._ensure_tx()
+        if not conn._raw.is_in_transaction():
+            raise RuntimeError(
+                f"{who} requires an open transaction on the grant connection; "
+                "a pg_advisory_xact_lock outside a transaction releases "
+                "immediately and would silently double-grant"
+            )
+
     async def repo_lock(self, conn, repo: str | None) -> None:
         # coalesce(repo, '') so the NULL-repo bucket is locked rather than
         # running unserialized (design 5.4). The schema prefix keeps locks
         # private to this store's isolated schema.
+        await self._require_open_tx(conn, "repo_lock")
         key = f"{self._schema}:repo:{repo or ''}"
         await conn._raw.execute(
             "SELECT pg_advisory_xact_lock(hashtextextended($1, $2))",
@@ -730,6 +879,7 @@ class PostgresStore(Database):
         # serialized across replicas and the per-engineer cap cannot
         # overshoot. Disjoint engineers hash to different keys and never
         # block each other.
+        await self._require_open_tx(conn, "engineer_lock")
         key = f"{self._schema}:eng:{engineer}"
         await conn._raw.execute(
             "SELECT pg_advisory_xact_lock(hashtextextended($1, $2))",
