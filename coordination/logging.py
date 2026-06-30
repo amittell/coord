@@ -72,6 +72,11 @@ _STANDARD_RECORD_ATTRS = frozenset(
     }
 )
 
+# Non-standard record attributes that are noise in structured output and
+# should never be surfaced as JSON fields. ``color_message`` is uvicorn's
+# ANSI-coloured duplicate of ``msg``.
+_NOISE_RECORD_ATTRS = frozenset({"color_message"})
+
 
 class JsonFormatter(logging.Formatter):
     """Format a :class:`LogRecord` as a single-line JSON object.
@@ -101,9 +106,15 @@ class JsonFormatter(logging.Formatter):
             payload["exc"] = self.formatException(record.exc_info)
 
         # Surface any caller-supplied extras without overwriting the
-        # base keys above.
+        # base keys above. ``_NOISE_RECORD_ATTRS`` is dropped: uvicorn
+        # attaches a ``color_message`` (the ANSI-coloured variant of
+        # ``msg``) to its records, which is pure terminal noise in JSON.
         for key, value in record.__dict__.items():
-            if key in _STANDARD_RECORD_ATTRS or key.startswith("_"):
+            if (
+                key in _STANDARD_RECORD_ATTRS
+                or key in _NOISE_RECORD_ATTRS
+                or key.startswith("_")
+            ):
                 continue
             if key in payload:
                 continue

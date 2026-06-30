@@ -164,3 +164,16 @@ def test_access_log_record_has_event_field() -> None:
     assert parsed["duration_ms"] == 1.23
     assert parsed["request_id"] == "rid-abc"
     assert parsed["logger"] == "coordination.access"
+
+
+def test_json_formatter_drops_uvicorn_color_message() -> None:
+    """uvicorn attaches a ``color_message`` (ANSI-coloured variant of msg);
+    it is terminal noise and must not surface as a JSON field."""
+    record = _make_record(
+        msg="Started server process [1]", logger_name="uvicorn.error"
+    )
+    record.color_message = "Started server process [\x1b[36m%d\x1b[0m]"
+    parsed = json.loads(coord_logging.JsonFormatter().format(record))
+    assert parsed["msg"] == "Started server process [1]"
+    assert parsed["logger"] == "uvicorn.error"
+    assert "color_message" not in parsed
