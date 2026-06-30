@@ -30,7 +30,12 @@ from coordination.dashboard import render_dashboard
 from coordination.db import acquire_instance_lock
 from coordination.deps import get_service
 from coordination.tokens import generate_raw_token, sha256_token
-from coordination.logging import ACCESS_LOGGER_NAME, configure_logging, request_id_var
+from coordination.logging import (
+    ACCESS_LOGGER_NAME,
+    configure_logging,
+    configure_uvicorn_logging,
+    request_id_var,
+)
 from coordination.otel import setup_tracing
 from coordination.ownership import parse_ownership_yaml
 from coordination.service import LspUnavailable, RateLimitExceeded
@@ -2105,12 +2110,20 @@ def run() -> None:
     import uvicorn
 
     settings = get_settings()
+    # coord owns logging: route uvicorn's loggers through coord's formatter
+    # and pass log_config=None so uvicorn does not reinstall its own. Disable
+    # uvicorn's access log -- the access-log middleware already emits a richer
+    # structured line (method/path/status/duration_ms/request_id), so leaving
+    # uvicorn's on would just duplicate it.
+    configure_uvicorn_logging()
     uvicorn.run(
         "coordination.main:app",
         host=settings.host,
         port=settings.port,
         reload=False,
         log_level=settings.log_level,
+        log_config=None,
+        access_log=False,
     )
 
 

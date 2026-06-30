@@ -133,20 +133,13 @@ def _env_flag(name: str, *, default: bool) -> bool:
     return default
 
 
-def configure_logging() -> None:
-    """Configure the ``coordination`` logger namespace.
+# uvicorn's own loggers: the server/startup logger, its error logger, and
+# the per-request access logger.
+_UVICORN_LOGGER_NAMES = ("uvicorn", "uvicorn.error", "uvicorn.access")
 
-    Reads ``COORD_LOG_LEVEL`` (default ``INFO``) for the level. Logs are
-    structured one-line JSON by default (best for log aggregators such as
-    Loki); set ``COORD_LOG_JSON=false`` to fall back to a plain
-    human-readable formatter. This only configures the ``coordination``
-    logger so uvicorn's own access logs keep their existing formatting.
-    """
-    level_name = os.environ.get("COORD_LOG_LEVEL", "INFO").upper()
-    level = logging.getLevelName(level_name)
-    if not isinstance(level, int):
-        level = logging.INFO
 
+def _build_handler() -> logging.Handler:
+    """A stderr handler formatted per ``COORD_LOG_JSON`` (JSON by default)."""
     handler = logging.StreamHandler(stream=sys.stderr)
     if _env_flag("COORD_LOG_JSON", default=True):
         handler.setFormatter(JsonFormatter())
@@ -154,10 +147,46 @@ def configure_logging() -> None:
         handler.setFormatter(
             logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
         )
+    return handler
+
+
+def configure_logging() -> None:
+    """Configure the ``coordination`` logger namespace.
+
+    Reads ``COORD_LOG_LEVEL`` (default ``INFO``) for the level. Logs are
+    structured one-line JSON by default (best for log aggregators such as
+    Loki); set ``COORD_LOG_JSON=false`` to fall back to a plain
+    human-readable formatter. This configures only the ``coordination``
+    logger; :func:`configure_uvicorn_logging` brings uvicorn's own loggers
+    onto the same format when the server actually runs.
+    """
+    level_name = os.environ.get("COORD_LOG_LEVEL", "INFO").upper()
+    level = logging.getLevelName(level_name)
+    if not isinstance(level, int):
+        level = logging.INFO
 
     logger = logging.getLogger("coordination")
     logger.setLevel(level)
     # Replace existing handlers so repeated calls (e.g. tests, reload)
     # do not stack duplicate handlers.
-    logger.handlers = [handler]
+    logger.handlers = [_build_handler()]
     logger.propagate = False
+
+
+def configure_uvicorn_logging() -> None:
+    """Route uvicorn's own loggers through coord's formatter.
+
+    Called from :func:`coordination.main.run` (not at import) so it only
+    takes effect when coord is actually running the server -- the test
+    process's uvicorn loggers stay untouched. Paired with
+    ``uvicorn.run(log_config=None)`` so uvicorn does not reinstall its
+    default handlers over these, the whole process then emits one
+    consistent format: the uvicorn startup banner and any uvicorn errors
+    land as JSON too, not just coord's own logs. uvicorn's per-request
+    access log is disabled separately (``access_log=False``) because the
+    access-log middleware already emits a richer structured line.
+    """
+    for name in _UVICORN_LOGGER_NAMES:
+        ulog = logging.getLogger(name)
+        ulog.handlers = [_build_handler()]
+        ulog.propagate = False

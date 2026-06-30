@@ -91,6 +91,49 @@ def test_configure_logging_plain_when_disabled(monkeypatch: pytest.MonkeyPatch) 
     assert not any(isinstance(h.formatter, coord_logging.JsonFormatter) for h in handlers)
 
 
+@pytest.fixture()
+def _restore_uvicorn_loggers():
+    """Snapshot + restore uvicorn loggers so styling them does not leak."""
+    saved = {
+        name: (logging.getLogger(name).handlers[:], logging.getLogger(name).propagate)
+        for name in coord_logging._UVICORN_LOGGER_NAMES
+    }
+    try:
+        yield
+    finally:
+        for name, (handlers, propagate) in saved.items():
+            lg = logging.getLogger(name)
+            lg.handlers = handlers
+            lg.propagate = propagate
+
+
+def test_configure_uvicorn_logging_json_by_default(
+    monkeypatch: pytest.MonkeyPatch, _restore_uvicorn_loggers: None
+) -> None:
+    """uvicorn's own loggers are routed through the JSON formatter (so the
+    startup banner / access lines are JSON too) and stop propagating."""
+    monkeypatch.delenv("COORD_LOG_JSON", raising=False)
+    coord_logging.configure_uvicorn_logging()
+    for name in coord_logging._UVICORN_LOGGER_NAMES:
+        lg = logging.getLogger(name)
+        assert lg.handlers
+        assert any(isinstance(h.formatter, coord_logging.JsonFormatter) for h in lg.handlers)
+        assert lg.propagate is False
+
+
+def test_configure_uvicorn_logging_plain_when_disabled(
+    monkeypatch: pytest.MonkeyPatch, _restore_uvicorn_loggers: None
+) -> None:
+    monkeypatch.setenv("COORD_LOG_JSON", "false")
+    coord_logging.configure_uvicorn_logging()
+    for name in coord_logging._UVICORN_LOGGER_NAMES:
+        lg = logging.getLogger(name)
+        assert lg.handlers
+        assert not any(
+            isinstance(h.formatter, coord_logging.JsonFormatter) for h in lg.handlers
+        )
+
+
 def test_access_log_record_has_event_field() -> None:
     """An access-log record passed through JsonFormatter must round-trip
     the structured extras used by the middleware (method, path, status,
