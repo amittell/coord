@@ -80,6 +80,18 @@ def _base_url() -> str:
     return os.environ.get("COORD_API_URL", "http://127.0.0.1:8080").rstrip("/")
 
 
+def _repo_id() -> str:
+    """The repo id this client is scoped to, or "" when unset.
+
+    Read from ``COORD_REPO_ID`` (bootstrapped from ``.coordination/local.env``
+    by ``_load_local_env``). When set, the read tools scope their queries to
+    this repo by default so a hosted shared service fronting multiple repos
+    does not surface unrelated repos' claims (issue #30). When unset (the
+    single-repo deployment shape) the tools behave exactly as before.
+    """
+    return os.environ.get("COORD_REPO_ID", "").strip()
+
+
 def _headers() -> dict[str, str]:
     token = os.environ.get("COORD_AUTH_TOKEN", "")
     h: dict[str, str] = {"Accept": "application/json"}
@@ -120,13 +132,24 @@ async def list_claims(
     active_only: bool = True,
     engineer: str | None = None,
     module: str | None = None,
+    all_repos: bool = False,
 ) -> dict[str, Any]:
-    """List coordination claims (who is working on which paths)."""
+    """List coordination claims (who is working on which paths).
+
+    Scoped to this client's ``COORD_REPO_ID`` by default so a hosted shared
+    service does not surface unrelated repos' claims (issue #30). Pass
+    ``all_repos=True`` for the operator view across every repo. With no
+    ``COORD_REPO_ID`` configured (single-repo deployment) the scope is a
+    no-op and every claim is returned regardless of this flag.
+    """
     params: dict[str, Any] = {"active_only": str(active_only).lower()}
     if engineer:
         params["engineer"] = engineer
     if module:
         params["module"] = module
+    repo_id = _repo_id()
+    if repo_id and not all_repos:
+        params["repo"] = repo_id
     # Session_id doubles as an activity ping on the server side: a
     # session that is actively listing claims is alive, so its held
     # claims should not idle-expire.
@@ -138,14 +161,26 @@ async def list_claims(
 
 
 @mcp.tool()
-async def check_conflicts(files: list[str], engineer: str) -> dict[str, Any]:
-    """Check whether planned file paths conflict with other engineers' active claims."""
+async def check_conflicts(
+    files: list[str], engineer: str, all_repos: bool = False
+) -> dict[str, Any]:
+    """Check whether planned file paths conflict with other engineers' active claims.
+
+    Scoped to this client's ``COORD_REPO_ID`` by default (issue #30): without
+    a repo the server compares only against legacy NULL-repo claims, which
+    under-reports conflicts on a repo-tagged deployment. Pass ``all_repos=True``
+    to check against every repo's claims. A no-op when ``COORD_REPO_ID`` is
+    unset.
+    """
     # Annotated with the broader value type httpx.AsyncClient.get accepts so
     # mypy sees an invariant-compatible list when we pass it as `params`.
     params: list[tuple[str, str | int | float | bool | None]] = [
         ("pattern", f) for f in files
     ]
     params.append(("engineer", engineer))
+    repo_id = _repo_id()
+    if repo_id and not all_repos:
+        params.append(("repo", repo_id))
     # Session_id makes the conflict check session-aware (so an agent's
     # own subagents don't false-positive against each other) and acts
     # as an activity ping for idle expiration on the server side.
