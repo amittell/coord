@@ -1,7 +1,7 @@
 # Coord roadmap
 
 Status: living document
-Last updated: 2026-06-21 (after v0.33.0)
+Last updated: 2026-07-01 (after v0.40.2)
 
 This is the post-v0.33 forward look. Items here are candidates, not commitments -- order and scope move as production telemetry and operator feedback arrive. Entries already shipped live in [CHANGELOG.md](../../CHANGELOG.md); see also [docs/design/sub-file-claims.md](./sub-file-claims.md) for the v0.14-v0.26 arc design. The shipped sections below are kept for context; the **Forward plan** immediately following is the live priority order.
 
@@ -9,27 +9,25 @@ This is the post-v0.33 forward look. Items here are candidates, not commitments 
 
 Version-assigned by current priority, using value-per-effort against today's single-fleet deployment. Candidates, not commitments; the ordering moves when the usage shape changes (multi-team / multi-tenant demand is the big lever). Detailed designs for the larger items live in their own sections further down.
 
-Note: ``v0.32.5`` and ``v0.33.0`` did not ship what an earlier revision of this plan slotted there. ``v0.32.5`` became a regex-degradation hotfix (symbol claims fall back to regex cleanly when a native grammar wheel is absent) and ``v0.33.0`` became the 11-language symbol expansion (issue #29) plus the linked-worktree pre-push fix (issue #28) and a session-marker worktree fix. Both are in the shipped section below; the items here are renumbered around them.
+Note: the v0.34.0 (GitHub PR-comment integration) and v0.35.0 (symbol-level coexist) items below shipped as planned. The **operator approval workflow** originally slotted at v0.36.0 did NOT ship -- the v0.36-v0.40 releases went to unplanned work instead: dashboard redesign (v0.36.0), ``coord mcp install`` (v0.37.0), OpenTelemetry tracing (v0.38.0), JSON-logging-by-default (v0.39.0), uvicorn log unification (v0.40.0), plus worktree and logging fixes through v0.40.2. The outbox retry CLI an earlier revision slotted at v0.33.1 had already shipped back in v0.27.1; the ``coord upgrade``-from-linked-worktree fix landed in v0.35.2 and the ``coord doctor`` pre-push worktree check in v0.40.2. The two live candidates below are renumbered around all of that.
 
-### v0.33.1 (next) -- Outbox retry CLI + small fixes
+### v0.41.0 (in progress) -- Repo-aware filtering for hosted shared services (#30)
 
-``coord outbox retry --exhausted`` + ``coord outbox stats`` so an operator can drive the webhook retry rotation after fixing a receiver, without touching SQLite directly. No schema migration; finishes the v0.27 webhook story. Smallest self-contained increment, effectively zero risk -- the natural next point release. Bundle the known small follow-up here too: ``coord upgrade`` currently errors when run from a linked git worktree (``.git/hooks`` is a file, not a directory, there) -- it should resolve the common git dir, the same fix v0.33.0 applied to the hook shim.
+On a hosted shared coord service fronting multiple repos, ``coord status`` reports ``Repo-aware: false`` and global claim / conflict / dashboard views leak claims across unrelated repos. Root cause: the ``Repo-aware`` signal is derived from the server-wide ``COORD_REPO_ROOT`` (a single-checkout symbol-validation setting) rather than from the ``claims.repo`` column that actually scopes claims -- so a hosted service that deliberately runs without a global checkout looks "not repo-aware" even though every claim is repo-tagged. Scope:
 
-### v0.34.0 -- GitHub PR-comment integration
+- Default ``/claims`` and the dashboard to the caller's repo id, with an explicit all-repos operator mode.
+- Teach the MCP ``list_claims`` / ``check_conflicts`` wrappers and the ``coord claims`` CLI to pass ``COORD_REPO_ID`` (today only ``claim_files`` sends it).
+- Split the ``coord status`` signal: distinguish service-level repo filtering from the local symbol-validation root, so ``Repo-aware`` stops depending on a single global checkout.
 
-When a pre-push hook 409s, the next push that succeeds comments on the PR naming the files that bounced and which engineer held them. Closes the "why did my PR sit unmerged" gap -- the most-felt day-to-day friction. Reuses the v0.27 webhook delivery + HMAC surface.
+Feeds the larger Multi-namespace arc below (delivers its repo-scoped-visibility half) without taking on the namespace-isolation decisions.
 
-### v0.35.0 -- Symbol-level coexist
+### Operator approval workflow (next scoped feature, unversioned)
 
-Extend ``coexist`` so two claims can share a single symbol-scope file with explicit boundaries (``coexist_pattern`` -> ``coexist_symbols``). Higher value after v0.33.0: symbol claims now span 14 languages, so two agents working disjoint symbols of the same large file is a much more common shape. Small migration on the coexist representation.
-
-### v0.36.0 -- Operator approval workflow
-
-A ``pending_promotion`` row that an operator approves from the dashboard, bridging v0.21 fully-soft and v0.22 fully-automatic auto-promote. Schema migration for the pending-promotion table plus a dashboard approve / deny surface.
+A ``pending_promotion`` row that an operator approves from the dashboard, bridging v0.21 fully-soft and v0.22 fully-automatic auto-promote. Schema migration for the pending-promotion table plus a dashboard approve / deny surface. Self-contained and low-risk; the natural next minor once #30 lands.
 
 ### Design-gated (no firm version -- write the design doc first)
 
-- **Multi-namespace coordination** -- one instance serving multiple repos / teams. Build only once multi-tenant demand is concrete, and after ``docs/design/multi-namespace.md`` settles the irreversible decisions (URL shape, isolation level, tenant tokens). Candidate items in the Multi-namespace section below.
+- **Multi-namespace coordination** -- one instance serving multiple repos / teams. Issue #30 (above) is the first concrete demand signal and delivers the repo-scoped-visibility half; the remaining namespace decisions (URL shape, isolation level, tenant tokens) still want ``docs/design/multi-namespace.md`` settled before code. Candidate items in the Multi-namespace section below.
 - **Postgres backend** -- the large bet that gates a whole tier of optimizations (NOTIFY-driven queue grant, partitioned conflict_log, read-replica dashboard). Pull the trigger when topology shifts to multi-replica / high-throughput. Full detail and the dependent optimizations in the Large bets section below.
 
 ### Parked (unsized, no demand signal yet)
@@ -213,3 +211,15 @@ This roadmap supersedes the older "candidate" markers in the v0.14 sub-file clai
 | v0.32.4 | dependency maintenance: anyio 4.14.0, certifi 2026.6.17, fastapi 0.137.2, mcp 1.28.0 |
 | v0.32.5 | symbol backends declare GRAMMAR_MODULE; dispatcher find_spec-degrades to regex when a grammar wheel is absent (shipped within v0.33.0) |
 | v0.33.0 | symbol claims for 11 more languages JS/Rust/Java/C/C++/C#/Ruby/PHP/Kotlin/Swift/Scala (#29) + linked-worktree pre-push & session-marker fix (#28) |
+| v0.34.0 | GitHub PR-comment integration: a 409 push-bounce posts/updates a de-duped PR comment (push_bounced event, outbox kind column, schema v17); off unless COORD_GITHUB_TOKEN set |
+| v0.35.0 | symbol-level coexist: coexist_symbols on respond_to_request grants disjoint symbols within a contested file (schema v18) |
+| v0.35.1 | proactive sessions.live dead-PID pruning under lock; symbol-parser hint uses real coord-mcp-server[symbols] package name |
+| v0.35.2 | coord init/upgrade no longer crash from a linked worktree (resolve hook path via git rev-parse --git-path) |
+| v0.35.3 | shared .coordination/local.env parser (envfile.parse_env) so doctor / MCP / hook agree on quoted / exported / duplicated tokens |
+| v0.36.0 | dashboard redesign: live-first hero stats, needs-attention rollup, contention flags, auto-refresh + CSS var fixes |
+| v0.37.0 | coord mcp install: auto-detect + idempotent MCP registration into Claude Code / Desktop / Codex / Cursor |
+| v0.38.0 | optional OpenTelemetry tracing (COORD_OTEL_ENABLED, fail-open, separate requirements-otel.txt / [otel] extra) |
+| v0.39.0 | structured JSON logging is now the default (COORD_LOG_JSON off restores plain formatter) |
+| v0.40.0 | uvicorn's own loggers routed through coord's formatter; duplicate uvicorn access log disabled |
+| v0.40.1 | drop uvicorn's color_message field from JSON log lines |
+| v0.40.2 | coord doctor pre-push hook check no longer false-negatives inside a git worktree |

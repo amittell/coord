@@ -314,6 +314,20 @@ def _resolve_service() -> _ServiceContext | None:
     return None
 
 
+def _scope_repo_id(ctx: _ServiceContext) -> str | None:
+    """The repo id a repo-local client should scope its views to (issue #30).
+
+    Prefers the ``repo_id`` in ``.coordination/config.toml`` (the canonical
+    per-repo identity ``coord init`` writes), falling back to a ``COORD_REPO_ID``
+    env override. Returns None when neither is set -- the single-repo
+    deployment shape, where scoping is a no-op and every claim is in view.
+    """
+    if ctx.config is not None and ctx.config.repo_id:
+        return ctx.config.repo_id
+    env = os.environ.get("COORD_REPO_ID", "").strip()
+    return env or None
+
+
 def _auth_headers(ctx: _ServiceContext) -> dict[str, str]:
     if ctx.auth_token:
         return {"Authorization": f"Bearer {ctx.auth_token}"}
@@ -342,21 +356,28 @@ def run_status(_args) -> int:
         ready_state = f"unreachable ({exc})"
 
     version = "?"
-    repo_aware = "?"
+    symbol_validation: bool | None = None
     try:
         m = httpx.get(f"{ctx.service_url}/meta", timeout=3.0)
         if m.status_code == 200:
             data = m.json()
             version = str(data.get("version", "?"))
-            repo_aware = str(data.get("repo_root_configured", False)).lower()
+            symbol_validation = bool(data.get("repo_root_configured", False))
     except httpx.HTTPError:
         pass
 
+    # Scope the count to the same repo the "Repo scope" line reports, so a
+    # multi-repo hosted service does not show a cross-repo total under a
+    # single-repo scope (issue #30).
+    scope = _scope_repo_id(ctx)
+    count_params: dict[str, str] = {"active_only": "true"}
+    if scope:
+        count_params["repo"] = scope
     claim_count: int | str = "?"
     try:
         c = httpx.get(
             f"{ctx.service_url}/claims",
-            params={"active_only": "true"},
+            params=count_params,
             headers=_auth_headers(ctx),
             timeout=3.0,
         )
@@ -368,8 +389,22 @@ def run_status(_args) -> int:
     except httpx.HTTPError as exc:
         claim_count = f"unreachable ({exc})"
 
+    # Issue #30: the old single "Repo-aware" line conflated two unrelated
+    # facts -- whether THIS client scopes its views to a repo, and whether the
+    # SERVER has a checkout for symbol validation. A hosted shared service is
+    # deliberately repo-scoped WITHOUT a global COORD_REPO_ROOT, so the merged
+    # signal misreported it as "not repo-aware". Report the two separately.
+    # (``scope`` was resolved above to scope the active-claims count.)
+    scope_label = scope if scope else "all repos (no COORD_REPO_ID)"
+    if symbol_validation is None:
+        symbol_label = "unknown"
+    else:
+        symbol_label = "enabled" if symbol_validation else "disabled"
+
     print(f"Service: {ctx.service_url}   {ready_state}")
-    print(f"Version: {version}    Repo-aware: {repo_aware}")
+    print(f"Version: {version}")
+    print(f"Repo scope: {scope_label}")
+    print(f"Symbol validation: {symbol_label} (server COORD_REPO_ROOT)")
     print(f"Active claims: {claim_count}")
     return 0 if ready_state == "ready" else 1
 
@@ -391,6 +426,16 @@ def run_claims(args) -> int:
     params: dict[str, str] = {"active_only": "false" if args.all else "true"}
     if args.engineer:
         params["engineer"] = args.engineer
+    # Issue #30: scope to the local repo by default so a hosted shared service
+    # does not list unrelated repos' claims. --repo <id> targets a specific
+    # repo; --all-repos is the operator view across every repo.
+    explicit_repo = getattr(args, "repo", None)
+    if explicit_repo:
+        params["repo"] = explicit_repo
+    elif not getattr(args, "all_repos", False):
+        scope = _scope_repo_id(ctx)
+        if scope:
+            params["repo"] = scope
 
     try:
         response = httpx.get(

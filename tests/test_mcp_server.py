@@ -238,6 +238,9 @@ async def test_check_conflicts_passes_params_as_list_of_tuples_preserving_order(
     collapse the duplicate `pattern` keys)."""
     monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
     monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    # check_conflicts appends a ``repo`` param when COORD_REPO_ID is set; this
+    # exact-order assertion must not see an ambient value from the dev's shell.
+    monkeypatch.delenv("COORD_REPO_ID", raising=False)
 
     captured_params: list[Any] = []
 
@@ -2187,3 +2190,105 @@ async def test_cancel_queue_request_tool_forwards_delete(
     assert str(req.url).startswith("http://svc:8080/requests/q123")
     assert req.url.params.get("engineer") == "bob"
     assert req.headers.get("Authorization") == "Bearer tok"
+
+
+# ---------------------------------------------------------------------------
+# repo scoping (issue #30): list_claims / check_conflicts default to the
+# client's COORD_REPO_ID so a hosted shared service does not leak claims
+# across unrelated repos. all_repos=True is the operator opt-out.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_claims_scopes_to_repo_id_when_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.setenv("COORD_REPO_ID", "amittell/coord")
+    captured = _install_mock_transport(monkeypatch, _json_handler(200, {"claims": []}))
+
+    await mcp_server.list_claims()
+
+    assert captured[0].url.params.get("repo") == "amittell/coord"
+
+
+@pytest.mark.asyncio
+async def test_list_claims_omits_repo_when_repo_id_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.delenv("COORD_REPO_ID", raising=False)
+    captured = _install_mock_transport(monkeypatch, _json_handler(200, {"claims": []}))
+
+    await mcp_server.list_claims()
+
+    assert "repo" not in captured[0].url.params
+
+
+@pytest.mark.asyncio
+async def test_list_claims_all_repos_overrides_repo_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.setenv("COORD_REPO_ID", "amittell/coord")
+    captured = _install_mock_transport(monkeypatch, _json_handler(200, {"claims": []}))
+
+    await mcp_server.list_claims(all_repos=True)
+
+    assert "repo" not in captured[0].url.params
+
+
+@pytest.mark.asyncio
+async def test_check_conflicts_scopes_to_repo_id_when_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.setenv("COORD_REPO_ID", "amittell/coord")
+    captured = _install_mock_transport(
+        monkeypatch,
+        _json_handler(200, {"has_conflicts": False, "conflicts": [], "safe": True}),
+    )
+
+    await mcp_server.check_conflicts(files=["src/a.py"], engineer="alice")
+
+    assert captured[0].url.params.get("repo") == "amittell/coord"
+
+
+@pytest.mark.asyncio
+async def test_check_conflicts_omits_repo_when_repo_id_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.delenv("COORD_REPO_ID", raising=False)
+    captured = _install_mock_transport(
+        monkeypatch,
+        _json_handler(200, {"has_conflicts": False, "conflicts": [], "safe": True}),
+    )
+
+    await mcp_server.check_conflicts(files=["src/a.py"], engineer="alice")
+
+    assert "repo" not in captured[0].url.params
+
+
+@pytest.mark.asyncio
+async def test_check_conflicts_all_repos_overrides_repo_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.setenv("COORD_REPO_ID", "amittell/coord")
+    captured = _install_mock_transport(
+        monkeypatch,
+        _json_handler(200, {"has_conflicts": False, "conflicts": [], "safe": True}),
+    )
+
+    await mcp_server.check_conflicts(
+        files=["src/a.py"], engineer="alice", all_repos=True
+    )
+
+    assert "repo" not in captured[0].url.params

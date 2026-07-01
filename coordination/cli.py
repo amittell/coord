@@ -193,8 +193,11 @@ def build_parser() -> argparse.ArgumentParser:
         "claims",
         help="List active claims",
         description=(
-            "List claims from the configured service. Filter by --engineer, include "
-            "expired claims with --all, or emit raw JSON with --json."
+            "List claims from the configured service. Scopes to the local repo "
+            "(config.toml repo_id / COORD_REPO_ID) by default; use --repo <id> to "
+            "target another repo or --all-repos for the operator view across every "
+            "repo. Filter by --engineer, include expired claims with --all, or emit "
+            "raw JSON with --json."
         ),
     )
     claims.add_argument("--engineer", help="Only show claims for this engineer id")
@@ -202,6 +205,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--all",
         action="store_true",
         help="Include expired claims (active_only=false)",
+    )
+    # --repo and --all-repos are logically exclusive: one narrows to a single
+    # repo, the other widens to every repo. Enforce it in argparse so the CLI
+    # fails fast with a clear error instead of silently preferring one.
+    repo_scope = claims.add_mutually_exclusive_group()
+    repo_scope.add_argument(
+        "--repo",
+        help="Scope to a specific repo id (overrides the local repo default)",
+    )
+    repo_scope.add_argument(
+        "--all-repos",
+        action="store_true",
+        help="Show claims across every repo (operator view; skips the local-repo scope)",
     )
     claims.add_argument(
         "--json",
