@@ -19,6 +19,19 @@ from coordination.db import Database
 from coordination.service import CoordinationService
 
 
+def _recent_iso(days_ago: int = 5) -> str:
+    """An ISO-Z timestamp safely inside the hotspot 30-day window.
+
+    The hotspot query uses a rolling ``now - 30 days`` cutoff, so seeding
+    conflict_log rows with a hardcoded absolute date is a time-bomb: it works
+    until the wall clock rolls far enough past that date for the rows to age
+    out of the window. Anchoring the seed data a few days before ``now`` keeps
+    these tests deterministic regardless of the run date.
+    """
+    ts = (datetime.now(UTC) - timedelta(days=days_ago)).replace(microsecond=0)
+    return ts.isoformat().replace("+00:00", "Z")
+
+
 # ---------------------------------------------------------------------------
 # Fixture
 # ---------------------------------------------------------------------------
@@ -1059,13 +1072,14 @@ async def test_dashboard_renders_hotspots_panel(
     # middleware.ts (-> "monitor"). cold.ts has 3 attempts (-> filtered).
     async with aiosqlite.connect(svc.db.path) as conn:
         await _configure_sqlite(conn)
+        recent = _recent_iso()
         for i in range(25):
             await conn.execute(
                 "INSERT INTO conflict_log (id, claim_id, attempted_by, "
                 "attempted_pattern, resolution, created_at) "
                 "VALUES (?, ?, ?, ?, NULL, ?)",
                 (str(uuid4()), "holder-h", f"eng-{i % 6}",
-                 "src/router.ts", "2026-06-01T10:00:00Z"),
+                 "src/router.ts", recent),
             )
         for i in range(7):
             await conn.execute(
@@ -1073,7 +1087,7 @@ async def test_dashboard_renders_hotspots_panel(
                 "attempted_pattern, resolution, created_at) "
                 "VALUES (?, ?, ?, ?, NULL, ?)",
                 (str(uuid4()), "holder-w", f"eng-{i}",
-                 "src/middleware.ts", "2026-06-01T11:00:00Z"),
+                 "src/middleware.ts", recent),
             )
         await conn.commit()
 
@@ -1119,13 +1133,14 @@ async def test_dashboard_hotspot_action_link_present(
     # 7 on monitor.ts (-> "monitor").
     async with aiosqlite.connect(svc.db.path) as conn:
         await _configure_sqlite(conn)
+        recent = _recent_iso()
         for i in range(25):
             await conn.execute(
                 "INSERT INTO conflict_log (id, claim_id, attempted_by, "
                 "attempted_pattern, resolution, created_at) "
                 "VALUES (?, ?, ?, ?, NULL, ?)",
                 (str(uuid4()), "h-promote", f"eng-{i % 6}",
-                 "src/promote.ts", "2026-06-01T10:00:00Z"),
+                 "src/promote.ts", recent),
             )
         for i in range(7):
             await conn.execute(
@@ -1133,7 +1148,7 @@ async def test_dashboard_hotspot_action_link_present(
                 "attempted_pattern, resolution, created_at) "
                 "VALUES (?, ?, ?, ?, NULL, ?)",
                 (str(uuid4()), "h-monitor", f"eng-{i}",
-                 "src/monitor.ts", "2026-06-01T11:00:00Z"),
+                 "src/monitor.ts", recent),
             )
         await conn.commit()
 
