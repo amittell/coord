@@ -874,6 +874,62 @@ def test_status_shows_repo_scope_and_symbol_validation(
     assert "Symbol validation:" in out
 
 
+def test_status_active_claims_count_is_scoped_to_local_repo(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Review follow-up: the "Active claims" count must be scoped to the same
+    # repo the "Repo scope" line reports, not a cross-repo total.
+    seen: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            if self.path == "/readyz":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"status":"ready"}')
+                return
+            if self.path == "/meta":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(
+                    b'{"version":"0.1.0","repo_root_configured":false}'
+                )
+                return
+            if self.path.startswith("/claims"):
+                seen.append(self.path)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"claims":[],"count":0}')
+                return
+            self.send_response(404)
+            self.end_headers()
+
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A003
+            return
+
+    with _MockServer(Handler) as mock:
+        _init_repo_with_service(tmp_path, monkeypatch, mock.port)
+        capsys.readouterr()
+        exit_code = cli.main(["status"])
+    assert exit_code == 0
+    assert any("repo=app" in p for p in seen)
+
+
+def test_claims_repo_and_all_repos_are_mutually_exclusive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Review follow-up: --repo and --all-repos contradict each other; argparse
+    # should reject the combination (exit 2) rather than silently pick one.
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["claims", "--repo", "otherorg/svc", "--all-repos"])
+    assert excinfo.value.code == 2
+
+
 # ---------------------------------------------------------------------------
 # coord release
 # ---------------------------------------------------------------------------

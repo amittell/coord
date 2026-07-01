@@ -206,11 +206,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Include expired claims (active_only=false)",
     )
-    claims.add_argument(
+    # --repo and --all-repos are logically exclusive: one narrows to a single
+    # repo, the other widens to every repo. Enforce it in argparse so the CLI
+    # fails fast with a clear error instead of silently preferring one.
+    repo_scope = claims.add_mutually_exclusive_group()
+    repo_scope.add_argument(
         "--repo",
         help="Scope to a specific repo id (overrides the local repo default)",
     )
-    claims.add_argument(
+    repo_scope.add_argument(
         "--all-repos",
         action="store_true",
         help="Show claims across every repo (operator view; skips the local-repo scope)",

@@ -366,11 +366,18 @@ def run_status(_args) -> int:
     except httpx.HTTPError:
         pass
 
+    # Scope the count to the same repo the "Repo scope" line reports, so a
+    # multi-repo hosted service does not show a cross-repo total under a
+    # single-repo scope (issue #30).
+    scope = _scope_repo_id(ctx)
+    count_params: dict[str, str] = {"active_only": "true"}
+    if scope:
+        count_params["repo"] = scope
     claim_count: int | str = "?"
     try:
         c = httpx.get(
             f"{ctx.service_url}/claims",
-            params={"active_only": "true"},
+            params=count_params,
             headers=_auth_headers(ctx),
             timeout=3.0,
         )
@@ -387,7 +394,7 @@ def run_status(_args) -> int:
     # SERVER has a checkout for symbol validation. A hosted shared service is
     # deliberately repo-scoped WITHOUT a global COORD_REPO_ROOT, so the merged
     # signal misreported it as "not repo-aware". Report the two separately.
-    scope = _scope_repo_id(ctx)
+    # (``scope`` was resolved above to scope the active-claims count.)
     scope_label = scope if scope else "all repos (no COORD_REPO_ID)"
     if symbol_validation is None:
         symbol_label = "unknown"
