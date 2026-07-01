@@ -9,6 +9,18 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.40.2] - 2026-06-30
+
+### Fixed
+
+- ``coord doctor``'s "pre-push hook installed" check no longer
+  false-negatives inside a git worktree. It checked
+  ``<repo>/.git/hooks/pre-push`` directly, but in a linked worktree
+  ``.git`` is a file (not a directory) and the hook lives in the shared
+  common git dir; the check now resolves the worktree's ``gitdir`` /
+  ``commondir`` so a worktree that shares its parent's installed hook
+  reports correctly.
+
 ## [0.40.1] - 2026-06-30
 
 ### Fixed

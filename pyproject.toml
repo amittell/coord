@@ -1,6 +1,6 @@
 [project]
 name = "coord-mcp-server"
-version = "0.40.1"
+version = "0.40.2"
 description = "Coordination service for multi-engineer agent teams (HTTP API + MCP + dashboard)"
 readme = "README.md"
 license = "Apache-2.0"

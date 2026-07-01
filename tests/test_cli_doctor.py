@@ -555,3 +555,49 @@ def test_sessions_live_busy_lock_warns_without_pruning(
     assert busy.level == "warn"
     assert "could not acquire" in busy.detail
     assert marker.read_text(encoding="utf-8") == "sess-b 2147480000 0\n"
+
+
+def test_installed_pre_push_hook_detected_in_worktree(tmp_path: Path) -> None:
+    """The pre-push hook check must resolve the shared hooks dir in a git
+    worktree (where ``.git`` is a file), not false-negative on it."""
+    import subprocess
+
+    def git(*args: str, cwd: Path) -> None:
+        subprocess.run(
+            ["git", "-c", "user.email=t@t", "-c", "user.name=t", *args],
+            cwd=str(cwd),
+            check=True,
+            capture_output=True,
+        )
+
+    main = tmp_path / "main"
+    main.mkdir()
+    git("init", "-q", cwd=main)
+    (main / "README.md").write_text("x", encoding="utf-8")
+    git("add", ".", cwd=main)
+    git("commit", "-qm", "init", cwd=main)
+
+    # Install a pre-push hook in the (shared) hooks dir.
+    hooks = main / ".git" / "hooks"
+    hooks.mkdir(exist_ok=True)
+    (hooks / "pre-push").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+
+    # A linked worktree shares that hooks dir; its own .git is a file.
+    wt = tmp_path / "wt"
+    git("worktree", "add", "-q", str(wt), "-b", "feat", cwd=main)
+    assert (wt / ".git").is_file()
+    # The naive check the bug used would fail here...
+    assert not (wt / ".git" / "hooks" / "pre-push").exists()
+    # ...but the resolver finds the shared, installed hook.
+    assert cli_doctor._installed_pre_push_hook(wt) is not None
+    assert cli_doctor._installed_pre_push_hook(main) is not None
+
+
+def test_installed_pre_push_hook_absent(tmp_path: Path) -> None:
+    """No hook installed -> None (plain repo)."""
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
+    assert cli_doctor._installed_pre_push_hook(repo) is None

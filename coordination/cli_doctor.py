@@ -632,6 +632,51 @@ def _print_results(results: list[CheckResult]) -> None:
             print(f"      hint: {result.hint}")
 
 
+def _installed_pre_push_hook(repo_root: Path) -> Path | None:
+    """Path to the active pre-push hook, or ``None`` if not installed.
+
+    Resolves the git hooks directory for both plain repos and linked
+    worktrees. In a worktree ``.git`` is a *file* (``gitdir: <path>``), and
+    hooks live in the shared common git dir -- not under
+    ``<worktree>/.git/hooks`` (which is not even a real path there). Without
+    this, ``coord doctor`` false-negatives on every worktree that shares its
+    parent's installed hook.
+    """
+    dotgit = repo_root / ".git"
+    if dotgit.is_dir():
+        git_dir: Path = dotgit
+    elif dotgit.is_file():
+        try:
+            line = dotgit.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        if not line.startswith("gitdir:"):
+            return None
+        wt_git_dir = Path(line.split(":", 1)[1].strip())
+        if not wt_git_dir.is_absolute():
+            wt_git_dir = (repo_root / wt_git_dir).resolve()
+        # The per-worktree git dir's ``commondir`` points at the shared git
+        # dir where hooks actually live.
+        commondir_file = wt_git_dir / "commondir"
+        if commondir_file.exists():
+            try:
+                common = commondir_file.read_text(encoding="utf-8").strip()
+            except OSError:
+                common = ".."
+            common_path = Path(common)
+            git_dir = (
+                common_path
+                if common_path.is_absolute()
+                else (wt_git_dir / common_path).resolve()
+            )
+        else:
+            git_dir = wt_git_dir
+    else:
+        return None
+    hook = git_dir / "hooks" / "pre-push"
+    return hook if hook.exists() else None
+
+
 def run_doctor(args) -> int:
     repo_root = find_repo_root()
     results: list[CheckResult] = []
@@ -721,7 +766,7 @@ def run_doctor(args) -> int:
             )
         )
 
-    hook_ok = (repo_root / ".git" / "hooks" / "pre-push").exists()
+    hook_ok = _installed_pre_push_hook(repo_root) is not None
     results.append(CheckResult("pre-push hook installed", hook_ok))
 
     # The .git/hooks/pre-push (or whatever the user wired up) typically
