@@ -7,7 +7,29 @@ Semantic Versioning.
 
 ## [Unreleased]
 
-(none recorded yet)
+### Changed
+
+- Repo-aware filtering for hosted shared services (#30, slice 1). A coord
+  service that fronts multiple repos no longer leaks unrelated repos' claims
+  into a repo-local client's views, and ``coord status`` stops misreporting a
+  deliberately-repo-scoped hosted service as "not repo-aware".
+  - The MCP ``list_claims`` and ``check_conflicts`` tools now scope their
+    queries to the client's ``COORD_REPO_ID`` by default (as ``claim_files``
+    already did), with an ``all_repos=True`` opt-out for the operator view.
+    This also fixes a latent gap: ``check_conflicts`` previously sent no repo,
+    so on a repo-tagged deployment the server's ``repo=None`` default compared
+    only against legacy NULL-repo claims and under-reported conflicts.
+  - ``coord claims`` scopes to the local repo (``config.toml`` ``repo_id`` /
+    ``COORD_REPO_ID``) by default; new ``--repo <id>`` targets a specific repo
+    and ``--all-repos`` restores the cross-repo operator view.
+  - ``coord status`` splits the old single ``Repo-aware:`` line into an honest
+    client-side ``Repo scope:`` (the local repo id, or "all repos") and a
+    server-side ``Symbol validation:`` (the ``COORD_REPO_ROOT`` signal). The
+    two facts were unrelated; merging them made a hosted service that scopes
+    by repo without a global checkout look un-scoped.
+  - Deployments with no ``COORD_REPO_ID`` (the single-repo shape) see no
+    behavior change. No schema migration; server endpoints (``/claims`` and
+    ``/conflicts`` already accept ``repo=``) are unchanged.
 
 ## [0.40.2] - 2026-06-30
 

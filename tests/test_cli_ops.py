@@ -776,6 +776,104 @@ def test_claims_engineer_filter_is_forwarded(
     assert any("active_only=false" in p for p in received)
 
 
+def _claims_path_recorder() -> "tuple[type[BaseHTTPRequestHandler], list[str]]":
+    """A handler that records every /claims request path and returns empty."""
+    received: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            auth = self.headers.get("Authorization", "")
+            if self.path == "/readyz":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"status":"ready"}')
+                return
+            if self.path.startswith("/claims"):
+                received.append(self.path)
+                if not auth.startswith("Bearer "):
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"claims":[],"count":0}')
+                return
+            self.send_response(404)
+            self.end_headers()
+
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A003
+            return
+
+    return Handler, received
+
+
+def test_claims_scopes_to_local_repo_by_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # _init_repo_with_service detects the repo id as the directory basename
+    # ("app") because the fake repo has no git origin. Issue #30: a repo-local
+    # client scopes its claim view to that repo by default.
+    handler, received = _claims_path_recorder()
+    with _MockServer(handler) as mock:
+        _init_repo_with_service(tmp_path, monkeypatch, mock.port)
+        capsys.readouterr()
+        exit_code = cli.main(["claims"])
+    assert exit_code == 0
+    assert any("repo=app" in p for p in received)
+
+
+def test_claims_all_repos_flag_omits_repo_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    handler, received = _claims_path_recorder()
+    with _MockServer(handler) as mock:
+        _init_repo_with_service(tmp_path, monkeypatch, mock.port)
+        capsys.readouterr()
+        exit_code = cli.main(["claims", "--all-repos"])
+    assert exit_code == 0
+    assert received
+    assert all("repo=" not in p for p in received)
+
+
+def test_claims_repo_flag_overrides_local_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    handler, received = _claims_path_recorder()
+    with _MockServer(handler) as mock:
+        _init_repo_with_service(tmp_path, monkeypatch, mock.port)
+        capsys.readouterr()
+        exit_code = cli.main(["claims", "--repo", "otherorg/svc"])
+    assert exit_code == 0
+    # httpx URL-encodes the slash in the query string.
+    assert any("repo=otherorg%2Fsvc" in p for p in received)
+    assert all("repo=app" not in p for p in received)
+
+
+def test_status_shows_repo_scope_and_symbol_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with _MockServer(_status_handler_factory(claims_count=1)) as mock:
+        _init_repo_with_service(tmp_path, monkeypatch, mock.port)
+        capsys.readouterr()
+        exit_code = cli.main(["status"])
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    # Issue #30: the old single "Repo-aware:" line is split into an honest
+    # client-side repo scope and a server-side symbol-validation signal.
+    assert "Repo scope: app" in out
+    assert "Symbol validation:" in out
+
+
 # ---------------------------------------------------------------------------
 # coord release
 # ---------------------------------------------------------------------------

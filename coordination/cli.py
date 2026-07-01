@@ -193,8 +193,11 @@ def build_parser() -> argparse.ArgumentParser:
         "claims",
         help="List active claims",
         description=(
-            "List claims from the configured service. Filter by --engineer, include "
-            "expired claims with --all, or emit raw JSON with --json."
+            "List claims from the configured service. Scopes to the local repo "
+            "(config.toml repo_id / COORD_REPO_ID) by default; use --repo <id> to "
+            "target another repo or --all-repos for the operator view across every "
+            "repo. Filter by --engineer, include expired claims with --all, or emit "
+            "raw JSON with --json."
         ),
     )
     claims.add_argument("--engineer", help="Only show claims for this engineer id")
@@ -202,6 +205,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--all",
         action="store_true",
         help="Include expired claims (active_only=false)",
+    )
+    claims.add_argument(
+        "--repo",
+        help="Scope to a specific repo id (overrides the local repo default)",
+    )
+    claims.add_argument(
+        "--all-repos",
+        action="store_true",
+        help="Show claims across every repo (operator view; skips the local-repo scope)",
     )
     claims.add_argument(
         "--json",
