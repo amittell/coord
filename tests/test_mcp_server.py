@@ -238,6 +238,9 @@ async def test_check_conflicts_passes_params_as_list_of_tuples_preserving_order(
     collapse the duplicate `pattern` keys)."""
     monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
     monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    # check_conflicts appends a ``repo`` param when COORD_REPO_ID is set; this
+    # exact-order assertion must not see an ambient value from the dev's shell.
+    monkeypatch.delenv("COORD_REPO_ID", raising=False)
 
     captured_params: list[Any] = []
 
