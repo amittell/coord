@@ -223,9 +223,10 @@ tokens exist. `COORD_REQUIRE_SCOPED_TOKEN` is the separate "make it mandatory" s
 
 ## Resolved (as built)
 
-1. **OIDC** -- **operator-only in v1.** OIDC/dashboard login keeps minting unscoped
-   short-lived tokens (all-repo dashboard visibility); documented as a known limitation in
-   `deployment.md`. A `COORD_OIDC_REPO_CLAIM` mapping is the future path for scoped humans.
+1. **OIDC** -- **unscoped by default, repo-scoped via `COORD_OIDC_REPO_CLAIM`.** OIDC login
+   mints an unscoped (operator) token unless `COORD_OIDC_REPO_CLAIM` names an ID-token claim
+   carrying the repo id, in which case the session token is bound to that repo; a
+   configured-but-missing claim refuses the login. See `deployment.md`.
 2. **`POST /sessions/{id}/release`** -- **partial in-scope release.** A scoped token releases
    only its repo's claims within the session and reports the count; it never 403s the whole
    call (non-destructive to other repos, and a scoped token cannot see the rest anyway).
@@ -238,6 +239,6 @@ tokens exist. `COORD_REQUIRE_SCOPED_TOKEN` is the separate "make it mandatory" s
 
 ## Still open (future)
 
-- `COORD_OIDC_REPO_CLAIM` to bind an SSO principal to a repo (removes the operator-only
-  OIDC limitation).
-- Allowed-set tokens via the join table, if/when a token legitimately spans several repos.
+- Allowed-set tokens via a `engineer_token_repos(token_id, repo)` join table, if/when a
+  token legitimately needs to span several repos. No concrete demand yet; the scalar
+  `repo` column backfills into it cleanly.

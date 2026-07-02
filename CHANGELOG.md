@@ -31,9 +31,12 @@ Semantic Versioning.
     dashboard session can no longer mint an unscoped token.
   - ``COORD_REQUIRE_SCOPED_TOKEN`` (default off) rejects unscoped per-engineer
     tokens to make scoping mandatory; the shared token stays the operator escape
-    hatch. See ``docs/deployment.md`` for the hosted-multi-repo rollout,
-    including the OIDC operator-only limitation and the legacy NULL-repo claim
-    drain step.
+    hatch. See ``docs/deployment.md`` for the hosted-multi-repo rollout and the
+    legacy NULL-repo claim drain step.
+  - ``COORD_OIDC_REPO_CLAIM`` (default unset) binds an SSO-minted session token
+    to a repo from a configured ID-token claim, so OIDC dashboard sessions can
+    be repo-scoped instead of operator-wide; a configured-but-missing claim
+    refuses the login rather than silently granting all-repo access.
 
 ### Changed
 

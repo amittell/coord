@@ -1095,3 +1095,78 @@ def test_map_claim_allowlist_checked_before_prefix() -> None:
             allow_any=False,
             prefix="sso/",
         )
+
+
+# ---------------------------------------------------------------------------
+# COORD_OIDC_REPO_CLAIM (#30 slice 2/3): bind the SSO-minted token to a repo
+# from a configured claim so OIDC dashboard sessions can be repo-scoped.
+# ---------------------------------------------------------------------------
+
+
+async def test_oidc_repo_claim_scopes_minted_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    idp = FakeIdP()
+    idp.id_token_kwargs = {"extra": {"coord_repo": "amittell/repo-a"}}
+    _setup(monkeypatch, tmp_path, idp, env={"COORD_OIDC_REPO_CLAIM": "coord_repo"})
+    async with _client() as client:
+        qs, _ = await _login_redirect(client)
+        idp.nonce = qs["nonce"]
+        r = await client.get(
+            "/auth/oidc/callback",
+            params={"code": "authcode-1", "state": qs["state"]},
+            follow_redirects=False,
+        )
+        assert r.status_code == 303, r.text
+        from coordination.deps import get_service
+
+        rows = await get_service().db.list_engineer_tokens(
+            engineer="dev@example.com"
+        )
+        assert len(rows) == 1
+        assert rows[0]["repo"] == "amittell/repo-a"
+
+
+async def test_oidc_repo_claim_missing_refuses_login(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Configured-but-absent claim is a refusal, never a silent all-repo grant.
+    idp = FakeIdP()  # no coord_repo claim in the token
+    _setup(monkeypatch, tmp_path, idp, env={"COORD_OIDC_REPO_CLAIM": "coord_repo"})
+    async with _client() as client:
+        qs, _ = await _login_redirect(client)
+        idp.nonce = qs["nonce"]
+        r = await client.get(
+            "/auth/oidc/callback",
+            params={"code": "authcode-1", "state": qs["state"]},
+            follow_redirects=False,
+        )
+        assert r.status_code == 403, r.text
+        from coordination.deps import get_service
+
+        rows = await get_service().db.list_engineer_tokens(
+            engineer="dev@example.com"
+        )
+        assert rows == []  # no token minted for a refused login
+
+
+async def test_oidc_without_repo_claim_mints_unscoped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    idp = FakeIdP()
+    _setup(monkeypatch, tmp_path, idp)  # COORD_OIDC_REPO_CLAIM unset
+    async with _client() as client:
+        qs, _ = await _login_redirect(client)
+        idp.nonce = qs["nonce"]
+        r = await client.get(
+            "/auth/oidc/callback",
+            params={"code": "authcode-1", "state": qs["state"]},
+            follow_redirects=False,
+        )
+        assert r.status_code == 303, r.text
+        from coordination.deps import get_service
+
+        rows = await get_service().db.list_engineer_tokens(
+            engineer="dev@example.com"
+        )
+        assert rows[0]["repo"] is None

@@ -197,6 +197,13 @@ class Settings(BaseSettings):
     # ``sso/dev@example.com``. Keeps SSO-minted identities visually
     # distinct from hand-minted ones in claims and token listings.
     oidc_engineer_prefix: str = ""
+    # #30 slice 2/3: when set, the OIDC claim whose value binds the SSO-minted
+    # token to a repo (e.g. ``coord_repo``), so SSO dashboard sessions are
+    # repo-scoped rather than operator-wide. If configured and the claim is
+    # absent/empty in a principal's token, that login is REFUSED rather than
+    # silently granted all-repo access. Unset (default) keeps SSO sessions
+    # unscoped (operator) -- the documented v1 default.
+    oidc_repo_claim: str = ""
     # v0.30 per-engineer rate limiting + per-repo queue-depth quota.
     # All three knobs default to 0 = disabled, so an upgrade changes
     # nothing until the operator opts in. Limits key on the

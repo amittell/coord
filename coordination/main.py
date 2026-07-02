@@ -1474,6 +1474,25 @@ async def oidc_callback(request: Request) -> Response:
             "SSO sign-in refused", str(exc), 403
         )
 
+    # #30 slice 2/3: optionally bind the SSO-minted token to a repo from a
+    # configured claim, so SSO dashboard sessions are repo-scoped instead of
+    # operator-wide. Configured-but-missing is a refusal, never a silent grant
+    # of all-repo access.
+    oidc_repo: str | None = None
+    if settings.oidc_repo_claim:
+        raw_repo = claims.get(settings.oidc_repo_claim)
+        if not isinstance(raw_repo, str) or not raw_repo.strip():
+            return _oidc_error_clearing_state(
+                "SSO sign-in refused",
+                (
+                    f"the configured OIDC repo claim "
+                    f"'{settings.oidc_repo_claim}' is missing or empty; this "
+                    "deployment scopes SSO sessions to a repo."
+                ),
+                403,
+            )
+        oidc_repo = raw_repo.strip()
+
     # SSO sessions mint a REAL per-engineer token whose lifetime is
     # exactly the dashboard session lifetime, so the credential dies
     # with the cookie instead of accumulating as an immortal row. A
@@ -1498,6 +1517,7 @@ async def oidc_callback(request: Request) -> Response:
         sha256_token(raw),
         description="oidc sso login",
         expires_at=expires_at,
+        repo=oidc_repo,
     )
 
     response = Response(status_code=303)

@@ -255,11 +255,14 @@ unscoped per-engineer token -- for cross-repo visibility and the operator-only
 endpoints. A repo-scoped dashboard login sees only its repo (including its own
 token panel); an operator login sees everything, unchanged.
 
-**OIDC / SSO login is operator-only in v1.** Dashboard OIDC mints short-lived
-*unscoped* per-engineer tokens, so any SSO principal has all-repo dashboard
-visibility for the session. If you need repo-scoped humans, gate OIDC to
-operators (or map a principal to a repo) before telling engineers the dashboard
-is scoped. This is a known v1 limitation, not a bug.
+**OIDC / SSO sessions are unscoped (operator) by default, or repo-scoped via a
+claim.** With no `COORD_OIDC_REPO_CLAIM`, dashboard OIDC mints short-lived
+*unscoped* per-engineer tokens, so any SSO principal has all-repo visibility for
+the session -- fine when SSO is operator-only. To scope SSO humans to a repo,
+set `COORD_OIDC_REPO_CLAIM` to the ID-token claim whose value is the repo id
+(e.g. `coord_repo`); the minted session token is then bound to that repo. If the
+claim is configured but absent/empty in a principal's token the login is
+**refused**, never silently granted all-repo access.
 
 ### Making scoping mandatory
 
