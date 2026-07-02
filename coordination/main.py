@@ -340,6 +340,10 @@ class AuthOutcome:
     auth_kind: str | None = None  # "per_engineer" | "shared" | None
     engineer: str | None = None
     token_id: str | None = None
+    # v0.42 (#30 slice 2/3): the repo this token is bound to, or None for an
+    # unscoped (operator / shared) token. When set, the server forces repo
+    # scope from auth rather than trusting a client-supplied ``repo``.
+    token_repo: str | None = None
     # v0.29.5: the session token's own expiry (ISO ``...Z`` or None for
     # never), populated on the per-engineer ok path. The dashboard
     # token-create endpoint uses it to cap self-service token expiry.
@@ -450,6 +454,7 @@ async def _authenticate_bearer(
                 engineer=resolved["engineer"],
                 token_id=resolved["id"],
                 token_expires_at=resolved.get("expires_at"),
+                token_repo=resolved.get("repo"),
             )
         metrics.auth_failures_total.inc()
         if resolved["status"] == "expired":
@@ -519,10 +524,17 @@ async def require_auth(
         raise HTTPException(
             status_code=outcome.status_code, detail=outcome.detail
         )
+    # #30 slice 2/3: default the repo-scope state on every request so handlers
+    # can read request.state.token_repo unconditionally. An unscoped or shared
+    # token leaves it None (operator: sees all repos).
+    request.state.token_repo = None
+    request.state.token_scoped = False
     if outcome.auth_kind == "per_engineer":
         request.state.engineer = outcome.engineer
         request.state.auth_kind = "per_engineer"
         request.state.token_id = outcome.token_id
+        request.state.token_repo = outcome.token_repo
+        request.state.token_scoped = outcome.token_repo is not None
     elif outcome.auth_kind == "shared":
         request.state.auth_kind = "shared"
 

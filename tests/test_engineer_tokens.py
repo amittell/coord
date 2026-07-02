@@ -463,3 +463,78 @@ async def test_rotate_is_atomic_on_insert_failure(tmp_path: Path) -> None:
     assert row is not None
     assert row["status"] == "ok"
     assert row["rotation_grace_until"] is None
+
+
+# ---------------------------------------------------------------------------
+# repo-bound tokens (issue #30 slice 2/3): a nullable ``repo`` binds a token
+# to a repo so the server can enforce scope from auth. NULL = unscoped.
+# ---------------------------------------------------------------------------
+
+
+async def test_create_token_persists_repo(tmp_path: Path) -> None:
+    db = Database(tmp_path / "tok.sqlite")
+    raw = "coordt_" + "c" * 64
+    await db.create_engineer_token(
+        "alex/claude/main", _sha256(raw), repo="amittell/coord"
+    )
+    hit = await db.lookup_engineer_token(_sha256(raw))
+    assert hit is not None
+    assert hit["repo"] == "amittell/coord"
+    resolved = await db.resolve_engineer_token(_sha256(raw))
+    assert resolved is not None
+    assert resolved["repo"] == "amittell/coord"
+
+
+async def test_create_token_defaults_repo_to_null(tmp_path: Path) -> None:
+    # An unscoped (operator / back-compat) token: repo is NULL.
+    db = Database(tmp_path / "tok.sqlite")
+    raw = "coordt_" + "d" * 64
+    await db.create_engineer_token("alex/claude/main", _sha256(raw))
+    hit = await db.lookup_engineer_token(_sha256(raw))
+    assert hit is not None
+    assert hit["repo"] is None
+
+
+async def test_list_tokens_surfaces_repo(tmp_path: Path) -> None:
+    db = Database(tmp_path / "tok.sqlite")
+    await db.create_engineer_token(
+        "eng-a", _sha256("coordt_" + "e" * 64), repo="amittell/coord"
+    )
+    await db.create_engineer_token("eng-b", _sha256("coordt_" + "f" * 64))
+    rows = await db.list_engineer_tokens()
+    by_engineer = {r["engineer"]: r for r in rows}
+    assert by_engineer["eng-a"]["repo"] == "amittell/coord"
+    assert by_engineer["eng-b"]["repo"] is None
+
+
+async def test_get_token_by_id_surfaces_repo(tmp_path: Path) -> None:
+    db = Database(tmp_path / "tok.sqlite")
+    tid = await db.create_engineer_token(
+        "eng-a", _sha256("coordt_" + "1" * 64), repo="amittell/coord"
+    )
+    row = await db.get_engineer_token_by_id(tid)
+    assert row is not None
+    assert row["repo"] == "amittell/coord"
+
+
+async def test_rotate_carries_repo_forward(tmp_path: Path) -> None:
+    # Critical regression (flagged in review): a rotation must NOT silently
+    # unscope its successor, or a scoped token becomes operator-equivalent
+    # on rotation with no 401 to signal it.
+    db = Database(tmp_path / "tok.sqlite")
+    raw_old = "coordt_" + "2" * 64
+    raw_new = "coordt_" + "3" * 64
+    old_id = await db.create_engineer_token(
+        "eng-a", _sha256(raw_old), repo="amittell/coord"
+    )
+    grace = datetime.now(UTC) + timedelta(hours=1)
+    result = await db.rotate_engineer_token(
+        old_id, _sha256(raw_new), grace_until=grace
+    )
+    assert result["ok"] is True
+    successor = await db.resolve_engineer_token(_sha256(raw_new))
+    assert successor is not None
+    assert successor["status"] == "ok"
+    assert successor["repo"] == "amittell/coord", (
+        "rotation silently dropped the repo scope"
+    )

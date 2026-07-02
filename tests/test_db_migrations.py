@@ -239,6 +239,22 @@ async def test_two_database_instances_same_path(tmp_path: Path) -> None:
     assert rows[0][0] == CURRENT_SCHEMA_VERSION
 
 
+async def test_v19_adds_repo_column_to_engineer_tokens(tmp_path: Path) -> None:
+    """Migration v19 introduces a nullable `repo` column on engineer_tokens
+    (issue #30 slice 2/3). NULL = unscoped token; the migration is inert."""
+    db_path = tmp_path / "v19.sqlite"
+    db = Database(db_path)
+    await db.init()
+
+    rows = await _fetch_all(db_path, "PRAGMA table_info(engineer_tokens)")
+    cols = {r[1] for r in rows}  # column name is index 1
+    assert "repo" in cols, f"engineer_tokens missing repo column; saw: {cols}"
+
+    # Nullable: notnull flag (index 3) must be 0 so existing tokens are NULL.
+    repo_row = next(r for r in rows if r[1] == "repo")
+    assert repo_row[3] == 0, "repo column must be nullable (NULL = unscoped)"
+
+
 async def test_v2_adds_repo_column_to_claims(tmp_path: Path) -> None:
     """Migration v2 introduces a nullable `repo` column on claims."""
     db_path = tmp_path / "v2.sqlite"

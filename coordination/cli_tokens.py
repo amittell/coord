@@ -102,6 +102,7 @@ async def _create(args: argparse.Namespace) -> int:
         sha256_token(raw),
         description=args.description,
         expires_at=expires_at,
+        repo=args.repo,
     )
     expires_str = _iso_z(expires_at) if expires_at else None
     if args.json:
@@ -110,6 +111,7 @@ async def _create(args: argparse.Namespace) -> int:
             "engineer": args.engineer,
             "description": args.description,
             "expires_at": expires_str,
+            "repo": args.repo,
             "token": raw,
         }
         print(json.dumps(out, indent=2))
@@ -120,6 +122,7 @@ async def _create(args: argparse.Namespace) -> int:
             print(f"Description:  {args.description}")
         if expires_str:
             print(f"Expires:      {expires_str}")
+        print(f"Repo scope:   {args.repo or 'all repos (unscoped)'}")
         print("")
         print(f"  {raw}")
         print("")
@@ -327,6 +330,15 @@ def add_tokens_subparser(sub: argparse._SubParsersAction) -> None:
         help=(
             "Optional expiry as <number><unit> with unit m/h/d/w "
             "(e.g. 30d, 12h). Omit for a token that never expires"
+        ),
+    )
+    create.add_argument(
+        "--repo",
+        metavar="REPO_ID",
+        help=(
+            "Bind the token to a repo id (e.g. amittell/coord) so the server "
+            "enforces repo scope from auth. Omit for an unscoped (operator) "
+            "token that sees all repos"
         ),
     )
     create.add_argument(

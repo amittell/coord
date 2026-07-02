@@ -141,7 +141,7 @@ CREATE INDEX IF NOT EXISTS idx_claims_engineer ON claims (engineer);
 """
 
 
-CURRENT_SCHEMA_VERSION = 18
+CURRENT_SCHEMA_VERSION = 19
 
 
 # v0.28 fairness pass: per-blocking-claim counter that
@@ -596,6 +596,16 @@ MIGRATIONS: list[tuple[int, str]] = [
     (
         18,
         "ALTER TABLE requests ADD COLUMN coexist_symbols TEXT;",
+    ),
+    # v19: repo-scoped tokens (issue #30 slice 2/3). ``engineer_tokens`` gains
+    # a nullable ``repo`` binding so the server can derive and enforce repo
+    # scope from authentication instead of trusting a client-supplied ``repo``.
+    # NULL = unscoped (operator / back-compat): every existing token keeps its
+    # all-repo behaviour and the migration is inert until a scoped token is
+    # minted.
+    (
+        19,
+        "ALTER TABLE engineer_tokens ADD COLUMN repo TEXT;",
     ),
 ]
 
@@ -2084,6 +2094,7 @@ class Database:
         description: str | None = None,
         expires_at: datetime | None = None,
         rotated_from: str | None = None,
+        repo: str | None = None,
         now: datetime | None = None,
     ) -> str:
         """v0.29: insert a per-engineer bearer token row. The caller is
@@ -2108,9 +2119,9 @@ class Database:
             await conn.execute(
                 "INSERT INTO engineer_tokens "
                 "(id, engineer, token_sha256, description, created_at, "
-                "expires_at, rotated_from) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (token_id, engineer, token_sha256, description, ts, exp_ts, rotated_from),
+                "expires_at, rotated_from, repo) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (token_id, engineer, token_sha256, description, ts, exp_ts, rotated_from, repo),
             )
             await conn.commit()
         return token_id
@@ -2138,7 +2149,7 @@ class Database:
             cur = await conn.execute(
                 "SELECT id, engineer, description, created_at, last_used_at, "
                 "expires_at, rotated_from, rotation_grace_until, "
-                "request_count, last_source_ip, last_user_agent "
+                "request_count, last_source_ip, last_user_agent, repo "
                 "FROM engineer_tokens "
                 "WHERE token_sha256 = ? AND revoked_at IS NULL",
                 (token_sha256,),
@@ -2221,7 +2232,7 @@ class Database:
             "SELECT id, engineer, description, created_at, "
             "revoked_at, last_used_at, expires_at, rotated_from, "
             "rotation_grace_until, request_count, last_source_ip, "
-            "last_user_agent FROM engineer_tokens"
+            "last_user_agent, repo FROM engineer_tokens"
         )
         clauses: list[str] = []
         params: list[Any] = []
@@ -2256,7 +2267,7 @@ class Database:
                 "SELECT id, engineer, description, created_at, "
                 "revoked_at, last_used_at, expires_at, rotated_from, "
                 "rotation_grace_until, request_count, last_source_ip, "
-                "last_user_agent FROM engineer_tokens WHERE id = ?",
+                "last_user_agent, repo FROM engineer_tokens WHERE id = ?",
                 (token_id,),
             )
             row = await cur.fetchone()
@@ -2339,7 +2350,7 @@ class Database:
             await conn.execute("BEGIN IMMEDIATE")
             cur = await conn.execute(
                 "SELECT id, engineer, description, revoked_at, "
-                "expires_at, rotation_grace_until "
+                "expires_at, rotation_grace_until, repo "
                 "FROM engineer_tokens WHERE id = ?",
                 (token_id,),
             )
@@ -2359,8 +2370,8 @@ class Database:
             await conn.execute(
                 "INSERT INTO engineer_tokens "
                 "(id, engineer, token_sha256, description, created_at, "
-                "expires_at, rotated_from) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "expires_at, rotated_from, repo) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     old["engineer"],
@@ -2369,6 +2380,7 @@ class Database:
                     ts,
                     exp_ts,
                     old["id"],
+                    old["repo"],
                 ),
             )
             await conn.execute(
