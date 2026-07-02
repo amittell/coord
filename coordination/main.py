@@ -212,6 +212,13 @@ async def _count_http_requests(request: Request, call_next):
     label so cardinality stays bounded; falls back to the raw URL path
     if routing did not attach a matched route (404s, /metrics itself)."""
     response = await call_next(request)
+    # #30 slice 2/3: advertise the repo a scoped token was pinned to, so an
+    # operator who dropped a token into the wrong repo's local.env can see
+    # why results are empty instead of a silent void. Unscoped tokens (the
+    # common case) get no header.
+    _scope = getattr(request.state, "token_repo", None)
+    if _scope is not None:
+        response.headers["X-Coord-Repo-Scope"] = _scope
     route = request.scope.get("route")
     path_label = getattr(route, "path", None) or request.url.path
     metrics.http_requests_total.inc(
@@ -537,6 +544,75 @@ async def require_auth(
         request.state.token_scoped = outcome.token_repo is not None
     elif outcome.auth_kind == "shared":
         request.state.auth_kind = "shared"
+
+
+# ---------------------------------------------------------------------------
+# Repo-scope enforcement (#30 slice 2/3). A scoped token's repo comes from
+# auth (request.state.token_repo), never from the client, so these helpers are
+# the boundary that makes visibility a server-side authorization decision.
+# ---------------------------------------------------------------------------
+
+
+def _token_repo(request: Request) -> str | None:
+    """The repo this request's token is bound to, or None when unscoped."""
+    return getattr(request.state, "token_repo", None)
+
+
+def _effective_read_repo(
+    request: Request, client_repo: str | None, *, all_repos: bool = False
+) -> str | None:
+    """Resolve the repo filter for a READ, enforcing token scope.
+
+    Unscoped (operator) token: the client's ``repo`` / ``all_repos`` are
+    honored verbatim. Scoped token: the filter is forced to the token's repo;
+    an explicit request for a different repo (or all repos) is a 403 rather
+    than a silent lie, while an absent ``repo`` is silently scoped so a stale
+    client that sends nothing is still enforced.
+    """
+    token_repo = _token_repo(request)
+    if token_repo is None:
+        return client_repo
+    if all_repos or (client_repo is not None and client_repo != token_repo):
+        want = "all repos" if all_repos else f"repo '{client_repo}'"
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"This token is scoped to repo '{token_repo}'; it cannot "
+                f"access {want}."
+            ),
+        )
+    return token_repo
+
+
+def _enforce_write_repo(request: Request, body_repo: str | None) -> str | None:
+    """Resolve the repo a WRITE tags, enforcing token scope. Scoped token:
+    default to the token's repo when the body omits it, 403 on mismatch.
+    Unscoped token: the body value is honored verbatim."""
+    token_repo = _token_repo(request)
+    if token_repo is None:
+        return body_repo
+    if body_repo is not None and body_repo != token_repo:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"This token is scoped to repo '{token_repo}'; it cannot "
+                f"write to repo '{body_repo}'."
+            ),
+        )
+    return token_repo
+
+
+def _require_operator(request: Request) -> None:
+    """Reject a repo-scoped token from an operator-only (global) endpoint."""
+    token_repo = _token_repo(request)
+    if token_repo is not None:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "This endpoint mutates global state and is operator-only; a "
+                f"token scoped to repo '{token_repo}' cannot use it."
+            ),
+        )
 
 
 # Cookie set by ``/dashboard/login``. HTTP-only so JS in any
@@ -1630,7 +1706,8 @@ async def dashboard_tokens_revoke(
 
 
 @app.post("/claims")
-async def create_claims(body: CreateClaimsRequest, _: None = Depends(require_auth)) -> JSONResponse:
+async def create_claims(request: Request, body: CreateClaimsRequest, _: None = Depends(require_auth)) -> JSONResponse:
+    body.repo = _enforce_write_repo(request, body.repo)
     # v0.30: rate-limit raises map to 429 before (and independent of)
     # the warnings->400 mapping below -- a quota breach is not a
     # validation problem and must carry its own Retry-After signal.
@@ -1661,13 +1738,14 @@ async def create_claims(body: CreateClaimsRequest, _: None = Depends(require_aut
 
 @app.post("/claims/refactor")
 async def claim_refactor(
-    body: ClaimRefactorRequest, _: None = Depends(require_auth)
+    request: Request, body: ClaimRefactorRequest, _: None = Depends(require_auth)
 ) -> JSONResponse:
     """v0.31 wave 2: reserve a symbol's definition plus every callsite
     the language server can see, as one normal claims batch. Response
     shapes are byte-compatible with POST /claims (200 / 400 / 409 /
     429); the only new shape is 503 when no language server can answer,
     because refactor claims are meaningless without references."""
+    body.repo = _enforce_write_repo(request, body.repo)
     try:
         result = await get_service().create_refactor_claims(body)
     except LspUnavailable as exc:
@@ -1704,6 +1782,7 @@ async def claim_refactor(
 
 @app.get("/claims")
 async def list_claims(
+    request: Request,
     active: bool = Query(default=True, alias="active_only"),
     engineer: str | None = None,
     module: str | None = None,
@@ -1711,6 +1790,7 @@ async def list_claims(
     session_id: str | None = None,
     _: None = Depends(require_auth),
 ) -> dict:
+    repo = _effective_read_repo(request, repo)
     rows = await get_service().list_claims(
         active_only=active,
         engineer=engineer,
@@ -1723,10 +1803,13 @@ async def list_claims(
 
 
 @app.get("/repos")
-async def list_repos(_: None = Depends(require_auth)) -> dict:
+async def list_repos(request: Request, _: None = Depends(require_auth)) -> dict:
     """Per-repo activity summary: one row for each distinct repo that has
     ever submitted a claim with a non-null repo identifier."""
     rows = await get_service().db.list_repos()
+    token_repo = _token_repo(request)
+    if token_repo is not None:
+        rows = [r for r in rows if r.get("repo") == token_repo]
     return {"repos": rows, "count": len(rows)}
 
 
@@ -1736,6 +1819,7 @@ async def hotspots_metric(
     min_attempts: int = Query(default=5, ge=1),
     limit: int = Query(default=20, ge=1, le=200),
     repo: str | None = Query(default=None),
+    request: Request = None,  # type: ignore[assignment]
     _: None = Depends(require_auth),
 ) -> dict:
     """Top files by blocked claim attempts (v0.20).
@@ -1743,6 +1827,7 @@ async def hotspots_metric(
     Operators look at this list to decide which files belong in a
     ``shared_file`` rule or which areas need to be split into modules.
     """
+    repo = _effective_read_repo(request, repo)
     rows = await get_service().db.hotspot_files(
         days=days, min_attempts=min_attempts, limit=limit, repo=repo,
     )
@@ -1756,6 +1841,7 @@ async def hotspots_metric(
 
 @app.post("/metrics/hotspots/promote")
 async def promote_hotspot(
+    request: Request,
     body: PromoteHotspotRequest,
     _: None = Depends(require_auth),
 ) -> dict:
@@ -1770,6 +1856,7 @@ async def promote_hotspot(
     The dashboard renders an "apply" link per qualifying hotspot row
     pointing at this endpoint; the operator is in the loop.
     """
+    _require_operator(request)
     try:
         patched = await get_service().promote_hotspot(
             action=body.action,
@@ -1791,6 +1878,7 @@ async def promote_hotspot(
 async def auto_resolutions_metric(
     days: int = Query(default=30, ge=1, le=90),
     repo: str | None = Query(default=None),
+    request: Request = None,  # type: ignore[assignment]
     _: None = Depends(require_auth),
 ) -> dict:
     """Daily auto-coexist / auto-narrow counts per repo (v0.18).
@@ -1799,6 +1887,7 @@ async def auto_resolutions_metric(
     available standalone for external monitoring. Empty days are
     omitted -- callers that want a dense grid fill the gaps.
     """
+    repo = _effective_read_repo(request, repo)
     rows = await get_service().db.daily_auto_resolutions(days=days, repo=repo)
     return {"series": rows, "days": days, "count": len(rows)}
 
@@ -1810,8 +1899,10 @@ async def conflicts(
     repo: str | None = Query(default=None),
     session_id: list[str] | None = Query(default=None),
     branch: str | None = Query(default=None),
+    request: Request = None,  # type: ignore[assignment]
     _: None = Depends(require_auth),
 ) -> dict:
+    repo = _effective_read_repo(request, repo)
     if not pattern:
         raise HTTPException(status_code=400, detail="Provide one or more pattern= query params")
     try:
