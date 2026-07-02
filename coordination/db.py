@@ -2499,12 +2499,19 @@ class Database:
             await conn.commit()
         return [dict(r) for r in rows]
 
-    async def release_for_session(self, session_id: str) -> int:
+    async def release_for_session(
+        self, session_id: str, *, repo: str | None = None
+    ) -> int:
         """Release every active claim that was created with the given
         session_id, regardless of engineer name. Returns the count of
         rows actually closed. Intended for end-of-work cleanup so an
         agent process can reliably tear down everything it produced
         even when it spawned subagents under multiple engineer names.
+
+        ``repo`` (#30 slice 2/3) scopes the release: when set, only claims
+        tagged with that repo are closed, so a repo-scoped token cannot
+        tear down another repo's work sharing the same session id. None
+        (operator) releases the whole session as before.
         """
         if not session_id:
             return 0
@@ -2519,16 +2526,25 @@ class Database:
             await _configure_sqlite(conn)
             await conn.execute("BEGIN IMMEDIATE")
             try:
+                repo_clause = " AND repo = ?" if repo is not None else ""
+                sel_params: list[Any] = [session_id]
+                if repo is not None:
+                    sel_params.append(repo)
                 cur = await conn.execute(
-                    "SELECT id FROM claims WHERE session_id = ? AND released_at IS NULL",
-                    (session_id,),
+                    "SELECT id FROM claims WHERE session_id = ? "
+                    "AND released_at IS NULL" + repo_clause,
+                    sel_params,
                 )
                 to_close = [str(r["id"]) for r in await cur.fetchall()]
                 if to_close:
+                    upd_params: list[Any] = [now, session_id]
+                    if repo is not None:
+                        upd_params.append(repo)
                     cur = await conn.execute(
                         "UPDATE claims SET released_at = ? "
-                        "WHERE session_id = ? AND released_at IS NULL",
-                        (now, session_id),
+                        "WHERE session_id = ? AND released_at IS NULL"
+                        + repo_clause,
+                        upd_params,
                     )
                     n = cur.rowcount or 0
                 else:
@@ -2549,6 +2565,63 @@ class Database:
                 cid, release_kind="session-bulk", actor_engineer=None
             )
         return n
+
+    async def claim_repo(self, claim_id: str) -> tuple[bool, str | None]:
+        """Scope-guard lookup: ``(exists, repo)`` for a claim id (#30 s2/3).
+
+        ``exists`` is False when the id is unknown so a guard can fall
+        through to the handler's own 404 / no-op instead of turning a
+        typo into a 403.
+        """
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                "SELECT repo FROM claims WHERE id = ?", (claim_id,)
+            )
+            row = await cur.fetchone()
+        return (False, None) if row is None else (True, row["repo"])
+
+    async def request_repo(self, request_id: str) -> tuple[bool, str | None]:
+        """``(exists, repo)`` for a request id, via its target claim."""
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                "SELECT c.repo AS repo FROM requests r "
+                "JOIN claims c ON c.id = r.claim_id WHERE r.id = ?",
+                (request_id,),
+            )
+            row = await cur.fetchone()
+        return (False, None) if row is None else (True, row["repo"])
+
+    async def queue_entry_repo(self, queue_id: str) -> tuple[bool, str | None]:
+        """``(exists, repo)`` for a claim_queue entry id."""
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                "SELECT repo FROM claim_queue WHERE id = ?", (queue_id,)
+            )
+            row = await cur.fetchone()
+        return (False, None) if row is None else (True, row["repo"])
+
+    async def session_repos(self, session_id: str) -> set[str | None]:
+        """Distinct repos of the active claims under a session id."""
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                "SELECT DISTINCT repo FROM claims "
+                "WHERE session_id = ? AND released_at IS NULL",
+                (session_id,),
+            )
+            rows = await cur.fetchall()
+        return {r["repo"] for r in rows}
 
     async def release_claims(self, claim_ids: list[str], engineer: str | None = None) -> int:
         now = _utcnow()

@@ -615,6 +615,46 @@ def _require_operator(request: Request) -> None:
         )
 
 
+def _scope_403(token_repo: str, kind: str) -> HTTPException:
+    return HTTPException(
+        status_code=403,
+        detail=(
+            f"This token is scoped to repo '{token_repo}'; that {kind} "
+            "belongs to another repo."
+        ),
+    )
+
+
+async def _require_claim_in_scope(request: Request, claim_id: str) -> None:
+    """403 when a scoped token references a claim in another repo. A missing
+    claim falls through so the handler's own 404 / no-op logic runs (no
+    existence 403 for an id the token could not have created)."""
+    token_repo = _token_repo(request)
+    if token_repo is None:
+        return
+    exists, repo = await get_service().db.claim_repo(claim_id)
+    if exists and repo != token_repo:
+        raise _scope_403(token_repo, "claim")
+
+
+async def _require_request_in_scope(request: Request, request_id: str) -> None:
+    token_repo = _token_repo(request)
+    if token_repo is None:
+        return
+    exists, repo = await get_service().db.request_repo(request_id)
+    if exists and repo != token_repo:
+        raise _scope_403(token_repo, "request")
+
+
+async def _require_queue_in_scope(request: Request, queue_id: str) -> None:
+    token_repo = _token_repo(request)
+    if token_repo is None:
+        return
+    exists, repo = await get_service().db.queue_entry_repo(queue_id)
+    if exists and repo != token_repo:
+        raise _scope_403(token_repo, "queue entry")
+
+
 # Cookie set by ``/dashboard/login``. HTTP-only so JS in any
 # extension/widget can't read it; SameSite=Lax so a cross-site GET
 # doesn't accidentally carry it; Secure because the login page
@@ -1932,19 +1972,27 @@ async def conflicts(
 @app.post("/sessions/{session_id}/release")
 async def release_session(
     session_id: str,
+    request: Request,
     _: None = Depends(require_auth),
 ) -> dict:
     """Release every active claim that was created with the given
     session_id. Intended for end-of-work cleanup so a single call from
     coord-mcp tears down everything the agent and its subagents
-    produced, regardless of engineer name."""
-    n = await get_service().db.release_for_session(session_id)
+    produced, regardless of engineer name.
+
+    A repo-scoped token releases only that repo's claims within the
+    session (#30 slice 2/3), so it cannot tear down another repo's work
+    that happens to share a session id."""
+    n = await get_service().db.release_for_session(
+        session_id, repo=_token_repo(request)
+    )
     return {"released": n}
 
 
 @app.get("/sessions/{session_id}/pending_requests")
 async def pending_requests(
     session_id: str,
+    request: Request,
     _: None = Depends(require_auth),
 ) -> dict:
     """Return the merged inbox the holder polls. Includes first-class
@@ -1953,12 +2001,18 @@ async def pending_requests(
     operations so they can approve / deny pending release requests and
     see who has been blocked on their scope. Coord-mcp exposes this as
     a `pending_requests` tool."""
+    token_repo = _token_repo(request)
+    if token_repo is not None:
+        session_repos = await get_service().db.session_repos(session_id)
+        if session_repos and token_repo not in session_repos:
+            raise _scope_403(token_repo, "session")
     rows = await get_service().pending_requests(session_id)
     return {"pending": rows, "count": len(rows)}
 
 
 @app.post("/requests")
 async def file_request(
+    request: Request,
     body: FileRequestRequest,
     _: None = Depends(require_auth),
 ) -> JSONResponse:
@@ -1969,9 +2023,10 @@ async def file_request(
     open until the holder responds, the shortened TTL fires, or the
     timeout elapses -- whichever comes first.
     """
+    await _require_claim_in_scope(request, body.claim_id)
     svc = get_service()
     try:
-        request = await svc.file_request(
+        filed = await svc.file_request(
             claim_id=body.claim_id,
             requester=body.requester,
             requester_session_id=body.session_id,
@@ -1986,18 +2041,19 @@ async def file_request(
 
     if body.wait_seconds > 0:
         final = await svc.wait_for_decision(
-            request["id"], timeout_seconds=body.wait_seconds
+            filed["id"], timeout_seconds=body.wait_seconds
         )
         if final is not None:
-            request = final
+            filed = final
 
-    return JSONResponse(status_code=200, content=request)
+    return JSONResponse(status_code=200, content=filed)
 
 
 @app.post("/requests/{request_id}/respond")
 async def respond_to_request(
     request_id: str,
     body: RespondToRequestRequest,
+    request: Request,
     _: None = Depends(require_auth),
 ) -> JSONResponse:
     """The holder responds to an open request.
@@ -2012,6 +2068,7 @@ async def respond_to_request(
       claims, mutually self-excluded via ``claims.coexists_with``.
 
     All transitions are audit-logged."""
+    await _require_request_in_scope(request, request_id)
     if body.decision not in ("approved", "denied", "narrowed", "coexist"):
         raise HTTPException(
             status_code=400,
@@ -2062,6 +2119,7 @@ async def list_requests(
     decision: str | None = Query(default=None),
     queued: bool = Query(default=False),
     state: str | None = Query(default=None),
+    request: Request = None,  # type: ignore[assignment]
     _: None = Depends(require_auth),
 ) -> dict:
     """List requests filtered by requester, claim, or decision state.
@@ -2076,11 +2134,16 @@ async def list_requests(
     omit the param to keep the default). ``requester`` continues to
     apply, filtering queue rows by ``requester_engineer``.
     """
+    token_repo = _token_repo(request)
     if queued:
         rows = await get_service().db.list_queued_with_holder(
             engineer=requester,
             state=state or "waiting",
         )
+        if token_repo is not None:
+            # A scoped token only sees queue entries for its own repo
+            # (claim_queue.repo is the requester's repo at enqueue time).
+            rows = [r for r in rows if r.get("repo") == token_repo]
         out: list[dict] = []
         for r in rows:
             symbols_field: list[str] | None = None
@@ -2116,14 +2179,21 @@ async def list_requests(
         claim_id=claim_id,
         decision=decision,
     )
+    if token_repo is not None:
+        # holder_repo is the target claim's repo (joined in list_requests).
+        rows_legacy = [
+            r for r in rows_legacy if r.get("holder_repo") == token_repo
+        ]
     return {"requests": rows_legacy, "count": len(rows_legacy)}
 
 
 @app.get("/requests/{request_id}")
 async def get_request(
     request_id: str,
+    request: Request,
     _: None = Depends(require_auth),
 ) -> JSONResponse:
+    await _require_request_in_scope(request, request_id)
     row = await get_service().get_request(request_id)
     if row is None:
         raise HTTPException(status_code=404, detail="request not found")
@@ -2133,11 +2203,13 @@ async def get_request(
 @app.get("/requests/{request_id}/events")
 async def get_request_events(
     request_id: str,
+    request: Request,
     _: None = Depends(require_auth),
 ) -> dict:
     """Return the immutable audit-event timeline for a request,
     oldest first. Each row carries the actor, timestamp, and a JSON
     detail blob with the per-event-type specifics."""
+    await _require_request_in_scope(request, request_id)
     rows = await get_service().list_request_events(request_id)
     return {"events": rows, "count": len(rows)}
 
@@ -2145,6 +2217,7 @@ async def get_request_events(
 @app.delete("/requests/{queue_id}")
 async def cancel_request(
     queue_id: str,
+    request: Request,
     engineer: str | None = Query(default=None),
     _: None = Depends(require_auth),
 ) -> dict:
@@ -2155,6 +2228,7 @@ async def cancel_request(
     waiting/in_progress row was actually transitioned to cancelled,
     False when the row was already terminal or unknown.
     """
+    await _require_queue_in_scope(request, queue_id)
     cancelled = await get_service().cancel_queue_request(
         queue_id, engineer=engineer
     )
@@ -2164,15 +2238,19 @@ async def cancel_request(
 @app.delete("/claims/{claim_id}")
 async def delete_claim(
     claim_id: str,
+    request: Request,
     engineer: str | None = Query(default=None),
     _: None = Depends(require_auth),
 ) -> dict:
+    await _require_claim_in_scope(request, claim_id)
     released = await get_service().release_claims([claim_id], engineer)
     return {"released": released}
 
 
 @app.post("/claims/release")
-async def release_claims(body: ReleaseClaimsRequest, _: None = Depends(require_auth)) -> dict:
+async def release_claims(body: ReleaseClaimsRequest, request: Request, _: None = Depends(require_auth)) -> dict:
+    for _cid in body.claim_ids:
+        await _require_claim_in_scope(request, _cid)
     released = await get_service().release_claims(body.claim_ids, body.engineer)
     return {"released": released}
 
@@ -2181,8 +2259,10 @@ async def release_claims(body: ReleaseClaimsRequest, _: None = Depends(require_a
 async def extend_claim(
     claim_id: str,
     body: ExtendClaimRequest,
+    request: Request,
     _: None = Depends(require_auth),
 ) -> dict:
+    await _require_claim_in_scope(request, claim_id)
     ok = await get_service().extend_claim(claim_id, body.engineer, body.ttl_hours)
     if not ok:
         raise HTTPException(status_code=404, detail="Claim not found or not owned")
@@ -2191,6 +2271,7 @@ async def extend_claim(
 
 @app.post("/config/ownership")
 async def set_ownership(request: Request, _: None = Depends(require_auth)) -> dict:
+    _require_operator(request)
     raw = await request.body()
     text = raw.decode("utf-8")
     try:
