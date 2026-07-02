@@ -1659,12 +1659,19 @@ async def dashboard_tokens_create(
                 "outlive the session token; pick a shorter duration.",
             )
 
+    # #30 slice 2/3: a repo-scoped session may only mint tokens bound to its
+    # own repo -- it must never be able to mint an unscoped (operator) token
+    # or one for another repo, which would be a privilege escalation. An
+    # operator (unscoped / shared) session has token_repo=None and keeps
+    # minting unscoped tokens as before.
+    new_token_repo = outcome.token_repo
     raw = generate_raw_token()
     token_id = await get_service().db.create_engineer_token(
         engineer,
         sha256_token(raw),
         description=description,
         expires_at=expires_at,
+        repo=new_token_repo,
     )
 
     # One-time reveal page. The raw value exists only in this
@@ -1680,6 +1687,7 @@ async def dashboard_tokens_create(
         f"<p><code>{html_mod.escape(raw)}</code></p>"
         f"<p>engineer: {html_mod.escape(engineer)}<br>"
         f"token id: {html_mod.escape(token_id)}<br>"
+        f"repo scope: {html_mod.escape(new_token_repo or 'all repos (unscoped)')}<br>"
         f"expires: {html_mod.escape(_iso_z_or_never(expires_at))}</p>"
         "<p><a href=\"/dashboard\">back to dashboard</a></p>"
         "</body></html>"
