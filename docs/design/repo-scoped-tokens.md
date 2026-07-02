@@ -1,6 +1,6 @@
 # Server-enforced repo scoping via repo-bound tokens
 
-Status: proposal (draft v2 -- revised after oracle + code-review critique)
+Status: implemented (PRs #56 core + #57 dashboard + hardening flag; 2026-07-02)
 Author: (coord)
 Related: issue #30, [roadmap.md](./roadmap.md), [multi-namespace.md](./multi-namespace.md)
 
@@ -221,13 +221,23 @@ repo to scoped tokens, and the docs must call it out.
 No feature flag needed for the mechanism: NULL = unscoped keeps it inert until scoped
 tokens exist. `COORD_REQUIRE_SCOPED_TOKEN` is the separate "make it mandatory" switch.
 
-## Open questions (post-review)
+## Resolved (as built)
 
-1. OIDC in v1: operator-only (proposed) vs block dashboard login when scoping is required
-   vs ship `COORD_OIDC_REPO_CLAIM` immediately?
-2. `POST /sessions/{id}/release` under a scoped token when the session spans repos: 403
-   the whole call (proposed) or partial-release only in-scope claims and report the count?
-3. Ship `COORD_REQUIRE_SCOPED_TOKEN` in the same release (so hosted deployments can
-   actually enforce) or the next?
-4. Allowed-set tokens: is single-repo going to bite soon enough to justify the join table
-   in this migration rather than a later one?
+1. **OIDC** -- **operator-only in v1.** OIDC/dashboard login keeps minting unscoped
+   short-lived tokens (all-repo dashboard visibility); documented as a known limitation in
+   `deployment.md`. A `COORD_OIDC_REPO_CLAIM` mapping is the future path for scoped humans.
+2. **`POST /sessions/{id}/release`** -- **partial in-scope release.** A scoped token releases
+   only its repo's claims within the session and reports the count; it never 403s the whole
+   call (non-destructive to other repos, and a scoped token cannot see the rest anyway).
+3. **`COORD_REQUIRE_SCOPED_TOKEN`** -- **shipped in the same release** (default off). Rejects
+   unscoped per-engineer tokens; the shared token stays the operator escape hatch. See the
+   `deployment.md` caveat about combining it with `COORD_REQUIRE_PER_ENGINEER_TOKEN`.
+4. **Allowed-set tokens** -- **deferred; scalar `repo` kept.** A later
+   `engineer_token_repos(token_id, repo)` join table can backfill scalar values with no
+   painful migration. No concrete multi-repo-per-token demand yet.
+
+## Still open (future)
+
+- `COORD_OIDC_REPO_CLAIM` to bind an SSO principal to a repo (removes the operator-only
+  OIDC limitation).
+- Allowed-set tokens via the join table, if/when a token legitimately spans several repos.

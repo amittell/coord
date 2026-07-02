@@ -384,3 +384,70 @@ async def test_scoped_token_set_ownership_is_operator_only(client: AsyncClient) 
         "/config/ownership", headers=_auth(raw), content="shared_files:\n  - src/x.py\n"
     )
     assert r.status_code == 403, r.text
+
+
+# ---------------------------------------------------------------------------
+# COORD_REQUIRE_SCOPED_TOKEN: make repo scoping mandatory. An unscoped
+# per-engineer token is rejected; the shared token stays the operator hatch.
+# ---------------------------------------------------------------------------
+
+
+async def test_require_scoped_token_rejects_unscoped_per_engineer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "db.sqlite"
+    monkeypatch.setenv("COORD_AUTH_TOKEN", SHARED)
+    monkeypatch.setenv("COORD_DATABASE_PATH", str(db_path))
+    monkeypatch.setenv("COORD_REQUIRE_SCOPED_TOKEN", "true")
+    monkeypatch.setenv("COORD_DISABLE_BACKGROUND_CLEANUP", "1")
+    monkeypatch.setenv("COORD_DISABLE_INSTANCE_LOCK", "1")
+    monkeypatch.delenv("COORD_REPO_ROOT", raising=False)
+
+    from coordination import deps
+
+    deps.get_service.cache_clear()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        svc = deps.get_service()
+        unscoped = "coordt_" + "a" * 64
+        await svc.db.create_engineer_token("e", _sha256(unscoped))
+        scoped = "coordt_" + "b" * 64
+        await svc.db.create_engineer_token("e", _sha256(scoped), repo=REPO_A)
+
+        # Unscoped per-engineer token -> 401 with an actionable hint.
+        r1 = await ac.get("/claims", headers=_auth(unscoped))
+        assert r1.status_code == 401, r1.text
+        assert "repo-scoped token" in r1.json()["detail"].lower()
+
+        # Scoped per-engineer token -> 200.
+        r2 = await ac.get("/claims", headers=_auth(scoped))
+        assert r2.status_code == 200, r2.text
+
+        # Shared token stays the operator escape hatch -> 200.
+        r3 = await ac.get(
+            "/claims", headers={"Authorization": f"Bearer {SHARED}"}
+        )
+        assert r3.status_code == 200, r3.text
+
+
+async def test_unscoped_per_engineer_ok_when_flag_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "db.sqlite"
+    monkeypatch.setenv("COORD_AUTH_TOKEN", SHARED)
+    monkeypatch.setenv("COORD_DATABASE_PATH", str(db_path))
+    monkeypatch.delenv("COORD_REQUIRE_SCOPED_TOKEN", raising=False)
+    monkeypatch.setenv("COORD_DISABLE_BACKGROUND_CLEANUP", "1")
+    monkeypatch.setenv("COORD_DISABLE_INSTANCE_LOCK", "1")
+    monkeypatch.delenv("COORD_REPO_ROOT", raising=False)
+
+    from coordination import deps
+
+    deps.get_service.cache_clear()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        svc = deps.get_service()
+        unscoped = "coordt_" + "d" * 64
+        await svc.db.create_engineer_token("e", _sha256(unscoped))
+        r = await ac.get("/claims", headers=_auth(unscoped))
+        assert r.status_code == 200, r.text

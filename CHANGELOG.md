@@ -7,6 +7,34 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- Server-enforced repo scoping via repo-bound tokens (#30 slice 2/3, #55).
+  Repo isolation is now a server-side authorization boundary, derived from the
+  auth token rather than a client-supplied ``repo`` -- so it holds regardless of
+  client version and cannot be bypassed with ``all_repos`` or an arbitrary
+  ``repo=``.
+  - Schema v19: nullable ``engineer_tokens.repo``. ``NULL`` = unscoped
+    (operator / back-compat); ``owner/name`` = scoped. Inert on upgrade -- every
+    existing token stays unscoped until a scoped one is minted.
+    ``coord tokens create --repo <id>`` mints a scoped token; ``list`` shows the
+    repo column; rotation carries the repo forward.
+  - Every authenticated repo-tagged endpoint is scoped: reads force the token's
+    repo (``403`` on an explicit cross-repo / ``all_repos``, silent-scope when
+    absent); writes ``403`` across repos and default a claim's repo to the
+    token's; id-addressed claim / request / queue / session endpoints are
+    guarded at the data-access boundary; ``POST /metrics/hotspots/promote`` and
+    ``POST /config/ownership`` are operator-only. Responses carry an
+    ``X-Coord-Repo-Scope`` header.
+  - The operator dashboard is scoped for a repo-bound session (all panels plus
+    its own token panel); operator / OIDC sessions are unchanged. A repo-scoped
+    dashboard session can no longer mint an unscoped token.
+  - ``COORD_REQUIRE_SCOPED_TOKEN`` (default off) rejects unscoped per-engineer
+    tokens to make scoping mandatory; the shared token stays the operator escape
+    hatch. See ``docs/deployment.md`` for the hosted-multi-repo rollout,
+    including the OIDC operator-only limitation and the legacy NULL-repo claim
+    drain step.
+
 ### Changed
 
 - Repo-aware filtering for hosted shared services (#30, slice 1). A coord

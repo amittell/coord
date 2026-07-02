@@ -207,6 +207,82 @@ The shared token has no grace-window mechanism; if you need zero-downtime rotati
 | `http_requests_total` | counter | `method`, `path`, `status` | Every response the app emits. `path` is the matched route template so cardinality is bounded. |
 | `build_info` | gauge | `version` | Constant 1.0 with the running service version in the label. |
 
+## Hosted multi-repo deployments (repo-scoped tokens)
+
+When one coord service fronts several repos, bind each token to a repo so the
+server enforces per-repo isolation from authentication -- not from a value the
+client chooses to send. This is the server-side counterpart to the client-side
+repo defaults (issue #30 slice 1): it holds regardless of client version and
+cannot be bypassed with an arbitrary `repo=` or `all_repos`.
+
+### Model
+
+`engineer_tokens.repo` (schema v19) binds a token to a repo. `NULL` = unscoped
+(operator / all repos, the back-compat default); `owner/name` = scoped. The
+migration is inert -- every existing token is unscoped until you mint a scoped
+one, so upgrading changes nothing.
+
+A scoped token:
+
+- reads only its repo's claims / conflicts / requests / queue / metrics /
+  dashboard (an explicit cross-repo `repo=` or `all_repos` is a `403`; an absent
+  `repo` is silently scoped, so even an un-upgraded `coord-mcp` is enforced);
+- writes only into its repo (creating a claim tagged another repo is a `403`;
+  claim / request / queue / session mutations by id are `403` across repos);
+- cannot reach operator-only endpoints (`POST /metrics/hotspots/promote`,
+  `POST /config/ownership`) or mint an unscoped token from the dashboard.
+
+Every scoped response carries an `X-Coord-Repo-Scope: <repo>` header so an
+operator who dropped a token into the wrong repo's `local.env` sees why results
+are empty instead of a silent void.
+
+### Minting and wiring
+
+```
+coord tokens create <engineer> --repo owner/name     # scoped
+coord tokens create <engineer>                         # unscoped (operator)
+coord tokens list                                      # 'repo' column; 'all' = unscoped
+```
+
+Drop the scoped token into that repo's gitignored `.coordination/local.env` as
+`COORD_AUTH_TOKEN=...`. Rotation (`coord tokens rotate`) carries the repo
+forward, so a rotated scoped token stays scoped.
+
+### Operators and the dashboard
+
+Operators keep an **unscoped** credential -- the shared `COORD_AUTH_TOKEN` or an
+unscoped per-engineer token -- for cross-repo visibility and the operator-only
+endpoints. A repo-scoped dashboard login sees only its repo (including its own
+token panel); an operator login sees everything, unchanged.
+
+**OIDC / SSO login is operator-only in v1.** Dashboard OIDC mints short-lived
+*unscoped* per-engineer tokens, so any SSO principal has all-repo dashboard
+visibility for the session. If you need repo-scoped humans, gate OIDC to
+operators (or map a principal to a repo) before telling engineers the dashboard
+is scoped. This is a known v1 limitation, not a bug.
+
+### Making scoping mandatory
+
+`COORD_REQUIRE_SCOPED_TOKEN=true` (default false) rejects any **per-engineer**
+token that has no repo binding, so every agent token must be scoped. The shared
+`COORD_AUTH_TOKEN` is deliberately exempt -- it stays the operator escape hatch.
+
+Caveat: keep a shared token for operators when this flag is on. Combining it
+with `COORD_REQUIRE_PER_ENGINEER_TOKEN=true` (which disables the shared token)
+locks out every unscoped credential and therefore all cross-repo / operator
+access -- only enable both together once you have a dedicated operator path.
+
+### Rollout safety: drain legacy NULL-repo claims first
+
+Conflict detection isolates the `NULL`-repo bucket from repo-tagged claims
+(`repo=NULL` and `repo=X` never conflict). So while legacy `NULL`-repo claims
+(created under the shared token or a client that sent no `repo`) still exist, a
+newly-scoped client's pre-push conflict check will **not** see them -- a
+false-safe. Before switching a hot repo to scoped tokens, let its in-flight
+`NULL`-repo claims expire or release them (`coord claims --all-repos` to find
+them, `coord engineers stale --release`, or `POST /claims/release`), so scoped
+clients aren't blind to work created the old way.
+
 ## Multi-instance detection
 
 The coordination service assumes single-writer semantics for its in-process caches and background cleanup loop. Running two live replicas against the same SQLite file is almost always a misconfiguration. To catch that at startup, the service takes an advisory `fcntl.flock(LOCK_EX | LOCK_NB)` on `<COORD_DATABASE_PATH>.lock` during lifespan initialisation. If the lock is already held, the process refuses to start with a message identifying the current holder's PID.

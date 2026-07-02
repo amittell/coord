@@ -444,6 +444,25 @@ async def _authenticate_bearer(
     resolved = await service.db.resolve_engineer_token(token_hash)
     if resolved is not None:
         if resolved["status"] == "ok":
+            # #30 slice 2/3 hardening: a deployment can require every
+            # per-engineer token to be repo-scoped. An unscoped one is
+            # rejected with an actionable hint; the shared token stays the
+            # operator escape hatch (handled on its own path below).
+            if (
+                settings.require_scoped_token
+                and resolved.get("repo") is None
+            ):
+                metrics.auth_failures_total.inc()
+                return AuthOutcome(
+                    ok=False,
+                    status_code=401,
+                    detail=(
+                        "This deployment requires a repo-scoped token "
+                        "(COORD_REQUIRE_SCOPED_TOKEN). Ask an operator for a "
+                        "token bound to your repo: coord tokens create "
+                        "<engineer> --repo <id>."
+                    ),
+                )
             # Best-effort activity capture. The auth path must never
             # 401 because the update failed (e.g. transient lock
             # contention), so a broad except is correct here.
