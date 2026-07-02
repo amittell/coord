@@ -2811,17 +2811,30 @@ class Database:
             )
             await conn.commit()
 
-    async def recent_conflicts(self, limit: int = 50) -> list[dict[str, Any]]:
+    async def recent_conflicts(
+        self, limit: int = 50, *, repo: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Most recent conflict_log rows. ``repo`` (#30 slice 2/3) scopes to
+        conflicts whose blocking claim is in that repo, joining claims;
+        None returns every repo's conflicts (operator / back-compat)."""
         await self.init()
         async with aiosqlite.connect(self.path) as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
-            cur = await conn.execute(
-                """
-                SELECT * FROM conflict_log ORDER BY datetime(created_at) DESC LIMIT ?
-                """,
-                (limit,),
-            )
+            if repo is None:
+                cur = await conn.execute(
+                    "SELECT * FROM conflict_log "
+                    "ORDER BY datetime(created_at) DESC LIMIT ?",
+                    (limit,),
+                )
+            else:
+                cur = await conn.execute(
+                    "SELECT cl.* FROM conflict_log cl "
+                    "JOIN claims c ON c.id = cl.claim_id "
+                    "WHERE c.repo = ? "
+                    "ORDER BY datetime(cl.created_at) DESC LIMIT ?",
+                    (repo, limit),
+                )
             rows = await cur.fetchall()
             await conn.commit()
             return [dict(r) for r in rows]

@@ -1025,6 +1025,7 @@ async def render_dashboard(
     *,
     viewer_engineer: str | None = None,
     is_operator: bool = False,
+    viewer_repo: str | None = None,
     csrf_token: str | None = None,
     token_error: str | None = None,
     token_success: str | None = None,
@@ -1043,17 +1044,34 @@ async def render_dashboard(
     now = datetime.now(UTC)
 
     rows = await svc.list_claims(active_only=True)
-    conflicts = await svc.db.recent_conflicts(500)
+    conflicts = await svc.db.recent_conflicts(500, repo=viewer_repo)
     recent = await svc.db.list_recent_claims(500)
+    # #55: a repo-scoped viewer sees only its repo. rows/recent are filtered
+    # before activity is derived; the repo-aware DB calls take viewer_repo
+    # directly; the webhook and stale-engineer panels are global operational
+    # data (not repo-tagged) and are left unscoped.
+    if viewer_repo is not None:
+        rows = [c for c in rows if c.get("repo") == viewer_repo]
+        recent = [c for c in recent if c.get("repo") == viewer_repo]
     activity = _recent_activity(claims=recent, conflicts=conflicts, now=now)
     repos = await svc.db.list_repos()
     idle_timeout_sec = svc.settings.idle_timeout_sec
     requests = await svc.list_requests(limit=200)
-    auto_resolutions = await svc.db.count_auto_resolutions_since(window_hours=24)
-    auto_resolution_series = await svc.db.daily_auto_resolutions(days=30)
-    hotspot_rows = await svc.db.hotspot_files(days=30, min_attempts=5, limit=10)
+    auto_resolutions = await svc.db.count_auto_resolutions_since(
+        window_hours=24, repo=viewer_repo
+    )
+    auto_resolution_series = await svc.db.daily_auto_resolutions(
+        days=30, repo=viewer_repo
+    )
+    hotspot_rows = await svc.db.hotspot_files(
+        days=30, min_attempts=5, limit=10, repo=viewer_repo
+    )
     queued_rows = await svc.db.list_queued_with_holder(state="waiting", limit=100)
     webhook_stats = await svc.db.webhook_delivery_stats(window_hours=24)
+    if viewer_repo is not None:
+        repos = [r for r in repos if r.get("repo") == viewer_repo]
+        requests = [q for q in requests if q.get("holder_repo") == viewer_repo]
+        queued_rows = [q for q in queued_rows if q.get("repo") == viewer_repo]
     stale_engineer_days = svc.settings.stale_engineer_days
     if stale_engineer_days > 0:
         stale_engineers = await svc.db.list_stale_engineers(
@@ -1772,6 +1790,9 @@ async def render_dashboard(
             token_rows = await svc.db.list_engineer_tokens(
                 engineer=viewer_engineer, include_revoked=True
             )
+        # #55: a repo-scoped viewer only manages tokens bound to its repo.
+        if viewer_repo is not None:
+            token_rows = [t for t in token_rows if t.get("repo") == viewer_repo]
 
         banner_html = ""
         if token_error:

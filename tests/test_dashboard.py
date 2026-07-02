@@ -1509,3 +1509,72 @@ async def test_dashboard_includes_auto_refresh_script(
     assert "auto-refresh" in html_out
     assert "sessionStorage" in html_out  # scroll-position preservation
 
+
+
+# ---------------------------------------------------------------------------
+# repo-scoped dashboard viewer (#30 slice 2/3). A scoped-token session sees
+# only its repo; an operator (viewer_repo=None) sees everything (unchanged).
+# ---------------------------------------------------------------------------
+
+
+async def _seed_repo_claim(
+    svc: CoordinationService, cid: str, pattern: str, repo: str
+) -> None:
+    await svc.db.insert_claims_batch(
+        engineer="eng",
+        branch=None,
+        description=None,
+        items=[(cid, "file", pattern, "soft", "2099-01-01T00:00:00Z")],
+        session_id="sess-" + cid,
+        repo=repo,
+    )
+
+
+async def test_dashboard_scoped_viewer_hides_other_repo_claims(
+    svc: CoordinationService,
+) -> None:
+    await _seed_repo_claim(svc, "ca", "src/alpha.py", "amittell/repo-a")
+    await _seed_repo_claim(svc, "cb", "src/beta.py", "amittell/repo-b")
+
+    html_out = await render_dashboard(viewer_repo="amittell/repo-a")
+    assert "src/alpha.py" in html_out
+    assert "src/beta.py" not in html_out
+
+
+async def test_dashboard_operator_viewer_sees_all_repos(
+    svc: CoordinationService,
+) -> None:
+    await _seed_repo_claim(svc, "ca", "src/alpha.py", "amittell/repo-a")
+    await _seed_repo_claim(svc, "cb", "src/beta.py", "amittell/repo-b")
+
+    html_out = await render_dashboard()  # viewer_repo=None -> operator
+    assert "src/alpha.py" in html_out
+    assert "src/beta.py" in html_out
+
+
+async def test_dashboard_scoped_viewer_hotspots_scoped(
+    svc: CoordinationService,
+) -> None:
+    from uuid import uuid4
+    import aiosqlite
+    from coordination.db import _configure_sqlite
+
+    await _seed_repo_claim(svc, "ha", "src/hot-a.py", "amittell/repo-a")
+    await _seed_repo_claim(svc, "hb", "src/hot-b.py", "amittell/repo-b")
+    recent = _recent_iso()
+    async with aiosqlite.connect(svc.db.path) as conn:
+        await _configure_sqlite(conn)
+        for claim_id, pat in (("ha", "src/hot-a.py"), ("hb", "src/hot-b.py")):
+            for i in range(25):
+                await conn.execute(
+                    "INSERT INTO conflict_log (id, claim_id, attempted_by, "
+                    "attempted_pattern, resolution, created_at) "
+                    "VALUES (?, ?, ?, ?, NULL, ?)",
+                    (str(uuid4()), claim_id, f"e{i % 6}", pat, recent),
+                )
+        await conn.commit()
+
+    html_out = await render_dashboard(viewer_repo="amittell/repo-a")
+    hotspots = html_out[html_out.index("hotspot files (30d)"):]
+    assert "src/hot-a.py" in hotspots
+    assert "src/hot-b.py" not in hotspots

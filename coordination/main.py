@@ -822,6 +822,7 @@ async def _render_dashboard_for(
     return await render_dashboard(
         viewer_engineer=outcome.engineer,
         is_operator=outcome.auth_kind == "shared",
+        viewer_repo=outcome.token_repo,
         csrf_token=csrf,
         token_error=token_error,
         token_success=token_success,
