@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from coordination import cli
+from coordination import cli, cli_ops
 
 
 def _make_repo(root: Path) -> Path:
@@ -740,6 +740,7 @@ def test_claims_engineer_filter_is_forwarded(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     received: list[str] = []
+    received_engineers: list[str | None] = []
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
@@ -752,6 +753,7 @@ def test_claims_engineer_filter_is_forwarded(
                 return
             if self.path.startswith("/claims"):
                 received.append(self.path)
+                received_engineers.append(self.headers.get("X-Coord-Engineer"))
                 if not auth.startswith("Bearer "):
                     self.send_response(401)
                     self.end_headers()
@@ -774,6 +776,7 @@ def test_claims_engineer_filter_is_forwarded(
     assert exit_code == 0
     assert any("engineer=bob" in p for p in received)
     assert any("active_only=false" in p for p in received)
+    assert received_engineers == ["bob"]
 
 
 def _claims_path_recorder() -> "tuple[type[BaseHTTPRequestHandler], list[str]]":
@@ -855,6 +858,58 @@ def test_claims_repo_flag_overrides_local_scope(
     # httpx URL-encodes the slash in the query string.
     assert any("repo=otherorg%2Fsvc" in p for p in received)
     assert all("repo=app" not in p for p in received)
+
+
+def test_claims_falls_back_to_local_env_repo_id_when_config_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    handler, received = _claims_path_recorder()
+    with _MockServer(handler) as mock:
+        repo = _init_repo_with_service(tmp_path, monkeypatch, mock.port)
+        config_path = repo / ".coordination" / "config.toml"
+        config_text = "\n".join(
+            line
+            for line in config_path.read_text(encoding="utf-8").splitlines()
+            if not line.startswith("repo_id =")
+        )
+        config_path.write_text(config_text + "\n", encoding="utf-8")
+        local_env = repo / ".coordination" / "local.env"
+        with local_env.open("a", encoding="utf-8") as fh:
+            fh.write("COORD_REPO_ID='local-env-app'\n")
+        capsys.readouterr()
+        exit_code = cli.main(["claims"])
+    assert exit_code == 0
+    assert any("repo=local-env-app" in p for p in received)
+
+
+def test_scope_repo_id_ignores_placeholder_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = cli_ops._ServiceContext(
+        service_url="http://svc",
+        auth_token="",
+        repo_id=None,
+        repo_root=None,
+        config=None,
+    )
+    monkeypatch.setenv("COORD_REPO_ID", "example-org/example-repo")
+
+    assert cli_ops._scope_repo_id(ctx) is None
+
+
+def test_auth_headers_strip_engineer_name() -> None:
+    ctx = cli_ops._ServiceContext(
+        service_url="http://svc",
+        auth_token="tok",
+        repo_id=None,
+        repo_root=None,
+        config=None,
+    )
+
+    assert cli_ops._auth_headers(ctx, " alice ")["X-Coord-Engineer"] == "alice"
+    assert "X-Coord-Engineer" not in cli_ops._auth_headers(ctx, "   ")
 
 
 def test_status_shows_repo_scope_and_symbol_validation(

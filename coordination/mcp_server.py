@@ -22,6 +22,7 @@ _LOCAL_ENV_KEYS = (
     "COORD_API_URL",
     "COORD_SERVICE_URL",
     "COORD_AUTH_TOKEN",
+    "COORD_BRANCH",
     "COORD_REPO_ID",
     "COORD_REPO_ROOT",
     "COORD_USER",
@@ -87,17 +88,60 @@ def _repo_id() -> str:
     by ``_load_local_env``). When set, the read tools scope their queries to
     this repo by default so a hosted shared service fronting multiple repos
     does not surface unrelated repos' claims (issue #30). When unset (the
-    single-repo deployment shape) the tools behave exactly as before.
+    single-repo deployment shape) the tools behave exactly as before. Template
+    placeholders are treated as unset so checked-in examples do not become a
+    real repo scope.
     """
-    return os.environ.get("COORD_REPO_ID", "").strip()
+    repo_id = os.environ.get("COORD_REPO_ID", "").strip()
+    if repo_id in _PLACEHOLDER_VALUES:
+        return ""
+    return repo_id
 
 
-def _headers() -> dict[str, str]:
+def _headers(engineer: str | None = None) -> dict[str, str]:
     token = os.environ.get("COORD_AUTH_TOKEN", "")
     h: dict[str, str] = {"Accept": "application/json"}
     if token and token not in _PLACEHOLDER_VALUES:
         h["Authorization"] = f"Bearer {token}"
+    if engineer:
+        stripped = engineer.strip()
+        if stripped:
+            h["X-Coord-Engineer"] = stripped
     return h
+
+
+def _git_stdout(*args: str) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", *args],
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    value = completed.stdout.strip()
+    return value or None
+
+
+def _current_branch_or_worktree() -> str | None:
+    explicit = os.environ.get("COORD_BRANCH", "").strip()
+    if explicit:
+        return explicit
+
+    branch = _git_stdout("symbolic-ref", "--quiet", "--short", "HEAD")
+    if branch:
+        return branch
+
+    worktree = _git_stdout("rev-parse", "--show-toplevel")
+    commit = _git_stdout("rev-parse", "--short", "HEAD")
+    if worktree and commit:
+        return f"{Path(worktree).name}@{commit}"
+    if worktree:
+        return Path(worktree).name
+    return commit
 
 
 def _resolve_session_id() -> str:
@@ -155,7 +199,9 @@ async def list_claims(
     # claims should not idle-expire.
     params["session_id"] = _SESSION_ID
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.get(f"{_base_url()}/claims", params=params, headers=_headers())
+        r = await client.get(
+            f"{_base_url()}/claims", params=params, headers=_headers(engineer)
+        )
         r.raise_for_status()
         return r.json()
 
@@ -181,12 +227,17 @@ async def check_conflicts(
     repo_id = _repo_id()
     if repo_id and not all_repos:
         params.append(("repo", repo_id))
+    branch = _current_branch_or_worktree()
+    if branch:
+        params.append(("branch", branch))
     # Session_id makes the conflict check session-aware (so an agent's
     # own subagents don't false-positive against each other) and acts
     # as an activity ping for idle expiration on the server side.
     params.append(("session_id", _SESSION_ID))
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.get(f"{_base_url()}/conflicts", params=params, headers=_headers())
+        r = await client.get(
+            f"{_base_url()}/conflicts", params=params, headers=_headers(engineer)
+        )
         r.raise_for_status()
         return r.json()
 
@@ -394,13 +445,13 @@ async def claim_files(
         claims.append(sf_entry)
     body: dict[str, Any] = {
         "engineer": engineer,
-        "branch": branch,
+        "branch": branch or _current_branch_or_worktree(),
         "description": description,
         "claims": claims,
     }
     if ttl_hours is not None:
         body["ttl_hours"] = ttl_hours
-    repo_id = os.environ.get("COORD_REPO_ID", "").strip()
+    repo_id = _repo_id()
     if repo_id:
         body["repo"] = repo_id
     body["session_id"] = _SESSION_ID
@@ -416,7 +467,11 @@ async def claim_files(
     if urgency is not None:
         body["urgency"] = urgency
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.post(f"{_base_url()}/claims", json=body, headers={**_headers(), "Content-Type": "application/json"})
+        r = await client.post(
+            f"{_base_url()}/claims",
+            json=body,
+            headers={**_headers(engineer), "Content-Type": "application/json"},
+        )
         if r.status_code == 429:
             # v0.30 rate limit. Like 400/409 below this is structured
             # data the agent should reason about, not an exception:
@@ -482,8 +537,9 @@ async def claim_refactor(
         body["new_name"] = new_name
     if description:
         body["description"] = description
-    if branch:
-        body["branch"] = branch
+    claim_branch = branch or _current_branch_or_worktree()
+    if claim_branch:
+        body["branch"] = claim_branch
     if ttl_hours is not None:
         body["ttl_hours"] = ttl_hours
     # Mirror claim_files: only forward the queue knobs when they ask
@@ -500,7 +556,7 @@ async def claim_refactor(
         r = await client.post(
             f"{_base_url()}/claims/refactor",
             json=body,
-            headers={**_headers(), "Content-Type": "application/json"},
+            headers={**_headers(engineer), "Content-Type": "application/json"},
         )
         if r.status_code == 503:
             # LSP disabled or unavailable server-side. Structured, not
@@ -528,7 +584,7 @@ async def release_claims(claim_ids: list[str], engineer: str | None = None) -> d
         r = await client.post(
             f"{_base_url()}/claims/release",
             json={"claim_ids": claim_ids, "engineer": engineer},
-            headers={**_headers(), "Content-Type": "application/json"},
+            headers={**_headers(engineer), "Content-Type": "application/json"},
         )
         r.raise_for_status()
         return r.json()
@@ -779,7 +835,7 @@ async def cancel_queue_request(
         r = await client.delete(
             f"{_base_url()}/requests/{queue_id}",
             params=params,
-            headers=_headers(),
+            headers=_headers(engineer),
         )
         r.raise_for_status()
         return r.json()

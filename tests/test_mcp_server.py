@@ -101,6 +101,7 @@ async def test_list_claims_passes_engineer_and_module_filters(
     assert req.url.params.get("active_only") == "false"
     assert req.url.params.get("engineer") == "alex/claude/main"
     assert req.url.params.get("module") == "auth"
+    assert req.headers.get("x-coord-engineer") == "alex/claude/main"
 
 
 @pytest.mark.asyncio
@@ -180,6 +181,9 @@ async def test_check_conflicts_sends_one_pattern_param_per_file(
 ) -> None:
     monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
     monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.setattr(
+        mcp_server, "_current_branch_or_worktree", lambda: "feature/auth"
+    )
     captured = _install_mock_transport(
         monkeypatch,
         _json_handler(
@@ -199,6 +203,8 @@ async def test_check_conflicts_sends_one_pattern_param_per_file(
     pattern_values = req.url.params.get_list("pattern")
     assert pattern_values == ["src/auth/login.ts", "src/auth/logout.ts"]
     assert req.url.params.get("engineer") == "alice"
+    assert req.url.params.get("branch") == "feature/auth"
+    assert req.headers.get("x-coord-engineer") == "alice"
 
 
 @pytest.mark.asyncio
@@ -241,6 +247,9 @@ async def test_check_conflicts_passes_params_as_list_of_tuples_preserving_order(
     # check_conflicts appends a ``repo`` param when COORD_REPO_ID is set; this
     # exact-order assertion must not see an ambient value from the dev's shell.
     monkeypatch.delenv("COORD_REPO_ID", raising=False)
+    monkeypatch.setattr(
+        mcp_server, "_current_branch_or_worktree", lambda: "feature/order"
+    )
 
     captured_params: list[Any] = []
 
@@ -279,13 +288,14 @@ async def test_check_conflicts_passes_params_as_list_of_tuples_preserving_order(
     # Each entry must be a 2-tuple.
     assert all(isinstance(p, tuple) and len(p) == 2 for p in params)
     # Order: pattern entries first (preserved relative to input order), then
-    # engineer, then session_id. Session_id is appended last as the
+    # engineer, branch, and session_id. Session_id is appended last as the
     # activity-ping signal.
     assert params == [
         ("pattern", "a.py"),
         ("pattern", "b.py"),
         ("pattern", "c.py"),
         ("engineer", "alice"),
+        ("branch", "feature/order"),
         ("session_id", "fixed-test-session"),
     ]
 
@@ -364,6 +374,32 @@ async def test_claim_files_includes_repo_id_from_env(
 
     body = _json.loads(captured[0].content.decode("utf-8"))
     assert body["repo"] == "amittell/coord"
+    assert captured[0].headers.get("x-coord-engineer") == "alice"
+
+
+@pytest.mark.asyncio
+async def test_claim_files_defaults_branch_from_current_worktree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.setattr(
+        mcp_server, "_current_branch_or_worktree", lambda: "feature/default"
+    )
+    captured = _install_mock_transport(
+        monkeypatch,
+        _json_handler(
+            200,
+            {"claim_ids": ["c"], "conflicts": [], "warnings": [], "options": []},
+        ),
+    )
+
+    await mcp_server.claim_files(engineer="alice", patterns=["src/**"])
+
+    import json as _json
+
+    body = _json.loads(captured[0].content.decode("utf-8"))
+    assert body["branch"] == "feature/default"
 
 
 @pytest.mark.asyncio
@@ -375,6 +411,28 @@ async def test_claim_files_omits_repo_when_env_unset(
     monkeypatch.delenv("COORD_REPO_ID", raising=False)
     captured = _install_mock_transport(
         monkeypatch, _json_handler(200, {"claim_ids": ["c"], "conflicts": [], "warnings": [], "options": []})
+    )
+
+    await mcp_server.claim_files(engineer="alice", patterns=["src/**"])
+
+    import json as _json
+
+    body = _json.loads(captured[0].content.decode("utf-8"))
+    assert "repo" not in body
+
+
+@pytest.mark.asyncio
+async def test_claim_files_omits_repo_when_repo_id_is_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.setenv("COORD_REPO_ID", "example-org/example-repo")
+    captured = _install_mock_transport(
+        monkeypatch,
+        _json_handler(
+            200, {"claim_ids": ["c"], "conflicts": [], "warnings": [], "options": []}
+        ),
     )
 
     await mcp_server.claim_files(engineer="alice", patterns=["src/**"])
@@ -565,6 +623,16 @@ def test_headers_include_bearer_when_token_set(monkeypatch: pytest.MonkeyPatch) 
     assert mcp_server._headers().get("Authorization") == "Bearer abc"
 
 
+def test_headers_include_engineer_when_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("COORD_AUTH_TOKEN", raising=False)
+    assert mcp_server._headers(" alice ").get("X-Coord-Engineer") == "alice"
+
+
+def test_headers_omit_engineer_when_blank(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("COORD_AUTH_TOKEN", raising=False)
+    assert "X-Coord-Engineer" not in mcp_server._headers("   ")
+
+
 def test_headers_omit_bearer_when_token_empty(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("COORD_AUTH_TOKEN", "")
     assert "Authorization" not in mcp_server._headers()
@@ -587,6 +655,48 @@ def test_headers_omit_bearer_when_token_is_placeholder(
     assert "Authorization" not in mcp_server._headers()
 
 
+def test_current_branch_or_worktree_prefers_coord_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COORD_BRANCH", "codex/coord-client")
+    assert mcp_server._current_branch_or_worktree() == "codex/coord-client"
+
+
+def test_current_branch_or_worktree_uses_git_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("COORD_BRANCH", raising=False)
+
+    def fake_git_stdout(*args: str) -> str | None:
+        if args == ("symbolic-ref", "--quiet", "--short", "HEAD"):
+            return "main"
+        return None
+
+    monkeypatch.setattr(mcp_server, "_git_stdout", fake_git_stdout)
+
+    assert mcp_server._current_branch_or_worktree() == "main"
+
+
+def test_current_branch_or_worktree_uses_worktree_and_commit_when_detached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("COORD_BRANCH", raising=False)
+    checkout = tmp_path / "coord-detached"
+
+    def fake_git_stdout(*args: str) -> str | None:
+        if args == ("symbolic-ref", "--quiet", "--short", "HEAD"):
+            return None
+        if args == ("rev-parse", "--show-toplevel"):
+            return str(checkout)
+        if args == ("rev-parse", "--short", "HEAD"):
+            return "abc1234"
+        return None
+
+    monkeypatch.setattr(mcp_server, "_git_stdout", fake_git_stdout)
+
+    assert mcp_server._current_branch_or_worktree() == "coord-detached@abc1234"
+
+
 # ---------------------------------------------------------------------------
 # .coordination/local.env auto-load
 # ---------------------------------------------------------------------------
@@ -605,9 +715,11 @@ def test_load_local_env_populates_unset_vars(
 ) -> None:
     _seed_local_env(
         tmp_path,
-        "COORD_API_URL=http://svc.example\nCOORD_AUTH_TOKEN=real-token\n",
+        "COORD_API_URL=http://svc.example\n"
+        "COORD_AUTH_TOKEN=real-token\n"
+        "COORD_BRANCH=feature/local-env\n",
     )
-    for key in ("COORD_API_URL", "COORD_AUTH_TOKEN"):
+    for key in ("COORD_API_URL", "COORD_AUTH_TOKEN", "COORD_BRANCH"):
         monkeypatch.delenv(key, raising=False)
 
     loaded = mcp_server._load_local_env(start=tmp_path)
@@ -615,6 +727,7 @@ def test_load_local_env_populates_unset_vars(
     assert loaded == tmp_path / ".coordination" / "local.env"
     assert os.environ["COORD_API_URL"] == "http://svc.example"
     assert os.environ["COORD_AUTH_TOKEN"] == "real-token"
+    assert os.environ["COORD_BRANCH"] == "feature/local-env"
 
 
 def test_load_local_env_overrides_placeholder_token(
@@ -2220,6 +2333,20 @@ async def test_list_claims_omits_repo_when_repo_id_unset(
     monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
     monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
     monkeypatch.delenv("COORD_REPO_ID", raising=False)
+    captured = _install_mock_transport(monkeypatch, _json_handler(200, {"claims": []}))
+
+    await mcp_server.list_claims()
+
+    assert "repo" not in captured[0].url.params
+
+
+@pytest.mark.asyncio
+async def test_list_claims_omits_repo_when_repo_id_is_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.setenv("COORD_REPO_ID", "example-org/example-repo")
     captured = _install_mock_transport(monkeypatch, _json_handler(200, {"claims": []}))
 
     await mcp_server.list_claims()
