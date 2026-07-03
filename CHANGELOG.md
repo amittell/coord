@@ -42,6 +42,42 @@ Semantic Versioning.
     be repo-scoped instead of operator-wide; a configured-but-missing claim
     refuses the login rather than silently granting all-repo access.
 
+### Security
+
+- Pre-release security review (independent Codex + oracle passes) hardening.
+  Eight cross-repo gaps in the repo-scoping boundary were closed before the
+  tag; all are within the same server-side authorization model:
+  - Token revoke is repo-scoped: a repo-bound dashboard session can no longer
+    revoke the same engineer's token in another repo, nor an unscoped operator
+    token (the repo predicate is folded into the atomic ``UPDATE``).
+  - ``GET /sessions/{id}/pending_requests`` filters rows by repo: a session id
+    that spans repos no longer leaks another repo's pending requests or conflict
+    feed to a scoped token -- and no longer fires ``notified`` audit events for
+    out-of-scope requests. (Replaces the previous session-level guard, which
+    missed mixed-repo sessions.)
+  - Session activity refresh (``last_activity``) is repo-scoped: a scoped token
+    can no longer keep another repo's claims warm by supplying a shared session
+    id on ``POST /claims`` / ``GET /claims`` / ``GET /conflicts``.
+  - Hard auto-promote (which writes the global ownership YAML) is operator-only:
+    a repo-scoped caller's conflicting claim no longer rewrites deployment-wide
+    config.
+  - The dashboard stale-engineers panel is scoped to the viewer's repo, so a
+    repo-bound session cannot see other repos' holders, counts, or repo names.
+  - ``X-Coord-Queue-Depth`` is attributed from the authenticated identity only:
+    an unauthenticated caller can no longer read any engineer's queue depth by
+    naming them in ``?engineer=``. A per-engineer token sees only its own depth;
+    operators keep full visibility.
+  - ``COORD_REQUIRE_SCOPED_TOKEN`` combined with OIDC but no
+    ``COORD_OIDC_REPO_CLAIM`` now refuses the SSO login up front instead of
+    minting a session token that the bearer path would immediately reject (a
+    dead session).
+  - The advertised ``all_repos`` -> ``403`` for a scoped token is now wired
+    end-to-end: the ``/claims``, ``/conflicts``, ``/metrics/hotspots`` and
+    ``/metrics/auto-resolutions`` routes accept an explicit ``all_repos`` param,
+    and the MCP ``list_claims`` / ``check_conflicts`` tools send it, so an
+    operator-wide read from a scoped token is rejected rather than silently
+    narrowed.
+
 ### Changed
 
 - Repo-aware filtering for hosted shared services (#30, slice 1). A coord

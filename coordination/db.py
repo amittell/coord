@@ -2278,6 +2278,7 @@ class Database:
         token_id: str,
         *,
         engineer: str | None = None,
+        repo: str | None = None,
         now: datetime | None = None,
     ) -> bool:
         """v0.29: idempotent revocation. Returns True if a previously
@@ -2290,7 +2291,13 @@ class Database:
         v0.29.5: ``engineer`` scopes the revocation -- the UPDATE only
         matches when the row belongs to that engineer, so a
         self-service dashboard revoke is atomic (no read-then-write
-        race against an operator acting on the same row)."""
+        race against an operator acting on the same row).
+
+        v0.42: ``repo`` further scopes the revocation to a single repo.
+        A repo-scoped dashboard session passes its bound repo so it can
+        never revoke the same engineer's tokens in another repo (or an
+        unscoped operator token). Combined with ``engineer`` the UPDATE
+        stays atomic -- no read-then-write race."""
         await self.init()
         ts = (now or datetime.now(UTC)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         sql = (
@@ -2301,6 +2308,9 @@ class Database:
         if engineer is not None:
             sql += " AND engineer = ?"
             params.append(engineer)
+        if repo is not None:
+            sql += " AND repo = ?"
+            params.append(repo)
         async with aiosqlite.connect(self.path) as conn:
             await _configure_sqlite(conn)
             cur = await conn.execute(sql, params)
@@ -2443,58 +2453,78 @@ class Database:
             rows = await cur.fetchall()
             return [dict(r) for r in rows]
 
-    async def touch_session_activity(self, session_id: str) -> int:
+    async def touch_session_activity(
+        self, session_id: str, *, repo: str | None = None
+    ) -> int:
         """Bump ``last_activity`` on every active claim that belongs to
         the given session. Returns the rowcount so callers can log /
         verify. No-op when ``session_id`` is empty.
+
+        v0.42: when ``repo`` is given, only the caller's own repo's
+        claims are warmed. This stops a repo-scoped token from keeping
+        another repo's claims alive by supplying (or guessing) a shared
+        session id on a read/write. ``repo=None`` keeps the legacy
+        behaviour of warming every claim in the session, which is what
+        an unscoped operator or an all-repos read wants.
         """
         if not session_id:
             return 0
         now = _utcnow()
         await self.init()
+        sql = "UPDATE claims SET last_activity = ? " \
+            "WHERE session_id = ? AND released_at IS NULL"
+        params: list[Any] = [now, session_id]
+        if repo is not None:
+            sql += " AND repo IS ?"
+            params.append(repo)
         async with aiosqlite.connect(self.path) as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
-            cur = await conn.execute(
-                """
-                UPDATE claims SET last_activity = ?
-                WHERE session_id = ? AND released_at IS NULL
-                """,
-                (now, session_id),
-            )
+            cur = await conn.execute(sql, params)
             await conn.commit()
             return cur.rowcount or 0
 
     async def pending_requests_for_session(
-        self, session_id: str, *, limit: int = 100
+        self, session_id: str, *, repo: str | None = None, limit: int = 100
     ) -> list[dict[str, Any]]:
         """Return recent conflict-log entries logged against active
         claims that this session currently holds. Used by the holder
         to poll "has anyone been blocked on my scope?" so they can
         decide whether to release.
+
+        v0.42: when ``repo`` is given, only entries logged against the
+        caller's own repo are returned, so a session id that spans
+        repos cannot leak another repo's conflict feed to a repo-scoped
+        token.
         """
         if not session_id:
             return []
         await self.init()
-        async with aiosqlite.connect(self.path) as conn:
-            conn.row_factory = aiosqlite.Row
-            await _configure_sqlite(conn)
-            cur = await conn.execute(
-                """
+        sql = """
                 SELECT cl.id, cl.claim_id, cl.attempted_by,
                        cl.attempted_pattern, cl.attempted_session_id,
                        cl.created_at,
                        c.pattern AS holder_pattern,
-                       c.engineer AS holder_engineer
+                       c.engineer AS holder_engineer,
+                       c.repo AS holder_repo
                 FROM conflict_log cl
                 JOIN claims c ON cl.claim_id = c.id
                 WHERE c.session_id = ?
                   AND c.released_at IS NULL
+        """
+        params: list[Any] = [session_id]
+        if repo is not None:
+            sql += "          AND c.repo IS ?\n"
+            params.append(repo)
+        sql += """
                 ORDER BY datetime(cl.created_at) DESC
                 LIMIT ?
-                """,
-                (session_id, limit),
-            )
+        """
+        params.append(limit)
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(sql, params)
             rows = await cur.fetchall()
             await conn.commit()
         return [dict(r) for r in rows]
@@ -2608,20 +2638,6 @@ class Database:
             )
             row = await cur.fetchone()
         return (False, None) if row is None else (True, row["repo"])
-
-    async def session_repos(self, session_id: str) -> set[str | None]:
-        """Distinct repos of the active claims under a session id."""
-        await self.init()
-        async with aiosqlite.connect(self.path) as conn:
-            conn.row_factory = aiosqlite.Row
-            await _configure_sqlite(conn)
-            cur = await conn.execute(
-                "SELECT DISTINCT repo FROM claims "
-                "WHERE session_id = ? AND released_at IS NULL",
-                (session_id,),
-            )
-            rows = await cur.fetchall()
-        return {r["repo"] for r in rows}
 
     async def release_claims(self, claim_ids: list[str], engineer: str | None = None) -> int:
         now = _utcnow()
@@ -3102,6 +3118,7 @@ class Database:
         self,
         *,
         days: int,
+        repo: str | None = None,
         now: datetime | None = None,
     ) -> list[dict[str, Any]]:
         """v0.28: return engineers whose most-recent active-claim
@@ -3129,6 +3146,16 @@ class Database:
         now = now or datetime.now(UTC)
         cutoff = (now - timedelta(days=days)).replace(microsecond=0)
         cutoff_iso = cutoff.isoformat().replace("+00:00", "Z")
+        # v0.42: a repo-scoped dashboard viewer must not see other repos'
+        # stale holders. The filter is applied before the GROUP BY so
+        # both the per-engineer counts and the repos aggregate are
+        # confined to the viewer's repo.
+        repo_clause = ""
+        params: list[Any] = []
+        if repo is not None:
+            repo_clause = "                  AND repo IS ?\n"
+            params.append(repo)
+        params.append(cutoff_iso)
         async with aiosqlite.connect(self.path) as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
@@ -3142,11 +3169,13 @@ class Database:
                 FROM claims
                 WHERE released_at IS NULL
                   AND last_activity IS NOT NULL
-                GROUP BY engineer
+"""
+                + repo_clause +
+                """                GROUP BY engineer
                 HAVING datetime(MAX(last_activity)) < datetime(?)
                 ORDER BY datetime(MAX(last_activity)) ASC, engineer ASC
                 """,
-                (cutoff_iso,),
+                params,
             )
             rows = await cur.fetchall()
             await conn.commit()
@@ -3991,19 +4020,20 @@ class Database:
             return [dict(r) for r in rows]
 
     async def list_open_requests_for_session(
-        self, session_id: str, *, limit: int = 100
+        self, session_id: str, *, repo: str | None = None, limit: int = 100
     ) -> list[dict[str, Any]]:
         """Return open (decision='pending') requests filed against
         claims this session currently holds. The holder's
-        pending_requests inbox merges this with the conflict-log feed."""
+        pending_requests inbox merges this with the conflict-log feed.
+
+        v0.42: when ``repo`` is given, only requests against the
+        caller's own repo are returned, so a session id that spans
+        repos cannot leak another repo's pending requests to a
+        repo-scoped token (or trigger ``notified`` events for them)."""
         if not session_id:
             return []
         await self.init()
-        async with aiosqlite.connect(self.path) as conn:
-            conn.row_factory = aiosqlite.Row
-            await _configure_sqlite(conn)
-            cur = await conn.execute(
-                """
+        sql = """
                 SELECT r.*,
                        c.engineer AS holder_engineer,
                        c.pattern  AS holder_pattern,
@@ -4013,11 +4043,20 @@ class Database:
                 WHERE c.session_id = ?
                   AND c.released_at IS NULL
                   AND r.decision = 'pending'
+        """
+        params: list[Any] = [session_id]
+        if repo is not None:
+            sql += "          AND c.repo IS ?\n"
+            params.append(repo)
+        sql += """
                 ORDER BY datetime(r.created_at) DESC
                 LIMIT ?
-                """,
-                (session_id, limit),
-            )
+        """
+        params.append(limit)
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(sql, params)
             rows = await cur.fetchall()
             return [dict(r) for r in rows]
 

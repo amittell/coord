@@ -271,8 +271,10 @@ async def _backpressure_middleware(request: Request, call_next):
 
     * Skipped entirely when ``settings.backpressure_header`` is False
       (operators on receivers that strip unknown headers).
-    * Skipped when no engineer signal is present (anonymous health
-      checks, /metrics scrapes, etc.).
+    * Skipped when the request carries no authenticated identity
+      (anonymous health checks, /metrics scrapes, failed auth). The
+      engineer is taken from the authenticated token, not from an
+      unauthenticated client-supplied value.
     * Counting errors are swallowed so a transient DB issue never
       poisons the underlying response -- the header just goes missing
       for that one request.
@@ -281,7 +283,23 @@ async def _backpressure_middleware(request: Request, call_next):
     settings = get_settings()
     if not settings.backpressure_header:
         return response
-    engineer = _engineer_from_request(request)
+    # v0.42: attribute queue depth from the AUTHENTICATED identity, never
+    # from an unauthenticated client-supplied ``engineer``. Otherwise
+    # anyone could read any engineer's queue depth by naming them
+    # (``?engineer=victim``) with no credential. require_auth has run by
+    # now (it is a route dependency, so request.state is populated on the
+    # same request object), so:
+    #   * per-engineer token -> only its own depth (self-attributed);
+    #   * shared/operator token -> may attribute any engineer it names
+    #     (operator-wide visibility is the point of the shared token);
+    #   * unauthenticated / no-auth / failed auth -> no header at all.
+    auth_kind = getattr(request.state, "auth_kind", None)
+    if auth_kind == "per_engineer":
+        engineer = getattr(request.state, "engineer", None)
+    elif auth_kind == "shared":
+        engineer = _engineer_from_request(request)
+    else:
+        engineer = None
     if not engineer:
         return response
     try:
@@ -1493,6 +1511,22 @@ async def oidc_callback(request: Request) -> Response:
             )
         oidc_repo = raw_repo.strip()
 
+    # A deployment that requires repo-scoped tokens but does not bind SSO
+    # sessions to a repo would mint an unscoped session token that the
+    # bearer path (_authenticate_bearer) rejects on the very next
+    # request -- a dead session. Refuse the login up front with an
+    # actionable message instead of handing out a credential that cannot
+    # be used.
+    if settings.require_scoped_token and oidc_repo is None:
+        return _oidc_error_clearing_state(
+            "SSO configuration error",
+            "COORD_REQUIRE_SCOPED_TOKEN is set but this SSO login is not "
+            "bound to a repo. Configure COORD_OIDC_REPO_CLAIM so the "
+            "ID token carries the repo, or the minted session would be "
+            "rejected immediately.",
+            500,
+        )
+
     # SSO sessions mint a REAL per-engineer token whose lifetime is
     # exactly the dashboard session lifetime, so the credential dies
     # with the cookie instead of accumulating as an immortal row. A
@@ -1747,10 +1781,12 @@ async def dashboard_tokens_revoke(
 
     Form fields: ``token_id``, ``csrf_token``. Per-engineer sessions
     can only revoke their own tokens (the UPDATE is engineer-scoped
-    in the database, so the check is atomic); a foreign live token
-    answers 403 with no mutation. Operators revoke anyone's. Missing
-    or already-revoked ids are idempotent successes -- 303 back to
-    the dashboard either way (PRG)."""
+    in the database, so the check is atomic); a repo-scoped session is
+    further confined to its own repo, so it cannot revoke the same
+    engineer's token in another repo or an unscoped operator token. A
+    foreign live token answers 403 with no mutation. Operators revoke
+    anyone's. Missing or already-revoked ids are idempotent successes
+    -- 303 back to the dashboard either way (PRG)."""
     gate = await _authenticate_token_management(request, authorization)
     if isinstance(gate, Response):
         return gate
@@ -1766,25 +1802,46 @@ async def dashboard_tokens_revoke(
     token_id = _form_str(form, "token_id")
     db = get_service().db
     if outcome.auth_kind == "per_engineer":
+        # A repo-scoped session may only revoke tokens in its own repo;
+        # the repo predicate is folded into the atomic UPDATE so a
+        # same-engineer token in another repo (or an unscoped operator
+        # token) is never touched.
         revoked = await db.revoke_engineer_token(
-            token_id, engineer=outcome.engineer
+            token_id,
+            engineer=outcome.engineer,
+            repo=outcome.token_repo,
         )
         if not revoked:
             # Distinguish "not yours" (403, no mutation) from "gone or
             # already revoked" (idempotent 303). The scoped UPDATE
             # already guaranteed no foreign row was touched.
             row = await db.get_engineer_token_by_id(token_id)
-            if row is not None and row.get("engineer") != outcome.engineer:
-                return HTMLResponse(
-                    "<!doctype html><html lang=\"en\"><head>"
-                    "<meta charset=\"utf-8\">"
-                    "<title>coord -- forbidden</title></head><body>"
-                    "<p>That token belongs to another engineer. Ask an "
-                    "operator to revoke it.</p>"
-                    "<p><a href=\"/dashboard\">back to dashboard</a></p>"
-                    "</body></html>",
-                    status_code=403,
-                )
+            if row is not None:
+                if row.get("engineer") != outcome.engineer:
+                    return HTMLResponse(
+                        "<!doctype html><html lang=\"en\"><head>"
+                        "<meta charset=\"utf-8\">"
+                        "<title>coord -- forbidden</title></head><body>"
+                        "<p>That token belongs to another engineer. Ask an "
+                        "operator to revoke it.</p>"
+                        "<p><a href=\"/dashboard\">back to dashboard</a></p>"
+                        "</body></html>",
+                        status_code=403,
+                    )
+                if (
+                    outcome.token_repo is not None
+                    and row.get("repo") != outcome.token_repo
+                ):
+                    return HTMLResponse(
+                        "<!doctype html><html lang=\"en\"><head>"
+                        "<meta charset=\"utf-8\">"
+                        "<title>coord -- forbidden</title></head><body>"
+                        "<p>That token belongs to another repo. Ask an "
+                        "operator to revoke it.</p>"
+                        "<p><a href=\"/dashboard\">back to dashboard</a></p>"
+                        "</body></html>",
+                        status_code=403,
+                    )
     else:
         await db.revoke_engineer_token(token_id)
 
@@ -1804,8 +1861,13 @@ async def create_claims(request: Request, body: CreateClaimsRequest, _: None = D
     # which swallows the exception per-waiter, and the v0.11
     # narrowed/coexist decisions create claims in the DB layer without
     # passing through create_claims at all.
+    # Auto-promote writes global ownership YAML, so only an unscoped
+    # (operator) token may trigger it. A repo-scoped token creating a
+    # conflicting claim must not rewrite deployment-wide config.
     try:
-        result = await get_service().create_claims(body)
+        result = await get_service().create_claims(
+            body, auto_promote_allowed=_token_repo(request) is None
+        )
     except RateLimitExceeded as exc:
         return JSONResponse(
             status_code=429,
@@ -1875,15 +1937,17 @@ async def list_claims(
     engineer: str | None = None,
     module: str | None = None,
     repo: str | None = None,
+    all_repos: bool = Query(default=False),
     session_id: str | None = None,
     _: None = Depends(require_auth),
 ) -> dict:
-    repo = _effective_read_repo(request, repo)
+    repo = _effective_read_repo(request, repo, all_repos=all_repos)
     rows = await get_service().list_claims(
         active_only=active,
         engineer=engineer,
         module_substring=module,
         session_id=session_id,
+        repo=repo,
     )
     if repo is not None:
         rows = [r for r in rows if r.get("repo") == repo]
@@ -1907,6 +1971,7 @@ async def hotspots_metric(
     min_attempts: int = Query(default=5, ge=1),
     limit: int = Query(default=20, ge=1, le=200),
     repo: str | None = Query(default=None),
+    all_repos: bool = Query(default=False),
     request: Request = None,  # type: ignore[assignment]
     _: None = Depends(require_auth),
 ) -> dict:
@@ -1915,7 +1980,7 @@ async def hotspots_metric(
     Operators look at this list to decide which files belong in a
     ``shared_file`` rule or which areas need to be split into modules.
     """
-    repo = _effective_read_repo(request, repo)
+    repo = _effective_read_repo(request, repo, all_repos=all_repos)
     rows = await get_service().db.hotspot_files(
         days=days, min_attempts=min_attempts, limit=limit, repo=repo,
     )
@@ -1966,6 +2031,7 @@ async def promote_hotspot(
 async def auto_resolutions_metric(
     days: int = Query(default=30, ge=1, le=90),
     repo: str | None = Query(default=None),
+    all_repos: bool = Query(default=False),
     request: Request = None,  # type: ignore[assignment]
     _: None = Depends(require_auth),
 ) -> dict:
@@ -1975,7 +2041,7 @@ async def auto_resolutions_metric(
     available standalone for external monitoring. Empty days are
     omitted -- callers that want a dense grid fill the gaps.
     """
-    repo = _effective_read_repo(request, repo)
+    repo = _effective_read_repo(request, repo, all_repos=all_repos)
     rows = await get_service().db.daily_auto_resolutions(days=days, repo=repo)
     return {"series": rows, "days": days, "count": len(rows)}
 
@@ -1985,12 +2051,13 @@ async def conflicts(
     pattern: list[str] | None = Query(default=None),
     engineer: str = Query(...),
     repo: str | None = Query(default=None),
+    all_repos: bool = Query(default=False),
     session_id: list[str] | None = Query(default=None),
     branch: str | None = Query(default=None),
     request: Request = None,  # type: ignore[assignment]
     _: None = Depends(require_auth),
 ) -> dict:
-    repo = _effective_read_repo(request, repo)
+    repo = _effective_read_repo(request, repo, all_repos=all_repos)
     if not pattern:
         raise HTTPException(status_code=400, detail="Provide one or more pattern= query params")
     try:
@@ -2049,12 +2116,13 @@ async def pending_requests(
     operations so they can approve / deny pending release requests and
     see who has been blocked on their scope. Coord-mcp exposes this as
     a `pending_requests` tool."""
-    token_repo = _token_repo(request)
-    if token_repo is not None:
-        session_repos = await get_service().db.session_repos(session_id)
-        if session_repos and token_repo not in session_repos:
-            raise _scope_403(token_repo, "session")
-    rows = await get_service().pending_requests(session_id)
+    # Row-level repo scoping: a scoped token gets only its own repo's
+    # rows even when the session id spans repos. Filtering per row (not
+    # per session) also means out-of-scope requests never fire a
+    # ``notified`` audit event.
+    rows = await get_service().pending_requests(
+        session_id, repo=_token_repo(request)
+    )
     return {"pending": rows, "count": len(rows)}
 
 

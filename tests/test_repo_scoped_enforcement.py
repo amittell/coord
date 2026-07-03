@@ -339,9 +339,12 @@ async def test_scoped_token_list_requests_only_own_repo(client: AsyncClient) -> 
     assert claim_ids == {cid_a}, claim_ids
 
 
-async def test_scoped_token_pending_requests_403_on_other_repo_session(
+async def test_scoped_token_pending_requests_empty_on_other_repo_session(
     client: AsyncClient,
 ) -> None:
+    # A session entirely in REPO_B, polled by a REPO_A token, yields an
+    # empty inbox (200) -- row-level filtering, not a 403 existence
+    # oracle that would confirm the session lives in another repo.
     from coordination.deps import get_service
 
     svc = get_service()
@@ -352,7 +355,48 @@ async def test_scoped_token_pending_requests_403_on_other_repo_session(
     )
     raw = await _mint(REPO_A)
     r = await client.get("/sessions/b-sess/pending_requests", headers=_auth(raw))
-    assert r.status_code == 403, r.text
+    assert r.status_code == 200, r.text
+    assert r.json() == {"pending": [], "count": 0}, r.text
+
+
+async def test_scoped_token_pending_requests_filters_mixed_repo_session(
+    client: AsyncClient,
+) -> None:
+    # The real bypass: ONE session id holds claims in BOTH repos, each
+    # with a pending release request. A REPO_A token polling this shared
+    # session must see only REPO_A's request -- and must NOT fire a
+    # ``notified`` audit event against REPO_B's request (which would both
+    # leak the row and forge evidence the B holder saw it).
+    from coordination.deps import get_service
+
+    svc = get_service()
+    await svc.db.insert_claims_batch(
+        engineer="dev", branch=None, description=None,
+        items=[("ca", "file", "src/a.py", "soft", "2099-01-01T00:00:00Z")],
+        session_id="mix-sess", repo=REPO_A,
+    )
+    await svc.db.insert_claims_batch(
+        engineer="dev", branch=None, description=None,
+        items=[("cb", "file", "src/b.py", "soft", "2099-01-01T00:00:00Z")],
+        session_id="mix-sess", repo=REPO_B,
+    )
+    rid_a = await _file_request(client, "ca")
+    rid_b = await _file_request(client, "cb")
+
+    raw = await _mint(REPO_A)
+    r = await client.get("/sessions/mix-sess/pending_requests", headers=_auth(raw))
+    assert r.status_code == 200, r.text
+    request_ids = {
+        row.get("id") for row in r.json()["pending"] if row.get("kind") == "request"
+    }
+    assert request_ids == {rid_a}, r.json()
+
+    # REPO_B's request was neither returned nor notified by A's poll.
+    ev_b = await svc.db.list_request_events(rid_b)
+    assert not any(e["event_type"] == "notified" for e in ev_b), ev_b
+    # REPO_A's request WAS notified (the in-scope holder genuinely saw it).
+    ev_a = await svc.db.list_request_events(rid_a)
+    assert any(e["event_type"] == "notified" for e in ev_a), ev_a
 
 
 async def test_scoped_token_cancel_queue_403_on_other_repo(client: AsyncClient) -> None:
@@ -451,3 +495,179 @@ async def test_unscoped_per_engineer_ok_when_flag_off(
         await svc.db.create_engineer_token("e", _sha256(unscoped))
         r = await ac.get("/claims", headers=_auth(unscoped))
         assert r.status_code == 200, r.text
+
+
+# ---------------------------------------------------------------------------
+# v0.42 security-review hardening (post-review fixes)
+# ---------------------------------------------------------------------------
+
+
+async def test_touch_session_activity_repo_scoped(client: AsyncClient) -> None:
+    # A repo-scoped warm-up must not refresh another repo's claims that
+    # happen to share a session id. Pinned at the DB layer so it is
+    # deterministic (no wall-clock dependence beyond "!= the old value").
+    from coordination.deps import get_service
+
+    svc = get_service()
+    old = "2020-01-01T00:00:00Z"
+    await svc.db.insert_claims_batch(
+        engineer="dev", branch=None, description=None,
+        items=[("ta", "file", "src/a.py", "soft", "2099-01-01T00:00:00Z")],
+        session_id="warm", repo=REPO_A, last_activity=old,
+    )
+    await svc.db.insert_claims_batch(
+        engineer="dev", branch=None, description=None,
+        items=[("tb", "file", "src/b.py", "soft", "2099-01-01T00:00:00Z")],
+        session_id="warm", repo=REPO_B, last_activity=old,
+    )
+    n = await svc.db.touch_session_activity("warm", repo=REPO_A)
+    assert n == 1, n  # only the REPO_A claim was warmed
+    rows = {r["id"]: r for r in await svc.db.list_active_claims_rows()}
+    assert rows["ta"]["last_activity"] != old, rows["ta"]
+    assert rows["tb"]["last_activity"] == old, rows["tb"]
+
+
+async def test_scoped_token_all_repos_rejected(client: AsyncClient) -> None:
+    # The advertised explicit-403 for all_repos, now actually wired.
+    raw = await _mint(REPO_A)
+    r = await client.get("/claims?all_repos=true", headers=_auth(raw))
+    assert r.status_code == 403, r.text
+    rc = await client.get(
+        "/conflicts?engineer=e&pattern=src/x.py&all_repos=true",
+        headers=_auth(raw),
+    )
+    assert rc.status_code == 403, rc.text
+    rh = await client.get("/metrics/hotspots?all_repos=true", headers=_auth(raw))
+    assert rh.status_code == 403, rh.text
+
+
+async def test_operator_all_repos_ok(client: AsyncClient) -> None:
+    await _seed_claim(client, REPO_A, "src/a.py")
+    await _seed_claim(client, REPO_B, "src/b.py")
+    r = await client.get(
+        "/claims?all_repos=true",
+        headers={"Authorization": f"Bearer {SHARED}"},
+    )
+    assert r.status_code == 200, r.text
+    repos = {c.get("repo") for c in r.json()["claims"]}
+    assert repos == {REPO_A, REPO_B}, repos
+
+
+async def test_queue_depth_header_absent_without_auth(client: AsyncClient) -> None:
+    # Before v0.42 the backpressure middleware stamped queue depth from a
+    # client-supplied ``engineer`` with no credential -- anyone could read
+    # any engineer's depth. Now an unauthenticated request gets no header.
+    r = await client.get("/claims?engineer=victim")
+    assert r.status_code == 401, r.text
+    assert "X-Coord-Queue-Depth" not in r.headers
+
+
+async def test_queue_depth_header_present_for_authed(client: AsyncClient) -> None:
+    raw = await _mint(REPO_A, engineer="eng")
+    r = await client.get("/claims", headers=_auth(raw))
+    assert r.status_code == 200, r.text
+    assert "X-Coord-Queue-Depth" in r.headers
+
+
+async def test_list_stale_engineers_repo_scoped(client: AsyncClient) -> None:
+    # A repo-scoped dashboard viewer must not see other repos' stale
+    # holders, their counts, or their repo names.
+    from coordination.deps import get_service
+
+    svc = get_service()
+    old = "2020-01-01T00:00:00Z"
+    await svc.db.insert_claims_batch(
+        engineer="alice", branch=None, description=None,
+        items=[("sa", "file", "src/a.py", "soft", "2099-01-01T00:00:00Z")],
+        session_id="sa", repo=REPO_A, last_activity=old,
+    )
+    await svc.db.insert_claims_batch(
+        engineer="bob", branch=None, description=None,
+        items=[("sb", "file", "src/b.py", "soft", "2099-01-01T00:00:00Z")],
+        session_id="sb", repo=REPO_B, last_activity=old,
+    )
+    scoped = await svc.db.list_stale_engineers(days=1, repo=REPO_A)
+    assert {row["engineer"] for row in scoped} == {"alice"}, scoped
+    assert all(row["repos"] == [REPO_A] for row in scoped), scoped
+    unscoped = await svc.db.list_stale_engineers(days=1)
+    assert {row["engineer"] for row in unscoped} == {"alice", "bob"}, unscoped
+
+
+@pytest.fixture()
+async def client_promote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncClient:
+    # Auto-promote enabled so a single bounce crosses the threshold.
+    db_path = tmp_path / "db.sqlite"
+    monkeypatch.setenv("COORD_AUTH_TOKEN", SHARED)
+    monkeypatch.setenv("COORD_DATABASE_PATH", str(db_path))
+    monkeypatch.setenv("COORD_DISABLE_BACKGROUND_CLEANUP", "1")
+    monkeypatch.setenv("COORD_DISABLE_INSTANCE_LOCK", "1")
+    monkeypatch.delenv("COORD_REPO_ROOT", raising=False)
+    monkeypatch.setenv("COORD_AUTO_PROMOTE_THRESHOLD", "1")
+    monkeypatch.setenv("COORD_AUTO_PROMOTE_WINDOW_DAYS", "7")
+
+    from coordination import deps
+
+    deps.get_service.cache_clear()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
+    deps.get_service.cache_clear()
+
+
+async def _bounce(ac: AsyncClient, headers: dict[str, str], repo: str | None) -> None:
+    # Seed a holder (operator token) then bounce a second claim off it so a
+    # conflict lands in conflict_log and _maybe_auto_promote is reached.
+    rh = await ac.post(
+        "/claims",
+        headers={"Authorization": f"Bearer {SHARED}"},
+        json={
+            "engineer": "holder",
+            "repo": REPO_A,
+            "claims": [{"type": "file", "pattern": "src/hot.py"}],
+        },
+    )
+    assert rh.status_code == 200, rh.text
+    body: dict = {
+        "engineer": "bouncer",
+        "claims": [{"type": "file", "pattern": "src/hot.py"}],
+    }
+    if repo is not None:
+        body["repo"] = repo
+    rb = await ac.post("/claims", headers=headers, json=body)
+    assert rb.status_code in (200, 409), rb.text
+    assert rb.json().get("claim_ids") == [], rb.text
+
+
+async def test_scoped_token_conflict_does_not_auto_promote(
+    client_promote: AsyncClient,
+) -> None:
+    # A repo-scoped caller's conflict must not rewrite the GLOBAL
+    # ownership YAML (auto-promote is operator-only).
+    raw = await _mint(REPO_A, engineer="bouncer")
+    await _bounce(client_promote, _auth(raw), repo=None)
+    g = await client_promote.get(
+        "/config/ownership", headers={"Authorization": f"Bearer {SHARED}"}
+    )
+    # 204 (no ownership YAML at all) or 200 without the pattern -- either
+    # way the scoped caller promoted nothing.
+    assert g.status_code in (200, 204), g.text
+    if g.status_code == 200:
+        assert "src/hot.py" not in g.text, g.text
+
+
+async def test_operator_conflict_still_auto_promotes(
+    client_promote: AsyncClient,
+) -> None:
+    # The operator (unscoped) path is unchanged: it still promotes.
+    await _bounce(
+        client_promote,
+        {"Authorization": f"Bearer {SHARED}"},
+        repo=REPO_A,
+    )
+    g = await client_promote.get(
+        "/config/ownership", headers={"Authorization": f"Bearer {SHARED}"}
+    )
+    assert g.status_code == 200, g.text
+    assert "src/hot.py" in g.text, g.text

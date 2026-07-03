@@ -663,7 +663,7 @@ class CoordinationService:
         # needs to keep its claims warm.
         if session_ids:
             for sid in session_ids:
-                await self.db.touch_session_activity(sid)
+                await self.db.touch_session_activity(sid, repo=repo)
         active = await self.db.list_active_claims_rows(exclude_engineer=engineer)
         # Repo-scoped check (v0.4.0): only consider claims from the same
         # repo as the caller. NULL repo forms its own legacy bucket so
@@ -849,13 +849,20 @@ class CoordinationService:
             scope="claims", detail=detail, retry_after_sec=retry_after
         )
 
-    async def create_claims(self, body: CreateClaimsRequest) -> CreateClaimsResponse:
+    async def create_claims(
+        self,
+        body: CreateClaimsRequest,
+        *,
+        auto_promote_allowed: bool = True,
+    ) -> CreateClaimsResponse:
         await self.db.expire_stale_claims(self.settings.idle_timeout_sec)
         # Activity ping: making a claim is the strongest possible
         # liveness signal -- bump last_activity for every claim this
         # session already holds before we decide what's stale.
         if body.session_id:
-            await self.db.touch_session_activity(body.session_id)
+            await self.db.touch_session_activity(
+                body.session_id, repo=body.repo
+            )
         rules = await self._rules()
         patterns = [c.pattern for c in body.claims]
         for pat in patterns:
@@ -1010,7 +1017,13 @@ class CoordinationService:
             # ownership YAML and record an audit event. The current
             # 409 response is unchanged -- the new rule governs the
             # NEXT overlap on this pattern.
-            if self.settings.auto_promote_threshold > 0:
+            # Auto-promote mutates the GLOBAL ownership YAML, so it is
+            # an operator-only action. A repo-scoped caller passes
+            # ``auto_promote_allowed=False`` (v0.42) to keep its claim
+            # activity from silently rewriting shared config across the
+            # whole deployment -- the operator-only manual promote /
+            # config-write endpoints are the sanctioned path.
+            if self.settings.auto_promote_threshold > 0 and auto_promote_allowed:
                 await self._maybe_auto_promote(conflicts)
             # v0.21: if the caller passed wait_seconds > 0, enqueue the
             # FIRST conflicting requester item behind its blocking
@@ -2102,13 +2115,16 @@ class CoordinationService:
         engineer: str | None = None,
         module_substring: str | None = None,
         session_id: str | None = None,
+        repo: str | None = None,
     ) -> list[dict[str, Any]]:
         await self.db.expire_stale_claims(self.settings.idle_timeout_sec)
         # Activity ping: an agent reading the claim list is still alive,
         # so keep its claims warm. No-op when session_id is unset
-        # (legacy / non-MCP callers).
+        # (legacy / non-MCP callers). ``repo`` scopes the warm-up so a
+        # repo-scoped reader cannot refresh another repo's claims via a
+        # shared session id (v0.42).
         if session_id:
-            await self.db.touch_session_activity(session_id)
+            await self.db.touch_session_activity(session_id, repo=repo)
         if active_only:
             rows = await self.db.list_active_claims_rows(exclude_engineer=None)
         else:
@@ -2120,7 +2136,9 @@ class CoordinationService:
             rows = [r for r in rows if m in (r.get("pattern") or "").lower()]
         return rows
 
-    async def pending_requests(self, session_id: str) -> list[dict[str, Any]]:
+    async def pending_requests(
+        self, session_id: str, *, repo: str | None = None
+    ) -> list[dict[str, Any]]:
         """Return the inbox the holder polls. Merges two streams:
 
         - First-class release ``requests`` (decision='pending', kind='request').
@@ -2134,12 +2152,22 @@ class CoordinationService:
 
         Each row in the returned list carries a ``kind`` discriminator so
         the agent / dashboard can render them appropriately.
+
+        v0.42: ``repo`` scopes the inbox. When set (a repo-scoped
+        token), only requests / conflicts against the caller's own repo
+        are returned -- and, critically, only in-scope requests fire a
+        ``notified`` audit event, so a session id spanning repos never
+        leaks (or records evidence of seeing) another repo's rows.
         """
         if not session_id:
             return []
         # First-class requests get the audit-event treatment so the
-        # operator can prove "the holder did/didn't see this".
-        open_requests = await self.db.list_open_requests_for_session(session_id)
+        # operator can prove "the holder did/didn't see this". The repo
+        # filter is applied in the query so out-of-scope requests are
+        # neither returned nor notified.
+        open_requests = await self.db.list_open_requests_for_session(
+            session_id, repo=repo
+        )
         for r in open_requests:
             await self.db.record_request_notify(
                 r["id"],
@@ -2149,7 +2177,9 @@ class CoordinationService:
         request_rows = [{"kind": "request", **r} for r in open_requests]
 
         # Auto-conflict entries (the v0.6 pre-existing inbox).
-        conflicts = await self.db.pending_requests_for_session(session_id)
+        conflicts = await self.db.pending_requests_for_session(
+            session_id, repo=repo
+        )
         conflict_rows = [{"kind": "auto-conflict", **c} for c in conflicts]
         return request_rows + conflict_rows
 

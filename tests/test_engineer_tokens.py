@@ -76,6 +76,40 @@ async def test_revoked_token_does_not_authenticate(tmp_path: Path) -> None:
     assert await db.revoke_engineer_token(token_id) is False
 
 
+async def test_revoke_is_repo_scoped(tmp_path: Path) -> None:
+    """v0.42: a repo-scoped dashboard session passes ``repo`` to revoke.
+    The UPDATE must not touch the same engineer's token in another repo
+    (nor an unscoped operator token), so the cross-repo revoke bypass is
+    closed atomically at the DB layer."""
+    db = Database(tmp_path / "tok.sqlite")
+    raw_a = "coordt_" + "a" * 64
+    raw_b = "coordt_" + "b" * 64
+    raw_op = "coordt_" + "e" * 64
+    id_a = await db.create_engineer_token(
+        "eng", _sha256(raw_a), repo="owner/repo-a"
+    )
+    id_b = await db.create_engineer_token(
+        "eng", _sha256(raw_b), repo="owner/repo-b"
+    )
+    id_op = await db.create_engineer_token("eng", _sha256(raw_op))  # unscoped
+
+    # A repo-a-scoped session cannot revoke the repo-b token...
+    assert await db.revoke_engineer_token(
+        id_b, engineer="eng", repo="owner/repo-a"
+    ) is False
+    assert await db.lookup_engineer_token(_sha256(raw_b)) is not None
+    # ...nor the unscoped operator token...
+    assert await db.revoke_engineer_token(
+        id_op, engineer="eng", repo="owner/repo-a"
+    ) is False
+    assert await db.lookup_engineer_token(_sha256(raw_op)) is not None
+    # ...but it can revoke its own repo's token.
+    assert await db.revoke_engineer_token(
+        id_a, engineer="eng", repo="owner/repo-a"
+    ) is True
+    assert await db.lookup_engineer_token(_sha256(raw_a)) is None
+
+
 async def test_list_excludes_revoked_by_default(tmp_path: Path) -> None:
     db = Database(tmp_path / "tok.sqlite")
     raw_live = "coordt_" + "c" * 64

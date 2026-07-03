@@ -1047,9 +1047,10 @@ async def render_dashboard(
     conflicts = await svc.db.recent_conflicts(500, repo=viewer_repo)
     recent = await svc.db.list_recent_claims(500)
     # #55: a repo-scoped viewer sees only its repo. rows/recent are filtered
-    # before activity is derived; the repo-aware DB calls take viewer_repo
-    # directly; the webhook and stale-engineer panels are global operational
-    # data (not repo-tagged) and are left unscoped.
+    # before activity is derived; the repo-aware DB calls (including the
+    # stale-engineer panel, scoped in v0.42) take viewer_repo directly.
+    # Only the webhook panel is global operational data (not repo-tagged)
+    # and is left unscoped.
     if viewer_repo is not None:
         rows = [c for c in rows if c.get("repo") == viewer_repo]
         recent = [c for c in recent if c.get("repo") == viewer_repo]
@@ -1074,8 +1075,11 @@ async def render_dashboard(
         queued_rows = [q for q in queued_rows if q.get("repo") == viewer_repo]
     stale_engineer_days = svc.settings.stale_engineer_days
     if stale_engineer_days > 0:
+        # v0.42: scope the stale-holder panel to the viewer's repo so a
+        # repo-bound dashboard session cannot see other repos' holders,
+        # counts, or repo names.
         stale_engineers = await svc.db.list_stale_engineers(
-            days=stale_engineer_days, now=now
+            days=stale_engineer_days, repo=viewer_repo, now=now
         )
     else:
         stale_engineers = []
