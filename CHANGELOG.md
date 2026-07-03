@@ -7,6 +7,10 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+(none recorded yet)
+
+## [0.42.0] - 2026-07-02
+
 ### Added
 
 - Server-enforced repo scoping via repo-bound tokens (#30 slice 2/3, #55).
