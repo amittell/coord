@@ -383,14 +383,20 @@ class CoordinationService:
     # ``await asyncio.gather(*service._enrichment_tasks)``.
     _enrichment_tasks: set[asyncio.Task[None]] = field(default_factory=set)
 
-    async def count_queued_for(self, engineer: str) -> int:
+    async def count_queued_for(
+        self, engineer: str, *, repo: str | None = None
+    ) -> int:
         """v0.28: return how many waiting queue rows the given engineer
         currently owns. Drives the ``X-Coord-Queue-Depth`` backpressure
         header so clients can self-regulate without an extra round trip
         to ``/requests?queued=true``.
+
+        v0.42: ``repo`` confines the count to a single repo so a
+        repo-scoped token cannot read the engineer's cross-repo queue
+        depth. ``repo=None`` (operator) counts across every repo.
         """
         rows = await self.db.list_queued_with_holder(
-            engineer=engineer, state="waiting"
+            engineer=engineer, state="waiting", repo=repo
         )
         return len(rows)
 
@@ -1906,7 +1912,10 @@ class CoordinationService:
     # ------------------------------------------------------------------
 
     async def create_refactor_claims(
-        self, body: ClaimRefactorRequest
+        self,
+        body: ClaimRefactorRequest,
+        *,
+        auto_promote_allowed: bool = True,
     ) -> CreateClaimsResponse:
         """Expand a (file, symbol) refactor intent into a normal
         ``create_claims`` batch covering the definition and every
@@ -2078,7 +2087,11 @@ class CoordinationService:
                 session_id=body.session_id,
                 wait_seconds=body.wait_seconds,
                 urgency=body.urgency,
-            )
+            ),
+            # Auto-promote writes global ownership YAML, so a repo-scoped
+            # caller must not trigger it via the refactor path either
+            # (v0.42; mirrors the POST /claims gate).
+            auto_promote_allowed=auto_promote_allowed,
         )
         # Partial-coverage guard. The v0.21 queue enqueues only the
         # single conflicted item, so a wait_seconds grant that arrives
@@ -2792,7 +2805,16 @@ class CoordinationService:
                 return
             grant_body = self._queue_entry_to_create_request(entry)
             try:
-                resp = await self.create_claims(grant_body)
+                # A drain grant is an internal, server-initiated re-issue on
+                # behalf of a queued waiter whose token scope is not available
+                # here. Auto-promote mutates global ownership YAML and is an
+                # operator-only action, so it must never fire from this path
+                # (v0.42) -- otherwise a repo-scoped requester's grant could
+                # rewrite deployment-wide config. Direct operator POST /claims
+                # still promotes.
+                resp = await self.create_claims(
+                    grant_body, auto_promote_allowed=False
+                )
             except RateLimitExceeded as exc:
                 # v0.30: a queue grant must not blast through the
                 # active-claim cap -- the waiter's engineer is at

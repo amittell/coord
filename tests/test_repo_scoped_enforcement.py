@@ -671,3 +671,51 @@ async def test_operator_conflict_still_auto_promotes(
     )
     assert g.status_code == 200, g.text
     assert "src/hot.py" in g.text, g.text
+
+
+async def test_count_queued_for_repo_scoped(client: AsyncClient) -> None:
+    # A repo-scoped token must not read an engineer's cross-repo queue
+    # depth via the X-Coord-Queue-Depth backpressure header.
+    from coordination.deps import get_service
+
+    svc = get_service()
+    await svc.db.insert_claims_batch(
+        engineer="holder", branch=None, description=None,
+        items=[("qha", "file", "src/a.py", "soft", "2099-01-01T00:00:00Z")],
+        repo=REPO_A,
+    )
+    await svc.db.insert_claims_batch(
+        engineer="holder", branch=None, description=None,
+        items=[("qhb", "file", "src/b.py", "soft", "2099-01-01T00:00:00Z")],
+        repo=REPO_B,
+    )
+    for repo, blk, pat in ((REPO_A, "qha", "src/a.py"), (REPO_B, "qhb", "src/b.py")):
+        await svc.db.enqueue_claim_request(
+            blocking_claim_id=blk,
+            requester_engineer="alice",
+            requester_session_id=None,
+            requester_branch=None,
+            requester_description=None,
+            repo=repo,
+            claim_type="file",
+            pattern=pat,
+            symbols=None,
+            narrowable=None,
+            ttl_hours=None,
+            wait_seconds=0,
+        )
+    assert await svc.count_queued_for("alice", repo=REPO_A) == 1
+    assert await svc.count_queued_for("alice", repo=REPO_B) == 1
+    assert await svc.count_queued_for("alice") == 2  # operator sees all repos
+
+
+async def test_scoped_token_cannot_read_ownership_yaml(client: AsyncClient) -> None:
+    # GET /config/ownership exposes deployment-wide (cross-repo) config, so
+    # it is operator-only like its POST sibling.
+    raw = await _mint(REPO_A)
+    r = await client.get("/config/ownership", headers=_auth(raw))
+    assert r.status_code == 403, r.text
+    ro = await client.get(
+        "/config/ownership", headers={"Authorization": f"Bearer {SHARED}"}
+    )
+    assert ro.status_code in (200, 204), ro.text

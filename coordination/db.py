@@ -2412,6 +2412,7 @@ class Database:
         *,
         engineer: str | None = None,
         state: str | None = "waiting",
+        repo: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         """v0.22: queue rows joined with the blocking holder's engineer
@@ -2442,6 +2443,11 @@ class Database:
         if state:
             clauses.append("cq.state = ?")
             params.append(state)
+        if repo is not None:
+            # v0.42: confine to one repo so a scoped token cannot read an
+            # engineer's cross-repo queue depth via the backpressure header.
+            clauses.append("cq.repo IS ?")
+            params.append(repo)
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY cq.enqueued_at DESC LIMIT ?"

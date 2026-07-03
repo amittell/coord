@@ -148,13 +148,14 @@ async def list_claims(
     if module:
         params["module"] = module
     repo_id = _repo_id()
-    if repo_id and not all_repos:
-        params["repo"] = repo_id
-    elif repo_id and all_repos:
-        # Send the opt-out explicitly rather than just omitting ``repo``:
-        # a repo-scoped token then gets an honest 403 ("you cannot see
-        # all repos") instead of being silently narrowed to its own repo.
+    if all_repos:
+        # Always transmit the explicit opt-out (not just an omitted
+        # ``repo``) so a repo-scoped token gets an honest 403 ("you cannot
+        # see all repos") rather than being silently narrowed -- even when
+        # this client has no local COORD_REPO_ID to scope to.
         params["all_repos"] = "true"
+    elif repo_id:
+        params["repo"] = repo_id
     # Session_id doubles as an activity ping on the server side: a
     # session that is actively listing claims is alive, so its held
     # claims should not idle-expire.
@@ -184,12 +185,13 @@ async def check_conflicts(
     ]
     params.append(("engineer", engineer))
     repo_id = _repo_id()
-    if repo_id and not all_repos:
-        params.append(("repo", repo_id))
-    elif repo_id and all_repos:
-        # Explicit opt-out so a repo-scoped token is rejected with a 403
-        # rather than silently narrowed to its own repo.
+    if all_repos:
+        # Always transmit the explicit opt-out so a repo-scoped token is
+        # rejected with a 403 rather than silently narrowed, even when this
+        # client has no local COORD_REPO_ID.
         params.append(("all_repos", "true"))
+    elif repo_id:
+        params.append(("repo", repo_id))
     # Session_id makes the conflict check session-aware (so an agent's
     # own subagents don't false-positive against each other) and acts
     # as an activity ping for idle expiration on the server side.

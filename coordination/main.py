@@ -303,7 +303,9 @@ async def _backpressure_middleware(request: Request, call_next):
     if not engineer:
         return response
     try:
-        depth = await get_service().count_queued_for(engineer)
+        depth = await get_service().count_queued_for(
+            engineer, repo=_token_repo(request)
+        )
         response.headers["X-Coord-Queue-Depth"] = str(depth)
     except Exception:  # pragma: no cover - best-effort header
         logger.debug(
@@ -1897,7 +1899,9 @@ async def claim_refactor(
     because refactor claims are meaningless without references."""
     body.repo = _enforce_write_repo(request, body.repo)
     try:
-        result = await get_service().create_refactor_claims(body)
+        result = await get_service().create_refactor_claims(
+            body, auto_promote_allowed=_token_repo(request) is None
+        )
     except LspUnavailable as exc:
         return JSONResponse(
             status_code=503,
@@ -2399,7 +2403,14 @@ async def set_ownership(request: Request, _: None = Depends(require_auth)) -> di
 
 
 @app.get("/config/ownership")
-async def get_ownership(_: None = Depends(require_auth)) -> Response:
+async def get_ownership(
+    request: Request, _: None = Depends(require_auth)
+) -> Response:
+    # Ownership YAML is deployment-wide (not repo-tagged) config: it can
+    # disclose other repos' shared_files / split rules. The POST sibling is
+    # already operator-only, so the read is too (v0.42) -- a repo-scoped
+    # token cannot enumerate the whole deployment's ownership policy.
+    _require_operator(request)
     text = await get_service().get_ownership_yaml()
     if text is None:
         return PlainTextResponse("", status_code=204)
