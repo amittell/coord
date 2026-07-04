@@ -205,6 +205,23 @@ async def _request_id_middleware(request: Request, call_next):
     return response
 
 
+def _unscoped_token_warning(engineer: str | None) -> str:
+    """Compose the v0.43 soft-deprecation notice for an unscoped
+    per-engineer token. One ASCII line (it rides in an HTTP header): what
+    is wrong, why it matters, and the exact command to switch. The MCP
+    wrapper surfaces it to the agent as ``coord_notice`` and ``coord
+    status`` prints it, so the same message reaches humans and agents."""
+    who = engineer or "<engineer>"
+    return (
+        "Your coord token is not bound to a repo. On a shared multi-repo coord "
+        "service an unscoped per-engineer token sees and can affect EVERY "
+        "repo's claims, which is deprecated. Ask an operator for a repo-scoped "
+        f"token and switch: `coord tokens create {who} --repo <owner/name>`, "
+        "then set it in .coordination/local.env. See the 'Repo-scoped tokens' "
+        "section of AGENTS.md / docs/deployment.md. Honored for now."
+    )
+
+
 @app.middleware("http")
 async def _count_http_requests(request: Request, call_next):
     """Increment ``http_requests_total`` after each response. Uses the
@@ -219,6 +236,18 @@ async def _count_http_requests(request: Request, call_next):
     _scope = getattr(request.state, "token_repo", None)
     if _scope is not None:
         response.headers["X-Coord-Repo-Scope"] = _scope
+    elif (
+        get_settings().warn_unscoped_token
+        and getattr(request.state, "auth_kind", None) == "per_engineer"
+    ):
+        # v0.43: soft-deprecate unscoped per-engineer tokens -- honor the
+        # request but nudge toward a repo-bound token. The shared operator
+        # token (auth_kind != per_engineer) is exempt; when
+        # require_scoped_token is set the unscoped token 401s before here so
+        # this never double-signals.
+        response.headers["X-Coord-Token-Warning"] = _unscoped_token_warning(
+            getattr(request.state, "engineer", None)
+        )
     route = request.scope.get("route")
     path_label = getattr(route, "path", None) or request.url.path
     metrics.http_requests_total.inc(

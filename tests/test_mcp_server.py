@@ -2461,3 +2461,61 @@ async def test_check_conflicts_all_repos_sends_flag_without_repo_id(
 
     assert captured[0].url.params.get("all_repos") == "true"
     assert "repo" not in captured[0].url.params
+
+
+# ---------------------------------------------------------------------------
+# v0.43: the MCP wrapper surfaces the server's X-Coord-Token-Warning header as
+# a coord_notice so the agent (not just an HTTP header) sees the deprecation.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_claims_surfaces_token_notice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.delenv("COORD_REPO_ID", raising=False)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"claims": [], "count": 0},
+            headers={"X-Coord-Token-Warning": "switch to a repo-scoped token"},
+        )
+
+    _install_mock_transport(monkeypatch, handler)
+    result = await mcp_server.list_claims()
+    assert result["coord_notice"] == "switch to a repo-scoped token"
+
+
+@pytest.mark.asyncio
+async def test_list_claims_no_notice_when_header_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.delenv("COORD_REPO_ID", raising=False)
+    _install_mock_transport(monkeypatch, _json_handler(200, {"claims": []}))
+    result = await mcp_server.list_claims()
+    assert "coord_notice" not in result
+
+
+@pytest.mark.asyncio
+async def test_claim_files_surfaces_token_notice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.delenv("COORD_REPO_ID", raising=False)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"claim_ids": ["c1"], "conflicts": [], "warnings": []},
+            headers={"X-Coord-Token-Warning": "unscoped token deprecated"},
+        )
+
+    _install_mock_transport(monkeypatch, handler)
+    result = await mcp_server.claim_files(engineer="dana", patterns=["src/a.py"])
+    assert result["coord_notice"] == "unscoped token deprecated"

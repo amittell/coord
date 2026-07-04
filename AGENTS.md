@@ -10,6 +10,16 @@ Multi-agent file coordination via the `coord` MCP server. Required calls every s
 
 If `claim_files` returns conflicts, stop and ask the user. No edits outside claimed scope; no opportunistic refactors; shared config edits only with explicit user approval.
 
+### Repo-scoped tokens (v0.42+)
+
+On a shared coord service that fronts several repos, use a **repo-scoped token** so you only ever see and touch your own repo's claims. The server enforces the scope from the token, so `list_claims` / `check_conflicts` return just your repo no matter what the client sends.
+
+If a tool result carries a `coord_notice` -- or `coord status` prints a `Token warning:` line -- your token is **unscoped** and deprecated: on a shared service it sees and can affect every repo's claims. It is still honored for now, but switch. Ask an operator for a scoped token and drop it in `.coordination/local.env`:
+
+- `coord tokens create <engineer> --repo <owner/name>`
+
+Operator-wide reads are opt-in with `all_repos=True` (a scoped token gets a 403, not a silent all-repo view). Rollout detail: `docs/deployment.md`.
+
 ### Sub-file (symbol-level) claims (v0.14+)
 
 When two agents need different parts of the same file, claim symbols instead of whole files. Pass `symbols={"src/auth/login.ts": ["handleLogin"]}` to `claim_files` so the claim scopes to just that function. Two agents on disjoint symbols of the same file auto-coexist with no 409.

@@ -818,3 +818,71 @@ async def test_active_claim_cap_is_per_repo(client_capped: AsyncClient) -> None:
         },
     )
     assert r2.status_code == 429, r2.text
+
+
+# ---------------------------------------------------------------------------
+# v0.43 soft-deprecation warning for unscoped per-engineer tokens
+# ---------------------------------------------------------------------------
+
+
+async def test_unscoped_per_engineer_token_gets_deprecation_header(
+    client: AsyncClient,
+) -> None:
+    raw = await _mint(None, engineer="dana")  # unscoped per-engineer token
+    r = await client.get("/claims", headers=_auth(raw))
+    assert r.status_code == 200, r.text
+    warning = r.headers.get("X-Coord-Token-Warning")
+    assert warning is not None, r.headers
+    assert "coord tokens create dana --repo" in warning
+    assert "AGENTS.md" in warning
+
+
+async def test_scoped_token_no_deprecation_header(client: AsyncClient) -> None:
+    raw = await _mint(REPO_A)
+    r = await client.get("/claims", headers=_auth(raw))
+    assert r.status_code == 200, r.text
+    assert "X-Coord-Token-Warning" not in r.headers
+    # scoped tokens advertise their scope instead
+    assert r.headers.get("X-Coord-Repo-Scope") == REPO_A
+
+
+async def test_shared_operator_token_no_deprecation_header(
+    client: AsyncClient,
+) -> None:
+    # The shared operator token is unscoped by design -- it is the escape
+    # hatch, not a deprecated per-engineer token, so it is never warned.
+    r = await client.get(
+        "/claims", headers={"Authorization": f"Bearer {SHARED}"}
+    )
+    assert r.status_code == 200, r.text
+    assert "X-Coord-Token-Warning" not in r.headers
+
+
+@pytest.fixture()
+async def client_no_warn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncClient:
+    db_path = tmp_path / "db.sqlite"
+    monkeypatch.setenv("COORD_AUTH_TOKEN", SHARED)
+    monkeypatch.setenv("COORD_DATABASE_PATH", str(db_path))
+    monkeypatch.setenv("COORD_DISABLE_BACKGROUND_CLEANUP", "1")
+    monkeypatch.setenv("COORD_DISABLE_INSTANCE_LOCK", "1")
+    monkeypatch.delenv("COORD_REPO_ROOT", raising=False)
+    monkeypatch.setenv("COORD_WARN_UNSCOPED_TOKEN", "false")
+
+    from coordination import deps
+
+    deps.get_service.cache_clear()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
+    deps.get_service.cache_clear()
+
+
+async def test_deprecation_header_silenced_by_flag(
+    client_no_warn: AsyncClient,
+) -> None:
+    raw = await _mint(None, engineer="dana")
+    r = await client_no_warn.get("/claims", headers=_auth(raw))
+    assert r.status_code == 200, r.text
+    assert "X-Coord-Token-Warning" not in r.headers
