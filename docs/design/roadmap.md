@@ -11,15 +11,13 @@ Version-assigned by current priority, using value-per-effort against today's sin
 
 Note: the v0.34.0 (GitHub PR-comment integration) and v0.35.0 (symbol-level coexist) items below shipped as planned. The **operator approval workflow** originally slotted at v0.36.0 did NOT ship -- the v0.36-v0.40 releases went to unplanned work instead: dashboard redesign (v0.36.0), ``coord mcp install`` (v0.37.0), OpenTelemetry tracing (v0.38.0), JSON-logging-by-default (v0.39.0), uvicorn log unification (v0.40.0), plus worktree and logging fixes through v0.40.2. The outbox retry CLI an earlier revision slotted at v0.33.1 had already shipped back in v0.27.1; the ``coord upgrade``-from-linked-worktree fix landed in v0.35.2 and the ``coord doctor`` pre-push worktree check in v0.40.2. The two live candidates below are renumbered around all of that.
 
-### v0.41.0 (in progress) -- Repo-aware filtering for hosted shared services (#30)
+### v0.41.0 (shipped, #53) -- Repo-aware filtering for hosted shared services (#30 slice 1)
 
-On a hosted shared coord service fronting multiple repos, ``coord status`` reports ``Repo-aware: false`` and global claim / conflict / dashboard views leak claims across unrelated repos. Root cause: the ``Repo-aware`` signal is derived from the server-wide ``COORD_REPO_ROOT`` (a single-checkout symbol-validation setting) rather than from the ``claims.repo`` column that actually scopes claims -- so a hosted service that deliberately runs without a global checkout looks "not repo-aware" even though every claim is repo-tagged. Scope:
+Client-side repo scoping: the MCP ``list_claims`` / ``check_conflicts`` wrappers and the ``coord claims`` CLI now pass ``COORD_REPO_ID`` by default (with an ``all_repos`` opt-out), and ``coord status`` splits the misleading ``Repo-aware:`` line into a client ``Repo scope:`` and a server ``Symbol validation:``. Advisory only -- a stale client that omits ``repo`` still saw all repos, which motivated the server-side enforcement below.
 
-- Default ``/claims`` and the dashboard to the caller's repo id, with an explicit all-repos operator mode.
-- Teach the MCP ``list_claims`` / ``check_conflicts`` wrappers and the ``coord claims`` CLI to pass ``COORD_REPO_ID`` (today only ``claim_files`` sends it).
-- Split the ``coord status`` signal: distinguish service-level repo filtering from the local symbol-validation root, so ``Repo-aware`` stops depending on a single global checkout.
+### v0.42.0 (in review, #56 + #57) -- Server-enforced repo scoping via repo-bound tokens (#30 slice 2/3, #55)
 
-Feeds the larger Multi-namespace arc below (delivers its repo-scoped-visibility half) without taking on the namespace-isolation decisions.
+Makes repo isolation a server-side authorization boundary: a nullable ``engineer_tokens.repo`` (schema v19) binds a token to a repo, and every authenticated repo-tagged endpoint (reads, id-addressed writes, dashboard) is scoped from auth, not from a client-supplied ``repo``. Version-independent -- even an un-upgraded ``coord-mcp`` is enforced once its ``local.env`` carries a scoped token. Includes the dashboard-mint escalation fix and an opt-in ``COORD_REQUIRE_SCOPED_TOKEN`` to make scoping mandatory. Design + rollout in ``docs/design/repo-scoped-tokens.md`` and ``docs/deployment.md``. Delivers the Multi-namespace arc's repo-scoped-visibility half without taking on the namespace-isolation decisions.
 
 ### Operator approval workflow (next scoped feature, unversioned)
 

@@ -829,11 +829,15 @@ def test_claims_scopes_to_local_repo_by_default(
     assert any("repo=app" in p for p in received)
 
 
-def test_claims_all_repos_flag_omits_repo_scope(
+def test_claims_all_repos_flag_sends_explicit_opt_out(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    # v0.42: --all-repos sends an explicit ``all_repos=true`` (rather than
+    # merely omitting ``repo``) so a repo-scoped token is rejected with a
+    # 403 instead of being silently narrowed to its own repo. The local
+    # repo scope must not be applied.
     handler, received = _claims_path_recorder()
     with _MockServer(handler) as mock:
         _init_repo_with_service(tmp_path, monkeypatch, mock.port)
@@ -841,7 +845,8 @@ def test_claims_all_repos_flag_omits_repo_scope(
         exit_code = cli.main(["claims", "--all-repos"])
     assert exit_code == 0
     assert received
-    assert all("repo=" not in p for p in received)
+    assert any("all_repos=true" in p for p in received)
+    assert all("repo=app" not in p for p in received)
 
 
 def test_claims_repo_flag_overrides_local_scope(

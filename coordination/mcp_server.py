@@ -192,7 +192,13 @@ async def list_claims(
     if module:
         params["module"] = module
     repo_id = _repo_id()
-    if repo_id and not all_repos:
+    if all_repos:
+        # Always transmit the explicit opt-out (not just an omitted
+        # ``repo``) so a repo-scoped token gets an honest 403 ("you cannot
+        # see all repos") rather than being silently narrowed -- even when
+        # this client has no local COORD_REPO_ID to scope to.
+        params["all_repos"] = "true"
+    elif repo_id:
         params["repo"] = repo_id
     # Session_id doubles as an activity ping on the server side: a
     # session that is actively listing claims is alive, so its held
@@ -225,7 +231,12 @@ async def check_conflicts(
     ]
     params.append(("engineer", engineer))
     repo_id = _repo_id()
-    if repo_id and not all_repos:
+    if all_repos:
+        # Always transmit the explicit opt-out so a repo-scoped token is
+        # rejected with a 403 rather than silently narrowed, even when this
+        # client has no local COORD_REPO_ID.
+        params.append(("all_repos", "true"))
+    elif repo_id:
         params.append(("repo", repo_id))
     branch = _current_branch_or_worktree()
     if branch:

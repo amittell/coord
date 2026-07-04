@@ -212,6 +212,13 @@ async def _count_http_requests(request: Request, call_next):
     label so cardinality stays bounded; falls back to the raw URL path
     if routing did not attach a matched route (404s, /metrics itself)."""
     response = await call_next(request)
+    # #30 slice 2/3: advertise the repo a scoped token was pinned to, so an
+    # operator who dropped a token into the wrong repo's local.env can see
+    # why results are empty instead of a silent void. Unscoped tokens (the
+    # common case) get no header.
+    _scope = getattr(request.state, "token_repo", None)
+    if _scope is not None:
+        response.headers["X-Coord-Repo-Scope"] = _scope
     route = request.scope.get("route")
     path_label = getattr(route, "path", None) or request.url.path
     metrics.http_requests_total.inc(
@@ -264,8 +271,10 @@ async def _backpressure_middleware(request: Request, call_next):
 
     * Skipped entirely when ``settings.backpressure_header`` is False
       (operators on receivers that strip unknown headers).
-    * Skipped when no engineer signal is present (anonymous health
-      checks, /metrics scrapes, etc.).
+    * Skipped when the request carries no authenticated identity
+      (anonymous health checks, /metrics scrapes, failed auth). The
+      engineer is taken from the authenticated token, not from an
+      unauthenticated client-supplied value.
     * Counting errors are swallowed so a transient DB issue never
       poisons the underlying response -- the header just goes missing
       for that one request.
@@ -274,11 +283,29 @@ async def _backpressure_middleware(request: Request, call_next):
     settings = get_settings()
     if not settings.backpressure_header:
         return response
-    engineer = _engineer_from_request(request)
+    # v0.42: attribute queue depth from the AUTHENTICATED identity, never
+    # from an unauthenticated client-supplied ``engineer``. Otherwise
+    # anyone could read any engineer's queue depth by naming them
+    # (``?engineer=victim``) with no credential. require_auth has run by
+    # now (it is a route dependency, so request.state is populated on the
+    # same request object), so:
+    #   * per-engineer token -> only its own depth (self-attributed);
+    #   * shared/operator token -> may attribute any engineer it names
+    #     (operator-wide visibility is the point of the shared token);
+    #   * unauthenticated / no-auth / failed auth -> no header at all.
+    auth_kind = getattr(request.state, "auth_kind", None)
+    if auth_kind == "per_engineer":
+        engineer = getattr(request.state, "engineer", None)
+    elif auth_kind == "shared":
+        engineer = _engineer_from_request(request)
+    else:
+        engineer = None
     if not engineer:
         return response
     try:
-        depth = await get_service().count_queued_for(engineer)
+        depth = await get_service().count_queued_for(
+            engineer, repo=_token_repo(request)
+        )
         response.headers["X-Coord-Queue-Depth"] = str(depth)
     except Exception:  # pragma: no cover - best-effort header
         logger.debug(
@@ -340,6 +367,10 @@ class AuthOutcome:
     auth_kind: str | None = None  # "per_engineer" | "shared" | None
     engineer: str | None = None
     token_id: str | None = None
+    # v0.42 (#30 slice 2/3): the repo this token is bound to, or None for an
+    # unscoped (operator / shared) token. When set, the server forces repo
+    # scope from auth rather than trusting a client-supplied ``repo``.
+    token_repo: str | None = None
     # v0.29.5: the session token's own expiry (ISO ``...Z`` or None for
     # never), populated on the per-engineer ok path. The dashboard
     # token-create endpoint uses it to cap self-service token expiry.
@@ -433,6 +464,25 @@ async def _authenticate_bearer(
     resolved = await service.db.resolve_engineer_token(token_hash)
     if resolved is not None:
         if resolved["status"] == "ok":
+            # #30 slice 2/3 hardening: a deployment can require every
+            # per-engineer token to be repo-scoped. An unscoped one is
+            # rejected with an actionable hint; the shared token stays the
+            # operator escape hatch (handled on its own path below).
+            if (
+                settings.require_scoped_token
+                and resolved.get("repo") is None
+            ):
+                metrics.auth_failures_total.inc()
+                return AuthOutcome(
+                    ok=False,
+                    status_code=401,
+                    detail=(
+                        "This deployment requires a repo-scoped token "
+                        "(COORD_REQUIRE_SCOPED_TOKEN). Ask an operator for a "
+                        "token bound to your repo: coord tokens create "
+                        "<engineer> --repo <id>."
+                    ),
+                )
             # Best-effort activity capture. The auth path must never
             # 401 because the update failed (e.g. transient lock
             # contention), so a broad except is correct here.
@@ -450,6 +500,7 @@ async def _authenticate_bearer(
                 engineer=resolved["engineer"],
                 token_id=resolved["id"],
                 token_expires_at=resolved.get("expires_at"),
+                token_repo=resolved.get("repo"),
             )
         metrics.auth_failures_total.inc()
         if resolved["status"] == "expired":
@@ -519,12 +570,128 @@ async def require_auth(
         raise HTTPException(
             status_code=outcome.status_code, detail=outcome.detail
         )
+    # #30 slice 2/3: default the repo-scope state on every request so handlers
+    # can read request.state.token_repo unconditionally. An unscoped or shared
+    # token leaves it None (operator: sees all repos).
+    request.state.token_repo = None
+    request.state.token_scoped = False
     if outcome.auth_kind == "per_engineer":
         request.state.engineer = outcome.engineer
         request.state.auth_kind = "per_engineer"
         request.state.token_id = outcome.token_id
+        request.state.token_repo = outcome.token_repo
+        request.state.token_scoped = outcome.token_repo is not None
     elif outcome.auth_kind == "shared":
         request.state.auth_kind = "shared"
+
+
+# ---------------------------------------------------------------------------
+# Repo-scope enforcement (#30 slice 2/3). A scoped token's repo comes from
+# auth (request.state.token_repo), never from the client, so these helpers are
+# the boundary that makes visibility a server-side authorization decision.
+# ---------------------------------------------------------------------------
+
+
+def _token_repo(request: Request) -> str | None:
+    """The repo this request's token is bound to, or None when unscoped."""
+    return getattr(request.state, "token_repo", None)
+
+
+def _effective_read_repo(
+    request: Request, client_repo: str | None, *, all_repos: bool = False
+) -> str | None:
+    """Resolve the repo filter for a READ, enforcing token scope.
+
+    Unscoped (operator) token: the client's ``repo`` / ``all_repos`` are
+    honored verbatim. Scoped token: the filter is forced to the token's repo;
+    an explicit request for a different repo (or all repos) is a 403 rather
+    than a silent lie, while an absent ``repo`` is silently scoped so a stale
+    client that sends nothing is still enforced.
+    """
+    token_repo = _token_repo(request)
+    if token_repo is None:
+        return client_repo
+    if all_repos or (client_repo is not None and client_repo != token_repo):
+        want = "all repos" if all_repos else f"repo '{client_repo}'"
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"This token is scoped to repo '{token_repo}'; it cannot "
+                f"access {want}."
+            ),
+        )
+    return token_repo
+
+
+def _enforce_write_repo(request: Request, body_repo: str | None) -> str | None:
+    """Resolve the repo a WRITE tags, enforcing token scope. Scoped token:
+    default to the token's repo when the body omits it, 403 on mismatch.
+    Unscoped token: the body value is honored verbatim."""
+    token_repo = _token_repo(request)
+    if token_repo is None:
+        return body_repo
+    if body_repo is not None and body_repo != token_repo:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"This token is scoped to repo '{token_repo}'; it cannot "
+                f"write to repo '{body_repo}'."
+            ),
+        )
+    return token_repo
+
+
+def _require_operator(request: Request) -> None:
+    """Reject a repo-scoped token from an operator-only (global) endpoint."""
+    token_repo = _token_repo(request)
+    if token_repo is not None:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "This endpoint mutates global state and is operator-only; a "
+                f"token scoped to repo '{token_repo}' cannot use it."
+            ),
+        )
+
+
+def _scope_403(token_repo: str, kind: str) -> HTTPException:
+    return HTTPException(
+        status_code=403,
+        detail=(
+            f"This token is scoped to repo '{token_repo}'; that {kind} "
+            "belongs to another repo."
+        ),
+    )
+
+
+async def _require_claim_in_scope(request: Request, claim_id: str) -> None:
+    """403 when a scoped token references a claim in another repo. A missing
+    claim falls through so the handler's own 404 / no-op logic runs (no
+    existence 403 for an id the token could not have created)."""
+    token_repo = _token_repo(request)
+    if token_repo is None:
+        return
+    exists, repo = await get_service().db.claim_repo(claim_id)
+    if exists and repo != token_repo:
+        raise _scope_403(token_repo, "claim")
+
+
+async def _require_request_in_scope(request: Request, request_id: str) -> None:
+    token_repo = _token_repo(request)
+    if token_repo is None:
+        return
+    exists, repo = await get_service().db.request_repo(request_id)
+    if exists and repo != token_repo:
+        raise _scope_403(token_repo, "request")
+
+
+async def _require_queue_in_scope(request: Request, queue_id: str) -> None:
+    token_repo = _token_repo(request)
+    if token_repo is None:
+        return
+    exists, repo = await get_service().db.queue_entry_repo(queue_id)
+    if exists and repo != token_repo:
+        raise _scope_403(token_repo, "queue entry")
 
 
 # Cookie set by ``/dashboard/login``. HTTP-only so JS in any
@@ -694,6 +861,7 @@ async def _render_dashboard_for(
     return await render_dashboard(
         viewer_engineer=outcome.engineer,
         is_operator=outcome.auth_kind == "shared",
+        viewer_repo=outcome.token_repo,
         csrf_token=csrf,
         token_error=token_error,
         token_success=token_success,
@@ -1326,6 +1494,41 @@ async def oidc_callback(request: Request) -> Response:
             "SSO sign-in refused", str(exc), 403
         )
 
+    # #30 slice 2/3: optionally bind the SSO-minted token to a repo from a
+    # configured claim, so SSO dashboard sessions are repo-scoped instead of
+    # operator-wide. Configured-but-missing is a refusal, never a silent grant
+    # of all-repo access.
+    oidc_repo: str | None = None
+    if settings.oidc_repo_claim:
+        raw_repo = claims.get(settings.oidc_repo_claim)
+        if not isinstance(raw_repo, str) or not raw_repo.strip():
+            return _oidc_error_clearing_state(
+                "SSO sign-in refused",
+                (
+                    f"the configured OIDC repo claim "
+                    f"'{settings.oidc_repo_claim}' is missing or empty; this "
+                    "deployment scopes SSO sessions to a repo."
+                ),
+                403,
+            )
+        oidc_repo = raw_repo.strip()
+
+    # A deployment that requires repo-scoped tokens but does not bind SSO
+    # sessions to a repo would mint an unscoped session token that the
+    # bearer path (_authenticate_bearer) rejects on the very next
+    # request -- a dead session. Refuse the login up front with an
+    # actionable message instead of handing out a credential that cannot
+    # be used.
+    if settings.require_scoped_token and oidc_repo is None:
+        return _oidc_error_clearing_state(
+            "SSO configuration error",
+            "COORD_REQUIRE_SCOPED_TOKEN is set but this SSO login is not "
+            "bound to a repo. Configure COORD_OIDC_REPO_CLAIM so the "
+            "ID token carries the repo, or the minted session would be "
+            "rejected immediately.",
+            500,
+        )
+
     # SSO sessions mint a REAL per-engineer token whose lifetime is
     # exactly the dashboard session lifetime, so the credential dies
     # with the cookie instead of accumulating as an immortal row. A
@@ -1350,6 +1553,7 @@ async def oidc_callback(request: Request) -> Response:
         sha256_token(raw),
         description="oidc sso login",
         expires_at=expires_at,
+        repo=oidc_repo,
     )
 
     response = Response(status_code=303)
@@ -1531,12 +1735,19 @@ async def dashboard_tokens_create(
                 "outlive the session token; pick a shorter duration.",
             )
 
+    # #30 slice 2/3: a repo-scoped session may only mint tokens bound to its
+    # own repo -- it must never be able to mint an unscoped (operator) token
+    # or one for another repo, which would be a privilege escalation. An
+    # operator (unscoped / shared) session has token_repo=None and keeps
+    # minting unscoped tokens as before.
+    new_token_repo = outcome.token_repo
     raw = generate_raw_token()
     token_id = await get_service().db.create_engineer_token(
         engineer,
         sha256_token(raw),
         description=description,
         expires_at=expires_at,
+        repo=new_token_repo,
     )
 
     # One-time reveal page. The raw value exists only in this
@@ -1552,6 +1763,7 @@ async def dashboard_tokens_create(
         f"<p><code>{html_mod.escape(raw)}</code></p>"
         f"<p>engineer: {html_mod.escape(engineer)}<br>"
         f"token id: {html_mod.escape(token_id)}<br>"
+        f"repo scope: {html_mod.escape(new_token_repo or 'all repos (unscoped)')}<br>"
         f"expires: {html_mod.escape(_iso_z_or_never(expires_at))}</p>"
         "<p><a href=\"/dashboard\">back to dashboard</a></p>"
         "</body></html>"
@@ -1571,10 +1783,12 @@ async def dashboard_tokens_revoke(
 
     Form fields: ``token_id``, ``csrf_token``. Per-engineer sessions
     can only revoke their own tokens (the UPDATE is engineer-scoped
-    in the database, so the check is atomic); a foreign live token
-    answers 403 with no mutation. Operators revoke anyone's. Missing
-    or already-revoked ids are idempotent successes -- 303 back to
-    the dashboard either way (PRG)."""
+    in the database, so the check is atomic); a repo-scoped session is
+    further confined to its own repo, so it cannot revoke the same
+    engineer's token in another repo or an unscoped operator token. A
+    foreign live token answers 403 with no mutation. Operators revoke
+    anyone's. Missing or already-revoked ids are idempotent successes
+    -- 303 back to the dashboard either way (PRG)."""
     gate = await _authenticate_token_management(request, authorization)
     if isinstance(gate, Response):
         return gate
@@ -1590,25 +1804,46 @@ async def dashboard_tokens_revoke(
     token_id = _form_str(form, "token_id")
     db = get_service().db
     if outcome.auth_kind == "per_engineer":
+        # A repo-scoped session may only revoke tokens in its own repo;
+        # the repo predicate is folded into the atomic UPDATE so a
+        # same-engineer token in another repo (or an unscoped operator
+        # token) is never touched.
         revoked = await db.revoke_engineer_token(
-            token_id, engineer=outcome.engineer
+            token_id,
+            engineer=outcome.engineer,
+            repo=outcome.token_repo,
         )
         if not revoked:
             # Distinguish "not yours" (403, no mutation) from "gone or
             # already revoked" (idempotent 303). The scoped UPDATE
             # already guaranteed no foreign row was touched.
             row = await db.get_engineer_token_by_id(token_id)
-            if row is not None and row.get("engineer") != outcome.engineer:
-                return HTMLResponse(
-                    "<!doctype html><html lang=\"en\"><head>"
-                    "<meta charset=\"utf-8\">"
-                    "<title>coord -- forbidden</title></head><body>"
-                    "<p>That token belongs to another engineer. Ask an "
-                    "operator to revoke it.</p>"
-                    "<p><a href=\"/dashboard\">back to dashboard</a></p>"
-                    "</body></html>",
-                    status_code=403,
-                )
+            if row is not None:
+                if row.get("engineer") != outcome.engineer:
+                    return HTMLResponse(
+                        "<!doctype html><html lang=\"en\"><head>"
+                        "<meta charset=\"utf-8\">"
+                        "<title>coord -- forbidden</title></head><body>"
+                        "<p>That token belongs to another engineer. Ask an "
+                        "operator to revoke it.</p>"
+                        "<p><a href=\"/dashboard\">back to dashboard</a></p>"
+                        "</body></html>",
+                        status_code=403,
+                    )
+                if (
+                    outcome.token_repo is not None
+                    and row.get("repo") != outcome.token_repo
+                ):
+                    return HTMLResponse(
+                        "<!doctype html><html lang=\"en\"><head>"
+                        "<meta charset=\"utf-8\">"
+                        "<title>coord -- forbidden</title></head><body>"
+                        "<p>That token belongs to another repo. Ask an "
+                        "operator to revoke it.</p>"
+                        "<p><a href=\"/dashboard\">back to dashboard</a></p>"
+                        "</body></html>",
+                        status_code=403,
+                    )
     else:
         await db.revoke_engineer_token(token_id)
 
@@ -1618,7 +1853,8 @@ async def dashboard_tokens_revoke(
 
 
 @app.post("/claims")
-async def create_claims(body: CreateClaimsRequest, _: None = Depends(require_auth)) -> JSONResponse:
+async def create_claims(request: Request, body: CreateClaimsRequest, _: None = Depends(require_auth)) -> JSONResponse:
+    body.repo = _enforce_write_repo(request, body.repo)
     # v0.30: rate-limit raises map to 429 before (and independent of)
     # the warnings->400 mapping below -- a quota breach is not a
     # validation problem and must carry its own Retry-After signal.
@@ -1627,8 +1863,13 @@ async def create_claims(body: CreateClaimsRequest, _: None = Depends(require_aut
     # which swallows the exception per-waiter, and the v0.11
     # narrowed/coexist decisions create claims in the DB layer without
     # passing through create_claims at all.
+    # Auto-promote writes global ownership YAML, so only an unscoped
+    # (operator) token may trigger it. A repo-scoped token creating a
+    # conflicting claim must not rewrite deployment-wide config.
     try:
-        result = await get_service().create_claims(body)
+        result = await get_service().create_claims(
+            body, auto_promote_allowed=_token_repo(request) is None
+        )
     except RateLimitExceeded as exc:
         return JSONResponse(
             status_code=429,
@@ -1649,15 +1890,18 @@ async def create_claims(body: CreateClaimsRequest, _: None = Depends(require_aut
 
 @app.post("/claims/refactor")
 async def claim_refactor(
-    body: ClaimRefactorRequest, _: None = Depends(require_auth)
+    request: Request, body: ClaimRefactorRequest, _: None = Depends(require_auth)
 ) -> JSONResponse:
     """v0.31 wave 2: reserve a symbol's definition plus every callsite
     the language server can see, as one normal claims batch. Response
     shapes are byte-compatible with POST /claims (200 / 400 / 409 /
     429); the only new shape is 503 when no language server can answer,
     because refactor claims are meaningless without references."""
+    body.repo = _enforce_write_repo(request, body.repo)
     try:
-        result = await get_service().create_refactor_claims(body)
+        result = await get_service().create_refactor_claims(
+            body, auto_promote_allowed=_token_repo(request) is None
+        )
     except LspUnavailable as exc:
         return JSONResponse(
             status_code=503,
@@ -1692,18 +1936,22 @@ async def claim_refactor(
 
 @app.get("/claims")
 async def list_claims(
+    request: Request,
     active: bool = Query(default=True, alias="active_only"),
     engineer: str | None = None,
     module: str | None = None,
     repo: str | None = None,
+    all_repos: bool = Query(default=False),
     session_id: str | None = None,
     _: None = Depends(require_auth),
 ) -> dict:
+    repo = _effective_read_repo(request, repo, all_repos=all_repos)
     rows = await get_service().list_claims(
         active_only=active,
         engineer=engineer,
         module_substring=module,
         session_id=session_id,
+        repo=repo,
     )
     if repo is not None:
         rows = [r for r in rows if r.get("repo") == repo]
@@ -1711,10 +1959,13 @@ async def list_claims(
 
 
 @app.get("/repos")
-async def list_repos(_: None = Depends(require_auth)) -> dict:
+async def list_repos(request: Request, _: None = Depends(require_auth)) -> dict:
     """Per-repo activity summary: one row for each distinct repo that has
     ever submitted a claim with a non-null repo identifier."""
     rows = await get_service().db.list_repos()
+    token_repo = _token_repo(request)
+    if token_repo is not None:
+        rows = [r for r in rows if r.get("repo") == token_repo]
     return {"repos": rows, "count": len(rows)}
 
 
@@ -1724,6 +1975,8 @@ async def hotspots_metric(
     min_attempts: int = Query(default=5, ge=1),
     limit: int = Query(default=20, ge=1, le=200),
     repo: str | None = Query(default=None),
+    all_repos: bool = Query(default=False),
+    request: Request = None,  # type: ignore[assignment]
     _: None = Depends(require_auth),
 ) -> dict:
     """Top files by blocked claim attempts (v0.20).
@@ -1731,6 +1984,7 @@ async def hotspots_metric(
     Operators look at this list to decide which files belong in a
     ``shared_file`` rule or which areas need to be split into modules.
     """
+    repo = _effective_read_repo(request, repo, all_repos=all_repos)
     rows = await get_service().db.hotspot_files(
         days=days, min_attempts=min_attempts, limit=limit, repo=repo,
     )
@@ -1744,6 +1998,7 @@ async def hotspots_metric(
 
 @app.post("/metrics/hotspots/promote")
 async def promote_hotspot(
+    request: Request,
     body: PromoteHotspotRequest,
     _: None = Depends(require_auth),
 ) -> dict:
@@ -1758,6 +2013,7 @@ async def promote_hotspot(
     The dashboard renders an "apply" link per qualifying hotspot row
     pointing at this endpoint; the operator is in the loop.
     """
+    _require_operator(request)
     try:
         patched = await get_service().promote_hotspot(
             action=body.action,
@@ -1779,6 +2035,8 @@ async def promote_hotspot(
 async def auto_resolutions_metric(
     days: int = Query(default=30, ge=1, le=90),
     repo: str | None = Query(default=None),
+    all_repos: bool = Query(default=False),
+    request: Request = None,  # type: ignore[assignment]
     _: None = Depends(require_auth),
 ) -> dict:
     """Daily auto-coexist / auto-narrow counts per repo (v0.18).
@@ -1787,6 +2045,7 @@ async def auto_resolutions_metric(
     available standalone for external monitoring. Empty days are
     omitted -- callers that want a dense grid fill the gaps.
     """
+    repo = _effective_read_repo(request, repo, all_repos=all_repos)
     rows = await get_service().db.daily_auto_resolutions(days=days, repo=repo)
     return {"series": rows, "days": days, "count": len(rows)}
 
@@ -1796,10 +2055,13 @@ async def conflicts(
     pattern: list[str] | None = Query(default=None),
     engineer: str = Query(...),
     repo: str | None = Query(default=None),
+    all_repos: bool = Query(default=False),
     session_id: list[str] | None = Query(default=None),
     branch: str | None = Query(default=None),
+    request: Request = None,  # type: ignore[assignment]
     _: None = Depends(require_auth),
 ) -> dict:
+    repo = _effective_read_repo(request, repo, all_repos=all_repos)
     if not pattern:
         raise HTTPException(status_code=400, detail="Provide one or more pattern= query params")
     try:
@@ -1818,6 +2080,7 @@ async def conflicts(
             patterns=pattern,
             engineer=engineer,
             repo=repo,
+            all_repos=all_repos,
             session_ids=session_id,
             pushing_branch=branch,
         )
@@ -1829,19 +2092,27 @@ async def conflicts(
 @app.post("/sessions/{session_id}/release")
 async def release_session(
     session_id: str,
+    request: Request,
     _: None = Depends(require_auth),
 ) -> dict:
     """Release every active claim that was created with the given
     session_id. Intended for end-of-work cleanup so a single call from
     coord-mcp tears down everything the agent and its subagents
-    produced, regardless of engineer name."""
-    n = await get_service().db.release_for_session(session_id)
+    produced, regardless of engineer name.
+
+    A repo-scoped token releases only that repo's claims within the
+    session (#30 slice 2/3), so it cannot tear down another repo's work
+    that happens to share a session id."""
+    n = await get_service().db.release_for_session(
+        session_id, repo=_token_repo(request)
+    )
     return {"released": n}
 
 
 @app.get("/sessions/{session_id}/pending_requests")
 async def pending_requests(
     session_id: str,
+    request: Request,
     _: None = Depends(require_auth),
 ) -> dict:
     """Return the merged inbox the holder polls. Includes first-class
@@ -1850,12 +2121,19 @@ async def pending_requests(
     operations so they can approve / deny pending release requests and
     see who has been blocked on their scope. Coord-mcp exposes this as
     a `pending_requests` tool."""
-    rows = await get_service().pending_requests(session_id)
+    # Row-level repo scoping: a scoped token gets only its own repo's
+    # rows even when the session id spans repos. Filtering per row (not
+    # per session) also means out-of-scope requests never fire a
+    # ``notified`` audit event.
+    rows = await get_service().pending_requests(
+        session_id, repo=_token_repo(request)
+    )
     return {"pending": rows, "count": len(rows)}
 
 
 @app.post("/requests")
 async def file_request(
+    request: Request,
     body: FileRequestRequest,
     _: None = Depends(require_auth),
 ) -> JSONResponse:
@@ -1866,9 +2144,10 @@ async def file_request(
     open until the holder responds, the shortened TTL fires, or the
     timeout elapses -- whichever comes first.
     """
+    await _require_claim_in_scope(request, body.claim_id)
     svc = get_service()
     try:
-        request = await svc.file_request(
+        filed = await svc.file_request(
             claim_id=body.claim_id,
             requester=body.requester,
             requester_session_id=body.session_id,
@@ -1883,18 +2162,19 @@ async def file_request(
 
     if body.wait_seconds > 0:
         final = await svc.wait_for_decision(
-            request["id"], timeout_seconds=body.wait_seconds
+            filed["id"], timeout_seconds=body.wait_seconds
         )
         if final is not None:
-            request = final
+            filed = final
 
-    return JSONResponse(status_code=200, content=request)
+    return JSONResponse(status_code=200, content=filed)
 
 
 @app.post("/requests/{request_id}/respond")
 async def respond_to_request(
     request_id: str,
     body: RespondToRequestRequest,
+    request: Request,
     _: None = Depends(require_auth),
 ) -> JSONResponse:
     """The holder responds to an open request.
@@ -1909,6 +2189,7 @@ async def respond_to_request(
       claims, mutually self-excluded via ``claims.coexists_with``.
 
     All transitions are audit-logged."""
+    await _require_request_in_scope(request, request_id)
     if body.decision not in ("approved", "denied", "narrowed", "coexist"):
         raise HTTPException(
             status_code=400,
@@ -1959,6 +2240,7 @@ async def list_requests(
     decision: str | None = Query(default=None),
     queued: bool = Query(default=False),
     state: str | None = Query(default=None),
+    request: Request = None,  # type: ignore[assignment]
     _: None = Depends(require_auth),
 ) -> dict:
     """List requests filtered by requester, claim, or decision state.
@@ -1973,11 +2255,16 @@ async def list_requests(
     omit the param to keep the default). ``requester`` continues to
     apply, filtering queue rows by ``requester_engineer``.
     """
+    token_repo = _token_repo(request)
     if queued:
         rows = await get_service().db.list_queued_with_holder(
             engineer=requester,
             state=state or "waiting",
         )
+        if token_repo is not None:
+            # A scoped token only sees queue entries for its own repo
+            # (claim_queue.repo is the requester's repo at enqueue time).
+            rows = [r for r in rows if r.get("repo") == token_repo]
         out: list[dict] = []
         for r in rows:
             symbols_field: list[str] | None = None
@@ -2013,14 +2300,21 @@ async def list_requests(
         claim_id=claim_id,
         decision=decision,
     )
+    if token_repo is not None:
+        # holder_repo is the target claim's repo (joined in list_requests).
+        rows_legacy = [
+            r for r in rows_legacy if r.get("holder_repo") == token_repo
+        ]
     return {"requests": rows_legacy, "count": len(rows_legacy)}
 
 
 @app.get("/requests/{request_id}")
 async def get_request(
     request_id: str,
+    request: Request,
     _: None = Depends(require_auth),
 ) -> JSONResponse:
+    await _require_request_in_scope(request, request_id)
     row = await get_service().get_request(request_id)
     if row is None:
         raise HTTPException(status_code=404, detail="request not found")
@@ -2030,11 +2324,13 @@ async def get_request(
 @app.get("/requests/{request_id}/events")
 async def get_request_events(
     request_id: str,
+    request: Request,
     _: None = Depends(require_auth),
 ) -> dict:
     """Return the immutable audit-event timeline for a request,
     oldest first. Each row carries the actor, timestamp, and a JSON
     detail blob with the per-event-type specifics."""
+    await _require_request_in_scope(request, request_id)
     rows = await get_service().list_request_events(request_id)
     return {"events": rows, "count": len(rows)}
 
@@ -2042,6 +2338,7 @@ async def get_request_events(
 @app.delete("/requests/{queue_id}")
 async def cancel_request(
     queue_id: str,
+    request: Request,
     engineer: str | None = Query(default=None),
     _: None = Depends(require_auth),
 ) -> dict:
@@ -2052,6 +2349,7 @@ async def cancel_request(
     waiting/in_progress row was actually transitioned to cancelled,
     False when the row was already terminal or unknown.
     """
+    await _require_queue_in_scope(request, queue_id)
     cancelled = await get_service().cancel_queue_request(
         queue_id, engineer=engineer
     )
@@ -2061,15 +2359,19 @@ async def cancel_request(
 @app.delete("/claims/{claim_id}")
 async def delete_claim(
     claim_id: str,
+    request: Request,
     engineer: str | None = Query(default=None),
     _: None = Depends(require_auth),
 ) -> dict:
+    await _require_claim_in_scope(request, claim_id)
     released = await get_service().release_claims([claim_id], engineer)
     return {"released": released}
 
 
 @app.post("/claims/release")
-async def release_claims(body: ReleaseClaimsRequest, _: None = Depends(require_auth)) -> dict:
+async def release_claims(body: ReleaseClaimsRequest, request: Request, _: None = Depends(require_auth)) -> dict:
+    for _cid in body.claim_ids:
+        await _require_claim_in_scope(request, _cid)
     released = await get_service().release_claims(body.claim_ids, body.engineer)
     return {"released": released}
 
@@ -2078,8 +2380,10 @@ async def release_claims(body: ReleaseClaimsRequest, _: None = Depends(require_a
 async def extend_claim(
     claim_id: str,
     body: ExtendClaimRequest,
+    request: Request,
     _: None = Depends(require_auth),
 ) -> dict:
+    await _require_claim_in_scope(request, claim_id)
     ok = await get_service().extend_claim(claim_id, body.engineer, body.ttl_hours)
     if not ok:
         raise HTTPException(status_code=404, detail="Claim not found or not owned")
@@ -2088,6 +2392,7 @@ async def extend_claim(
 
 @app.post("/config/ownership")
 async def set_ownership(request: Request, _: None = Depends(require_auth)) -> dict:
+    _require_operator(request)
     raw = await request.body()
     text = raw.decode("utf-8")
     try:
@@ -2099,7 +2404,14 @@ async def set_ownership(request: Request, _: None = Depends(require_auth)) -> di
 
 
 @app.get("/config/ownership")
-async def get_ownership(_: None = Depends(require_auth)) -> Response:
+async def get_ownership(
+    request: Request, _: None = Depends(require_auth)
+) -> Response:
+    # Ownership YAML is deployment-wide (not repo-tagged) config: it can
+    # disclose other repos' shared_files / split rules. The POST sibling is
+    # already operator-only, so the read is too (v0.42) -- a repo-scoped
+    # token cannot enumerate the whole deployment's ownership policy.
+    _require_operator(request)
     text = await get_service().get_ownership_yaml()
     if text is None:
         return PlainTextResponse("", status_code=204)

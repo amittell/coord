@@ -132,7 +132,14 @@ class Settings(BaseSettings):
     # has switched to its own per-engineer token. Default False so
     # existing deployments keep working unchanged on upgrade.
     require_per_engineer_token: bool = False
-    # v0.29 dashboard cookie session. The dashboard login form sets
+    # #30 slice 2/3 hardening: when True, a per-engineer token WITHOUT a repo
+    # binding is rejected, so every agent token must be repo-scoped and the
+    # server's repo isolation is mandatory rather than opt-in. The shared
+    # COORD_AUTH_TOKEN is deliberately exempt -- it stays the operator /
+    # cross-repo escape hatch (keep one, or an operator loses all-repo access).
+    # Default False so existing deployments are unaffected on upgrade.
+    require_scoped_token: bool = False
+    # v0.29 dashboard cookie session.
     # an HTTP-only cookie with the engineer's bearer token so the
     # browser doesn't have to keep retyping it. Lifetime is bounded
     # by this many seconds; default 8h matches a working day. Set
@@ -190,6 +197,13 @@ class Settings(BaseSettings):
     # ``sso/dev@example.com``. Keeps SSO-minted identities visually
     # distinct from hand-minted ones in claims and token listings.
     oidc_engineer_prefix: str = ""
+    # #30 slice 2/3: when set, the OIDC claim whose value binds the SSO-minted
+    # token to a repo (e.g. ``coord_repo``), so SSO dashboard sessions are
+    # repo-scoped rather than operator-wide. If configured and the claim is
+    # absent/empty in a principal's token, that login is REFUSED rather than
+    # silently granted all-repo access. Unset (default) keeps SSO sessions
+    # unscoped (operator) -- the documented v1 default.
+    oidc_repo_claim: str = ""
     # v0.30 per-engineer rate limiting + per-repo queue-depth quota.
     # All three knobs default to 0 = disabled, so an upgrade changes
     # nothing until the operator opts in. Limits key on the

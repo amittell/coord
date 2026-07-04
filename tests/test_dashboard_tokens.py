@@ -87,14 +87,33 @@ def _svc():
 
 
 async def _mint_engineer_token(
-    engineer: str, *, expires_at: datetime | None = None
+    engineer: str, *, expires_at: datetime | None = None, repo: str | None = None
 ) -> tuple[str, str]:
     """Insert a per-engineer token row directly; returns (raw, id)."""
     raw = "coordt_" + secrets.token_hex(32)
     token_id = await _svc().db.create_engineer_token(
-        engineer, _sha256(raw), expires_at=expires_at
+        engineer, _sha256(raw), expires_at=expires_at, repo=repo
     )
     return raw, token_id
+
+
+async def test_scoped_session_cannot_mint_unscoped_token(
+    client: AsyncClient,
+) -> None:
+    """#30 slice 2/3 escalation guard: a repo-scoped session must not be able
+    to mint itself an unscoped (operator) token. The minted token inherits
+    the session token's repo, never NULL."""
+    raw, _ = await _mint_engineer_token("e/claude/main", repo="amittell/repo-a")
+    cookies = await _login(client, raw)
+    r = await client.post(
+        "/dashboard/tokens/create",
+        data={"description": "child-token", "csrf_token": cookies["coord_csrf"]},
+        cookies=cookies,
+    )
+    assert r.status_code == 200, r.text
+    rows = await _token_rows()
+    child = next(row for row in rows if row.get("description") == "child-token")
+    assert child["repo"] == "amittell/repo-a", child
 
 
 async def _login(client: AsyncClient, token: str) -> dict[str, str]:

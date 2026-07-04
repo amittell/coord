@@ -462,7 +462,14 @@ def run_claims(args) -> int:
     explicit_repo = getattr(args, "repo", None)
     if explicit_repo:
         params["repo"] = explicit_repo
-    elif not getattr(args, "all_repos", False):
+    elif getattr(args, "all_repos", False):
+        # v0.42: send the operator-wide opt-out explicitly rather than just
+        # omitting ``repo``. A repo-scoped token then gets an honest 403
+        # ("this token cannot access all repos") instead of being silently
+        # narrowed to its own repo. Harmless for an unscoped/operator token
+        # (the server returns every repo either way).
+        params["all_repos"] = "true"
+    else:
         scope = _scope_repo_id(ctx)
         if scope:
             params["repo"] = scope

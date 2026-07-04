@@ -2365,6 +2365,26 @@ async def test_list_claims_all_repos_overrides_repo_id(
 
     await mcp_server.list_claims(all_repos=True)
 
+    # v0.42: the opt-out is sent explicitly (not just an omitted repo) so a
+    # repo-scoped token is 403'd rather than silently narrowed.
+    assert "repo" not in captured[0].url.params
+    assert captured[0].url.params.get("all_repos") == "true"
+
+
+@pytest.mark.asyncio
+async def test_list_claims_all_repos_sends_flag_without_repo_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # v0.42: even with no local COORD_REPO_ID, all_repos=True must send
+    # all_repos=true so a repo-scoped token is rejected (not narrowed).
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.delenv("COORD_REPO_ID", raising=False)
+    captured = _install_mock_transport(monkeypatch, _json_handler(200, {"claims": []}))
+
+    await mcp_server.list_claims(all_repos=True)
+
+    assert captured[0].url.params.get("all_repos") == "true"
     assert "repo" not in captured[0].url.params
 
 
@@ -2418,4 +2438,26 @@ async def test_check_conflicts_all_repos_overrides_repo_id(
         files=["src/a.py"], engineer="alice", all_repos=True
     )
 
+    # v0.42: explicit opt-out param so a repo-scoped token is 403'd.
+    assert "repo" not in captured[0].url.params
+    assert captured[0].url.params.get("all_repos") == "true"
+
+
+@pytest.mark.asyncio
+async def test_check_conflicts_all_repos_sends_flag_without_repo_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.delenv("COORD_REPO_ID", raising=False)
+    captured = _install_mock_transport(
+        monkeypatch,
+        _json_handler(200, {"has_conflicts": False, "conflicts": [], "safe": True}),
+    )
+
+    await mcp_server.check_conflicts(
+        files=["src/a.py"], engineer="alice", all_repos=True
+    )
+
+    assert captured[0].url.params.get("all_repos") == "true"
     assert "repo" not in captured[0].url.params

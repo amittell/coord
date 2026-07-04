@@ -7,6 +7,95 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+(none recorded yet)
+
+## [0.42.0] - 2026-07-02
+
+### Added
+
+- Server-enforced repo scoping via repo-bound tokens (#30 slice 2/3, #55).
+  Repo isolation is now a server-side authorization boundary, derived from the
+  auth token rather than a client-supplied ``repo`` -- so it holds regardless of
+  client version and cannot be bypassed with ``all_repos`` or an arbitrary
+  ``repo=``.
+  - Schema v19: nullable ``engineer_tokens.repo``. ``NULL`` = unscoped
+    (operator / back-compat); ``owner/name`` = scoped. Inert on upgrade -- every
+    existing token stays unscoped until a scoped one is minted.
+    ``coord tokens create --repo <id>`` mints a scoped token; ``list`` shows the
+    repo column; rotation carries the repo forward.
+  - Every authenticated repo-tagged endpoint is scoped: reads force the token's
+    repo (``403`` on an explicit cross-repo / ``all_repos``, silent-scope when
+    absent); writes ``403`` across repos and default a claim's repo to the
+    token's; id-addressed claim / request / queue / session endpoints are
+    guarded at the data-access boundary; ``POST /metrics/hotspots/promote`` and
+    ``POST /config/ownership`` are operator-only. Responses carry an
+    ``X-Coord-Repo-Scope`` header.
+  - The operator dashboard is scoped for a repo-bound session (all panels plus
+    its own token panel); operator / OIDC sessions are unchanged. A repo-scoped
+    dashboard session can no longer mint an unscoped token.
+  - ``COORD_REQUIRE_SCOPED_TOKEN`` (default off) rejects unscoped per-engineer
+    tokens to make scoping mandatory; the shared token stays the operator escape
+    hatch. See ``docs/deployment.md`` for the hosted-multi-repo rollout and the
+    legacy NULL-repo claim drain step.
+  - ``COORD_OIDC_REPO_CLAIM`` (default unset) binds an SSO-minted session token
+    to a repo from a configured ID-token claim, so OIDC dashboard sessions can
+    be repo-scoped instead of operator-wide; a configured-but-missing claim
+    refuses the login rather than silently granting all-repo access.
+
+### Security
+
+- Pre-release security review (independent Codex + oracle passes) hardening.
+  Eight cross-repo gaps in the repo-scoping boundary were closed before the
+  tag; all are within the same server-side authorization model:
+  - Token revoke is repo-scoped: a repo-bound dashboard session can no longer
+    revoke the same engineer's token in another repo, nor an unscoped operator
+    token (the repo predicate is folded into the atomic ``UPDATE``).
+  - ``GET /sessions/{id}/pending_requests`` filters rows by repo: a session id
+    that spans repos no longer leaks another repo's pending requests or conflict
+    feed to a scoped token -- and no longer fires ``notified`` audit events for
+    out-of-scope requests. (Replaces the previous session-level guard, which
+    missed mixed-repo sessions.)
+  - Session activity refresh (``last_activity``) is repo-scoped: a scoped token
+    can no longer keep another repo's claims warm by supplying a shared session
+    id on ``POST /claims`` / ``GET /claims`` / ``GET /conflicts``.
+  - Hard auto-promote (which writes the global ownership YAML) is operator-only
+    on every path that reaches it: the direct ``POST /claims``, the
+    ``POST /claims/refactor`` expansion, and the internal FIFO queue-drain grant
+    (which has no token context) all suppress the promote for a repo-scoped
+    caller, so no scoped claim can rewrite deployment-wide config.
+  - ``GET /config/ownership`` is now operator-only (matching its ``POST``
+    sibling): the deployment-wide ownership YAML can disclose other repos'
+    ``shared_files`` / split rules, so a repo-scoped token can no longer read it.
+  - ``GET /conflicts?all_repos=true`` for an operator now genuinely checks
+    against every repo's claims instead of resolving to ``repo=None`` and
+    comparing only the legacy NULL bucket (which silently under-reported to
+    zero on a fully repo-tagged deployment). A scoped token requesting
+    ``all_repos`` is still ``403``.
+  - The per-engineer active-claim and queue caps
+    (``COORD_MAX_CLAIMS_PER_ENGINEER`` / ``COORD_MAX_QUEUED_PER_ENGINEER``) are
+    counted per-repo on a repo-tagged deployment, so an engineer's usage in one
+    repo no longer blocks -- or leaks its count into the quota error of -- a
+    scoped caller in another repo. Untagged (NULL-repo) deployments keep the
+    global count.
+  - The dashboard stale-engineers panel is scoped to the viewer's repo, so a
+    repo-bound session cannot see other repos' holders, counts, or repo names.
+  - ``X-Coord-Queue-Depth`` is attributed from the authenticated identity only
+    and repo-scoped: an unauthenticated caller can no longer read any engineer's
+    queue depth by naming them in ``?engineer=``, and a repo-scoped token sees
+    only its own repo's depth (not the engineer's cross-repo total). A
+    per-engineer token sees only its own depth; operators keep full visibility.
+  - ``COORD_REQUIRE_SCOPED_TOKEN`` combined with OIDC but no
+    ``COORD_OIDC_REPO_CLAIM`` now refuses the SSO login up front instead of
+    minting a session token that the bearer path would immediately reject (a
+    dead session).
+  - The advertised ``all_repos`` -> ``403`` for a scoped token is now wired
+    end-to-end: the ``/claims``, ``/conflicts``, ``/metrics/hotspots`` and
+    ``/metrics/auto-resolutions`` routes accept an explicit ``all_repos`` param,
+    and the MCP ``list_claims`` / ``check_conflicts`` tools plus
+    ``coord claims --all-repos`` send it (always when requested, even with no
+    local ``COORD_REPO_ID``), so an operator-wide read from a scoped token is
+    rejected rather than silently narrowed.
+
 ### Changed
 
 - Repo-aware filtering for hosted shared services (#30, slice 1). A coord

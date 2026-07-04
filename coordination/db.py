@@ -141,7 +141,7 @@ CREATE INDEX IF NOT EXISTS idx_claims_engineer ON claims (engineer);
 """
 
 
-CURRENT_SCHEMA_VERSION = 18
+CURRENT_SCHEMA_VERSION = 19
 
 
 # v0.28 fairness pass: per-blocking-claim counter that
@@ -596,6 +596,16 @@ MIGRATIONS: list[tuple[int, str]] = [
     (
         18,
         "ALTER TABLE requests ADD COLUMN coexist_symbols TEXT;",
+    ),
+    # v19: repo-scoped tokens (issue #30 slice 2/3). ``engineer_tokens`` gains
+    # a nullable ``repo`` binding so the server can derive and enforce repo
+    # scope from authentication instead of trusting a client-supplied ``repo``.
+    # NULL = unscoped (operator / back-compat): every existing token keeps its
+    # all-repo behaviour and the migration is inert until a scoped token is
+    # minted.
+    (
+        19,
+        "ALTER TABLE engineer_tokens ADD COLUMN repo TEXT;",
     ),
 ]
 
@@ -1833,6 +1843,7 @@ class Database:
         self,
         engineer: str,
         *,
+        repo: str | None = None,
         now: datetime | None = None,
     ) -> tuple[int, str | None]:
         """v0.30: count this engineer's active claims and report the
@@ -1854,14 +1865,22 @@ class Database:
         round-trip through reformatting.
         """
         await self.init()
+        # v0.42: on a repo-tagged deployment the per-engineer cap is
+        # per-repo, so a scoped caller's budget in one repo is not
+        # consumed (or disclosed) by its claims in another. ``repo=None``
+        # keeps the legacy global count for untagged deployments.
+        sql = (
+            "SELECT expires_at FROM claims "
+            "WHERE released_at IS NULL AND engineer = ?"
+        )
+        params: list[Any] = [engineer]
+        if repo is not None:
+            sql += " AND repo IS ?"
+            params.append(repo)
         async with aiosqlite.connect(self.path) as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
-            cur = await conn.execute(
-                "SELECT expires_at FROM claims "
-                "WHERE released_at IS NULL AND engineer = ?",
-                (engineer,),
-            )
+            cur = await conn.execute(sql, params)
             rows = await cur.fetchall()
         ref = now or datetime.now(UTC)
         count = 0
@@ -1883,6 +1902,7 @@ class Database:
         engineer: str,
         *,
         states: tuple[str, ...] = ("waiting", "in_progress"),
+        repo: str | None = None,
     ) -> int:
         """v0.30: count this engineer's live claim_queue entries.
 
@@ -1899,14 +1919,21 @@ class Database:
             return 0
         await self.init()
         placeholders = ",".join("?" for _ in states)
+        # v0.42: repo-scope the per-engineer queue cap (like the active
+        # claim cap) so a scoped caller's queue budget is per-repo and its
+        # count is not disclosed across repos. ``repo=None`` = global.
+        sql = (
+            "SELECT COUNT(*) AS n FROM claim_queue "
+            f"WHERE requester_engineer = ? AND state IN ({placeholders})"
+        )
+        params: list[Any] = [engineer, *states]
+        if repo is not None:
+            sql += " AND repo IS ?"
+            params.append(repo)
         async with aiosqlite.connect(self.path) as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
-            cur = await conn.execute(
-                "SELECT COUNT(*) AS n FROM claim_queue "
-                f"WHERE requester_engineer = ? AND state IN ({placeholders})",
-                (engineer, *states),
-            )
+            cur = await conn.execute(sql, params)
             row = await cur.fetchone()
             return int(row["n"]) if row else 0
 
@@ -2084,6 +2111,7 @@ class Database:
         description: str | None = None,
         expires_at: datetime | None = None,
         rotated_from: str | None = None,
+        repo: str | None = None,
         now: datetime | None = None,
     ) -> str:
         """v0.29: insert a per-engineer bearer token row. The caller is
@@ -2108,9 +2136,9 @@ class Database:
             await conn.execute(
                 "INSERT INTO engineer_tokens "
                 "(id, engineer, token_sha256, description, created_at, "
-                "expires_at, rotated_from) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (token_id, engineer, token_sha256, description, ts, exp_ts, rotated_from),
+                "expires_at, rotated_from, repo) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (token_id, engineer, token_sha256, description, ts, exp_ts, rotated_from, repo),
             )
             await conn.commit()
         return token_id
@@ -2138,7 +2166,7 @@ class Database:
             cur = await conn.execute(
                 "SELECT id, engineer, description, created_at, last_used_at, "
                 "expires_at, rotated_from, rotation_grace_until, "
-                "request_count, last_source_ip, last_user_agent "
+                "request_count, last_source_ip, last_user_agent, repo "
                 "FROM engineer_tokens "
                 "WHERE token_sha256 = ? AND revoked_at IS NULL",
                 (token_sha256,),
@@ -2221,7 +2249,7 @@ class Database:
             "SELECT id, engineer, description, created_at, "
             "revoked_at, last_used_at, expires_at, rotated_from, "
             "rotation_grace_until, request_count, last_source_ip, "
-            "last_user_agent FROM engineer_tokens"
+            "last_user_agent, repo FROM engineer_tokens"
         )
         clauses: list[str] = []
         params: list[Any] = []
@@ -2256,7 +2284,7 @@ class Database:
                 "SELECT id, engineer, description, created_at, "
                 "revoked_at, last_used_at, expires_at, rotated_from, "
                 "rotation_grace_until, request_count, last_source_ip, "
-                "last_user_agent FROM engineer_tokens WHERE id = ?",
+                "last_user_agent, repo FROM engineer_tokens WHERE id = ?",
                 (token_id,),
             )
             row = await cur.fetchone()
@@ -2267,6 +2295,7 @@ class Database:
         token_id: str,
         *,
         engineer: str | None = None,
+        repo: str | None = None,
         now: datetime | None = None,
     ) -> bool:
         """v0.29: idempotent revocation. Returns True if a previously
@@ -2279,7 +2308,13 @@ class Database:
         v0.29.5: ``engineer`` scopes the revocation -- the UPDATE only
         matches when the row belongs to that engineer, so a
         self-service dashboard revoke is atomic (no read-then-write
-        race against an operator acting on the same row)."""
+        race against an operator acting on the same row).
+
+        v0.42: ``repo`` further scopes the revocation to a single repo.
+        A repo-scoped dashboard session passes its bound repo so it can
+        never revoke the same engineer's tokens in another repo (or an
+        unscoped operator token). Combined with ``engineer`` the UPDATE
+        stays atomic -- no read-then-write race."""
         await self.init()
         ts = (now or datetime.now(UTC)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         sql = (
@@ -2290,6 +2325,9 @@ class Database:
         if engineer is not None:
             sql += " AND engineer = ?"
             params.append(engineer)
+        if repo is not None:
+            sql += " AND repo = ?"
+            params.append(repo)
         async with aiosqlite.connect(self.path) as conn:
             await _configure_sqlite(conn)
             cur = await conn.execute(sql, params)
@@ -2339,7 +2377,7 @@ class Database:
             await conn.execute("BEGIN IMMEDIATE")
             cur = await conn.execute(
                 "SELECT id, engineer, description, revoked_at, "
-                "expires_at, rotation_grace_until "
+                "expires_at, rotation_grace_until, repo "
                 "FROM engineer_tokens WHERE id = ?",
                 (token_id,),
             )
@@ -2359,8 +2397,8 @@ class Database:
             await conn.execute(
                 "INSERT INTO engineer_tokens "
                 "(id, engineer, token_sha256, description, created_at, "
-                "expires_at, rotated_from) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "expires_at, rotated_from, repo) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     old["engineer"],
@@ -2369,6 +2407,7 @@ class Database:
                     ts,
                     exp_ts,
                     old["id"],
+                    old["repo"],
                 ),
             )
             await conn.execute(
@@ -2390,6 +2429,7 @@ class Database:
         *,
         engineer: str | None = None,
         state: str | None = "waiting",
+        repo: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         """v0.22: queue rows joined with the blocking holder's engineer
@@ -2420,6 +2460,11 @@ class Database:
         if state:
             clauses.append("cq.state = ?")
             params.append(state)
+        if repo is not None:
+            # v0.42: confine to one repo so a scoped token cannot read an
+            # engineer's cross-repo queue depth via the backpressure header.
+            clauses.append("cq.repo IS ?")
+            params.append(repo)
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY cq.enqueued_at DESC LIMIT ?"
@@ -2431,68 +2476,95 @@ class Database:
             rows = await cur.fetchall()
             return [dict(r) for r in rows]
 
-    async def touch_session_activity(self, session_id: str) -> int:
+    async def touch_session_activity(
+        self, session_id: str, *, repo: str | None = None
+    ) -> int:
         """Bump ``last_activity`` on every active claim that belongs to
         the given session. Returns the rowcount so callers can log /
         verify. No-op when ``session_id`` is empty.
+
+        v0.42: when ``repo`` is given, only the caller's own repo's
+        claims are warmed. This stops a repo-scoped token from keeping
+        another repo's claims alive by supplying (or guessing) a shared
+        session id on a read/write. ``repo=None`` keeps the legacy
+        behaviour of warming every claim in the session, which is what
+        an unscoped operator or an all-repos read wants.
         """
         if not session_id:
             return 0
         now = _utcnow()
         await self.init()
+        sql = "UPDATE claims SET last_activity = ? " \
+            "WHERE session_id = ? AND released_at IS NULL"
+        params: list[Any] = [now, session_id]
+        if repo is not None:
+            sql += " AND repo IS ?"
+            params.append(repo)
         async with aiosqlite.connect(self.path) as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
-            cur = await conn.execute(
-                """
-                UPDATE claims SET last_activity = ?
-                WHERE session_id = ? AND released_at IS NULL
-                """,
-                (now, session_id),
-            )
+            cur = await conn.execute(sql, params)
             await conn.commit()
             return cur.rowcount or 0
 
     async def pending_requests_for_session(
-        self, session_id: str, *, limit: int = 100
+        self, session_id: str, *, repo: str | None = None, limit: int = 100
     ) -> list[dict[str, Any]]:
         """Return recent conflict-log entries logged against active
         claims that this session currently holds. Used by the holder
         to poll "has anyone been blocked on my scope?" so they can
         decide whether to release.
+
+        v0.42: when ``repo`` is given, only entries logged against the
+        caller's own repo are returned, so a session id that spans
+        repos cannot leak another repo's conflict feed to a repo-scoped
+        token.
         """
         if not session_id:
             return []
         await self.init()
-        async with aiosqlite.connect(self.path) as conn:
-            conn.row_factory = aiosqlite.Row
-            await _configure_sqlite(conn)
-            cur = await conn.execute(
-                """
+        sql = """
                 SELECT cl.id, cl.claim_id, cl.attempted_by,
                        cl.attempted_pattern, cl.attempted_session_id,
                        cl.created_at,
                        c.pattern AS holder_pattern,
-                       c.engineer AS holder_engineer
+                       c.engineer AS holder_engineer,
+                       c.repo AS holder_repo
                 FROM conflict_log cl
                 JOIN claims c ON cl.claim_id = c.id
                 WHERE c.session_id = ?
                   AND c.released_at IS NULL
+        """
+        params: list[Any] = [session_id]
+        if repo is not None:
+            sql += "          AND c.repo IS ?\n"
+            params.append(repo)
+        sql += """
                 ORDER BY datetime(cl.created_at) DESC
                 LIMIT ?
-                """,
-                (session_id, limit),
-            )
+        """
+        params.append(limit)
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(sql, params)
             rows = await cur.fetchall()
             await conn.commit()
         return [dict(r) for r in rows]
 
-    async def release_for_session(self, session_id: str) -> int:
+    async def release_for_session(
+        self, session_id: str, *, repo: str | None = None
+    ) -> int:
         """Release every active claim that was created with the given
         session_id, regardless of engineer name. Returns the count of
         rows actually closed. Intended for end-of-work cleanup so an
         agent process can reliably tear down everything it produced
         even when it spawned subagents under multiple engineer names.
+
+        ``repo`` (#30 slice 2/3) scopes the release: when set, only claims
+        tagged with that repo are closed, so a repo-scoped token cannot
+        tear down another repo's work sharing the same session id. None
+        (operator) releases the whole session as before.
         """
         if not session_id:
             return 0
@@ -2507,16 +2579,25 @@ class Database:
             await _configure_sqlite(conn)
             await conn.execute("BEGIN IMMEDIATE")
             try:
+                repo_clause = " AND repo = ?" if repo is not None else ""
+                sel_params: list[Any] = [session_id]
+                if repo is not None:
+                    sel_params.append(repo)
                 cur = await conn.execute(
-                    "SELECT id FROM claims WHERE session_id = ? AND released_at IS NULL",
-                    (session_id,),
+                    "SELECT id FROM claims WHERE session_id = ? "
+                    "AND released_at IS NULL" + repo_clause,
+                    sel_params,
                 )
                 to_close = [str(r["id"]) for r in await cur.fetchall()]
                 if to_close:
+                    upd_params: list[Any] = [now, session_id]
+                    if repo is not None:
+                        upd_params.append(repo)
                     cur = await conn.execute(
                         "UPDATE claims SET released_at = ? "
-                        "WHERE session_id = ? AND released_at IS NULL",
-                        (now, session_id),
+                        "WHERE session_id = ? AND released_at IS NULL"
+                        + repo_clause,
+                        upd_params,
                     )
                     n = cur.rowcount or 0
                 else:
@@ -2537,6 +2618,49 @@ class Database:
                 cid, release_kind="session-bulk", actor_engineer=None
             )
         return n
+
+    async def claim_repo(self, claim_id: str) -> tuple[bool, str | None]:
+        """Scope-guard lookup: ``(exists, repo)`` for a claim id (#30 s2/3).
+
+        ``exists`` is False when the id is unknown so a guard can fall
+        through to the handler's own 404 / no-op instead of turning a
+        typo into a 403.
+        """
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                "SELECT repo FROM claims WHERE id = ?", (claim_id,)
+            )
+            row = await cur.fetchone()
+        return (False, None) if row is None else (True, row["repo"])
+
+    async def request_repo(self, request_id: str) -> tuple[bool, str | None]:
+        """``(exists, repo)`` for a request id, via its target claim."""
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                "SELECT c.repo AS repo FROM requests r "
+                "JOIN claims c ON c.id = r.claim_id WHERE r.id = ?",
+                (request_id,),
+            )
+            row = await cur.fetchone()
+        return (False, None) if row is None else (True, row["repo"])
+
+    async def queue_entry_repo(self, queue_id: str) -> tuple[bool, str | None]:
+        """``(exists, repo)`` for a claim_queue entry id."""
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                "SELECT repo FROM claim_queue WHERE id = ?", (queue_id,)
+            )
+            row = await cur.fetchone()
+        return (False, None) if row is None else (True, row["repo"])
 
     async def release_claims(self, claim_ids: list[str], engineer: str | None = None) -> int:
         now = _utcnow()
@@ -2726,17 +2850,30 @@ class Database:
             )
             await conn.commit()
 
-    async def recent_conflicts(self, limit: int = 50) -> list[dict[str, Any]]:
+    async def recent_conflicts(
+        self, limit: int = 50, *, repo: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Most recent conflict_log rows. ``repo`` (#30 slice 2/3) scopes to
+        conflicts whose blocking claim is in that repo, joining claims;
+        None returns every repo's conflicts (operator / back-compat)."""
         await self.init()
         async with aiosqlite.connect(self.path) as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
-            cur = await conn.execute(
-                """
-                SELECT * FROM conflict_log ORDER BY datetime(created_at) DESC LIMIT ?
-                """,
-                (limit,),
-            )
+            if repo is None:
+                cur = await conn.execute(
+                    "SELECT * FROM conflict_log "
+                    "ORDER BY datetime(created_at) DESC LIMIT ?",
+                    (limit,),
+                )
+            else:
+                cur = await conn.execute(
+                    "SELECT cl.* FROM conflict_log cl "
+                    "JOIN claims c ON c.id = cl.claim_id "
+                    "WHERE c.repo = ? "
+                    "ORDER BY datetime(cl.created_at) DESC LIMIT ?",
+                    (repo, limit),
+                )
             rows = await cur.fetchall()
             await conn.commit()
             return [dict(r) for r in rows]
@@ -3004,6 +3141,7 @@ class Database:
         self,
         *,
         days: int,
+        repo: str | None = None,
         now: datetime | None = None,
     ) -> list[dict[str, Any]]:
         """v0.28: return engineers whose most-recent active-claim
@@ -3031,6 +3169,16 @@ class Database:
         now = now or datetime.now(UTC)
         cutoff = (now - timedelta(days=days)).replace(microsecond=0)
         cutoff_iso = cutoff.isoformat().replace("+00:00", "Z")
+        # v0.42: a repo-scoped dashboard viewer must not see other repos'
+        # stale holders. The filter is applied before the GROUP BY so
+        # both the per-engineer counts and the repos aggregate are
+        # confined to the viewer's repo.
+        repo_clause = ""
+        params: list[Any] = []
+        if repo is not None:
+            repo_clause = "                  AND repo IS ?\n"
+            params.append(repo)
+        params.append(cutoff_iso)
         async with aiosqlite.connect(self.path) as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
@@ -3044,11 +3192,13 @@ class Database:
                 FROM claims
                 WHERE released_at IS NULL
                   AND last_activity IS NOT NULL
-                GROUP BY engineer
+"""
+                + repo_clause +
+                """                GROUP BY engineer
                 HAVING datetime(MAX(last_activity)) < datetime(?)
                 ORDER BY datetime(MAX(last_activity)) ASC, engineer ASC
                 """,
-                (cutoff_iso,),
+                params,
             )
             rows = await cur.fetchall()
             await conn.commit()
@@ -3893,19 +4043,20 @@ class Database:
             return [dict(r) for r in rows]
 
     async def list_open_requests_for_session(
-        self, session_id: str, *, limit: int = 100
+        self, session_id: str, *, repo: str | None = None, limit: int = 100
     ) -> list[dict[str, Any]]:
         """Return open (decision='pending') requests filed against
         claims this session currently holds. The holder's
-        pending_requests inbox merges this with the conflict-log feed."""
+        pending_requests inbox merges this with the conflict-log feed.
+
+        v0.42: when ``repo`` is given, only requests against the
+        caller's own repo are returned, so a session id that spans
+        repos cannot leak another repo's pending requests to a
+        repo-scoped token (or trigger ``notified`` events for them)."""
         if not session_id:
             return []
         await self.init()
-        async with aiosqlite.connect(self.path) as conn:
-            conn.row_factory = aiosqlite.Row
-            await _configure_sqlite(conn)
-            cur = await conn.execute(
-                """
+        sql = """
                 SELECT r.*,
                        c.engineer AS holder_engineer,
                        c.pattern  AS holder_pattern,
@@ -3915,11 +4066,20 @@ class Database:
                 WHERE c.session_id = ?
                   AND c.released_at IS NULL
                   AND r.decision = 'pending'
+        """
+        params: list[Any] = [session_id]
+        if repo is not None:
+            sql += "          AND c.repo IS ?\n"
+            params.append(repo)
+        sql += """
                 ORDER BY datetime(r.created_at) DESC
                 LIMIT ?
-                """,
-                (session_id, limit),
-            )
+        """
+        params.append(limit)
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(sql, params)
             rows = await cur.fetchall()
             return [dict(r) for r in rows]
 
