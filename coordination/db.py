@@ -1843,6 +1843,7 @@ class Database:
         self,
         engineer: str,
         *,
+        repo: str | None = None,
         now: datetime | None = None,
     ) -> tuple[int, str | None]:
         """v0.30: count this engineer's active claims and report the
@@ -1864,14 +1865,22 @@ class Database:
         round-trip through reformatting.
         """
         await self.init()
+        # v0.42: on a repo-tagged deployment the per-engineer cap is
+        # per-repo, so a scoped caller's budget in one repo is not
+        # consumed (or disclosed) by its claims in another. ``repo=None``
+        # keeps the legacy global count for untagged deployments.
+        sql = (
+            "SELECT expires_at FROM claims "
+            "WHERE released_at IS NULL AND engineer = ?"
+        )
+        params: list[Any] = [engineer]
+        if repo is not None:
+            sql += " AND repo IS ?"
+            params.append(repo)
         async with aiosqlite.connect(self.path) as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
-            cur = await conn.execute(
-                "SELECT expires_at FROM claims "
-                "WHERE released_at IS NULL AND engineer = ?",
-                (engineer,),
-            )
+            cur = await conn.execute(sql, params)
             rows = await cur.fetchall()
         ref = now or datetime.now(UTC)
         count = 0
@@ -1893,6 +1902,7 @@ class Database:
         engineer: str,
         *,
         states: tuple[str, ...] = ("waiting", "in_progress"),
+        repo: str | None = None,
     ) -> int:
         """v0.30: count this engineer's live claim_queue entries.
 
@@ -1909,14 +1919,21 @@ class Database:
             return 0
         await self.init()
         placeholders = ",".join("?" for _ in states)
+        # v0.42: repo-scope the per-engineer queue cap (like the active
+        # claim cap) so a scoped caller's queue budget is per-repo and its
+        # count is not disclosed across repos. ``repo=None`` = global.
+        sql = (
+            "SELECT COUNT(*) AS n FROM claim_queue "
+            f"WHERE requester_engineer = ? AND state IN ({placeholders})"
+        )
+        params: list[Any] = [engineer, *states]
+        if repo is not None:
+            sql += " AND repo IS ?"
+            params.append(repo)
         async with aiosqlite.connect(self.path) as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
-            cur = await conn.execute(
-                "SELECT COUNT(*) AS n FROM claim_queue "
-                f"WHERE requester_engineer = ? AND state IN ({placeholders})",
-                (engineer, *states),
-            )
+            cur = await conn.execute(sql, params)
             row = await cur.fetchone()
             return int(row["n"]) if row else 0
 

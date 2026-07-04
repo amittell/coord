@@ -2080,6 +2080,7 @@ async def conflicts(
             patterns=pattern,
             engineer=engineer,
             repo=repo,
+            all_repos=all_repos,
             session_ids=session_id,
             pushing_branch=branch,
         )

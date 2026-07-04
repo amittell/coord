@@ -66,6 +66,17 @@ Semantic Versioning.
   - ``GET /config/ownership`` is now operator-only (matching its ``POST``
     sibling): the deployment-wide ownership YAML can disclose other repos'
     ``shared_files`` / split rules, so a repo-scoped token can no longer read it.
+  - ``GET /conflicts?all_repos=true`` for an operator now genuinely checks
+    against every repo's claims instead of resolving to ``repo=None`` and
+    comparing only the legacy NULL bucket (which silently under-reported to
+    zero on a fully repo-tagged deployment). A scoped token requesting
+    ``all_repos`` is still ``403``.
+  - The per-engineer active-claim and queue caps
+    (``COORD_MAX_CLAIMS_PER_ENGINEER`` / ``COORD_MAX_QUEUED_PER_ENGINEER``) are
+    counted per-repo on a repo-tagged deployment, so an engineer's usage in one
+    repo no longer blocks -- or leaks its count into the quota error of -- a
+    scoped caller in another repo. Untagged (NULL-repo) deployments keep the
+    global count.
   - The dashboard stale-engineers panel is scoped to the viewer's repo, so a
     repo-bound session cannot see other repos' holders, counts, or repo names.
   - ``X-Coord-Queue-Depth`` is attributed from the authenticated identity only

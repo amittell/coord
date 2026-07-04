@@ -719,3 +719,102 @@ async def test_scoped_token_cannot_read_ownership_yaml(client: AsyncClient) -> N
         "/config/ownership", headers={"Authorization": f"Bearer {SHARED}"}
     )
     assert ro.status_code in (200, 204), ro.text
+
+
+async def test_operator_all_repos_conflicts_span_repos(client: AsyncClient) -> None:
+    # v0.42: an operator's /conflicts?all_repos=true actually checks against
+    # every repo's claims, instead of resolving to repo=None and comparing
+    # only the (here empty) legacy NULL bucket.
+    await _seed_claim(client, REPO_A, "src/shared.py")
+    await _seed_claim(client, REPO_B, "src/shared.py")
+    op = {"Authorization": f"Bearer {SHARED}"}
+
+    r = await client.get(
+        "/conflicts?engineer=other&pattern=src/shared.py&all_repos=true", headers=op
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["has_conflicts"] is True, body
+    assert len(body["conflicts"]) == 2, body  # one per repo
+
+    # Operator without all_repos (repo=None) only sees the legacy NULL bucket,
+    # which is empty here because both claims are repo-tagged.
+    r2 = await client.get(
+        "/conflicts?engineer=other&pattern=src/shared.py", headers=op
+    )
+    assert r2.json()["has_conflicts"] is False, r2.json()
+
+    # A scoped REPO_A token cannot request all_repos...
+    raw = await _mint(REPO_A)
+    r3 = await client.get(
+        "/conflicts?engineer=other&pattern=src/shared.py&all_repos=true",
+        headers=_auth(raw),
+    )
+    assert r3.status_code == 403, r3.text
+    # ...and scoped to its own repo it sees only REPO_A's claim.
+    r4 = await client.get(
+        "/conflicts?engineer=other&pattern=src/shared.py", headers=_auth(raw)
+    )
+    assert r4.status_code == 200, r4.text
+    assert len(r4.json()["conflicts"]) == 1, r4.json()
+
+
+@pytest.fixture()
+async def client_capped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncClient:
+    db_path = tmp_path / "db.sqlite"
+    monkeypatch.setenv("COORD_AUTH_TOKEN", SHARED)
+    monkeypatch.setenv("COORD_DATABASE_PATH", str(db_path))
+    monkeypatch.setenv("COORD_DISABLE_BACKGROUND_CLEANUP", "1")
+    monkeypatch.setenv("COORD_DISABLE_INSTANCE_LOCK", "1")
+    monkeypatch.delenv("COORD_REPO_ROOT", raising=False)
+    monkeypatch.setenv("COORD_MAX_CLAIMS_PER_ENGINEER", "2")
+
+    from coordination import deps
+
+    deps.get_service.cache_clear()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
+    deps.get_service.cache_clear()
+
+
+async def test_active_claim_cap_is_per_repo(client_capped: AsyncClient) -> None:
+    # v0.42: the per-engineer active-claim cap is per-repo on a repo-tagged
+    # deployment, so alice's REPO_B usage neither blocks nor is disclosed to
+    # her REPO_A work.
+    ac = client_capped
+    op = {"Authorization": f"Bearer {SHARED}"}
+    for i in range(2):  # fill alice's cap (2) in REPO_B
+        r = await ac.post(
+            "/claims",
+            headers=op,
+            json={
+                "engineer": "alice",
+                "repo": REPO_B,
+                "claims": [{"type": "file", "pattern": f"src/b{i}.py"}],
+            },
+        )
+        assert r.status_code == 200, r.text
+
+    # A REPO_A-scoped alice token still has a full budget in REPO_A.
+    raw = await _mint(REPO_A, engineer="alice")
+    r = await ac.post(
+        "/claims",
+        headers=_auth(raw),
+        json={"engineer": "alice", "claims": [{"type": "file", "pattern": "src/a.py"}]},
+    )
+    assert r.status_code == 200, r.text
+
+    # A third REPO_B claim is over the per-repo cap -> 429.
+    r2 = await ac.post(
+        "/claims",
+        headers=op,
+        json={
+            "engineer": "alice",
+            "repo": REPO_B,
+            "claims": [{"type": "file", "pattern": "src/b2.py"}],
+        },
+    )
+    assert r2.status_code == 429, r2.text

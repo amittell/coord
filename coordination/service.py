@@ -651,6 +651,7 @@ class CoordinationService:
         patterns: list[str],
         engineer: str,
         repo: str | None = None,
+        all_repos: bool = False,
         session_ids: list[str] | None = None,
         pushing_branch: str | None = None,
     ) -> ConflictCheckResponse:
@@ -675,7 +676,16 @@ class CoordinationService:
         # repo as the caller. NULL repo forms its own legacy bucket so
         # tagged callers never collide with un-tagged historical claims
         # and vice versa.
-        active = [r for r in active if r.get("repo") == repo]
+        #
+        # v0.42: an operator explicitly asking for all_repos wants to see
+        # every repo's claims, so skip the bucket filter entirely.
+        # Without this, all_repos resolves to repo=None and the filter
+        # would compare only against the legacy NULL bucket -- on a fully
+        # repo-tagged deployment that returns zero and silently
+        # under-reports. (A scoped token never reaches here with
+        # all_repos: _effective_read_repo 403s it first.)
+        if not all_repos:
+            active = [r for r in active if r.get("repo") == repo]
         # Session-scoped self-exclusion (v0.5.0, generalised in v0.10):
         # drop any active claim whose session_id matches one of the
         # caller's live session_ids. The pre-push hook reads every line
@@ -795,7 +805,7 @@ class CoordinationService:
         )
 
     async def _enforce_active_claim_cap(
-        self, *, engineer: str, about_to_insert: int
+        self, *, engineer: str, about_to_insert: int, repo: str | None = None
     ) -> None:
         """v0.30 active-claim cap: raise :class:`RateLimitExceeded`
         when inserting ``about_to_insert`` new claim rows would push
@@ -826,7 +836,7 @@ class CoordinationService:
         if limit <= 0:
             return
         count, soonest_expiry = await self.db.count_active_claims_for_engineer(
-            engineer
+            engineer, repo=repo
         )
         if count + about_to_insert <= limit:
             return
@@ -1091,7 +1101,9 @@ class CoordinationService:
         if self.settings.max_claims_per_engineer > 0:
             async with self._quota_lock:
                 await self._enforce_active_claim_cap(
-                    engineer=body.engineer, about_to_insert=len(ids)
+                    engineer=body.engineer,
+                    about_to_insert=len(ids),
+                    repo=body.repo,
                 )
                 created = await _insert_batch()
         else:
@@ -2657,7 +2669,7 @@ class CoordinationService:
             engineer_queue_limit = self.settings.max_queued_per_engineer
             if engineer_queue_limit > 0:
                 queued_count = await self.db.count_queue_entries_for_engineer(
-                    body.engineer
+                    body.engineer, repo=body.repo
                 )
                 if queued_count + 1 > engineer_queue_limit:
                     raise RateLimitExceeded(
