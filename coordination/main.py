@@ -26,6 +26,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from coordination import __version__
 from coordination import metrics
 from coordination import oidc
+from coordination.repo_id import InvalidRepoId, normalize_repo_id
 from coordination.cli_shared import parse_duration
 from coordination.config import get_settings
 from coordination.dashboard import render_dashboard
@@ -665,6 +666,15 @@ def _token_repo(request: Request) -> str | None:
     return getattr(request.state, "token_repo", None)
 
 
+def _normalized_request_repo(value: str | None) -> str | None:
+    """Validate/normalize a client-supplied repo id (#61), mapping a malformed
+    value to a 400 so every request ingress fails fast with the same rule."""
+    try:
+        return normalize_repo_id(value)
+    except InvalidRepoId as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 def _effective_read_repo(
     request: Request, client_repo: str | None, *, all_repos: bool = False
 ) -> str | None:
@@ -676,6 +686,7 @@ def _effective_read_repo(
     than a silent lie, while an absent ``repo`` is silently scoped so a stale
     client that sends nothing is still enforced.
     """
+    client_repo = _normalized_request_repo(client_repo)
     token_repo = _token_repo(request)
     if token_repo is None:
         return client_repo
@@ -688,6 +699,13 @@ def _effective_read_repo(
                 f"access {want}."
             ),
         )
+    if client_repo is None:
+        # #61: trace the silent-scope override so an operator can see why a
+        # scoped token got filtered/empty results instead of a silent void.
+        logger.debug(
+            "repo-scope: read with absent repo silently scoped to token repo %r",
+            token_repo,
+        )
     return token_repo
 
 
@@ -695,6 +713,7 @@ def _enforce_write_repo(request: Request, body_repo: str | None) -> str | None:
     """Resolve the repo a WRITE tags, enforcing token scope. Scoped token:
     default to the token's repo when the body omits it, 403 on mismatch.
     Unscoped token: the body value is honored verbatim."""
+    body_repo = _normalized_request_repo(body_repo)
     token_repo = _token_repo(request)
     if token_repo is None:
         return body_repo
@@ -705,6 +724,12 @@ def _enforce_write_repo(request: Request, body_repo: str | None) -> str | None:
                 f"This token is scoped to repo '{token_repo}'; it cannot "
                 f"write to repo '{body_repo}'."
             ),
+        )
+    if body_repo is None:
+        # #61: trace the default-to-token-repo override on a scoped write.
+        logger.debug(
+            "repo-scope: write with absent repo defaulted to token repo %r",
+            token_repo,
         )
     return token_repo
 
@@ -1579,7 +1604,19 @@ async def oidc_callback(request: Request) -> Response:
                 ),
                 403,
             )
-        oidc_repo = raw_repo.strip()
+        try:
+            oidc_repo = normalize_repo_id(raw_repo)
+        except InvalidRepoId as exc:
+            # #61: a malformed repo claim value is a refusal, not a 500 when
+            # the token mint later rejects it.
+            return _oidc_error_clearing_state(
+                "SSO sign-in refused",
+                (
+                    f"the OIDC repo claim '{settings.oidc_repo_claim}' is not a "
+                    f"valid repo id: {exc}"
+                ),
+                403,
+            )
 
     # A deployment that requires repo-scoped tokens but does not bind SSO
     # sessions to a repo would mint an unscoped session token that the

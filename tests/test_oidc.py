@@ -1201,3 +1201,29 @@ async def test_require_scoped_token_without_repo_claim_refuses_login(
             engineer="dev@example.com"
         )
         assert rows == []  # no dead-session token minted
+
+
+async def test_oidc_malformed_repo_claim_refuses_login(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #61: a repo claim value that is present but malformed (e.g. doubled
+    # slash) is a refusal, not a 500 when the token mint later rejects it,
+    # and mints no token.
+    idp = FakeIdP()
+    idp.id_token_kwargs = {"extra": {"coord_repo": "owner//name"}}
+    _setup(monkeypatch, tmp_path, idp, env={"COORD_OIDC_REPO_CLAIM": "coord_repo"})
+    async with _client() as client:
+        qs, _ = await _login_redirect(client)
+        idp.nonce = qs["nonce"]
+        r = await client.get(
+            "/auth/oidc/callback",
+            params={"code": "authcode-1", "state": qs["state"]},
+            follow_redirects=False,
+        )
+        assert r.status_code == 403, r.text
+        from coordination.deps import get_service
+
+        rows = await get_service().db.list_engineer_tokens(
+            engineer="dev@example.com"
+        )
+        assert rows == []  # no token minted for a refused login

@@ -12,6 +12,8 @@ from uuid import uuid4
 
 import aiosqlite
 
+from coordination.repo_id import normalize_repo_id
+
 
 # Sentinel returned by :func:`acquire_instance_lock` on platforms or
 # configurations where flock is unavailable or explicitly bypassed. It
@@ -2122,7 +2124,15 @@ class Database:
         v0.29.4: ``expires_at`` (None = never expires) and
         ``rotated_from`` (id of the predecessor token when this row is
         minted by a rotation) land in the v15 columns.
+
+        v0.44 (#61): ``repo`` is validated/normalized here so a newly-minted
+        token's repo is canonical; raises :class:`InvalidRepoId` on a bad value
+        (callers map it to a CLI error / login refusal / 400). Rotation
+        re-normalizes best-effort (see :meth:`rotate_engineer_token`), so a
+        pre-#61 legacy malformed value can still carry forward once rather than
+        break an existing token's rotation.
         """
+        repo = normalize_repo_id(repo)
         await self.init()
         token_id = str(uuid4())
         ts = (now or datetime.now(UTC)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -2394,6 +2404,14 @@ class Database:
             if old["rotation_grace_until"] is not None:
                 await conn.rollback()
                 return {"ok": False, "error": "already_rotated"}
+            # #61: re-normalize the carried-forward repo so a rotated token
+            # stays canonical. Best-effort -- if a legacy pre-#61 value cannot
+            # be normalized, carry it forward unchanged rather than break the
+            # rotation of an existing engineer's live token.
+            try:
+                rotated_repo = normalize_repo_id(old["repo"])
+            except ValueError:
+                rotated_repo = old["repo"]
             await conn.execute(
                 "INSERT INTO engineer_tokens "
                 "(id, engineer, token_sha256, description, created_at, "
@@ -2407,7 +2425,7 @@ class Database:
                     ts,
                     exp_ts,
                     old["id"],
-                    old["repo"],
+                    rotated_repo,
                 ),
             )
             await conn.execute(

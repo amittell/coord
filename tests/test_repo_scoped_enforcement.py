@@ -967,3 +967,40 @@ async def test_deprecation_header_handles_leading_dash_engineer(
     assert r.status_code == 200, r.text
     warning = r.headers["X-Coord-Token-Warning"]
     assert "coord tokens create --repo <owner/name> -- -foo" in warning, warning
+
+
+# ---------------------------------------------------------------------------
+# #61: central repo-id validation at request/store ingresses
+# ---------------------------------------------------------------------------
+
+
+async def test_malformed_repo_param_is_400(client: AsyncClient) -> None:
+    # A malformed repo= on a read fails fast with 400 (operator token).
+    r = await client.get(
+        "/claims?repo=owner//name", headers={"Authorization": f"Bearer {SHARED}"}
+    )
+    assert r.status_code == 400, r.text
+
+
+async def test_malformed_repo_body_is_400(client: AsyncClient) -> None:
+    r = await client.post(
+        "/claims",
+        headers={"Authorization": f"Bearer {SHARED}"},
+        json={
+            "engineer": "e",
+            "repo": "bad id",
+            "claims": [{"type": "file", "pattern": "src/x.py"}],
+        },
+    )
+    assert r.status_code == 400, r.text
+
+
+async def test_create_engineer_token_rejects_malformed_repo(
+    client: AsyncClient,
+) -> None:
+    from coordination.deps import get_service
+    from coordination.repo_id import InvalidRepoId
+
+    svc = get_service()
+    with pytest.raises(InvalidRepoId):
+        await svc.db.create_engineer_token("e", _sha256("x"), repo="owner//name")
