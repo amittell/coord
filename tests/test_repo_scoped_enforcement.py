@@ -903,3 +903,14 @@ async def test_deprecation_header_sanitizes_engineer(client: AsyncClient) -> Non
     assert "X-Injected" not in r.headers  # no header injection
     assert "☃" not in warning  # non-ASCII stripped
     warning.encode("ascii")  # must be pure ASCII (latin-1 header-safe)
+
+
+async def test_deprecation_header_caps_engineer_length(client: AsyncClient) -> None:
+    # An oversized engineer id must not bloat the header past receiver limits
+    # (Copilot review round 3, PR #62). "Z" is absent from the fixed template,
+    # so its count in the warning is exactly the cap.
+    raw = await _mint(None, engineer="Z" * 500)
+    r = await client.get("/claims", headers=_auth(raw))
+    assert r.status_code == 200, r.text
+    warning = r.headers["X-Coord-Token-Warning"]
+    assert warning.count("Z") == 64, warning.count("Z")

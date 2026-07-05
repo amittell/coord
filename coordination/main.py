@@ -216,9 +216,10 @@ def _unscoped_token_warning(engineer: str | None) -> str:
     # visible ASCII (0x20-0x7E): that drops CR/LF/tab/controls (header
     # injection / invalid header) AND non-ASCII (Starlette encodes header
     # values as latin-1, so a Unicode id would raise UnicodeEncodeError).
-    # Falls back to a placeholder if nothing usable survives.
+    # Falls back to a placeholder if nothing usable survives, and is capped
+    # so an oversized id cannot bloat the header past receiver size limits.
     who = "".join(ch for ch in (engineer or "") if 0x20 <= ord(ch) <= 0x7E).strip()
-    who = who or "<engineer>"
+    who = (who or "<engineer>")[:64]
     return (
         "Your coord token is not bound to a repo. On a shared multi-repo coord "
         "service an unscoped per-engineer token sees and can affect EVERY "

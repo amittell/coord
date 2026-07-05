@@ -539,7 +539,7 @@ When one coord service fronts several repos, bind each agent's token to a repo s
 
 ```
 coord tokens create <engineer> --repo owner/name   # scoped token
-coord tokens create <engineer>                       # unscoped (operator)
+coord tokens create <engineer>                       # unscoped (deprecated; all-repo)
 ```
 
 Unscoped per-engineer tokens are deprecated. While `COORD_WARN_UNSCOPED_TOKEN` is on (default) they still work, but every response carries an `X-Coord-Token-Warning` nudge -- surfaced to agents as a `coord_notice` field in `list_claims` / `check_conflicts` / `claim_files` results, and printed by `coord status` as a `Token warning:` line. Flip `COORD_REQUIRE_SCOPED_TOKEN=true` once the fleet is scoped to make it mandatory. Full rollout guide: [docs/deployment.md](docs/deployment.md#hosted-multi-repo-deployments-repo-scoped-tokens).
