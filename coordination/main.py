@@ -220,8 +220,14 @@ def _unscoped_token_warning(engineer: str | None) -> str:
     # values as latin-1, so a Unicode id would raise UnicodeEncodeError).
     # Falls back to a placeholder if nothing usable survives, and is capped
     # so an oversized id cannot bloat the header past receiver size limits.
-    who = "".join(ch for ch in (engineer or "") if 0x20 <= ord(ch) <= 0x7E).strip()
-    who = (who or "<engineer>")[:64]
+    sanitized = "".join(
+        ch for ch in (engineer or "") if 0x20 <= ord(ch) <= 0x7E
+    ).strip()[:64]
+    # Whether sanitization/truncation changed the id: if so the previewed
+    # command would mint under a different identity, so we warn the operator
+    # to copy the exact id rather than trust the preview.
+    altered = bool(engineer) and sanitized != engineer
+    who = sanitized or "<engineer>"
     # The message embeds a copy/pasteable `coord tokens create <who>` command,
     # so shell-quote an id that is not a plain, safe token -- otherwise a shell
     # metacharacter (`;` `` ` `` `$` `|` space ...) could turn a pasted command
@@ -229,13 +235,19 @@ def _unscoped_token_warning(engineer: str | None) -> str:
     # the docs/tests read naturally.
     if not re.fullmatch(r"[A-Za-z0-9._/@-]+", who):
         who = shlex.quote(who)
+    caveat = (
+        " (the id above was sanitized/truncated for this header -- copy the exact "
+        "engineer id from `coord tokens list`.)"
+        if altered
+        else ""
+    )
     return (
         "Your coord token is not bound to a repo. On a shared multi-repo coord "
         "service an unscoped per-engineer token sees and can affect EVERY "
         "repo's claims, which is deprecated. Ask an operator for a repo-scoped "
         f"token and switch: `coord tokens create {who} --repo <owner/name>`, "
         "then set it in .coordination/local.env. See the 'Repo-scoped tokens' "
-        "section of AGENTS.md / docs/deployment.md. Honored for now."
+        f"section of AGENTS.md / docs/deployment.md. Honored for now.{caveat}"
     )
 
 

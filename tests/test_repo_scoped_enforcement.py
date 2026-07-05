@@ -938,3 +938,19 @@ async def test_deprecation_header_plain_engineer_unquoted(
     assert r.status_code == 200, r.text
     warning = r.headers["X-Coord-Token-Warning"]
     assert "create alex/claude/main --repo" in warning, warning
+
+
+async def test_deprecation_header_notes_when_id_altered(client: AsyncClient) -> None:
+    # When the id is sanitized/truncated, the header tells the operator to copy
+    # the exact id from `coord tokens list` (Copilot review round 5, PR #62).
+    raw = await _mint(None, engineer="Z" * 500)
+    r = await client.get("/claims", headers=_auth(raw))
+    assert r.status_code == 200, r.text
+    assert "coord tokens list" in r.headers["X-Coord-Token-Warning"]
+
+
+async def test_deprecation_header_no_note_for_clean_id(client: AsyncClient) -> None:
+    raw = await _mint(None, engineer="alex/claude/main")
+    r = await client.get("/claims", headers=_auth(raw))
+    assert r.status_code == 200, r.text
+    assert "coord tokens list" not in r.headers["X-Coord-Token-Warning"]
