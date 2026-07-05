@@ -7,7 +7,25 @@ Semantic Versioning.
 
 ## [Unreleased]
 
-(none recorded yet)
+### Added
+
+- Central repo-id validator/normalizer (#61). A new `coordination/repo_id.py`
+  `normalize_repo_id()` is the one rule every ingress applies -- `coord tokens
+  create --repo`, the OIDC repo claim, a request `repo=` param/body, and the
+  token store (`create_engineer_token`). A malformed or non-canonical id
+  (empty, leading/trailing or doubled `/`, `.`/`..` segments, control chars,
+  `> 200` chars) now fails fast with a clear error (400 on a request, a CLI
+  error, or an SSO login refusal) instead of being silently accepted as long as
+  it matched on both sides. `None` (unscoped) passes through; existing canonical
+  ids (`owner/name`, bare basenames) are unaffected.
+
+### Changed
+
+- The repo-scope enforcement helpers (`_effective_read_repo` /
+  `_enforce_write_repo`) emit a `logger.debug` line when a scope override is
+  applied (an absent `repo` silently scoped, or a write defaulted to the token's
+  repo), so an operator can trace why a scoped token saw filtered/empty results
+  (#61).
 
 ## [0.43.0] - 2026-07-04
 

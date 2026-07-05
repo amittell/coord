@@ -12,6 +12,8 @@ from uuid import uuid4
 
 import aiosqlite
 
+from coordination.repo_id import normalize_repo_id
+
 
 # Sentinel returned by :func:`acquire_instance_lock` on platforms or
 # configurations where flock is unavailable or explicitly bypassed. It
@@ -2122,7 +2124,13 @@ class Database:
         v0.29.4: ``expires_at`` (None = never expires) and
         ``rotated_from`` (id of the predecessor token when this row is
         minted by a rotation) land in the v15 columns.
+
+        v0.44 (#61): ``repo`` is validated/normalized here so the durable
+        store never holds a malformed or non-canonical repo id. Raises
+        :class:`InvalidRepoId` on a bad value; callers map it to a CLI error /
+        login refusal / 400.
         """
+        repo = normalize_repo_id(repo)
         await self.init()
         token_id = str(uuid4())
         ts = (now or datetime.now(UTC)).replace(microsecond=0).isoformat().replace("+00:00", "Z")

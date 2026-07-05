@@ -58,6 +58,7 @@ from pathlib import Path
 from coordination.cli_shared import parse_duration
 from coordination.config import get_settings
 from coordination.db import Database
+from coordination.repo_id import InvalidRepoId, normalize_repo_id
 
 # Generation, hashing, and status derivation moved to
 # ``coordination.tokens`` in v0.29.5 so the dashboard token panel can
@@ -95,6 +96,14 @@ async def _create(args: argparse.Namespace) -> int:
         except ValueError as exc:
             print(str(exc), file=sys.stderr)
             return 1
+    # #61: validate/normalize the repo id up front so a malformed --repo
+    # fails with a clear message instead of a deep traceback, and the stored
+    # value is canonical.
+    try:
+        repo = normalize_repo_id(args.repo)
+    except InvalidRepoId as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     db = Database(_db_path())
     raw = generate_raw_token()
     token_id = await db.create_engineer_token(
@@ -102,7 +111,7 @@ async def _create(args: argparse.Namespace) -> int:
         sha256_token(raw),
         description=args.description,
         expires_at=expires_at,
-        repo=args.repo,
+        repo=repo,
     )
     expires_str = _iso_z(expires_at) if expires_at else None
     if args.json:
@@ -111,7 +120,7 @@ async def _create(args: argparse.Namespace) -> int:
             "engineer": args.engineer,
             "description": args.description,
             "expires_at": expires_str,
-            "repo": args.repo,
+            "repo": repo,
             "token": raw,
         }
         print(json.dumps(out, indent=2))
@@ -122,7 +131,7 @@ async def _create(args: argparse.Namespace) -> int:
             print(f"Description:  {args.description}")
         if expires_str:
             print(f"Expires:      {expires_str}")
-        print(f"Repo scope:   {args.repo or 'all repos (unscoped)'}")
+        print(f"Repo scope:   {repo or 'all repos (unscoped)'}")
         print("")
         print(f"  {raw}")
         print("")
