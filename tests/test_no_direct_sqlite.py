@@ -73,7 +73,7 @@ def test_no_direct_sqlite_connect_outside_db_module() -> None:
     for path in sorted(_PKG.glob("*.py")):
         if path.name in _EXEMPT_MODULES:
             continue  # the single sanctioned async SQLite seam
-        tree = ast.parse(path.read_text(), filename=str(path))
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         hits: list[str] = []
         for c in _calls(tree):
             root = _connect_root(c)

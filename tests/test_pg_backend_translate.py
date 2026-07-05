@@ -206,7 +206,7 @@ def _static_sql_strings(module: str) -> list[tuple[str, int]]:
     SQL (f-strings, ``+`` concatenation with variables) is a non-Constant node
     and is skipped (those run through ``translate`` in the live suite)."""
     path = _PKG / module
-    tree = ast.parse(path.read_text(), filename=str(path))
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     found: list[tuple[str, int]] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
