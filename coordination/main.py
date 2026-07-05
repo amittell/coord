@@ -233,8 +233,18 @@ def _unscoped_token_warning(engineer: str | None) -> str:
     # metacharacter (`;` `` ` `` `$` `|` space ...) could turn a pasted command
     # into something unsafe. Common ids (alnum plus / - _ . @) stay unquoted so
     # the docs/tests read naturally.
+    # A leading '-' makes argparse read the id as an option rather than the
+    # positional ``engineer``, so put --repo first and use ``--`` to force the
+    # id to be parsed as an argument. Detected before shell-quoting (quoting
+    # doesn't change how argparse sees the token once the shell strips quotes).
+    starts_dash = who.startswith("-")
     if not re.fullmatch(r"[A-Za-z0-9._/@-]+", who):
         who = shlex.quote(who)
+    cmd = (
+        f"coord tokens create --repo <owner/name> -- {who}"
+        if starts_dash
+        else f"coord tokens create {who} --repo <owner/name>"
+    )
     caveat = (
         " (the id above was sanitized/truncated for this header -- copy the exact "
         "engineer id from `coord tokens list`.)"
@@ -245,7 +255,7 @@ def _unscoped_token_warning(engineer: str | None) -> str:
         "Your coord token is not bound to a repo. On a shared multi-repo coord "
         "service an unscoped per-engineer token sees and can affect EVERY "
         "repo's claims, which is deprecated. Ask an operator for a repo-scoped "
-        f"token and switch: `coord tokens create {who} --repo <owner/name>`, "
+        f"token and switch: `{cmd}`, "
         "then set it in .coordination/local.env. See the 'Repo-scoped tokens' "
         f"section of AGENTS.md / docs/deployment.md. Honored for now.{caveat}"
     )

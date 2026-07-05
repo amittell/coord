@@ -954,3 +954,16 @@ async def test_deprecation_header_no_note_for_clean_id(client: AsyncClient) -> N
     r = await client.get("/claims", headers=_auth(raw))
     assert r.status_code == 200, r.text
     assert "coord tokens list" not in r.headers["X-Coord-Token-Warning"]
+
+
+async def test_deprecation_header_handles_leading_dash_engineer(
+    client: AsyncClient,
+) -> None:
+    # An engineer id starting with '-' would be read by argparse as an option,
+    # so the suggested command puts --repo first and uses `--` (Copilot review
+    # round 6, PR #62).
+    raw = await _mint(None, engineer="-foo")
+    r = await client.get("/claims", headers=_auth(raw))
+    assert r.status_code == 200, r.text
+    warning = r.headers["X-Coord-Token-Warning"]
+    assert "coord tokens create --repo <owner/name> -- -foo" in warning, warning
