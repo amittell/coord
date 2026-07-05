@@ -22,10 +22,11 @@ Three properties matter:
 
 from __future__ import annotations
 
+import aiosqlite
+import asyncio
 from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
-import sqlite3
 
 import pytest
 
@@ -44,15 +45,34 @@ def _parse_z(ts: str) -> datetime:
 
 
 def _force_expire(db_path: Path, token_id: str) -> None:
-    """Backdate a token's expiry directly in sqlite. The CLI only
-    accepts future durations, so manufacturing an already-expired
-    token has to go under the hood."""
-    with sqlite3.connect(db_path) as conn:
-        conn.execute(
-            "UPDATE engineer_tokens SET expires_at = ? WHERE id = ?",
-            ("2000-01-01T00:00:00Z", token_id),
-        )
-        conn.commit()
+    """Backdate a token's expiry through the ``aiosqlite`` seam. The CLI only
+    accepts future durations, so manufacturing an already-expired token has
+    to go under the hood. Using ``aiosqlite`` (not raw ``sqlite3``) means the
+    PG test harness redirects this write to the Postgres schema the store
+    reads, so the backdate lands in whichever backend the suite runs."""
+    async def _go() -> None:
+        async with aiosqlite.connect(str(db_path)) as conn:
+            await conn.execute(
+                "UPDATE engineer_tokens SET expires_at = ? WHERE id = ?",
+                ("2000-01-01T00:00:00Z", token_id),
+            )
+            await conn.commit()
+
+    asyncio.run(_go())
+
+
+def _read_row(db_path: Path, sql: str, params: tuple) -> tuple | None:
+    """Read a single row through the ``aiosqlite`` seam (redirected to the
+    Postgres schema under the PG harness). Returns the backend's native row
+    object (a sqlite3 tuple, or an asyncpg Record that indexes by position),
+    so callers compare by index rather than tuple-equality to stay backend
+    agnostic."""
+    async def _go() -> tuple | None:
+        async with aiosqlite.connect(str(db_path)) as conn:
+            cur = await conn.execute(sql, params)
+            return await cur.fetchone()
+
+    return asyncio.run(_go())
 
 
 def test_create_prints_raw_token_once(
@@ -173,13 +193,11 @@ def test_revoke_kills_lookup(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The CLI is synchronous (it wraps each subcommand in
-    ``asyncio.run``), so this test reads the DB through sqlite3
-    directly rather than spinning up another event loop -- which
-    would conflict with the pytest-asyncio loop the CLI already
-    used internally."""
-    import sqlite3
-
+    """The CLI is synchronous (it wraps each subcommand in ``asyncio.run``),
+    so this test reads the DB back through the ``aiosqlite`` seam (which the
+    PG harness redirects to the Postgres schema) to confirm revoke flipped
+    ``revoked_at`` -- rows are compared by index so the assertions hold on a
+    sqlite3 tuple or an asyncpg Record alike."""
     db_path = tmp_path / "db.sqlite"
     _run(
         ["tokens", "create", "alex/claude/main", "--json"],
@@ -190,22 +208,24 @@ def test_revoke_kills_lookup(
     token_id = created["id"]
 
     # Pre-revoke: row exists with revoked_at NULL (lookup matches).
-    with sqlite3.connect(db_path) as conn:
-        row = conn.execute(
-            "SELECT engineer, revoked_at FROM engineer_tokens WHERE id = ?",
-            (token_id,),
-        ).fetchone()
-    assert row == ("alex/claude/main", None)
+    row = _read_row(
+        db_path,
+        "SELECT engineer, revoked_at FROM engineer_tokens WHERE id = ?",
+        (token_id,),
+    )
+    assert row is not None
+    assert row[0] == "alex/claude/main"
+    assert row[1] is None
 
     rc = _run(["tokens", "revoke", token_id], db_path, monkeypatch)
     assert rc == 0
 
     # Post-revoke: revoked_at is a non-NULL ISO timestamp ending Z.
-    with sqlite3.connect(db_path) as conn:
-        row = conn.execute(
-            "SELECT engineer, revoked_at FROM engineer_tokens WHERE id = ?",
-            (token_id,),
-        ).fetchone()
+    row = _read_row(
+        db_path,
+        "SELECT engineer, revoked_at FROM engineer_tokens WHERE id = ?",
+        (token_id,),
+    )
     assert row is not None
     assert row[0] == "alex/claude/main"
     assert row[1] is not None
@@ -285,12 +305,13 @@ def test_create_expires_in_sets_expiry(
     delta = _parse_z(payload["expires_at"]) - datetime.now(UTC)
     assert timedelta(days=29) < delta <= timedelta(days=30)
     # The DB row carries the same value byte-for-byte.
-    with sqlite3.connect(db_path) as conn:
-        row = conn.execute(
-            "SELECT expires_at FROM engineer_tokens WHERE id = ?",
-            (payload["id"],),
-        ).fetchone()
-    assert row == (payload["expires_at"],)
+    row = _read_row(
+        db_path,
+        "SELECT expires_at FROM engineer_tokens WHERE id = ?",
+        (payload["id"],),
+    )
+    assert row is not None
+    assert row[0] == payload["expires_at"]
 
 
 def test_create_without_expires_in_is_unbounded(

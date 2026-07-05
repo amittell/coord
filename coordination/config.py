@@ -7,6 +7,12 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="COORD_", extra="ignore")
 
     database_path: Path = Path("data/coordination.db")
+    # HA re-architecture (design Sections 4-7). When set to a
+    # ``postgresql://`` (or ``postgres://``) DSN the service runs on the
+    # PostgresStore backend; the default (None) keeps the unchanged
+    # single-writer SQLite path at ``database_path``. ``COORD_DATABASE_PATH``
+    # stays the deprecated alias for the SQLite file location.
+    database_url: str | None = None
     auth_token: str | None = None
     allow_insecure_no_auth: bool = False
     repo_root: Path | None = None

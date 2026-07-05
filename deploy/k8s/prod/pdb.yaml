@@ -1,0 +1,20 @@
+# PodDisruptionBudget for the stateless coord Deployment (design Sections 4, 7).
+#
+# replicas:3 with minAvailable:2 keeps at least two coord pods serving during
+# voluntary disruptions (node drains, rolling updates). Paired with the
+# Deployment's RollingUpdate(maxUnavailable:0, maxSurge:1), deploys are
+# zero-downtime.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: coord
+  namespace: coord
+  labels:
+    app.kubernetes.io/name: coord
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: coord
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: coord

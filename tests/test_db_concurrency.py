@@ -13,6 +13,13 @@ import pytest
 from coordination import db as db_module
 from coordination.db import CURRENT_SCHEMA_VERSION, Database
 
+# These tests exercise the SQLite single-writer story (flock instance lock,
+# subprocess/threaded racing init, BEGIN IMMEDIATE contention). The Postgres
+# backend replaces that mechanism with server-side advisory locks (design
+# Section 7), so the flock/subprocess assertions are SQLite-only and are
+# skipped under PG by the conftest hook.
+pytestmark = pytest.mark.sqlite_only
+
 
 async def _fetch_one(path: Path, sql: str, args: tuple = ()) -> tuple | None:
     async with aiosqlite.connect(path) as conn:

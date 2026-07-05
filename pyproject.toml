@@ -1,6 +1,6 @@
 [project]
 name = "coord-mcp-server"
-version = "0.43.0"
+version = "0.44.0"
 description = "Coordination service for multi-engineer agent teams (HTTP API + MCP + dashboard)"
 readme = "README.md"
 license = "Apache-2.0"
@@ -46,6 +46,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# HA re-architecture (design Section 7): the PostgresStore backend. Prod-only
+# extra -- the default SQLite path keeps zero new dependencies.
+postgres = [
+    "asyncpg>=0.30.0",
+]
 symbols = [
     "tree-sitter>=0.25.2",
     "tree-sitter-typescript>=0.23.2",
@@ -162,4 +167,5 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
     "integration: end-to-end tests that spawn real processes (deselect with -m 'not integration')",
+    "sqlite_only: tests that exercise SQLite-internal mechanics (the migrations chain, flock/subprocess single-writer) that the Postgres backend replaces by design (consolidated v1 schema, advisory locks); skipped when COORD_DATABASE_URL selects Postgres",
 ]

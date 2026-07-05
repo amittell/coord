@@ -400,25 +400,29 @@ async def test_scoped_token_pending_requests_filters_mixed_repo_session(
 
 
 async def test_scoped_token_cancel_queue_403_on_other_repo(client: AsyncClient) -> None:
-    # Insert a claim_queue row tagged REPO_B directly, then a REPO_A token
-    # must not be able to cancel it.
-    import sqlite3
-
+    # Enqueue a claim_queue row tagged REPO_B via the Store (so this works on
+    # both the SQLite and Postgres backends), then a REPO_A token must not be
+    # able to cancel it.
     from coordination.deps import get_service
 
     svc = get_service()
     cid = await _seed_claim_id(client, REPO_B, "src/b.py")
-    with sqlite3.connect(svc.db.path) as conn:
-        conn.execute(
-            "INSERT INTO claim_queue (id, blocking_claim_id, requester_engineer, "
-            "repo, claim_type, pattern, position, state, enqueued_at, expires_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ("q-b", cid, "waiter", REPO_B, "file", "src/b.py", 1, "waiting",
-             "2026-01-01T00:00:00Z", "2099-01-01T00:00:00Z"),
-        )
-        conn.commit()
+    entry = await svc.db.enqueue_claim_request(
+        blocking_claim_id=cid,
+        requester_engineer="waiter",
+        requester_session_id=None,
+        requester_branch=None,
+        requester_description=None,
+        repo=REPO_B,
+        claim_type="file",
+        pattern="src/b.py",
+        symbols=None,
+        narrowable=None,
+        ttl_hours=None,
+        wait_seconds=0,
+    )
     raw = await _mint(REPO_A)
-    r = await client.delete("/requests/q-b", headers=_auth(raw))
+    r = await client.delete(f"/requests/{entry['id']}", headers=_auth(raw))
     assert r.status_code == 403, r.text
 
 

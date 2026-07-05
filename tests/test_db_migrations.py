@@ -12,6 +12,12 @@ import pytest
 from coordination import db as db_module
 from coordination.db import CURRENT_SCHEMA_VERSION, Database
 
+# The SQLite migrations chain (incremental v1..vN upgrades, legacy detection,
+# schema-version stamping) is a SQLite-internal mechanism. The Postgres backend
+# bootstraps a single consolidated schema instead (design Section 7.4), so these
+# tests are not meaningful on PG and are skipped there by the conftest hook.
+pytestmark = pytest.mark.sqlite_only
+
 
 async def _fetch_one(path: Path, sql: str, args: tuple = ()) -> tuple | None:
     async with aiosqlite.connect(path) as conn:

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import os
 import sqlite3
 import sys
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -13,6 +15,29 @@ from uuid import uuid4
 import aiosqlite
 
 from coordination.repo_id import normalize_repo_id
+
+
+# Transaction seam (HA re-architecture, design Sections 5/7). When a
+# claim-grant runs inside :meth:`Database.transaction`, the bound
+# connection is published here so every Database method invoked in that
+# scope reuses it (via :meth:`Database._acquire`) instead of opening its
+# own connection. Task-local: concurrent requests each see their own
+# bound connection (or ``None`` when not inside a transaction), so the
+# legacy connection-per-op path is byte-identical when unbound. Declared
+# at module scope per the contextvars guidance (never created per-call).
+_BOUND_CONN: contextvars.ContextVar[aiosqlite.Connection | None] = (
+    contextvars.ContextVar("coord_bound_conn", default=None)
+)
+
+
+# Per-engineer grant locks acquired during the current claim-grant
+# transaction, released by :meth:`Database.transaction` only after commit (so
+# the SQLite in-process lock matches Postgres ``pg_advisory_xact_lock``, which
+# is held to end-of-transaction). Task-local: each grant transaction owns its
+# own list; ``None`` when not inside a transaction.
+_TXN_ENG_LOCKS: contextvars.ContextVar[list[Any] | None] = (
+    contextvars.ContextVar("coord_txn_eng_locks", default=None)
+)
 
 
 # Sentinel returned by :func:`acquire_instance_lock` on platforms or
@@ -816,13 +841,61 @@ async def _migrate_to_current(conn: aiosqlite.Connection) -> None:
     await conn.commit()
 
 
+def _postgres_url_selected() -> str | None:
+    """Return the configured Postgres DSN when ``COORD_DATABASE_URL`` selects
+    the PG backend, else None. Read from the environment (not Settings) so the
+    dispatch works for every ``Database(path)`` call site -- including the many
+    tests that construct ``Database`` directly -- without threading settings
+    through each one."""
+    url = os.environ.get("COORD_DATABASE_URL", "")
+    if url.startswith("postgresql://") or url.startswith("postgres://"):
+        return url
+    return None
+
+
 class Database:
+    def __new__(cls, *args: Any, **kwargs: Any) -> "Database":
+        # Backend selection (design Section 4): a ``postgresql://``
+        # COORD_DATABASE_URL routes the bare ``Database(path)`` constructor to
+        # the asyncpg-backed PostgresStore, so the whole codebase (and the
+        # full test suite) runs on Postgres without touching call sites. The
+        # SQLite default is untouched. Constructing PostgresStore directly
+        # (cls is not Database) bypasses the dispatch and never recurses.
+        if cls is Database and _postgres_url_selected() is not None:
+            from coordination.pg_backend import PostgresStore
+
+            return object.__new__(PostgresStore)
+        return object.__new__(cls)
+
     def __init__(self, path: Path) -> None:
         self.path = path
+        # In-process per-engineer locks for the active-claim cap (design
+        # 5.3). The cap is per-engineer and GLOBAL across repos, so the
+        # per-repo grant lock does not cover it. On SQLite a single writer
+        # process (guaranteed by the flock instance lock) makes an
+        # in-process asyncio.Lock the exact equivalent of the per-engineer
+        # advisory lock the Postgres backend uses; keyed per engineer so
+        # disjoint engineers never serialize against each other. Created
+        # lazily in :meth:`engineer_lock`.
+        self._engineer_locks: dict[str, asyncio.Lock] = {}
+
+    def _connect(self):
+        """Open a fresh per-operation connection.
+
+        The single seam every non-grant Database method funnels through
+        (``async with self._connect() as conn``). On SQLite this is
+        literally :func:`aiosqlite.connect` -- byte-identical to the
+        legacy connection-per-op behaviour. The Postgres backend (P3,
+        :mod:`coordination.pg_backend`) overrides it to hand back a pool
+        connection wrapped in an aiosqlite-shaped adapter that translates
+        the dialect, so the same method body runs unchanged on either
+        store.
+        """
+        return aiosqlite.connect(self.path)
 
     async def init(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
 
@@ -838,8 +911,184 @@ class Database:
             # version is already current and do nothing.
             await _migrate_to_current(conn)
 
-    async def list_active_claims_rows(self, exclude_engineer: str | None = None) -> list[dict[str, Any]]:
+    @asynccontextmanager
+    async def transaction(self):
+        """Yield ONE connection bound for the duration of the block.
+
+        This is the transaction seam at the heart of the HA
+        re-architecture (design Sections 5 and 7). Every Database method
+        invoked inside the block reuses the yielded connection (via
+        :meth:`_acquire`), so the claims-table overlap re-check, the
+        claim insert, the symbol/scope finalization and the
+        auto-resolution bookkeeping all commit atomically on exit -- the
+        single unit-of-work the design requires before a per-repo lock
+        can make the grant correct under concurrent writers.
+
+        Re-entrant: a nested ``transaction()`` (e.g. a queue drain that
+        re-enters ``create_claims``) reuses the already-bound connection
+        and defers commit to the outermost block, so the grant never
+        deadlocks against its own open write transaction.
+
+        On SQLite the connection runs in the default deferred-isolation
+        mode: writes accumulate in one implicit transaction and commit
+        once here; an exception rolls the whole unit back.
+        """
+        existing = _BOUND_CONN.get()
+        if existing is not None:
+            # Re-entrant: reuse the outer connection; the outermost
+            # ``transaction`` owns commit/rollback/close.
+            yield existing
+            return
         await self.init()
+        async with self._connect() as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            token = _BOUND_CONN.set(conn)
+            held_eng_token = _TXN_ENG_LOCKS.set([])
+            try:
+                yield conn
+                await conn.commit()
+            except BaseException:
+                await conn.rollback()
+                raise
+            finally:
+                # Release any per-engineer grant locks acquired in this
+                # transaction AFTER commit/rollback -- matching the Postgres
+                # ``pg_advisory_xact_lock``, which only drops at end-of-txn.
+                # Releasing them earlier (at the inner ``engineer_lock`` block)
+                # let a same-engineer peer read a pre-insert snapshot and
+                # overshoot the cap. The connection's writes are durable by the
+                # time we release, so the next waiter's count sees them.
+                for held in reversed(_TXN_ENG_LOCKS.get() or []):
+                    held.release()
+                _TXN_ENG_LOCKS.reset(held_eng_token)
+                _BOUND_CONN.reset(token)
+
+    async def repo_lock(
+        self, conn: aiosqlite.Connection, repo: str | None
+    ) -> None:
+        """Per-repo serialization hook for the claim-grant transaction.
+
+        No-op on SQLite: the single-writer instance lock plus the bound
+        write transaction already serialize grants within the one
+        process that may touch the file. The Postgres backend (design
+        P3) overrides this to issue a transaction-scoped
+        ``pg_advisory_xact_lock`` keyed on ``coalesce(repo, '')`` so
+        concurrent replicas serialize per repo -- always via
+        ``coalesce`` so the NULL-repo bucket is locked too rather than
+        running unserialized (design 5.4).
+
+        Takes the bound ``conn`` explicitly so the lock is acquired on
+        the very connection the grant commits on; a lock on any other
+        connection would not serialize the right transaction.
+        """
+        return None
+
+    @asynccontextmanager
+    async def engineer_lock(
+        self, conn: aiosqlite.Connection, engineer: str
+    ):
+        """Serialize the per-engineer active-claim cap's count+insert.
+
+        The ``max_claims_per_engineer`` cap is per-engineer and GLOBAL
+        across repos, so the per-repo :meth:`repo_lock` does not cover it
+        (design 5.3): without a per-engineer guard, three replicas each
+        read an under-cap count before any insert lands and the cap
+        overshoots ~3x. This wraps the count and the insert so they are
+        atomic against any concurrent grant for the SAME engineer.
+
+        On SQLite this is an in-process ``asyncio.Lock`` keyed on the
+        engineer: a single event loop plus the flock instance lock mean
+        exactly one process touches the database, so an in-process lock
+        is byte-for-byte the serialization the advisory lock provides on
+        Postgres -- and the cap behaves exactly as it did under the old
+        service-level ``_quota_lock``. The Postgres backend (design 5.3,
+        P3) overrides this to issue ``pg_advisory_xact_lock(
+        hashtextextended('eng:'||engineer))`` on ``conn`` so the lock is
+        held until the grant commits and serializes across replicas.
+
+        Takes ``conn`` explicitly -- the bound grant connection -- so the
+        Postgres override locks the very transaction the grant commits
+        on; SQLite ignores it (the in-process lock needs no connection).
+
+        Hold-to-commit: like Postgres ``pg_advisory_xact_lock``, the lock is
+        held until the surrounding :meth:`transaction` commits, not merely
+        until this ``with`` block exits. The grant inserts its claim *after*
+        the cap check but commits later (scope/symbol finalize, auto-resolution
+        bookkeeping all run first), so releasing here would let a same-engineer
+        peer acquire the lock and count a pre-insert snapshot -> cap overshoot.
+        We register the held lock with the transaction, which releases it
+        post-commit. Outside a transaction (no registry) we fall back to
+        block-scoped release so the lock never leaks.
+        """
+        lock = self._engineer_locks.get(engineer)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._engineer_locks[engineer] = lock
+        registry = _TXN_ENG_LOCKS.get()
+        if registry is None:
+            # Not inside a grant transaction: behave like a plain scoped lock.
+            async with lock:
+                yield
+            return
+        await lock.acquire()
+        registry.append(lock)
+        # Released by transaction() after commit; do NOT release on block exit.
+        yield
+
+    async def acquire_leader_lease(
+        self, *, lease_name: str, holder_id: str, ttl_sec: float
+    ) -> bool:
+        """Single-leader election for the multi-replica background loops
+        (design Section 6).
+
+        The cleanup / auto-demote / rename-sweep / webhook-delivery loops
+        run in every replica's lifespan. On Postgres that means three
+        replicas would each expire claims, each auto-demote, and -- worst
+        -- each POST every due webhook row, breaking at-least-once-once
+        delivery with 3x duplicate PR comments. The fix is to let exactly
+        one replica (the leader) run those loops.
+
+        On SQLite there is a single writer process (the flock instance
+        lock guarantees it), so it is unconditionally the leader: this
+        returns True without touching the database and the loops run
+        exactly as they always have. The Postgres backend (design Section
+        6, P3) overrides this with a TTL lease row -- claim
+        ``(lease_name, holder_id, expires_at)`` only when the current
+        lease is unheld or expired, returning True when this replica owns
+        it -- so leadership survives a leader's death after ``ttl_sec``.
+
+        ``holder_id`` identifies the calling process for the Postgres
+        lease; ``ttl_sec`` bounds how long a dead leader blocks failover.
+        Both are ignored on SQLite.
+        """
+        return True
+
+    @asynccontextmanager
+    async def _acquire(self):
+        """Yield ``(conn, owns)`` for a single Database operation.
+
+        Inside a :meth:`transaction` block, yields the task-bound
+        connection with ``owns=False`` -- the operation must NOT commit
+        or close it, because the surrounding unit-of-work owns the
+        commit. Outside a transaction, opens a fresh connection with
+        ``owns=True``, reproducing the legacy connection-per-op
+        behaviour exactly (configure, run, the caller commits when
+        ``owns`` is true, the context closes it). The bound connection
+        already has ``row_factory`` set and the pragmas configured by
+        :meth:`transaction`, so both branches yield a ready connection.
+        """
+        bound = _BOUND_CONN.get()
+        if bound is not None:
+            yield bound, False
+        else:
+            await self.init()
+            async with self._connect() as conn:
+                conn.row_factory = aiosqlite.Row
+                await _configure_sqlite(conn)
+                yield conn, True
+
+    async def list_active_claims_rows(self, exclude_engineer: str | None = None) -> list[dict[str, Any]]:
         q = """
         SELECT * FROM claims
         WHERE released_at IS NULL
@@ -848,12 +1097,11 @@ class Database:
         if exclude_engineer:
             q += " AND engineer != ?"
             args.append(exclude_engineer)
-        async with aiosqlite.connect(self.path) as conn:
-            conn.row_factory = aiosqlite.Row
-            await _configure_sqlite(conn)
+        async with self._acquire() as (conn, owns):
             cur = await conn.execute(q, args)
             rows = await cur.fetchall()
-            await conn.commit()
+            if owns:
+                await conn.commit()
         now = datetime.now(UTC)
         out: list[dict[str, Any]] = []
         for r in rows:
@@ -891,10 +1139,7 @@ class Database:
         activity_value: str | None = None
         if session_id:
             activity_value = last_activity if last_activity is not None else now
-        await self.init()
-        async with aiosqlite.connect(self.path) as conn:
-            conn.row_factory = aiosqlite.Row
-            await _configure_sqlite(conn)
+        async with self._acquire() as (conn, owns):
             for cid, claim_type, pattern, severity, expires_at in items:
                 await conn.execute(
                     """
@@ -918,7 +1163,8 @@ class Database:
                         activity_value,
                     ),
                 )
-            await conn.commit()
+            if owns:
+                await conn.commit()
         return [i[0] for i in items]
 
     async def insert_claim_symbols(
@@ -956,9 +1202,7 @@ class Database:
         if not rows:
             return
         padded = [tuple(r) + (None,) * (11 - len(r)) for r in rows]
-        await self.init()
-        async with aiosqlite.connect(self.path) as conn:
-            await _configure_sqlite(conn)
+        async with self._acquire() as (conn, owns):
             await conn.executemany(
                 """
                 INSERT OR IGNORE INTO claim_symbols
@@ -969,7 +1213,8 @@ class Database:
                 """,
                 padded,
             )
-            await conn.commit()
+            if owns:
+                await conn.commit()
 
     async def get_claim_symbols(
         self, claim_id: str
@@ -980,10 +1225,7 @@ class Database:
         method-level rows (v0.16). The v16 span columns ride along:
         1-based lines, 0-based columns, NULL when no span was resolved
         at claim time (pre-v16 rows, no repo root, parser miss)."""
-        await self.init()
-        async with aiosqlite.connect(self.path) as conn:
-            conn.row_factory = aiosqlite.Row
-            await _configure_sqlite(conn)
+        async with self._acquire() as (conn, _owns):
             cur = await conn.execute(
                 """
                 SELECT file_path, symbol_name, symbol_kind, parent_symbol,
@@ -1019,7 +1261,7 @@ class Database:
         """
         await self.init()
         created_at = now or _utcnow()
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             await _configure_sqlite(conn)
             await conn.execute("BEGIN IMMEDIATE")
             await conn.execute(
@@ -1060,7 +1302,7 @@ class Database:
             return []
         await self.init()
         placeholders = ",".join("?" for _ in claim_ids)
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(
@@ -1090,7 +1332,7 @@ class Database:
         comparison quirks live in exactly one idiom.
         """
         await self.init()
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(
@@ -1146,7 +1388,7 @@ class Database:
         same row inside its transaction. Returns the new row id."""
         await self.init()
         new_id = str(uuid4())
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             await _configure_sqlite(conn)
             await conn.execute(
                 """
@@ -1186,7 +1428,7 @@ class Database:
             return []
         await self.init()
         placeholders = ",".join("?" for _ in claim_ids)
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(
@@ -1233,7 +1475,7 @@ class Database:
         sweep racing this one.
         """
         await self.init()
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             await conn.execute("BEGIN IMMEDIATE")
@@ -1361,7 +1603,7 @@ class Database:
         if repo is not None:
             sql += " AND c.repo IS ?"
             params.append(repo)
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(sql, params)
@@ -1408,7 +1650,7 @@ class Database:
         if repo is not None:
             sql += " AND c.repo IS ?"
             params.append(repo)
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(sql, params)
@@ -1450,7 +1692,7 @@ class Database:
         if repo is not None:
             sql += " AND repo IS ?"
             params.append(repo)
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(sql, params)
@@ -1466,10 +1708,7 @@ class Database:
         Used by auto-coexist / auto-narrow paths to mark two claims as
         cooperative without going through the request flow.
         """
-        await self.init()
-        async with aiosqlite.connect(self.path) as conn:
-            conn.row_factory = aiosqlite.Row
-            await _configure_sqlite(conn)
+        async with self._acquire() as (conn, owns):
             cur = await conn.execute(
                 "SELECT coexists_with FROM claims WHERE id = ? AND released_at IS NULL",
                 (claim_id,),
@@ -1491,7 +1730,8 @@ class Database:
                 "UPDATE claims SET coexists_with = ? WHERE id = ?",
                 (json.dumps(partners), claim_id),
             )
-            await conn.commit()
+            if owns:
+                await conn.commit()
 
     async def enqueue_claim_request(
         self,
@@ -1535,7 +1775,7 @@ class Database:
         else:
             narrowable_int = 1 if narrowable else 0
         new_id = str(uuid4())
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             await conn.execute("BEGIN IMMEDIATE")
@@ -1641,7 +1881,7 @@ class Database:
         if fairness_n > 0:
             count = _next_fairness_count(blocking_claim_id)
             fairness_pop = (count % fairness_n) == 0
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             await conn.execute("BEGIN IMMEDIATE")
@@ -1682,7 +1922,13 @@ class Database:
                 # still pops in declared FIFO order against equally
                 # low-floored peers.
                 cur = await conn.execute(
-                    "SELECT *, ("
+                    # Wrap the ranked rows in a subquery so ``_prio_rank`` is a
+                    # real column the outer ORDER BY can use inside a CASE.
+                    # SQLite tolerates a SELECT alias inside an ORDER BY
+                    # expression; PostgreSQL only allows a bare alias there, so
+                    # the subquery keeps both dialects happy (behaviour-identical
+                    # -- the same columns, including _prio_rank, are returned).
+                    "SELECT * FROM (SELECT *, ("
                     "CASE priority "
                     "WHEN 'blocking' THEN 4 "
                     "WHEN 'high' THEN 3 "
@@ -1701,7 +1947,8 @@ class Database:
                     "ELSE 0 END"
                     ") AS _prio_rank "
                     "FROM claim_queue "
-                    "WHERE blocking_claim_id = ? AND state = 'waiting' "
+                    "WHERE blocking_claim_id = ? AND state = 'waiting'"
+                    ") AS q "
                     "ORDER BY (CASE WHEN _prio_rank < 1 THEN 1 "
                     "ELSE _prio_rank END) DESC, position ASC LIMIT 1",
                     (
@@ -1730,7 +1977,7 @@ class Database:
         claim. The in-memory long-poll signal is fired by the service
         layer; this method just persists the state transition."""
         await self.init()
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             await _configure_sqlite(conn)
             await conn.execute(
                 "UPDATE claim_queue SET state = 'granted', "
@@ -1744,7 +1991,7 @@ class Database:
         a grant, or the drain attempt re-conflicted). The long-poll on
         the requester side surfaces the original 409 to the caller."""
         await self.init()
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             await _configure_sqlite(conn)
             await conn.execute(
                 "UPDATE claim_queue SET state = 'expired' WHERE id = ?",
@@ -1768,7 +2015,7 @@ class Database:
         state.
         """
         await self.init()
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             await _configure_sqlite(conn)
             if requester_engineer is not None:
                 cur = await conn.execute(
@@ -1795,7 +2042,7 @@ class Database:
         Python process (no in-memory asyncio.Event will fire for those).
         """
         await self.init()
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(
@@ -1812,7 +2059,7 @@ class Database:
         in-memory event was missed (process restart, server crash)."""
         await self.init()
         ts = now_iso or _utcnow()
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             await _configure_sqlite(conn)
             cur = await conn.execute(
                 "UPDATE claim_queue SET state = 'expired' "
@@ -1830,7 +2077,7 @@ class Database:
         by enqueued_at. Powers a v0.21 ``GET /requests`` extension and
         the dashboard's per-engineer queue panel (follow-up release)."""
         await self.init()
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(
@@ -1879,9 +2126,7 @@ class Database:
         if repo is not None:
             sql += " AND repo IS ?"
             params.append(repo)
-        async with aiosqlite.connect(self.path) as conn:
-            conn.row_factory = aiosqlite.Row
-            await _configure_sqlite(conn)
+        async with self._acquire() as (conn, _owns):
             cur = await conn.execute(sql, params)
             rows = await cur.fetchall()
         ref = now or datetime.now(UTC)
@@ -1932,7 +2177,7 @@ class Database:
         if repo is not None:
             sql += " AND repo IS ?"
             params.append(repo)
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(sql, params)
@@ -1960,7 +2205,7 @@ class Database:
                 "WHERE state = 'waiting' AND repo = ?"
             )
             params = (repo,)
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(sql, params)
@@ -1988,12 +2233,10 @@ class Database:
         'webhook' (default) POSTs to ``url`` with the HMAC header;
         'github' routes the row's ``detail`` to the GitHub adapter.
         """
-        await self.init()
         new_id = str(uuid4())
         now_iso = _utcnow()
         next_iso = next_attempt_at or now_iso
-        async with aiosqlite.connect(self.path) as conn:
-            await _configure_sqlite(conn)
+        async with self._acquire() as (conn, owns):
             await conn.execute(
                 "INSERT INTO webhook_outbox "
                 "(id, url, event_type, payload_json, hmac_signature, "
@@ -2002,7 +2245,8 @@ class Database:
                 (new_id, url, event_type, payload_json,
                  hmac_signature, next_iso, now_iso, kind),
             )
-            await conn.commit()
+            if owns:
+                await conn.commit()
         return new_id
 
     async def list_pending_webhooks(
@@ -2017,7 +2261,7 @@ class Database:
         """
         await self.init()
         ts = now_iso or _utcnow()
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(
@@ -2035,7 +2279,7 @@ class Database:
         successfully POSTed. delivered_at is stamped; status flips."""
         await self.init()
         now_iso = _utcnow()
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             await _configure_sqlite(conn)
             await conn.execute(
                 "UPDATE webhook_outbox SET status = 'delivered', "
@@ -2060,7 +2304,7 @@ class Database:
         await self.init()
         now_iso = _utcnow()
         new_status = "exhausted" if exhausted else "failed"
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             await _configure_sqlite(conn)
             await conn.execute(
                 "UPDATE webhook_outbox SET status = ?, "
@@ -2084,7 +2328,7 @@ class Database:
         now = now or datetime.now(UTC)
         cutoff = (now - timedelta(hours=window_hours)).replace(microsecond=0)
         cutoff_iso = cutoff.isoformat().replace("+00:00", "Z")
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(
@@ -2104,6 +2348,86 @@ class Database:
                 "pending": 0, "exhausted": 0,
             })[st] = int(r["n"] or 0)
         return out
+
+    async def recent_webhook_outbox(
+        self, *, limit: int
+    ) -> list[dict[str, Any]]:
+        """v0.27.1 (HA port): return the ``limit`` most recent outbox rows,
+        newest-first (created_at DESC, id DESC). ``coord outbox tail`` reverses
+        the slice for oldest-first display. Only the columns the CLI renders
+        are selected, so the operator path stays on the backend abstraction
+        instead of opening a raw sqlite3 connection."""
+        await self.init()
+        async with self._connect() as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                "SELECT id, status, event_type, created_at, last_error, "
+                "retry_count, next_attempt_at FROM webhook_outbox "
+                "ORDER BY datetime(created_at) DESC, id DESC LIMIT ?",
+                (limit,),
+            )
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+    async def count_webhook_outbox(self, statuses: list[str]) -> int:
+        """v0.27.1 (HA port): count outbox rows whose ``status`` is in
+        ``statuses``. Backs the row-count message and the ``--dry-run``
+        preview of ``coord outbox retry`` / ``purge``."""
+        if not statuses:
+            return 0
+        await self.init()
+        placeholders = ",".join(["?"] * len(statuses))
+        async with self._connect() as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                f"SELECT COUNT(*) AS n FROM webhook_outbox "
+                f"WHERE status IN ({placeholders})",
+                statuses,
+            )
+            row = await cur.fetchone()
+            return int(row["n"]) if row else 0
+
+    async def reset_webhook_outbox(
+        self, statuses: list[str], *, now_iso: str | None = None
+    ) -> int:
+        """v0.27.1 (HA port): reset every outbox row in ``statuses`` back to
+        'pending' with retry_count=0, next_attempt_at=now and last_error
+        cleared so the delivery loop re-tries it. Returns the rows reset.
+        Backs ``coord outbox retry``."""
+        if not statuses:
+            return 0
+        await self.init()
+        now = now_iso or _utcnow()
+        placeholders = ",".join(["?"] * len(statuses))
+        async with self._connect() as conn:
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                f"UPDATE webhook_outbox SET status='pending', retry_count=0, "
+                f"next_attempt_at=?, last_error=NULL "
+                f"WHERE status IN ({placeholders})",
+                [now, *statuses],
+            )
+            await conn.commit()
+            return int(cur.rowcount or 0)
+
+    async def delete_webhook_outbox(self, statuses: list[str]) -> int:
+        """v0.27.1 (HA port): DELETE every outbox row whose ``status`` is in
+        ``statuses`` (terminal states only -- enforced by the caller).
+        Returns the rows removed. Backs ``coord outbox purge``."""
+        if not statuses:
+            return 0
+        await self.init()
+        placeholders = ",".join(["?"] * len(statuses))
+        async with self._connect() as conn:
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                f"DELETE FROM webhook_outbox WHERE status IN ({placeholders})",
+                statuses,
+            )
+            await conn.commit()
+            return int(cur.rowcount or 0)
 
     async def create_engineer_token(
         self,
@@ -2141,7 +2465,7 @@ class Database:
             if expires_at
             else None
         )
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             await _configure_sqlite(conn)
             await conn.execute(
                 "INSERT INTO engineer_tokens "
@@ -2170,7 +2494,7 @@ class Database:
         weakening the valid-only contract of ``lookup_engineer_token``.
         """
         await self.init()
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(
@@ -2232,7 +2556,7 @@ class Database:
         ts = (now or datetime.now(UTC)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         ip = (source_ip or "")[:128] or None
         ua = (user_agent or "")[:512] or None
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             await _configure_sqlite(conn)
             await conn.execute(
                 "UPDATE engineer_tokens SET last_used_at = ?, "
@@ -2271,7 +2595,7 @@ class Database:
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY created_at DESC"
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(sql, params)
@@ -2287,7 +2611,7 @@ class Database:
         ``revoked_at`` so callers can distinguish "already revoked"
         from "not yours"; None when the id is unknown."""
         await self.init()
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(
@@ -2338,7 +2662,7 @@ class Database:
         if repo is not None:
             sql += " AND repo = ?"
             params.append(repo)
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             await _configure_sqlite(conn)
             cur = await conn.execute(sql, params)
             await conn.commit()
@@ -2381,7 +2705,7 @@ class Database:
             else None
         )
         new_id = str(uuid4())
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             await conn.execute("BEGIN IMMEDIATE")
@@ -2487,7 +2811,7 @@ class Database:
             sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY cq.enqueued_at DESC LIMIT ?"
         params.append(limit)
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(sql, params)
@@ -2518,7 +2842,7 @@ class Database:
         if repo is not None:
             sql += " AND repo IS ?"
             params.append(repo)
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(sql, params)
@@ -2562,7 +2886,7 @@ class Database:
                 LIMIT ?
         """
         params.append(limit)
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(sql, params)
@@ -2592,7 +2916,7 @@ class Database:
         # there is no TOCTOU window where a concurrent release_claims
         # could close some of these IDs between our SELECT and UPDATE,
         # causing spurious cascade-resolve calls on already-closed claims.
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             await conn.execute("BEGIN IMMEDIATE")
@@ -2684,7 +3008,7 @@ class Database:
         now = _utcnow()
         await self.init()
         released_ids: list[str] = []
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             n = 0
@@ -2718,9 +3042,35 @@ class Database:
             )
         return n
 
+    async def release_active_claims_for_engineers(
+        self, engineers: list[str], *, now_iso: str | None = None
+    ) -> dict[str, int]:
+        """v0.28 (HA port): release every active (unreleased) claim owned by
+        each engineer in ``engineers`` by stamping ``released_at=now``.
+
+        Returns ``{engineer: rows_released}`` preserving the input order so
+        ``coord engineers stale --release`` can report a per-engineer
+        breakdown. This is the backend-abstraction replacement for the CLI's
+        former raw ``sqlite3`` UPDATE; it deliberately mirrors that bulk
+        UPDATE (no cascade-resolve) to keep the operator output identical."""
+        await self.init()
+        now = now_iso or _utcnow()
+        released: dict[str, int] = {}
+        async with self._connect() as conn:
+            await _configure_sqlite(conn)
+            for engineer in engineers:
+                cur = await conn.execute(
+                    "UPDATE claims SET released_at = ? "
+                    "WHERE engineer = ? AND released_at IS NULL",
+                    (now, engineer),
+                )
+                released[engineer] = int(cur.rowcount or 0)
+            await conn.commit()
+        return released
+
     async def extend_claim(self, claim_id: str, engineer: str, new_expires_at: str) -> bool:
         await self.init()
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(
@@ -2746,7 +3096,7 @@ class Database:
         if idle_timeout_sec and idle_timeout_sec > 0:
             idle_cutoff = cutoff - timedelta(seconds=idle_timeout_sec)
         await self.init()
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(
@@ -2785,7 +3135,7 @@ class Database:
         if not to_close:
             return 0
 
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             n = 0
@@ -2820,10 +3170,7 @@ class Database:
         resolution: str | None,
         attempted_session_id: str | None = None,
     ) -> None:
-        await self.init()
-        async with aiosqlite.connect(self.path) as conn:
-            conn.row_factory = aiosqlite.Row
-            await _configure_sqlite(conn)
+        async with self._acquire() as (conn, owns):
             await conn.execute(
                 """
                 INSERT INTO conflict_log (
@@ -2842,11 +3189,12 @@ class Database:
                     attempted_session_id,
                 ),
             )
-            await conn.commit()
+            if owns:
+                await conn.commit()
 
     async def get_ownership_yaml(self) -> str | None:
         await self.init()
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute("SELECT yaml_text FROM ownership_config WHERE id = 1")
@@ -2859,7 +3207,7 @@ class Database:
     async def set_ownership_yaml(self, yaml_text: str) -> None:
         now = _utcnow()
         await self.init()
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             await conn.execute(
@@ -2875,7 +3223,7 @@ class Database:
         conflicts whose blocking claim is in that repo, joining claims;
         None returns every repo's conflicts (operator / back-compat)."""
         await self.init()
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             if repo is None:
@@ -2930,7 +3278,7 @@ class Database:
             repo_filter = " AND c.repo IS ?"
             params.append(repo)
         params.extend([min_attempts, limit])
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(
@@ -2943,7 +3291,9 @@ class Database:
                 "WHERE datetime(cl.created_at) >= datetime(?)"
                 + repo_filter
                 + " GROUP BY c.repo, cl.attempted_pattern "
-                "HAVING attempts >= ? "
+                # Reference the aggregate directly (not the SELECT alias)
+                # in HAVING: SQLite accepts the alias, PostgreSQL does not.
+                "HAVING COUNT(*) >= ? "
                 "ORDER BY attempts DESC, last_attempt DESC "
                 "LIMIT ?",
                 params,
@@ -2989,7 +3339,7 @@ class Database:
         if repo is not None:
             repo_filter = " AND c.repo IS ?"
             params.append(repo)
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(
@@ -3042,7 +3392,7 @@ class Database:
         cutoff = (now - timedelta(hours=window_hours)).replace(microsecond=0)
         cutoff_iso = cutoff.isoformat().replace("+00:00", "Z")
 
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             if repo is None:
@@ -3112,7 +3462,7 @@ class Database:
         cutoff_iso = cutoff.isoformat().replace("+00:00", "Z")
         now_iso = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(
@@ -3197,7 +3547,7 @@ class Database:
             repo_clause = "                  AND repo IS ?\n"
             params.append(repo)
         params.append(cutoff_iso)
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(
@@ -3276,7 +3626,7 @@ class Database:
         """
         await self.init()
         now = _utcnow()
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             await conn.execute("BEGIN IMMEDIATE")
@@ -3455,7 +3805,7 @@ class Database:
         # populate (new claim id, original pattern, etc.) so the
         # responded audit event records the full transition.
         extra_detail: dict[str, Any] = {}
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             await conn.execute("BEGIN IMMEDIATE")
@@ -3486,6 +3836,22 @@ class Database:
                     )
                     await conn.commit()
                     return dict(req)
+
+                # Per-repo serialization for the grant (design 5.2): the
+                # narrowed / coexist branches mutate the active-claim set
+                # and must hold the same per-repo lock the create path
+                # does. No-op on SQLite; the Postgres backend (P3)
+                # acquires ``pg_advisory_xact_lock`` on this very
+                # connection. Keyed off the holder claim's repo (coalesced
+                # to '' for the NULL-repo bucket inside ``repo_lock``).
+                repo_cur = await conn.execute(
+                    "SELECT repo FROM claims WHERE id = ?", (req["claim_id"],)
+                )
+                claim_repo_row = await repo_cur.fetchone()
+                await self.repo_lock(
+                    conn,
+                    claim_repo_row["repo"] if claim_repo_row is not None else None,
+                )
 
                 if decision == "approved":
                     await conn.execute(
@@ -3834,7 +4200,7 @@ class Database:
         import json as _json
 
         await self.init()
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             await conn.execute("BEGIN IMMEDIATE")
@@ -3900,7 +4266,7 @@ class Database:
         """
         await self.init()
         now = _utcnow()
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             await conn.execute("BEGIN IMMEDIATE")
@@ -3955,7 +4321,7 @@ class Database:
         new event was written.
         """
         await self.init()
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(
@@ -3994,10 +4360,7 @@ class Database:
         (``auto-coexist``, ``auto-narrow``) can record audit rows even
         though they bypass the ``requests`` table entirely.
         """
-        await self.init()
-        async with aiosqlite.connect(self.path) as conn:
-            conn.row_factory = aiosqlite.Row
-            await _configure_sqlite(conn)
+        async with self._acquire() as (conn, owns):
             await self._record_event_in_txn(
                 conn,
                 request_id=request_id,
@@ -4006,11 +4369,12 @@ class Database:
                 actor_session_id=actor_session_id,
                 detail=detail,
             )
-            await conn.commit()
+            if owns:
+                await conn.commit()
 
     async def get_request(self, request_id: str) -> dict[str, Any] | None:
         await self.init()
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(
@@ -4053,7 +4417,7 @@ class Database:
             LIMIT ?
         """
         args.append(limit)
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(sql, args)
@@ -4094,7 +4458,7 @@ class Database:
                 LIMIT ?
         """
         params.append(limit)
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(sql, params)
@@ -4106,7 +4470,7 @@ class Database:
     ) -> list[dict[str, Any]]:
         """Return the full event timeline for a request, oldest first."""
         await self.init()
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(
@@ -4119,7 +4483,7 @@ class Database:
 
     async def list_recent_claims(self, limit: int = 200) -> list[dict[str, Any]]:
         await self.init()
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(

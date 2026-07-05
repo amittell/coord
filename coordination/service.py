@@ -364,15 +364,22 @@ def _drop_waiter(queue_id: str) -> None:
 class CoordinationService:
     db: Database
     settings: Settings
-    # v0.30: serializes every rate-limit count-then-act critical
-    # section (active-claim cap + insert, enqueue quota checks +
-    # enqueue). Each Database call runs on its own connection in its
-    # own transaction, so without this two concurrent requests both
-    # read an under-cap count before either write lands and the cap
-    # overshoots. One asyncio.Lock is sufficient: the flock instance
-    # lock guarantees a single process per database, and a single
-    # event loop serializes everything else. Held only across the
-    # check+write pair -- never across the queue long-poll.
+    # v0.30: serializes the queue-enqueue count-then-act critical
+    # section (enqueue quota checks + enqueue). Each Database call runs
+    # on its own connection in its own transaction, so without this two
+    # concurrent requests both read an under-quota count before either
+    # write lands and the queue cap overshoots. One asyncio.Lock is
+    # sufficient on SQLite: the flock instance lock guarantees a single
+    # process per database, and a single event loop serializes
+    # everything else. Held only across the check+write pair -- never
+    # across the queue long-poll.
+    #
+    # The active-claim cap (max_claims_per_engineer) no longer rides this
+    # lock: design 5.3 re-homed it onto db.engineer_lock so the count and
+    # insert run on the bound grant connection under a per-engineer guard
+    # that also serializes across replicas on Postgres (this in-process
+    # lock cannot). The queue-enqueue cap stays here pending its own
+    # DB-side re-home.
     _quota_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # v0.31 wave 2: strong references to in-flight callsite-enrichment
     # tasks. asyncio.create_task only holds a weak reference, so a
@@ -933,98 +940,219 @@ class CoordinationService:
         # claim id back until insert_claims_batch returns.
         auto_resolutions: list[tuple[ClaimItem, dict[str, Any], Any]] = []
 
-        active = await self.db.list_active_claims_rows(exclude_engineer=body.engineer)
-        # Repo-scoped check (v0.4.0): see check_conflicts for rationale.
-        active = [r for r in active if r.get("repo") == body.repo]
-        # Session-scoped self-exclusion (v0.5.0): see check_conflicts.
-        if body.session_id:
-            active = [r for r in active if r.get("session_id") != body.session_id]
-        # Coexist self-exclusion (v0.11+): mirror check_conflicts so a
-        # coexist partner adding a NEW claim alongside their existing
-        # one isn't blocked by the partner they were explicitly granted
-        # coexistence with.
-        if body.session_id:
-            own_claims = await self.db.list_active_claims_rows(exclude_engineer=None)
-            own_claims = [
-                c
-                for c in own_claims
-                if c.get("session_id") == body.session_id
-                and c.get("repo") == body.repo
-            ]
-            partner_ids = _coexist_partner_ids_from_rows(own_claims)
-            if partner_ids:
-                # v0.35: only blanket-skip FILE-scoped partners. A
-                # symbol-scoped partner stays in ``active`` so this new
-                # claim is re-evaluated against its granted symbols via
-                # the normal symbol-overlap path (409 on collision,
-                # auto-coexist when disjoint).
-                skip = _blanket_skip_partner_ids(partner_ids, active)
-                if skip:
-                    active = [r for r in active if str(r.get("id")) not in skip]
-        for item in body.claims:
-            requester_scope = "symbol" if item.symbols else "file"
-            requester_symbols_by_file: dict[str, list[str]] = (
-                {item.pattern: list(item.symbols)} if item.symbols else {}
-            )
-            for row in active:
-                result = await check_symbol_overlap(
-                    db=self.db,
-                    holder=row,
-                    requester_pattern=item.pattern,
-                    requester_scope_type=requester_scope,
-                    requester_symbols_by_file=requester_symbols_by_file,
+        # Phase B (design 5.1/5.2): the claims-table overlap RE-CHECK,
+        # the claim insert, the v0.14 scope/symbol finalization and the
+        # auto-resolution bookkeeping run as ONE unit-of-work on ONE
+        # connection, under a per-repo lock, so the grant is atomic
+        # against concurrent writers. Phase A above (pattern expansion,
+        # git ls-files, LSP, scope/symbol validation) stayed lock-free.
+        # On SQLite ``repo_lock`` is a no-op and ``transaction`` yields a
+        # single connection every nested Database call reuses; the
+        # Postgres backend (P3) makes the lock real. The conflict tail
+        # (auto-promote, the wait-queue long-poll, the 409) runs OUTSIDE
+        # the transaction so slow work never executes under the lock.
+        created: list[str] = []
+        ids: list[tuple[str, str, str, str, str]] = []
+        # Parallel to ids: per-item (cid, item) so post-insert wiring can
+        # find the right ClaimItem for each created row without re-zipping.
+        item_for_cid: dict[str, ClaimItem] = {}
+        async with self.db.transaction() as conn:
+            await self.db.repo_lock(conn, body.repo)
+            active = await self.db.list_active_claims_rows(exclude_engineer=body.engineer)
+            # Repo-scoped check (v0.4.0): see check_conflicts for rationale.
+            active = [r for r in active if r.get("repo") == body.repo]
+            # Session-scoped self-exclusion (v0.5.0): see check_conflicts.
+            if body.session_id:
+                active = [r for r in active if r.get("session_id") != body.session_id]
+            # Coexist self-exclusion (v0.11+): mirror check_conflicts so a
+            # coexist partner adding a NEW claim alongside their existing
+            # one isn't blocked by the partner they were explicitly granted
+            # coexistence with.
+            if body.session_id:
+                own_claims = await self.db.list_active_claims_rows(exclude_engineer=None)
+                own_claims = [
+                    c
+                    for c in own_claims
+                    if c.get("session_id") == body.session_id
+                    and c.get("repo") == body.repo
+                ]
+                partner_ids = _coexist_partner_ids_from_rows(own_claims)
+                if partner_ids:
+                    # v0.35: only blanket-skip FILE-scoped partners. A
+                    # symbol-scoped partner stays in ``active`` so this new
+                    # claim is re-evaluated against its granted symbols via
+                    # the normal symbol-overlap path (409 on collision,
+                    # auto-coexist when disjoint).
+                    skip = _blanket_skip_partner_ids(partner_ids, active)
+                    if skip:
+                        active = [r for r in active if str(r.get("id")) not in skip]
+            for item in body.claims:
+                requester_scope = "symbol" if item.symbols else "file"
+                requester_symbols_by_file: dict[str, list[str]] = (
+                    {item.pattern: list(item.symbols)} if item.symbols else {}
                 )
-                if result.kind is OverlapKind.NO_OVERLAP:
-                    continue
-                if result.kind in (
-                    OverlapKind.AUTO_COEXIST,
-                    OverlapKind.AUTO_NARROW,
-                ):
-                    auto_resolutions.append((item, row, result))
-                    continue
-                # FILE_OVERLAP, SYMBOL_OVERLAP, PARTIAL_GRANT all 409.
-                holder_symbols: list[str] | None = None
-                if row.get("scope_type") == "symbol":
-                    holder_symbol_rows = await self.db.get_claim_symbols(
-                        str(row["id"])
+                for row in active:
+                    result = await check_symbol_overlap(
+                        db=self.db,
+                        holder=row,
+                        requester_pattern=item.pattern,
+                        requester_scope_type=requester_scope,
+                        requester_symbols_by_file=requester_symbols_by_file,
                     )
-                    holder_symbols = sorted(
-                        {s["symbol_name"] for s in holder_symbol_rows}
+                    if result.kind is OverlapKind.NO_OVERLAP:
+                        continue
+                    if result.kind in (
+                        OverlapKind.AUTO_COEXIST,
+                        OverlapKind.AUTO_NARROW,
+                    ):
+                        auto_resolutions.append((item, row, result))
+                        continue
+                    # FILE_OVERLAP, SYMBOL_OVERLAP, PARTIAL_GRANT all 409.
+                    holder_symbols: list[str] | None = None
+                    if row.get("scope_type") == "symbol":
+                        holder_symbol_rows = await self.db.get_claim_symbols(
+                            str(row["id"])
+                        )
+                        holder_symbols = sorted(
+                            {s["symbol_name"] for s in holder_symbol_rows}
+                        )
+                    symbol_overlap_payload: list[ConflictingSymbol] | None = None
+                    if result.kind is OverlapKind.SYMBOL_OVERLAP:
+                        symbol_overlap_payload = [
+                            ConflictingSymbol(file=f, symbols=list(syms))
+                            for f, syms in result.overlapping_symbols
+                        ]
+                    conflicts.append(
+                        ConflictEntry(
+                            your_pattern=item.pattern,
+                            your_symbols=(
+                                list(item.symbols) if item.symbols else None
+                            ),
+                            conflicting_claim=ConflictingClaim(
+                                id=row["id"],
+                                engineer=row["engineer"],
+                                pattern=row["pattern"],
+                                severity=row["severity"],
+                                description=row.get("description"),
+                                expires_at=row["expires_at"],
+                                scope_type=row.get("scope_type"),
+                                symbols=holder_symbols,
+                            ),
+                            overlap=list(result.overlapping_paths),
+                            symbol_overlap=symbol_overlap_payload,
+                        )
                     )
-                symbol_overlap_payload: list[ConflictingSymbol] | None = None
-                if result.kind is OverlapKind.SYMBOL_OVERLAP:
-                    symbol_overlap_payload = [
-                        ConflictingSymbol(file=f, symbols=list(syms))
-                        for f, syms in result.overlapping_symbols
-                    ]
-                conflicts.append(
-                    ConflictEntry(
-                        your_pattern=item.pattern,
-                        your_symbols=(
-                            list(item.symbols) if item.symbols else None
-                        ),
-                        conflicting_claim=ConflictingClaim(
-                            id=row["id"],
-                            engineer=row["engineer"],
-                            pattern=row["pattern"],
-                            severity=row["severity"],
-                            description=row.get("description"),
-                            expires_at=row["expires_at"],
-                            scope_type=row.get("scope_type"),
-                            symbols=holder_symbols,
-                        ),
-                        overlap=list(result.overlapping_paths),
-                        symbol_overlap=symbol_overlap_payload,
+                    await self.db.log_conflict(
+                        claim_id=row["id"],
+                        attempted_by=body.engineer,
+                        attempted_pattern=item.pattern,
+                        resolution=None,
+                        attempted_session_id=body.session_id,
                     )
+                    metrics.claims_conflicts_total.inc()
+
+            if not conflicts:
+                ttl = body.ttl_hours or self.settings.default_ttl_hours
+                for item in body.claims:
+                    cid = str(uuid4())
+                    sev = severity_for_pattern(item.pattern, rules) if rules else "soft"
+                    if item.type == "shared_file":
+                        exp = _expires_at(self.settings.shared_ttl_hours)
+                    else:
+                        exp = _expires_at(ttl)
+                    ids.append((cid, item.type, item.pattern, sev, exp))
+                    item_for_cid[cid] = item
+
+                # v0.30 active-claim cap: enforced here, on the only path in
+                # this method that inserts active claim rows, so that requests
+                # which 409 (or queue with wait_seconds) above are never
+                # blocked by the cap. Drain-time grants re-enter create_claims
+                # and hit this same check, so a queue grant cannot blast
+                # through the cap either -- _drain_queue_for catches the raise
+                # and moves on to the next waiter. The count and the insert run
+                # on the bound grant connection under db.engineer_lock (design
+                # 5.3): a per-engineer guard that is an in-process asyncio.Lock
+                # on SQLite and a per-engineer pg_advisory_xact_lock on Postgres,
+                # so two concurrent requests -- in one process or across three
+                # replicas -- cannot both observe an under-cap count and
+                # overshoot. When the cap is disabled (the default) the insert
+                # skips the guard entirely.
+
+                async def _insert_batch() -> Any:
+                    return await self.db.insert_claims_batch(
+                        engineer=body.engineer,
+                        branch=body.branch,
+                        description=body.description,
+                        items=ids,
+                        repo=body.repo,
+                        session_id=body.session_id,
+                    )
+
+                if self.settings.max_claims_per_engineer > 0:
+                    async with self.db.engineer_lock(conn, body.engineer):
+                        await self._enforce_active_claim_cap(
+                            engineer=body.engineer,
+                            about_to_insert=len(ids),
+                            repo=body.repo,
+                        )
+                        created = await _insert_batch()
+                else:
+                    created = await _insert_batch()
+                # v0.14: post-insert scope_type / narrowable / symbol rows. We
+                # defer this from insert_claims_batch to keep its signature stable
+                # and the migration footprint minimal -- the create_claims handler
+                # owns the symbol contract.
+                await self._finalise_v14_scope(
+                    created=created,
+                    item_for_cid=item_for_cid,
+                    parser_symbols_by_file=parser_symbols_by_file,
+                    lsp_symbols_by_file=lsp_symbols_by_file,
                 )
-                await self.db.log_conflict(
-                    claim_id=row["id"],
-                    attempted_by=body.engineer,
-                    attempted_pattern=item.pattern,
-                    resolution=None,
-                    attempted_session_id=body.session_id,
-                )
-                metrics.claims_conflicts_total.inc()
+
+                # v0.14: persist any auto-resolutions queued during overlap pass.
+                # We look up the requester's claim id by (item.pattern) match
+                # against the just-inserted batch. Each ClaimItem produces exactly
+                # one row in ``ids`` so the pattern is unique within this batch.
+                if auto_resolutions:
+                    cid_by_pattern: dict[str, str] = {
+                        pat: cid for cid, _ctype, pat, _sev, _exp in ids if cid in created
+                    }
+                    for item, holder_row, result in auto_resolutions:
+                        requester_cid = cid_by_pattern.get(item.pattern)
+                        if not requester_cid:
+                            continue
+                        await record_auto_resolution(
+                            db=self.db,
+                            kind=result.kind,
+                            holder_claim_id=str(holder_row["id"]),
+                            requester_claim_id=requester_cid,
+                            overlapping_paths=result.overlapping_paths,
+                            overlapping_symbols=result.overlapping_symbols,
+                            service=self,
+                        )
+
+                # Count one tick per successfully inserted claim. We look back at
+                # the computed severity for each item so the label distribution
+                # mirrors the ownership configuration.
+                for _cid, _ctype, _pattern, sev, _exp in ids:
+                    if _cid in created:
+                        metrics.claims_created_total.inc(severity=sev)
+                # v0.27: emit a single ``claim_granted`` webhook for the whole
+                # batch so external receivers see one event per
+                # ``POST /claims`` call instead of one per claim row. The detail
+                # carries the full list of created ids plus the caller identity
+                # so downstream subscribers can correlate against their own
+                # state without re-querying the API.
+                if created:
+                    await self.fire_webhook(
+                        "claim_granted",
+                        {
+                            "claim_ids": list(created),
+                            "engineer": body.engineer,
+                            "repo": body.repo,
+                            "session_id": body.session_id,
+                        },
+                    )
 
         if conflicts:
             # v0.22 hard auto-promote: when blocked patterns have crossed
@@ -1060,108 +1188,6 @@ class CoordinationService:
                 conflicts=conflicts,
                 warnings=[],
                 options=["wait", "narrow_claim", "escalate", "override"],
-            )
-
-        ttl = body.ttl_hours or self.settings.default_ttl_hours
-        ids: list[tuple[str, str, str, str, str]] = []
-        # Parallel to ids: per-item (cid, item) so post-insert wiring can
-        # find the right ClaimItem for each created row without re-zipping.
-        item_for_cid: dict[str, ClaimItem] = {}
-        for item in body.claims:
-            cid = str(uuid4())
-            sev = severity_for_pattern(item.pattern, rules) if rules else "soft"
-            if item.type == "shared_file":
-                exp = _expires_at(self.settings.shared_ttl_hours)
-            else:
-                exp = _expires_at(ttl)
-            ids.append((cid, item.type, item.pattern, sev, exp))
-            item_for_cid[cid] = item
-
-        # v0.30 active-claim cap: enforced here, on the only path in
-        # this method that inserts active claim rows, so that requests
-        # which 409 (or queue with wait_seconds) above are never
-        # blocked by the cap. Drain-time grants re-enter create_claims
-        # and hit this same check, so a queue grant cannot blast
-        # through the cap either -- _drain_queue_for catches the raise
-        # and moves on to the next waiter. The count and the insert
-        # run under _quota_lock so two concurrent requests cannot both
-        # observe an under-cap count and overshoot; when the cap is
-        # disabled (the default) the insert skips the lock entirely.
-
-        async def _insert_batch() -> Any:
-            return await self.db.insert_claims_batch(
-                engineer=body.engineer,
-                branch=body.branch,
-                description=body.description,
-                items=ids,
-                repo=body.repo,
-                session_id=body.session_id,
-            )
-
-        if self.settings.max_claims_per_engineer > 0:
-            async with self._quota_lock:
-                await self._enforce_active_claim_cap(
-                    engineer=body.engineer,
-                    about_to_insert=len(ids),
-                    repo=body.repo,
-                )
-                created = await _insert_batch()
-        else:
-            created = await _insert_batch()
-        # v0.14: post-insert scope_type / narrowable / symbol rows. We
-        # defer this from insert_claims_batch to keep its signature stable
-        # and the migration footprint minimal -- the create_claims handler
-        # owns the symbol contract.
-        await self._finalise_v14_scope(
-            created=created,
-            item_for_cid=item_for_cid,
-            parser_symbols_by_file=parser_symbols_by_file,
-            lsp_symbols_by_file=lsp_symbols_by_file,
-        )
-
-        # v0.14: persist any auto-resolutions queued during overlap pass.
-        # We look up the requester's claim id by (item.pattern) match
-        # against the just-inserted batch. Each ClaimItem produces exactly
-        # one row in ``ids`` so the pattern is unique within this batch.
-        if auto_resolutions:
-            cid_by_pattern: dict[str, str] = {
-                pat: cid for cid, _ctype, pat, _sev, _exp in ids if cid in created
-            }
-            for item, holder_row, result in auto_resolutions:
-                requester_cid = cid_by_pattern.get(item.pattern)
-                if not requester_cid:
-                    continue
-                await record_auto_resolution(
-                    db=self.db,
-                    kind=result.kind,
-                    holder_claim_id=str(holder_row["id"]),
-                    requester_claim_id=requester_cid,
-                    overlapping_paths=result.overlapping_paths,
-                    overlapping_symbols=result.overlapping_symbols,
-                    service=self,
-                )
-
-        # Count one tick per successfully inserted claim. We look back at
-        # the computed severity for each item so the label distribution
-        # mirrors the ownership configuration.
-        for _cid, _ctype, _pattern, sev, _exp in ids:
-            if _cid in created:
-                metrics.claims_created_total.inc(severity=sev)
-        # v0.27: emit a single ``claim_granted`` webhook for the whole
-        # batch so external receivers see one event per
-        # ``POST /claims`` call instead of one per claim row. The detail
-        # carries the full list of created ids plus the caller identity
-        # so downstream subscribers can correlate against their own
-        # state without re-querying the API.
-        if created:
-            await self.fire_webhook(
-                "claim_granted",
-                {
-                    "claim_ids": list(created),
-                    "engineer": body.engineer,
-                    "repo": body.repo,
-                    "session_id": body.session_id,
-                },
             )
 
         # v0.31 wave 2: background callsite enrichment. For every
@@ -1410,9 +1436,6 @@ class CoordinationService:
         """
         if not created:
             return
-        import aiosqlite  # local import: keep service.py import surface stable
-
-        from coordination.db import _configure_sqlite
 
         # Resolve span sources up front, before the DB connection
         # opens: the LSP roundtrip can take up to the request timeout
@@ -1447,8 +1470,12 @@ class CoordinationService:
                 )
 
         symbol_rows: list[tuple[Any, ...]] = []
-        async with aiosqlite.connect(self.db.path) as conn:
-            await _configure_sqlite(conn)
+        # Routed through the Database transaction seam: when this runs
+        # inside the claim-grant unit-of-work the scope UPDATEs land on
+        # the bound connection and commit with the rest of the grant;
+        # outside one it opens and commits its own connection, identical
+        # to the legacy connection-per-op behaviour.
+        async with self.db._acquire() as (conn, owns):
             for cid in created:
                 item = item_for_cid.get(cid)
                 if item is None:
@@ -1514,7 +1541,8 @@ class CoordinationService:
                                 *span,
                             )
                         )
-            await conn.commit()
+            if owns:
+                await conn.commit()
         if symbol_rows:
             await self.db.insert_claim_symbols(rows=symbol_rows)
 
