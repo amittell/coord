@@ -502,11 +502,14 @@ async def claim_files(
             # repo_queue) and ``retry_after`` is the server's hint, in
             # seconds, for when a retry might succeed.
             payload = r.json()
-            return {
-                "error": payload.get("detail"),
-                "scope": payload.get("scope"),
-                "retry_after": payload.get("retry_after"),
-            }
+            return _with_token_notice(
+                {
+                    "error": payload.get("detail"),
+                    "scope": payload.get("scope"),
+                    "retry_after": payload.get("retry_after"),
+                },
+                r,
+            )
         if r.status_code in (400, 409):
             return _with_token_notice(r.json(), r)
         r.raise_for_status()
@@ -589,11 +592,14 @@ async def claim_refactor(
             return {"error": payload.get("detail"), "status": 503}
         if r.status_code == 429:
             payload = r.json()
-            return {
-                "error": payload.get("detail"),
-                "scope": payload.get("scope"),
-                "retry_after": payload.get("retry_after"),
-            }
+            return _with_token_notice(
+                {
+                    "error": payload.get("detail"),
+                    "scope": payload.get("scope"),
+                    "retry_after": payload.get("retry_after"),
+                },
+                r,
+            )
         if r.status_code in (400, 409):
             return _with_token_notice(r.json(), r)
         r.raise_for_status()

@@ -892,10 +892,14 @@ async def test_deprecation_header_sanitizes_engineer(client: AsyncClient) -> Non
     # Engineer ids are stored verbatim, so a CR/LF in the name must not break
     # the X-Coord-Token-Warning header or inject a second header (Copilot
     # review, PR #62).
-    raw = await _mint(None, engineer="dana\r\nX-Injected: pwned")
+    # Includes CR/LF (header injection) and a non-ASCII char (Starlette
+    # encodes header values as latin-1, so a Unicode id would 500).
+    raw = await _mint(None, engineer="dana\r\nX-Injected: pwned☃")
     r = await client.get("/claims", headers=_auth(raw))
     assert r.status_code == 200, r.text
     warning = r.headers.get("X-Coord-Token-Warning")
     assert warning is not None
     assert "\r" not in warning and "\n" not in warning, repr(warning)
     assert "X-Injected" not in r.headers  # no header injection
+    assert "☃" not in warning  # non-ASCII stripped
+    warning.encode("ascii")  # must be pure ASCII (latin-1 header-safe)

@@ -2519,3 +2519,26 @@ async def test_claim_files_surfaces_token_notice(
     _install_mock_transport(monkeypatch, handler)
     result = await mcp_server.claim_files(engineer="dana", patterns=["src/a.py"])
     assert result["coord_notice"] == "unscoped token deprecated"
+
+
+@pytest.mark.asyncio
+async def test_claim_files_429_surfaces_token_notice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A rate-limited (429) claim still surfaces the unscoped-token nudge, so an
+    # agent hitting the cap does not miss it (Copilot review round 2, PR #62).
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "tok")
+    monkeypatch.delenv("COORD_REPO_ID", raising=False)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            json={"detail": "rate limited", "scope": "claims", "retry_after": 5},
+            headers={"X-Coord-Token-Warning": "unscoped token deprecated"},
+        )
+
+    _install_mock_transport(monkeypatch, handler)
+    result = await mcp_server.claim_files(engineer="dana", patterns=["src/a.py"])
+    assert result["error"] == "rate limited"
+    assert result["coord_notice"] == "unscoped token deprecated"

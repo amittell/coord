@@ -212,11 +212,12 @@ def _unscoped_token_warning(engineer: str | None) -> str:
     wrapper surfaces it to the agent as ``coord_notice`` and ``coord
     status`` prints it, so the same message reaches humans and agents."""
     # Engineer ids are stored verbatim from ``coord tokens create``, so
-    # sanitize before interpolating into an HTTP header value: drop any
-    # non-printable char (CR/LF/tab/controls) that would make the header
-    # invalid or enable header injection. Falls back to a placeholder if
-    # nothing printable survives.
-    who = "".join(ch for ch in (engineer or "") if ch.isprintable()).strip()
+    # sanitize before interpolating into an HTTP header value. Restrict to
+    # visible ASCII (0x20-0x7E): that drops CR/LF/tab/controls (header
+    # injection / invalid header) AND non-ASCII (Starlette encodes header
+    # values as latin-1, so a Unicode id would raise UnicodeEncodeError).
+    # Falls back to a placeholder if nothing usable survives.
+    who = "".join(ch for ch in (engineer or "") if 0x20 <= ord(ch) <= 0x7E).strip()
     who = who or "<engineer>"
     return (
         "Your coord token is not bound to a repo. On a shared multi-repo coord "
