@@ -886,3 +886,16 @@ async def test_deprecation_header_silenced_by_flag(
     r = await client_no_warn.get("/claims", headers=_auth(raw))
     assert r.status_code == 200, r.text
     assert "X-Coord-Token-Warning" not in r.headers
+
+
+async def test_deprecation_header_sanitizes_engineer(client: AsyncClient) -> None:
+    # Engineer ids are stored verbatim, so a CR/LF in the name must not break
+    # the X-Coord-Token-Warning header or inject a second header (Copilot
+    # review, PR #62).
+    raw = await _mint(None, engineer="dana\r\nX-Injected: pwned")
+    r = await client.get("/claims", headers=_auth(raw))
+    assert r.status_code == 200, r.text
+    warning = r.headers.get("X-Coord-Token-Warning")
+    assert warning is not None
+    assert "\r" not in warning and "\n" not in warning, repr(warning)
+    assert "X-Injected" not in r.headers  # no header injection

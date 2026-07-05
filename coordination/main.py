@@ -211,7 +211,13 @@ def _unscoped_token_warning(engineer: str | None) -> str:
     is wrong, why it matters, and the exact command to switch. The MCP
     wrapper surfaces it to the agent as ``coord_notice`` and ``coord
     status`` prints it, so the same message reaches humans and agents."""
-    who = engineer or "<engineer>"
+    # Engineer ids are stored verbatim from ``coord tokens create``, so
+    # sanitize before interpolating into an HTTP header value: drop any
+    # non-printable char (CR/LF/tab/controls) that would make the header
+    # invalid or enable header injection. Falls back to a placeholder if
+    # nothing printable survives.
+    who = "".join(ch for ch in (engineer or "") if ch.isprintable()).strip()
+    who = who or "<engineer>"
     return (
         "Your coord token is not bound to a repo. On a shared multi-repo coord "
         "service an unscoped per-engineer token sees and can affect EVERY "
