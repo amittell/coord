@@ -7,7 +7,9 @@ import html as html_mod
 import json
 import logging
 import os
+import re
 import secrets
+import shlex
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -205,6 +207,60 @@ async def _request_id_middleware(request: Request, call_next):
     return response
 
 
+def _unscoped_token_warning(engineer: str | None) -> str:
+    """Compose the v0.43 soft-deprecation notice for an unscoped
+    per-engineer token. One ASCII line (it rides in an HTTP header): what
+    is wrong, why it matters, and the exact command to switch. The MCP
+    wrapper surfaces it to the agent as ``coord_notice`` and ``coord
+    status`` prints it, so the same message reaches humans and agents."""
+    # Engineer ids are stored verbatim from ``coord tokens create``, so
+    # sanitize before interpolating into an HTTP header value. Restrict to
+    # visible ASCII (0x20-0x7E): that drops CR/LF/tab/controls (header
+    # injection / invalid header) AND non-ASCII (Starlette encodes header
+    # values as latin-1, so a Unicode id would raise UnicodeEncodeError).
+    # Falls back to a placeholder if nothing usable survives, and is capped
+    # so an oversized id cannot bloat the header past receiver size limits.
+    sanitized = "".join(
+        ch for ch in (engineer or "") if 0x20 <= ord(ch) <= 0x7E
+    ).strip()[:64]
+    # Whether sanitization/truncation changed the id: if so the previewed
+    # command would mint under a different identity, so we warn the operator
+    # to copy the exact id rather than trust the preview.
+    altered = bool(engineer) and sanitized != engineer
+    who = sanitized or "<engineer>"
+    # The message embeds a copy/pasteable `coord tokens create <who>` command,
+    # so shell-quote an id that is not a plain, safe token -- otherwise a shell
+    # metacharacter (`;` `` ` `` `$` `|` space ...) could turn a pasted command
+    # into something unsafe. Common ids (alnum plus / - _ . @) stay unquoted so
+    # the docs/tests read naturally.
+    # A leading '-' makes argparse read the id as an option rather than the
+    # positional ``engineer``, so put --repo first and use ``--`` to force the
+    # id to be parsed as an argument. Detected before shell-quoting (quoting
+    # doesn't change how argparse sees the token once the shell strips quotes).
+    starts_dash = who.startswith("-")
+    if not re.fullmatch(r"[A-Za-z0-9._/@-]+", who):
+        who = shlex.quote(who)
+    cmd = (
+        f"coord tokens create --repo <owner/name> -- {who}"
+        if starts_dash
+        else f"coord tokens create {who} --repo <owner/name>"
+    )
+    caveat = (
+        " (the id above was sanitized/truncated for this header -- copy the exact "
+        "engineer id from `coord tokens list`.)"
+        if altered
+        else ""
+    )
+    return (
+        "Your coord token is not bound to a repo. On a shared multi-repo coord "
+        "service an unscoped per-engineer token sees and can affect EVERY "
+        "repo's claims, which is deprecated. Ask an operator for a repo-scoped "
+        f"token and switch: `{cmd}`, "
+        "then set it in .coordination/local.env. See the 'Repo-scoped tokens' "
+        f"section of AGENTS.md / docs/deployment.md. Honored for now.{caveat}"
+    )
+
+
 @app.middleware("http")
 async def _count_http_requests(request: Request, call_next):
     """Increment ``http_requests_total`` after each response. Uses the
@@ -219,6 +275,18 @@ async def _count_http_requests(request: Request, call_next):
     _scope = getattr(request.state, "token_repo", None)
     if _scope is not None:
         response.headers["X-Coord-Repo-Scope"] = _scope
+    elif (
+        get_settings().warn_unscoped_token
+        and getattr(request.state, "auth_kind", None) == "per_engineer"
+    ):
+        # v0.43: soft-deprecate unscoped per-engineer tokens -- honor the
+        # request but nudge toward a repo-bound token. The shared operator
+        # token (auth_kind != per_engineer) is exempt; when
+        # require_scoped_token is set the unscoped token 401s before here so
+        # this never double-signals.
+        response.headers["X-Coord-Token-Warning"] = _unscoped_token_warning(
+            getattr(request.state, "engineer", None)
+        )
     route = request.scope.get("route")
     path_label = getattr(route, "path", None) or request.url.path
     metrics.http_requests_total.inc(

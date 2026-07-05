@@ -139,6 +139,16 @@ class Settings(BaseSettings):
     # cross-repo escape hatch (keep one, or an operator loses all-repo access).
     # Default False so existing deployments are unaffected on upgrade.
     require_scoped_token: bool = False
+    # ``warn_unscoped_token`` (v0.43): the middle-ground nudge before
+    # ``require_scoped_token`` is turned on. When True, a request made with
+    # an UNSCOPED per-engineer token (repo IS NULL) is still honored, but the
+    # response carries an ``X-Coord-Token-Warning`` header telling the agent
+    # its token is not repo-bound and how to switch. The MCP wrapper surfaces
+    # it as a ``coord_notice`` in the tool result and ``coord status`` prints
+    # it. The shared operator token is exempt (it is unscoped by design), and
+    # the header is never emitted once ``require_scoped_token`` hard-blocks
+    # unscoped tokens. Set False to silence the nudge.
+    warn_unscoped_token: bool = True
     # v0.29 dashboard cookie session.
     # an HTTP-only cookie with the engineer's bearer token so the
     # browser doesn't have to keep retyping it. Lifetime is bounded

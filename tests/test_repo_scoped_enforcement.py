@@ -818,3 +818,152 @@ async def test_active_claim_cap_is_per_repo(client_capped: AsyncClient) -> None:
         },
     )
     assert r2.status_code == 429, r2.text
+
+
+# ---------------------------------------------------------------------------
+# v0.43 soft-deprecation warning for unscoped per-engineer tokens
+# ---------------------------------------------------------------------------
+
+
+async def test_unscoped_per_engineer_token_gets_deprecation_header(
+    client: AsyncClient,
+) -> None:
+    raw = await _mint(None, engineer="dana")  # unscoped per-engineer token
+    r = await client.get("/claims", headers=_auth(raw))
+    assert r.status_code == 200, r.text
+    warning = r.headers.get("X-Coord-Token-Warning")
+    assert warning is not None, r.headers
+    assert "coord tokens create dana --repo" in warning
+    assert "AGENTS.md" in warning
+
+
+async def test_scoped_token_no_deprecation_header(client: AsyncClient) -> None:
+    raw = await _mint(REPO_A)
+    r = await client.get("/claims", headers=_auth(raw))
+    assert r.status_code == 200, r.text
+    assert "X-Coord-Token-Warning" not in r.headers
+    # scoped tokens advertise their scope instead
+    assert r.headers.get("X-Coord-Repo-Scope") == REPO_A
+
+
+async def test_shared_operator_token_no_deprecation_header(
+    client: AsyncClient,
+) -> None:
+    # The shared operator token is unscoped by design -- it is the escape
+    # hatch, not a deprecated per-engineer token, so it is never warned.
+    r = await client.get(
+        "/claims", headers={"Authorization": f"Bearer {SHARED}"}
+    )
+    assert r.status_code == 200, r.text
+    assert "X-Coord-Token-Warning" not in r.headers
+
+
+@pytest.fixture()
+async def client_no_warn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncClient:
+    db_path = tmp_path / "db.sqlite"
+    monkeypatch.setenv("COORD_AUTH_TOKEN", SHARED)
+    monkeypatch.setenv("COORD_DATABASE_PATH", str(db_path))
+    monkeypatch.setenv("COORD_DISABLE_BACKGROUND_CLEANUP", "1")
+    monkeypatch.setenv("COORD_DISABLE_INSTANCE_LOCK", "1")
+    monkeypatch.delenv("COORD_REPO_ROOT", raising=False)
+    monkeypatch.setenv("COORD_WARN_UNSCOPED_TOKEN", "false")
+
+    from coordination import deps
+
+    deps.get_service.cache_clear()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
+    deps.get_service.cache_clear()
+
+
+async def test_deprecation_header_silenced_by_flag(
+    client_no_warn: AsyncClient,
+) -> None:
+    raw = await _mint(None, engineer="dana")
+    r = await client_no_warn.get("/claims", headers=_auth(raw))
+    assert r.status_code == 200, r.text
+    assert "X-Coord-Token-Warning" not in r.headers
+
+
+async def test_deprecation_header_sanitizes_engineer(client: AsyncClient) -> None:
+    # Engineer ids are stored verbatim, so a CR/LF in the name must not break
+    # the X-Coord-Token-Warning header or inject a second header (Copilot
+    # review, PR #62).
+    # Includes CR/LF (header injection) and a non-ASCII char (Starlette
+    # encodes header values as latin-1, so a Unicode id would 500).
+    raw = await _mint(None, engineer="dana\r\nX-Injected: pwned☃")
+    r = await client.get("/claims", headers=_auth(raw))
+    assert r.status_code == 200, r.text
+    warning = r.headers.get("X-Coord-Token-Warning")
+    assert warning is not None
+    assert "\r" not in warning and "\n" not in warning, repr(warning)
+    assert "X-Injected" not in r.headers  # no header injection
+    assert "☃" not in warning  # non-ASCII stripped
+    warning.encode("ascii")  # must be pure ASCII (latin-1 header-safe)
+
+
+async def test_deprecation_header_caps_engineer_length(client: AsyncClient) -> None:
+    # An oversized engineer id must not bloat the header past receiver limits
+    # (Copilot review round 3, PR #62). "Z" is absent from the fixed template,
+    # so its count in the warning is exactly the cap.
+    raw = await _mint(None, engineer="Z" * 500)
+    r = await client.get("/claims", headers=_auth(raw))
+    assert r.status_code == 200, r.text
+    warning = r.headers["X-Coord-Token-Warning"]
+    assert warning.count("Z") == 64, warning.count("Z")
+
+
+async def test_deprecation_header_shell_quotes_unsafe_engineer(
+    client: AsyncClient,
+) -> None:
+    # The header embeds a copy/pasteable `coord tokens create <id>` command, so
+    # an id with shell metacharacters must be shell-quoted (Copilot review
+    # round 4, PR #62) -- a human pasting the command can't run the `; rm`.
+    raw = await _mint(None, engineer="foo; rm -rf ~")
+    r = await client.get("/claims", headers=_auth(raw))
+    assert r.status_code == 200, r.text
+    warning = r.headers["X-Coord-Token-Warning"]
+    assert "create 'foo; rm -rf ~' --repo" in warning, warning
+
+
+async def test_deprecation_header_plain_engineer_unquoted(
+    client: AsyncClient,
+) -> None:
+    # A normal id stays unquoted so the command reads naturally.
+    raw = await _mint(None, engineer="alex/claude/main")
+    r = await client.get("/claims", headers=_auth(raw))
+    assert r.status_code == 200, r.text
+    warning = r.headers["X-Coord-Token-Warning"]
+    assert "create alex/claude/main --repo" in warning, warning
+
+
+async def test_deprecation_header_notes_when_id_altered(client: AsyncClient) -> None:
+    # When the id is sanitized/truncated, the header tells the operator to copy
+    # the exact id from `coord tokens list` (Copilot review round 5, PR #62).
+    raw = await _mint(None, engineer="Z" * 500)
+    r = await client.get("/claims", headers=_auth(raw))
+    assert r.status_code == 200, r.text
+    assert "coord tokens list" in r.headers["X-Coord-Token-Warning"]
+
+
+async def test_deprecation_header_no_note_for_clean_id(client: AsyncClient) -> None:
+    raw = await _mint(None, engineer="alex/claude/main")
+    r = await client.get("/claims", headers=_auth(raw))
+    assert r.status_code == 200, r.text
+    assert "coord tokens list" not in r.headers["X-Coord-Token-Warning"]
+
+
+async def test_deprecation_header_handles_leading_dash_engineer(
+    client: AsyncClient,
+) -> None:
+    # An engineer id starting with '-' would be read by argparse as an option,
+    # so the suggested command puts --repo first and uses `--` (Copilot review
+    # round 6, PR #62).
+    raw = await _mint(None, engineer="-foo")
+    r = await client.get("/claims", headers=_auth(raw))
+    assert r.status_code == 200, r.text
+    warning = r.headers["X-Coord-Token-Warning"]
+    assert "coord tokens create --repo <owner/name> -- -foo" in warning, warning

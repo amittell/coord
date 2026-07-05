@@ -275,6 +275,22 @@ with `COORD_REQUIRE_PER_ENGINEER_TOKEN=true` (which disables the shared token)
 locks out every unscoped credential and therefore all cross-repo / operator
 access -- only enable both together once you have a dedicated operator path.
 
+### Middle ground: warn before you enforce (v0.43+)
+
+Flipping `COORD_REQUIRE_SCOPED_TOKEN=true` is a hard cutover -- every unscoped
+per-engineer token starts getting 401s. `COORD_WARN_UNSCOPED_TOKEN=true` (the
+default) is the soft step before that: an unscoped per-engineer token is still
+**honored**, but every response carries an `X-Coord-Token-Warning` header telling
+the caller its token is not repo-bound and how to switch. The MCP wrapper surfaces
+it to the agent as a `coord_notice` field in `list_claims` / `check_conflicts` /
+`claim_files` results, and `coord status` prints a `Token warning:` line, so both
+agents and humans see the nudge. The shared operator token is exempt (it is
+unscoped by design). Set `COORD_WARN_UNSCOPED_TOKEN=false` to silence it.
+
+Typical rollout: ship with the warning on, let agents rotate to scoped tokens as
+they notice the notice, then flip `COORD_REQUIRE_SCOPED_TOKEN=true` once the fleet
+is clean.
+
 ### Rollout safety: drain legacy NULL-repo claims first
 
 Conflict detection isolates the `NULL`-repo bucket from repo-tagged claims

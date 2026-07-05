@@ -9,6 +9,33 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.43.0] - 2026-07-04
+
+### Added
+
+- Soft-deprecation nudge for unscoped per-engineer tokens -- the middle ground
+  before `COORD_REQUIRE_SCOPED_TOKEN`. With `COORD_WARN_UNSCOPED_TOKEN=true`
+  (default), a request made with an unscoped per-engineer token is still
+  **honored**, but the response carries an `X-Coord-Token-Warning` header
+  explaining the token is not repo-bound and how to switch
+  (`coord tokens create <engineer> --repo <owner/name>`). The MCP wrapper
+  surfaces it to the agent as a `coord_notice` field in `list_claims` /
+  `check_conflicts` / `claim_files` results, and `coord status` prints a
+  `Token warning:` line, so both agents and humans see the nudge. The shared
+  operator token is exempt (unscoped by design), and the header is never emitted
+  once `COORD_REQUIRE_SCOPED_TOKEN` hard-blocks unscoped tokens. Set
+  `COORD_WARN_UNSCOPED_TOKEN=false` to silence.
+
+### Documentation
+
+- Agent-facing "Repo-scoped tokens" section added to the generated `AGENTS.md` /
+  `CLAUDE.md` coordination snippets, so agents learn to use a scoped token and
+  how to switch off a deprecated unscoped one. README gains a repo-scoped-tokens
+  subsection and env rows for `COORD_WARN_UNSCOPED_TOKEN` /
+  `COORD_REQUIRE_SCOPED_TOKEN` / `COORD_OIDC_REPO_CLAIM`; `.env.example`
+  documents the repo-scoping vars; `deployment.md` gains a "warn before you
+  enforce" rollout step.
+
 ## [0.42.0] - 2026-07-02
 
 ### Added

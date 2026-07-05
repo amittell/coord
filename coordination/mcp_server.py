@@ -171,6 +171,18 @@ _MARKER_LOCK_POLL_SECONDS = 0.05
 _MARKER_LOCK_STALE_SECONDS = 30.0
 
 
+def _with_token_notice(result: Any, response: httpx.Response) -> Any:
+    """Surface the server's ``X-Coord-Token-Warning`` header (v0.43) into a
+    tool result so the agent actually sees the unscoped-token deprecation
+    nudge -- a response header alone never reaches the model. No-op when the
+    header is absent, when the result is not a dict, or when a ``coord_notice``
+    is already present."""
+    warning = response.headers.get("x-coord-token-warning")
+    if warning and isinstance(result, dict) and "coord_notice" not in result:
+        result["coord_notice"] = warning
+    return result
+
+
 @mcp.tool()
 async def list_claims(
     active_only: bool = True,
@@ -209,7 +221,7 @@ async def list_claims(
             f"{_base_url()}/claims", params=params, headers=_headers(engineer)
         )
         r.raise_for_status()
-        return r.json()
+        return _with_token_notice(r.json(), r)
 
 
 @mcp.tool()
@@ -250,7 +262,7 @@ async def check_conflicts(
             f"{_base_url()}/conflicts", params=params, headers=_headers(engineer)
         )
         r.raise_for_status()
-        return r.json()
+        return _with_token_notice(r.json(), r)
 
 
 def _validate_symbols_locally(
@@ -490,15 +502,18 @@ async def claim_files(
             # repo_queue) and ``retry_after`` is the server's hint, in
             # seconds, for when a retry might succeed.
             payload = r.json()
-            return {
-                "error": payload.get("detail"),
-                "scope": payload.get("scope"),
-                "retry_after": payload.get("retry_after"),
-            }
+            return _with_token_notice(
+                {
+                    "error": payload.get("detail"),
+                    "scope": payload.get("scope"),
+                    "retry_after": payload.get("retry_after"),
+                },
+                r,
+            )
         if r.status_code in (400, 409):
-            return r.json()
+            return _with_token_notice(r.json(), r)
         r.raise_for_status()
-        return r.json()
+        return _with_token_notice(r.json(), r)
 
 
 @mcp.tool()
@@ -577,15 +592,18 @@ async def claim_refactor(
             return {"error": payload.get("detail"), "status": 503}
         if r.status_code == 429:
             payload = r.json()
-            return {
-                "error": payload.get("detail"),
-                "scope": payload.get("scope"),
-                "retry_after": payload.get("retry_after"),
-            }
+            return _with_token_notice(
+                {
+                    "error": payload.get("detail"),
+                    "scope": payload.get("scope"),
+                    "retry_after": payload.get("retry_after"),
+                },
+                r,
+            )
         if r.status_code in (400, 409):
-            return r.json()
+            return _with_token_notice(r.json(), r)
         r.raise_for_status()
-        return r.json()
+        return _with_token_notice(r.json(), r)
 
 
 @mcp.tool()

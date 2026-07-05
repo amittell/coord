@@ -404,6 +404,7 @@ def run_status(_args) -> int:
     if scope:
         count_params["repo"] = scope
     claim_count: int | str = "?"
+    token_warning: str | None = None
     try:
         c = httpx.get(
             f"{ctx.service_url}/claims",
@@ -411,6 +412,10 @@ def run_status(_args) -> int:
             headers=_auth_headers(ctx),
             timeout=3.0,
         )
+        # v0.43: the server flags an unscoped per-engineer token here so the
+        # human running `coord status` sees the same deprecation nudge the
+        # agent gets as a coord_notice.
+        token_warning = c.headers.get("x-coord-token-warning")
         if c.status_code == 200:
             data = c.json()
             claim_count = int(data.get("count", len(data.get("claims", []))))
@@ -436,6 +441,8 @@ def run_status(_args) -> int:
     print(f"Repo scope: {scope_label}")
     print(f"Symbol validation: {symbol_label} (server COORD_REPO_ROOT)")
     print(f"Active claims: {claim_count}")
+    if token_warning:
+        print(f"Token warning: {token_warning}")
     return 0 if ready_state == "ready" else 1
 
 

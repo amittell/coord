@@ -575,6 +575,7 @@ def _status_handler_factory(
     ready_ok: bool = True,
     meta_ok: bool = True,
     claims_count: int = 3,
+    token_warning: str | None = None,
 ):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
@@ -616,6 +617,8 @@ def _status_handler_factory(
                 body = json.dumps({"claims": claims, "count": len(claims)}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
+                if token_warning is not None:
+                    self.send_header("X-Coord-Token-Warning", token_warning)
                 self.end_headers()
                 self.wfile.write(body)
                 return
@@ -1109,3 +1112,36 @@ def test_release_requires_engineer_flag_when_no_config(
     monkeypatch.delenv("COORD_AUTH_TOKEN", raising=False)
     exit_code = cli.main(["release", "abc"])
     assert exit_code == 1
+
+
+def test_status_prints_token_warning_when_unscoped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # v0.43: when the server flags an unscoped per-engineer token via the
+    # X-Coord-Token-Warning header, `coord status` surfaces it to the human.
+    warning = "Your coord token is not bound to a repo. Switch to a scoped token."
+    with _MockServer(
+        _status_handler_factory(claims_count=1, token_warning=warning)
+    ) as mock:
+        _init_repo_with_service(tmp_path, monkeypatch, mock.port)
+        capsys.readouterr()
+        exit_code = cli.main(["status"])
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "Token warning:" in out
+    assert warning in out
+
+
+def test_status_no_token_warning_when_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with _MockServer(_status_handler_factory(claims_count=1)) as mock:
+        _init_repo_with_service(tmp_path, monkeypatch, mock.port)
+        capsys.readouterr()
+        exit_code = cli.main(["status"])
+    assert exit_code == 0
+    assert "Token warning:" not in capsys.readouterr().out
