@@ -128,8 +128,11 @@ async def test_require_per_engineer_token_rejects_shared(
             "/claims", headers={"Authorization": "Bearer shared-test-token"}
         )
         assert shared.status_code == 401
-        assert "Per-engineer token required" in shared.json()["detail"]
-        assert "coord tokens create" in shared.json()["detail"]
+        detail = shared.json()["detail"]
+        assert "Per-engineer token required" in detail
+        assert "coord tokens create \"<engineer>\" --repo <owner/name>" in detail
+        assert "coord server/service" in detail
+        assert "local SQLite token" in detail
 
         # Per-engineer token: still 200.
         per = await ac.get(

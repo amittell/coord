@@ -658,8 +658,13 @@ async def _authenticate_bearer(
             detail=(
                 "Per-engineer token required "
                 "(COORD_REQUIRE_PER_ENGINEER_TOKEN=true). "
-                "Run 'coord tokens create <engineer>' on the server "
-                "and paste the new token into .coordination/local.env."
+                "Run token creation on the coord server/service, e.g. "
+                "'kubectl -n coord exec deploy/coord -- coord tokens create "
+                "\"<engineer>\" --repo <owner/name>', then paste the new "
+                "token into .coordination/local.env. In remote-mode repos, "
+                "do not run 'coord tokens create' from the application "
+                "checkout; that creates a local SQLite token the remote "
+                "service will not know."
             ),
         )
 

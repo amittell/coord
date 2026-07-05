@@ -11,7 +11,7 @@ managing those tokens from the command line.
 Subcommands:
 
 * ``coord tokens create <engineer> [--description "..."]
-  [--expires-in 30d]``
+  [--expires-in 30d] [--repo owner/name] [--local-db]``
   Mint a fresh ``coordt_`` + 64-hex token, hash it with sha256, and
   insert the hash into ``engineer_tokens``. The raw token is printed
   exactly once -- there is no way to recover it later. The operator
@@ -52,12 +52,18 @@ import argparse
 import asyncio
 from datetime import UTC, datetime
 import json
+import os
 import sys
 from pathlib import Path
 
-from coordination.cli_shared import parse_duration
+from coordination.cli_shared import (
+    find_repo_root,
+    format_repo_scoped_token_create_command,
+    parse_duration,
+)
 from coordination.config import get_settings
 from coordination.db import Database
+from coordination.repo_config import RepoConfig
 from coordination.repo_id import InvalidRepoId, normalize_repo_id
 
 # Generation, hashing, and status derivation moved to
@@ -75,8 +81,85 @@ from coordination.tokens import (
 __all__ = ["TOKEN_PREFIX", "add_tokens_subparser", "run_tokens"]
 
 
-def _db_path() -> Path:
-    return Path(get_settings().database_path)
+def _db_path(args: argparse.Namespace | None = None) -> Path:
+    override = getattr(args, "database_path", None) if args is not None else None
+    return Path(override) if override else Path(get_settings().database_path)
+
+
+def _display_db_path(path: Path) -> Path:
+    return path if path.is_absolute() else (Path.cwd() / path).resolve()
+
+
+def _load_remote_mode_context() -> tuple[Path, RepoConfig] | None:
+    repo_root = find_repo_root()
+    if repo_root is None:
+        return None
+    config_path = repo_root / ".coordination" / "config.toml"
+    if not config_path.exists():
+        return None
+    try:
+        config = RepoConfig.load(config_path)
+    except Exception:  # noqa: BLE001 - token ops should not die on bad repo config
+        return None
+    if config.mode != "remote":
+        return None
+    return repo_root, config
+
+
+def _local_db_is_explicit(args: argparse.Namespace) -> bool:
+    return bool(
+        getattr(args, "local_db", False)
+        or getattr(args, "database_path", None)
+        or os.environ.get("COORD_DATABASE_PATH")
+    )
+
+
+def _remote_server_create_example(engineer: str, config: RepoConfig) -> str:
+    cmd = format_repo_scoped_token_create_command(engineer, config.repo_id)
+    return f"kubectl -n coord exec deploy/coord -- {cmd}"
+
+
+def _refuse_implicit_remote_mode_local_create(args: argparse.Namespace) -> bool:
+    """Return True when ``tokens create`` should be blocked.
+
+    In a remote-mode application repo, ``coord tokens create`` can only write a
+    local SQLite database. That is useful for an operator intentionally
+    pointing at a server-side DB, but disastrous when someone thinks the remote
+    service just minted a token. Require an explicit local-DB signal in that
+    context.
+    """
+    if _local_db_is_explicit(args):
+        return False
+    context = _load_remote_mode_context()
+    if context is None:
+        return False
+    repo_root, config = context
+    db_path = _display_db_path(_db_path(args))
+    env_path = repo_root / config.local_env_file
+    print(
+        "Refusing to create a local SQLite token from a remote-mode repo.",
+        file=sys.stderr,
+    )
+    print(
+        f"This command would write to {db_path}, but {config.service_url} "
+        "will not know that token.",
+        file=sys.stderr,
+    )
+    print(
+        "Create the token on the coord server/service instead, for example:",
+        file=sys.stderr,
+    )
+    print(f"  {_remote_server_create_example(args.engineer, config)}", file=sys.stderr)
+    print(
+        f"Then paste the token into {env_path} as COORD_AUTH_TOKEN=...",
+        file=sys.stderr,
+    )
+    print(
+        "Pass --local-db, --database-path, or COORD_DATABASE_PATH only when "
+        "you intentionally want a local-only SQLite token.",
+        file=sys.stderr,
+    )
+    return True
 
 
 def _iso_z(dt: datetime) -> str:
@@ -104,7 +187,9 @@ async def _create(args: argparse.Namespace) -> int:
     except InvalidRepoId as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    db = Database(_db_path())
+    if _refuse_implicit_remote_mode_local_create(args):
+        return 1
+    db = Database(_db_path(args))
     raw = generate_raw_token()
     token_id = await db.create_engineer_token(
         args.engineer,
@@ -348,6 +433,22 @@ def add_tokens_subparser(sub: argparse._SubParsersAction) -> None:
             "Bind the token to a repo id (e.g. amittell/coord) so the server "
             "enforces repo scope from auth. Omit for an unscoped (operator) "
             "token that sees all repos"
+        ),
+    )
+    create.add_argument(
+        "--database-path",
+        metavar="PATH",
+        help=(
+            "Explicit SQLite database path to write. Implies an intentional "
+            "local DB operation when run from a remote-mode repo"
+        ),
+    )
+    create.add_argument(
+        "--local-db",
+        action="store_true",
+        help=(
+            "Allow local SQLite token creation even when the current repo is "
+            "configured for a remote coord service"
         ),
     )
     create.add_argument(

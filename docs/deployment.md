@@ -133,11 +133,14 @@ Because claims are short-lived (TTL in hours), most teams do not need historical
 
 ### Per-engineer tokens (v0.29+)
 
-Day-to-day agent traffic should run on per-engineer bearer tokens rather than the shared `COORD_AUTH_TOKEN`. Mint and manage them with the `coord tokens` CLI on the server (or inside the pod):
+Day-to-day agent traffic should run on per-engineer bearer tokens rather than the shared `COORD_AUTH_TOKEN`. Mint and manage them with the `coord tokens` CLI on the server (or inside the pod), not from an application repo checkout that is configured for `mode = "remote"`:
 
 ```bash
-# Mint, optionally with an expiry (v0.29.4+)
-coord tokens create alex/claude/myrepo --description "laptop" --expires-in 90d
+# Mint, optionally scoped to one repo and with an expiry (v0.29.4+)
+coord tokens create alex/claude/myrepo --repo amittell/requesthub --description "laptop" --expires-in 90d
+
+# Kubernetes example: run the CLI against the service's database
+kubectl -n coord exec deploy/coord -- coord tokens create alex/claude/myrepo --repo amittell/requesthub
 
 # Inspect: status, expiry, request count, last source IP
 coord tokens list
@@ -146,7 +149,7 @@ coord tokens list
 coord tokens revoke <token-id>
 ```
 
-The raw token is printed exactly once at creation; only its sha256 lands in the database. Tokens created without `--expires-in` never expire (matching pre-v0.29.4 behavior).
+The raw token is printed exactly once at creation; only its sha256 lands in the database. Tokens created without `--expires-in` never expire (matching pre-v0.29.4 behavior). In a remote-mode repo, `coord tokens create` refuses the default local SQLite write unless you pass `--local-db`, `--database-path`, or `COORD_DATABASE_PATH`; that opt-in is for operators intentionally writing a server-side/local database, not for normal remote token creation.
 
 From v0.29.5 the same lifecycle is available in the dashboard: engineers logged in with a per-engineer token manage their own tokens (list, revoke, create with a capped expiry), and a shared-token session gets the operator view over all tokens.
 
@@ -247,6 +250,10 @@ coord tokens list                                      # 'repo' column; 'all' = 
 Drop the scoped token into that repo's gitignored `.coordination/local.env` as
 `COORD_AUTH_TOKEN=...`. Rotation (`coord tokens rotate`) carries the repo
 forward, so a rotated scoped token stays scoped.
+
+In remote mode, create scoped tokens on the coord server/service. Running
+`coord tokens create` from the application checkout would only write a local
+SQLite DB that the remote service does not read.
 
 ### Operators and the dashboard
 

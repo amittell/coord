@@ -27,6 +27,20 @@ Fix:
 curl -H "Authorization: Bearer $COORD_AUTH_TOKEN" http://127.0.0.1:8080/claims
 ```
 
+If this is a remote coord service and you recently ran `coord tokens create`
+from the application repo checkout, that token may exist only in
+`data/coordination.db` on your machine. The remote service has never seen it.
+Create the token on the server/service instead, preferably repo-scoped:
+
+```bash
+kubectl -n coord exec deploy/coord -- coord tokens create "<engineer>" --repo owner/name
+```
+
+Then paste the raw token into that repo's `.coordination/local.env` as
+`COORD_AUTH_TOKEN=...`. `coord doctor` warns when a remote-mode repo contains
+`data/coordination.db`, because that is the usual footprint of local-only
+tokens.
+
 ## MCP tools return `401` from a known-good service
 
 Symptom: `coord` MCP tools (e.g. `list_claims`) return `401` even though `curl -H "Authorization: Bearer $COORD_AUTH_TOKEN" $COORD_API_URL/claims` from the same shell returns `200`.

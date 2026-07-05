@@ -20,6 +20,7 @@ from coordination.cli_shared import (
     MANAGED_BEGIN,
     MANAGED_END,
     find_repo_root,
+    format_repo_scoped_token_create_command,
     local_coord_mcp_path,
 )
 from coordination.ownership import parse_ownership_yaml
@@ -92,6 +93,49 @@ def _managed_block_doc(repo_root: Path) -> str | None:
     return None
 
 
+def _remote_server_token_create_example(config: RepoConfig) -> str:
+    cmd = format_repo_scoped_token_create_command("<engineer>", config.repo_id)
+    return f"kubectl -n coord exec deploy/coord -- {cmd}"
+
+
+def _remote_auth_failure_hint(config: RepoConfig) -> str:
+    cmd = format_repo_scoped_token_create_command("<engineer>", config.repo_id)
+    return (
+        f"Remote coord auth failed: this token is not known to "
+        f"{config.service_url}. In remote mode, do not run "
+        "'coord tokens create' from this repo checkout; that creates a token "
+        "in a local SQLite DB. Run token creation on the coord server/service "
+        f"instead, e.g. '{_remote_server_token_create_example(config)}', then "
+        "paste the token into .coordination/local.env. Prefer repo-scoped "
+        f"tokens: '{cmd}'."
+    )
+
+
+def _check_remote_mode_local_db(
+    repo_root: Path, config: RepoConfig
+) -> list[CheckResult]:
+    if config.mode != "remote":
+        return []
+    db_path = repo_root / "data" / "coordination.db"
+    if not db_path.exists():
+        return []
+    return [
+        CheckResult(
+            "remote-mode repo has local SQLite DB",
+            False,
+            "data/coordination.db exists",
+            (
+                "You probably minted local-only tokens there; "
+                f"{config.service_url} will never see them. Create "
+                "repo-scoped tokens on the coord server/service instead, "
+                f"e.g. '{_remote_server_token_create_example(config)}', then "
+                "paste the token into .coordination/local.env."
+            ),
+            level="warn",
+        )
+    ]
+
+
 def _check_service(config: RepoConfig, token: str) -> list[CheckResult]:
     out: list[CheckResult] = []
     reach_hint = (
@@ -130,15 +174,6 @@ def _check_service(config: RepoConfig, token: str) -> list[CheckResult]:
     # and counts as a pass.
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     label = "auth token works" if token else "unauthenticated access works"
-    hint = (
-        "Check COORD_AUTH_TOKEN or regenerate the token via 'coord start'."
-        if token
-        else (
-            "Service rejected an unauthenticated request. Either set "
-            "COORD_AUTH_TOKEN in .coordination/local.env or run the service "
-            "with COORD_ALLOW_INSECURE_NO_AUTH=true."
-        )
-    )
     try:
         claims = httpx.get(
             f"{config.service_url}/claims",
@@ -146,12 +181,24 @@ def _check_service(config: RepoConfig, token: str) -> list[CheckResult]:
             timeout=5.0,
         )
         ok = claims.status_code == 200
+        if ok:
+            hint = ""
+        elif token and config.mode == "remote" and claims.status_code == 401:
+            hint = _remote_auth_failure_hint(config)
+        elif token:
+            hint = "Check COORD_AUTH_TOKEN or regenerate the token via 'coord start'."
+        else:
+            hint = (
+                "Service rejected an unauthenticated request. Either set "
+                "COORD_AUTH_TOKEN in .coordination/local.env or run the service "
+                "with COORD_ALLOW_INSECURE_NO_AUTH=true."
+            )
         out.append(
             CheckResult(
                 label,
                 ok,
                 "" if ok else f"status {claims.status_code}",
-                "" if ok else hint,
+                hint,
             )
         )
     except httpx.HTTPError as exc:
@@ -692,6 +739,7 @@ def run_doctor(args) -> int:
         return 1
 
     config = RepoConfig.load(config_path)
+    results.extend(_check_remote_mode_local_db(repo_root, config))
     ownership_path = repo_root / config.ownership_file
     try:
         parse_ownership_yaml(ownership_path.read_text(encoding="utf-8"))
