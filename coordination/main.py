@@ -7,7 +7,9 @@ import html as html_mod
 import json
 import logging
 import os
+import re
 import secrets
+import shlex
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -220,6 +222,13 @@ def _unscoped_token_warning(engineer: str | None) -> str:
     # so an oversized id cannot bloat the header past receiver size limits.
     who = "".join(ch for ch in (engineer or "") if 0x20 <= ord(ch) <= 0x7E).strip()
     who = (who or "<engineer>")[:64]
+    # The message embeds a copy/pasteable `coord tokens create <who>` command,
+    # so shell-quote an id that is not a plain, safe token -- otherwise a shell
+    # metacharacter (`;` `` ` `` `$` `|` space ...) could turn a pasted command
+    # into something unsafe. Common ids (alnum plus / - _ . @) stay unquoted so
+    # the docs/tests read naturally.
+    if not re.fullmatch(r"[A-Za-z0-9._/@-]+", who):
+        who = shlex.quote(who)
     return (
         "Your coord token is not bound to a repo. On a shared multi-repo coord "
         "service an unscoped per-engineer token sees and can affect EVERY "

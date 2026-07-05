@@ -914,3 +914,27 @@ async def test_deprecation_header_caps_engineer_length(client: AsyncClient) -> N
     assert r.status_code == 200, r.text
     warning = r.headers["X-Coord-Token-Warning"]
     assert warning.count("Z") == 64, warning.count("Z")
+
+
+async def test_deprecation_header_shell_quotes_unsafe_engineer(
+    client: AsyncClient,
+) -> None:
+    # The header embeds a copy/pasteable `coord tokens create <id>` command, so
+    # an id with shell metacharacters must be shell-quoted (Copilot review
+    # round 4, PR #62) -- a human pasting the command can't run the `; rm`.
+    raw = await _mint(None, engineer="foo; rm -rf ~")
+    r = await client.get("/claims", headers=_auth(raw))
+    assert r.status_code == 200, r.text
+    warning = r.headers["X-Coord-Token-Warning"]
+    assert "create 'foo; rm -rf ~' --repo" in warning, warning
+
+
+async def test_deprecation_header_plain_engineer_unquoted(
+    client: AsyncClient,
+) -> None:
+    # A normal id stays unquoted so the command reads naturally.
+    raw = await _mint(None, engineer="alex/claude/main")
+    r = await client.get("/claims", headers=_auth(raw))
+    assert r.status_code == 200, r.text
+    warning = r.headers["X-Coord-Token-Warning"]
+    assert "create alex/claude/main --repo" in warning, warning
