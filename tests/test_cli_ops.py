@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from coordination import cli
+from coordination import cli, cli_ops
 
 
 def _make_repo(root: Path) -> Path:
@@ -575,6 +575,7 @@ def _status_handler_factory(
     ready_ok: bool = True,
     meta_ok: bool = True,
     claims_count: int = 3,
+    token_warning: str | None = None,
 ):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
@@ -616,6 +617,8 @@ def _status_handler_factory(
                 body = json.dumps({"claims": claims, "count": len(claims)}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
+                if token_warning is not None:
+                    self.send_header("X-Coord-Token-Warning", token_warning)
                 self.end_headers()
                 self.wfile.write(body)
                 return
@@ -740,6 +743,7 @@ def test_claims_engineer_filter_is_forwarded(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     received: list[str] = []
+    received_engineers: list[str | None] = []
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
@@ -752,6 +756,7 @@ def test_claims_engineer_filter_is_forwarded(
                 return
             if self.path.startswith("/claims"):
                 received.append(self.path)
+                received_engineers.append(self.headers.get("X-Coord-Engineer"))
                 if not auth.startswith("Bearer "):
                     self.send_response(401)
                     self.end_headers()
@@ -774,6 +779,7 @@ def test_claims_engineer_filter_is_forwarded(
     assert exit_code == 0
     assert any("engineer=bob" in p for p in received)
     assert any("active_only=false" in p for p in received)
+    assert received_engineers == ["bob"]
 
 
 def _claims_path_recorder() -> "tuple[type[BaseHTTPRequestHandler], list[str]]":
@@ -826,11 +832,15 @@ def test_claims_scopes_to_local_repo_by_default(
     assert any("repo=app" in p for p in received)
 
 
-def test_claims_all_repos_flag_omits_repo_scope(
+def test_claims_all_repos_flag_sends_explicit_opt_out(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    # v0.42: --all-repos sends an explicit ``all_repos=true`` (rather than
+    # merely omitting ``repo``) so a repo-scoped token is rejected with a
+    # 403 instead of being silently narrowed to its own repo. The local
+    # repo scope must not be applied.
     handler, received = _claims_path_recorder()
     with _MockServer(handler) as mock:
         _init_repo_with_service(tmp_path, monkeypatch, mock.port)
@@ -838,7 +848,8 @@ def test_claims_all_repos_flag_omits_repo_scope(
         exit_code = cli.main(["claims", "--all-repos"])
     assert exit_code == 0
     assert received
-    assert all("repo=" not in p for p in received)
+    assert any("all_repos=true" in p for p in received)
+    assert all("repo=app" not in p for p in received)
 
 
 def test_claims_repo_flag_overrides_local_scope(
@@ -855,6 +866,58 @@ def test_claims_repo_flag_overrides_local_scope(
     # httpx URL-encodes the slash in the query string.
     assert any("repo=otherorg%2Fsvc" in p for p in received)
     assert all("repo=app" not in p for p in received)
+
+
+def test_claims_falls_back_to_local_env_repo_id_when_config_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    handler, received = _claims_path_recorder()
+    with _MockServer(handler) as mock:
+        repo = _init_repo_with_service(tmp_path, monkeypatch, mock.port)
+        config_path = repo / ".coordination" / "config.toml"
+        config_text = "\n".join(
+            line
+            for line in config_path.read_text(encoding="utf-8").splitlines()
+            if not line.startswith("repo_id =")
+        )
+        config_path.write_text(config_text + "\n", encoding="utf-8")
+        local_env = repo / ".coordination" / "local.env"
+        with local_env.open("a", encoding="utf-8") as fh:
+            fh.write("COORD_REPO_ID='local-env-app'\n")
+        capsys.readouterr()
+        exit_code = cli.main(["claims"])
+    assert exit_code == 0
+    assert any("repo=local-env-app" in p for p in received)
+
+
+def test_scope_repo_id_ignores_placeholder_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = cli_ops._ServiceContext(
+        service_url="http://svc",
+        auth_token="",
+        repo_id=None,
+        repo_root=None,
+        config=None,
+    )
+    monkeypatch.setenv("COORD_REPO_ID", "example-org/example-repo")
+
+    assert cli_ops._scope_repo_id(ctx) is None
+
+
+def test_auth_headers_strip_engineer_name() -> None:
+    ctx = cli_ops._ServiceContext(
+        service_url="http://svc",
+        auth_token="tok",
+        repo_id=None,
+        repo_root=None,
+        config=None,
+    )
+
+    assert cli_ops._auth_headers(ctx, " alice ")["X-Coord-Engineer"] == "alice"
+    assert "X-Coord-Engineer" not in cli_ops._auth_headers(ctx, "   ")
 
 
 def test_status_shows_repo_scope_and_symbol_validation(
@@ -1049,3 +1112,36 @@ def test_release_requires_engineer_flag_when_no_config(
     monkeypatch.delenv("COORD_AUTH_TOKEN", raising=False)
     exit_code = cli.main(["release", "abc"])
     assert exit_code == 1
+
+
+def test_status_prints_token_warning_when_unscoped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # v0.43: when the server flags an unscoped per-engineer token via the
+    # X-Coord-Token-Warning header, `coord status` surfaces it to the human.
+    warning = "Your coord token is not bound to a repo. Switch to a scoped token."
+    with _MockServer(
+        _status_handler_factory(claims_count=1, token_warning=warning)
+    ) as mock:
+        _init_repo_with_service(tmp_path, monkeypatch, mock.port)
+        capsys.readouterr()
+        exit_code = cli.main(["status"])
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "Token warning:" in out
+    assert warning in out
+
+
+def test_status_no_token_warning_when_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with _MockServer(_status_handler_factory(claims_count=1)) as mock:
+        _init_repo_with_service(tmp_path, monkeypatch, mock.port)
+        capsys.readouterr()
+        exit_code = cli.main(["status"])
+    assert exit_code == 0
+    assert "Token warning:" not in capsys.readouterr().out

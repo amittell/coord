@@ -24,6 +24,7 @@ _LOCAL_ENV_KEYS = (
     "COORD_API_URL",
     "COORD_SERVICE_URL",
     "COORD_AUTH_TOKEN",
+    "COORD_BRANCH",
     "COORD_REPO_ID",
     "COORD_REPO_ROOT",
     "COORD_USER",
@@ -89,17 +90,60 @@ def _repo_id() -> str:
     by ``_load_local_env``). When set, the read tools scope their queries to
     this repo by default so a hosted shared service fronting multiple repos
     does not surface unrelated repos' claims (issue #30). When unset (the
-    single-repo deployment shape) the tools behave exactly as before.
+    single-repo deployment shape) the tools behave exactly as before. Template
+    placeholders are treated as unset so checked-in examples do not become a
+    real repo scope.
     """
-    return os.environ.get("COORD_REPO_ID", "").strip()
+    repo_id = os.environ.get("COORD_REPO_ID", "").strip()
+    if repo_id in _PLACEHOLDER_VALUES:
+        return ""
+    return repo_id
 
 
-def _headers() -> dict[str, str]:
+def _headers(engineer: str | None = None) -> dict[str, str]:
     token = os.environ.get("COORD_AUTH_TOKEN", "")
     h: dict[str, str] = {"Accept": "application/json"}
     if token and token not in _PLACEHOLDER_VALUES:
         h["Authorization"] = f"Bearer {token}"
+    if engineer:
+        stripped = engineer.strip()
+        if stripped:
+            h["X-Coord-Engineer"] = stripped
     return h
+
+
+def _git_stdout(*args: str) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", *args],
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    value = completed.stdout.strip()
+    return value or None
+
+
+def _current_branch_or_worktree() -> str | None:
+    explicit = os.environ.get("COORD_BRANCH", "").strip()
+    if explicit:
+        return explicit
+
+    branch = _git_stdout("symbolic-ref", "--quiet", "--short", "HEAD")
+    if branch:
+        return branch
+
+    worktree = _git_stdout("rev-parse", "--show-toplevel")
+    commit = _git_stdout("rev-parse", "--short", "HEAD")
+    if worktree and commit:
+        return f"{Path(worktree).name}@{commit}"
+    if worktree:
+        return Path(worktree).name
+    return commit
 
 
 def _resolve_session_id() -> str:
@@ -299,6 +343,16 @@ async def _request_with_retry(
     # was enabled (the final attempt re-raises above, so this is defensive).
     assert last_exc is not None
     raise last_exc
+def _with_token_notice(result: Any, response: httpx.Response) -> Any:
+    """Surface the server's ``X-Coord-Token-Warning`` header (v0.43) into a
+    tool result so the agent actually sees the unscoped-token deprecation
+    nudge -- a response header alone never reaches the model. No-op when the
+    header is absent, when the result is not a dict, or when a ``coord_notice``
+    is already present."""
+    warning = response.headers.get("x-coord-token-warning")
+    if warning and isinstance(result, dict) and "coord_notice" not in result:
+        result["coord_notice"] = warning
+    return result
 
 
 @mcp.tool()
@@ -322,7 +376,13 @@ async def list_claims(
     if module:
         params["module"] = module
     repo_id = _repo_id()
-    if repo_id and not all_repos:
+    if all_repos:
+        # Always transmit the explicit opt-out (not just an omitted
+        # ``repo``) so a repo-scoped token gets an honest 403 ("you cannot
+        # see all repos") rather than being silently narrowed -- even when
+        # this client has no local COORD_REPO_ID to scope to.
+        params["all_repos"] = "true"
+    elif repo_id:
         params["repo"] = repo_id
     # Session_id doubles as an activity ping on the server side: a
     # session that is actively listing claims is alive, so its held
@@ -334,11 +394,11 @@ async def list_claims(
             "GET",
             f"{_base_url()}/claims",
             params=params,
-            headers=_headers(),
+            headers=_headers(engineer),
             idempotent=True,
         )
         r.raise_for_status()
-        return r.json()
+        return _with_token_notice(r.json(), r)
 
 
 @mcp.tool()
@@ -360,8 +420,16 @@ async def check_conflicts(
     ]
     params.append(("engineer", engineer))
     repo_id = _repo_id()
-    if repo_id and not all_repos:
+    if all_repos:
+        # Always transmit the explicit opt-out so a repo-scoped token is
+        # rejected with a 403 rather than silently narrowed, even when this
+        # client has no local COORD_REPO_ID.
+        params.append(("all_repos", "true"))
+    elif repo_id:
         params.append(("repo", repo_id))
+    branch = _current_branch_or_worktree()
+    if branch:
+        params.append(("branch", branch))
     # Session_id makes the conflict check session-aware (so an agent's
     # own subagents don't false-positive against each other) and acts
     # as an activity ping for idle expiration on the server side.
@@ -372,11 +440,11 @@ async def check_conflicts(
             "GET",
             f"{_base_url()}/conflicts",
             params=params,
-            headers=_headers(),
+            headers=_headers(engineer),
             idempotent=True,
         )
         r.raise_for_status()
-        return r.json()
+        return _with_token_notice(r.json(), r)
 
 
 def _validate_symbols_locally(
@@ -582,13 +650,13 @@ async def claim_files(
         claims.append(sf_entry)
     body: dict[str, Any] = {
         "engineer": engineer,
-        "branch": branch,
+        "branch": branch or _current_branch_or_worktree(),
         "description": description,
         "claims": claims,
     }
     if ttl_hours is not None:
         body["ttl_hours"] = ttl_hours
-    repo_id = os.environ.get("COORD_REPO_ID", "").strip()
+    repo_id = _repo_id()
     if repo_id:
         body["repo"] = repo_id
     body["session_id"] = _SESSION_ID
@@ -609,7 +677,7 @@ async def claim_files(
             "POST",
             f"{_base_url()}/claims",
             json=body,
-            headers={**_headers(), "Content-Type": "application/json"},
+            headers={**_headers(engineer), "Content-Type": "application/json"},
             idempotent=False,
         )
         if r.status_code == 429:
@@ -619,15 +687,18 @@ async def claim_files(
             # repo_queue) and ``retry_after`` is the server's hint, in
             # seconds, for when a retry might succeed.
             payload = r.json()
-            return {
-                "error": payload.get("detail"),
-                "scope": payload.get("scope"),
-                "retry_after": payload.get("retry_after"),
-            }
+            return _with_token_notice(
+                {
+                    "error": payload.get("detail"),
+                    "scope": payload.get("scope"),
+                    "retry_after": payload.get("retry_after"),
+                },
+                r,
+            )
         if r.status_code in (400, 409):
-            return r.json()
+            return _with_token_notice(r.json(), r)
         r.raise_for_status()
-        return r.json()
+        return _with_token_notice(r.json(), r)
 
 
 @mcp.tool()
@@ -677,8 +748,9 @@ async def claim_refactor(
         body["new_name"] = new_name
     if description:
         body["description"] = description
-    if branch:
-        body["branch"] = branch
+    claim_branch = branch or _current_branch_or_worktree()
+    if claim_branch:
+        body["branch"] = claim_branch
     if ttl_hours is not None:
         body["ttl_hours"] = ttl_hours
     # Mirror claim_files: only forward the queue knobs when they ask
@@ -697,7 +769,7 @@ async def claim_refactor(
             "POST",
             f"{_base_url()}/claims/refactor",
             json=body,
-            headers={**_headers(), "Content-Type": "application/json"},
+            headers={**_headers(engineer), "Content-Type": "application/json"},
             idempotent=False,
         )
         if r.status_code == 503:
@@ -708,15 +780,18 @@ async def claim_refactor(
             return {"error": payload.get("detail"), "status": 503}
         if r.status_code == 429:
             payload = r.json()
-            return {
-                "error": payload.get("detail"),
-                "scope": payload.get("scope"),
-                "retry_after": payload.get("retry_after"),
-            }
+            return _with_token_notice(
+                {
+                    "error": payload.get("detail"),
+                    "scope": payload.get("scope"),
+                    "retry_after": payload.get("retry_after"),
+                },
+                r,
+            )
         if r.status_code in (400, 409):
-            return r.json()
+            return _with_token_notice(r.json(), r)
         r.raise_for_status()
-        return r.json()
+        return _with_token_notice(r.json(), r)
 
 
 @mcp.tool()
@@ -728,7 +803,7 @@ async def release_claims(claim_ids: list[str], engineer: str | None = None) -> d
             "POST",
             f"{_base_url()}/claims/release",
             json={"claim_ids": claim_ids, "engineer": engineer},
-            headers={**_headers(), "Content-Type": "application/json"},
+            headers={**_headers(engineer), "Content-Type": "application/json"},
             idempotent=False,
         )
         r.raise_for_status()
@@ -1000,7 +1075,7 @@ async def cancel_queue_request(
             "DELETE",
             f"{_base_url()}/requests/{queue_id}",
             params=params,
-            headers=_headers(),
+            headers=_headers(engineer),
             idempotent=False,
         )
         r.raise_for_status()

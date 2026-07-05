@@ -134,6 +134,39 @@ def test_create_then_list_shows_metadata(
     assert "coordt_" not in out
 
 
+def test_create_with_repo_flag_persists_and_lists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Issue #30 slice 2/3: --repo mints a repo-scoped token; list surfaces it.
+    db_path = tmp_path / "db.sqlite"
+    rc = _run(
+        ["tokens", "create", "eng-a", "--repo", "amittell/coord"],
+        db_path,
+        monkeypatch,
+    )
+    assert rc == 0
+    capsys.readouterr()
+    _run(["tokens", "list", "--json"], db_path, monkeypatch)
+    rows = json.loads(capsys.readouterr().out)
+    assert len(rows) == 1
+    assert rows[0]["repo"] == "amittell/coord"
+
+
+def test_create_without_repo_flag_is_unscoped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    db_path = tmp_path / "db.sqlite"
+    _run(["tokens", "create", "eng-a"], db_path, monkeypatch)
+    capsys.readouterr()
+    _run(["tokens", "list", "--json"], db_path, monkeypatch)
+    rows = json.loads(capsys.readouterr().out)
+    assert rows[0]["repo"] is None
+
+
 def test_list_filters_by_engineer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

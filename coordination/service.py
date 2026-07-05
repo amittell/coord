@@ -390,14 +390,20 @@ class CoordinationService:
     # ``await asyncio.gather(*service._enrichment_tasks)``.
     _enrichment_tasks: set[asyncio.Task[None]] = field(default_factory=set)
 
-    async def count_queued_for(self, engineer: str) -> int:
+    async def count_queued_for(
+        self, engineer: str, *, repo: str | None = None
+    ) -> int:
         """v0.28: return how many waiting queue rows the given engineer
         currently owns. Drives the ``X-Coord-Queue-Depth`` backpressure
         header so clients can self-regulate without an extra round trip
         to ``/requests?queued=true``.
+
+        v0.42: ``repo`` confines the count to a single repo so a
+        repo-scoped token cannot read the engineer's cross-repo queue
+        depth. ``repo=None`` (operator) counts across every repo.
         """
         rows = await self.db.list_queued_with_holder(
-            engineer=engineer, state="waiting"
+            engineer=engineer, state="waiting", repo=repo
         )
         return len(rows)
 
@@ -652,6 +658,7 @@ class CoordinationService:
         patterns: list[str],
         engineer: str,
         repo: str | None = None,
+        all_repos: bool = False,
         session_ids: list[str] | None = None,
         pushing_branch: str | None = None,
     ) -> ConflictCheckResponse:
@@ -670,13 +677,22 @@ class CoordinationService:
         # needs to keep its claims warm.
         if session_ids:
             for sid in session_ids:
-                await self.db.touch_session_activity(sid)
+                await self.db.touch_session_activity(sid, repo=repo)
         active = await self.db.list_active_claims_rows(exclude_engineer=engineer)
         # Repo-scoped check (v0.4.0): only consider claims from the same
         # repo as the caller. NULL repo forms its own legacy bucket so
         # tagged callers never collide with un-tagged historical claims
         # and vice versa.
-        active = [r for r in active if r.get("repo") == repo]
+        #
+        # v0.42: an operator explicitly asking for all_repos wants to see
+        # every repo's claims, so skip the bucket filter entirely.
+        # Without this, all_repos resolves to repo=None and the filter
+        # would compare only against the legacy NULL bucket -- on a fully
+        # repo-tagged deployment that returns zero and silently
+        # under-reports. (A scoped token never reaches here with
+        # all_repos: _effective_read_repo 403s it first.)
+        if not all_repos:
+            active = [r for r in active if r.get("repo") == repo]
         # Session-scoped self-exclusion (v0.5.0, generalised in v0.10):
         # drop any active claim whose session_id matches one of the
         # caller's live session_ids. The pre-push hook reads every line
@@ -796,7 +812,7 @@ class CoordinationService:
         )
 
     async def _enforce_active_claim_cap(
-        self, *, engineer: str, about_to_insert: int
+        self, *, engineer: str, about_to_insert: int, repo: str | None = None
     ) -> None:
         """v0.30 active-claim cap: raise :class:`RateLimitExceeded`
         when inserting ``about_to_insert`` new claim rows would push
@@ -827,7 +843,7 @@ class CoordinationService:
         if limit <= 0:
             return
         count, soonest_expiry = await self.db.count_active_claims_for_engineer(
-            engineer
+            engineer, repo=repo
         )
         if count + about_to_insert <= limit:
             return
@@ -856,13 +872,20 @@ class CoordinationService:
             scope="claims", detail=detail, retry_after_sec=retry_after
         )
 
-    async def create_claims(self, body: CreateClaimsRequest) -> CreateClaimsResponse:
+    async def create_claims(
+        self,
+        body: CreateClaimsRequest,
+        *,
+        auto_promote_allowed: bool = True,
+    ) -> CreateClaimsResponse:
         await self.db.expire_stale_claims(self.settings.idle_timeout_sec)
         # Activity ping: making a claim is the strongest possible
         # liveness signal -- bump last_activity for every claim this
         # session already holds before we decide what's stale.
         if body.session_id:
-            await self.db.touch_session_activity(body.session_id)
+            await self.db.touch_session_activity(
+                body.session_id, repo=body.repo
+            )
         rules = await self._rules()
         patterns = [c.pattern for c in body.claims]
         for pat in patterns:
@@ -1068,7 +1091,9 @@ class CoordinationService:
                 if self.settings.max_claims_per_engineer > 0:
                     async with self.db.engineer_lock(conn, body.engineer):
                         await self._enforce_active_claim_cap(
-                            engineer=body.engineer, about_to_insert=len(ids)
+                            engineer=body.engineer,
+                            about_to_insert=len(ids),
+                            repo=body.repo,
                         )
                         created = await _insert_batch()
                 else:
@@ -1136,7 +1161,13 @@ class CoordinationService:
             # ownership YAML and record an audit event. The current
             # 409 response is unchanged -- the new rule governs the
             # NEXT overlap on this pattern.
-            if self.settings.auto_promote_threshold > 0:
+            # Auto-promote mutates the GLOBAL ownership YAML, so it is
+            # an operator-only action. A repo-scoped caller passes
+            # ``auto_promote_allowed=False`` (v0.42) to keep its claim
+            # activity from silently rewriting shared config across the
+            # whole deployment -- the operator-only manual promote /
+            # config-write endpoints are the sanctioned path.
+            if self.settings.auto_promote_threshold > 0 and auto_promote_allowed:
                 await self._maybe_auto_promote(conflicts)
             # v0.21: if the caller passed wait_seconds > 0, enqueue the
             # FIRST conflicting requester item behind its blocking
@@ -1921,7 +1952,10 @@ class CoordinationService:
     # ------------------------------------------------------------------
 
     async def create_refactor_claims(
-        self, body: ClaimRefactorRequest
+        self,
+        body: ClaimRefactorRequest,
+        *,
+        auto_promote_allowed: bool = True,
     ) -> CreateClaimsResponse:
         """Expand a (file, symbol) refactor intent into a normal
         ``create_claims`` batch covering the definition and every
@@ -2093,7 +2127,11 @@ class CoordinationService:
                 session_id=body.session_id,
                 wait_seconds=body.wait_seconds,
                 urgency=body.urgency,
-            )
+            ),
+            # Auto-promote writes global ownership YAML, so a repo-scoped
+            # caller must not trigger it via the refactor path either
+            # (v0.42; mirrors the POST /claims gate).
+            auto_promote_allowed=auto_promote_allowed,
         )
         # Partial-coverage guard. The v0.21 queue enqueues only the
         # single conflicted item, so a wait_seconds grant that arrives
@@ -2130,13 +2168,16 @@ class CoordinationService:
         engineer: str | None = None,
         module_substring: str | None = None,
         session_id: str | None = None,
+        repo: str | None = None,
     ) -> list[dict[str, Any]]:
         await self.db.expire_stale_claims(self.settings.idle_timeout_sec)
         # Activity ping: an agent reading the claim list is still alive,
         # so keep its claims warm. No-op when session_id is unset
-        # (legacy / non-MCP callers).
+        # (legacy / non-MCP callers). ``repo`` scopes the warm-up so a
+        # repo-scoped reader cannot refresh another repo's claims via a
+        # shared session id (v0.42).
         if session_id:
-            await self.db.touch_session_activity(session_id)
+            await self.db.touch_session_activity(session_id, repo=repo)
         if active_only:
             rows = await self.db.list_active_claims_rows(exclude_engineer=None)
         else:
@@ -2148,7 +2189,9 @@ class CoordinationService:
             rows = [r for r in rows if m in (r.get("pattern") or "").lower()]
         return rows
 
-    async def pending_requests(self, session_id: str) -> list[dict[str, Any]]:
+    async def pending_requests(
+        self, session_id: str, *, repo: str | None = None
+    ) -> list[dict[str, Any]]:
         """Return the inbox the holder polls. Merges two streams:
 
         - First-class release ``requests`` (decision='pending', kind='request').
@@ -2162,12 +2205,22 @@ class CoordinationService:
 
         Each row in the returned list carries a ``kind`` discriminator so
         the agent / dashboard can render them appropriately.
+
+        v0.42: ``repo`` scopes the inbox. When set (a repo-scoped
+        token), only requests / conflicts against the caller's own repo
+        are returned -- and, critically, only in-scope requests fire a
+        ``notified`` audit event, so a session id spanning repos never
+        leaks (or records evidence of seeing) another repo's rows.
         """
         if not session_id:
             return []
         # First-class requests get the audit-event treatment so the
-        # operator can prove "the holder did/didn't see this".
-        open_requests = await self.db.list_open_requests_for_session(session_id)
+        # operator can prove "the holder did/didn't see this". The repo
+        # filter is applied in the query so out-of-scope requests are
+        # neither returned nor notified.
+        open_requests = await self.db.list_open_requests_for_session(
+            session_id, repo=repo
+        )
         for r in open_requests:
             await self.db.record_request_notify(
                 r["id"],
@@ -2177,7 +2230,9 @@ class CoordinationService:
         request_rows = [{"kind": "request", **r} for r in open_requests]
 
         # Auto-conflict entries (the v0.6 pre-existing inbox).
-        conflicts = await self.db.pending_requests_for_session(session_id)
+        conflicts = await self.db.pending_requests_for_session(
+            session_id, repo=repo
+        )
         conflict_rows = [{"kind": "auto-conflict", **c} for c in conflicts]
         return request_rows + conflict_rows
 
@@ -2642,7 +2697,7 @@ class CoordinationService:
             engineer_queue_limit = self.settings.max_queued_per_engineer
             if engineer_queue_limit > 0:
                 queued_count = await self.db.count_queue_entries_for_engineer(
-                    body.engineer
+                    body.engineer, repo=body.repo
                 )
                 if queued_count + 1 > engineer_queue_limit:
                     raise RateLimitExceeded(
@@ -2790,7 +2845,16 @@ class CoordinationService:
                 return
             grant_body = self._queue_entry_to_create_request(entry)
             try:
-                resp = await self.create_claims(grant_body)
+                # A drain grant is an internal, server-initiated re-issue on
+                # behalf of a queued waiter whose token scope is not available
+                # here. Auto-promote mutates global ownership YAML and is an
+                # operator-only action, so it must never fire from this path
+                # (v0.42) -- otherwise a repo-scoped requester's grant could
+                # rewrite deployment-wide config. Direct operator POST /claims
+                # still promotes.
+                resp = await self.create_claims(
+                    grant_body, auto_promote_allowed=False
+                )
             except RateLimitExceeded as exc:
                 # v0.30: a queue grant must not blast through the
                 # active-claim cap -- the waiter's engineer is at

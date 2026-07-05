@@ -483,6 +483,9 @@ Start with `docs/integrations/claude-code.md` if your team is primarily on Claud
 | `COORD_DATABASE_PATH` | SQLite path. Default: `./data/coordination.db` |
 | `COORD_AUTH_TOKEN` | Bearer token required by the HTTP API |
 | `COORD_ALLOW_INSECURE_NO_AUTH` | Only for explicit local/demo mode; default `false` |
+| `COORD_WARN_UNSCOPED_TOKEN` | Soft-deprecate unscoped per-engineer tokens (v0.43): the request is still honored, but the response carries an `X-Coord-Token-Warning` nudge (surfaced to agents as `coord_notice` and printed by `coord status`). Set `false` to silence. Default: `true` |
+| `COORD_REQUIRE_SCOPED_TOKEN` | Reject any per-engineer token that is not repo-scoped (v0.42); the shared `COORD_AUTH_TOKEN` stays exempt as the operator escape hatch. Default: `false` |
+| `COORD_OIDC_REPO_CLAIM` | Bind an SSO-minted session token to a repo from this ID-token claim, so OIDC dashboard logins can be repo-scoped instead of operator-wide (v0.42). Default: unset |
 | `COORD_HOST` | Bind host for the API server. Default: `0.0.0.0` |
 | `COORD_PORT` | Bind port for the API server. Default: `8080` |
 | `COORD_LOG_LEVEL` | Uvicorn log level. Default: `info` |
@@ -529,6 +532,17 @@ Start with `docs/integrations/claude-code.md` if your team is primarily on Claud
 | `COORD_SESSION_ID` | Pin a stable session id across coord-mcp restarts (added in v0.5.0). Otherwise coord-mcp generates a fresh 16-char hex id at startup. |
 | `COORD_NO_UPDATE_CHECK` | Set truthy to silence the once-per-24h "update available" stderr line emitted by every `coord` CLI command. Default: unset |
 | `COORD_DISABLE_CLIENT_VALIDATION` | Set to `1` to bypass the MCP wrapper's local symbol pre-validation (v0.17). The server-side validator still runs when `COORD_REPO_ROOT` is set. Default: unset |
+
+### Repo-scoped tokens (hosted multi-repo)
+
+When one coord service fronts several repos, bind each agent's token to a repo so it only ever sees and touches that repo's claims. Enforcement is server-side (derived from the token), so it holds regardless of client version or an `all_repos` request:
+
+```
+coord tokens create <engineer> --repo owner/name   # scoped token
+coord tokens create <engineer>                       # unscoped (deprecated; all-repo)
+```
+
+Unscoped per-engineer tokens are deprecated. While `COORD_WARN_UNSCOPED_TOKEN` is on (default) they still work, but every response carries an `X-Coord-Token-Warning` nudge -- surfaced to agents as a `coord_notice` field in `list_claims` / `check_conflicts` / `claim_files` results, and printed by `coord status` as a `Token warning:` line. Flip `COORD_REQUIRE_SCOPED_TOKEN=true` once the fleet is scoped to make it mandatory. Full rollout guide: [docs/deployment.md](docs/deployment.md#hosted-multi-repo-deployments-repo-scoped-tokens).
 
 ## Development
 

@@ -12,7 +12,11 @@ from pathlib import Path
 import httpx
 
 from coordination.cli_shared import COORD_SERVE_MARKER, ensure_parent, find_repo_root, state_paths
+from coordination.envfile import read_env_file
 from coordination.repo_config import RepoConfig
+
+
+_PLACEHOLDER_REPO_IDS = {"set-me", "example-org/example-repo"}
 
 
 # ---------------------------------------------------------------------------
@@ -273,17 +277,23 @@ def run_stop(_args) -> int:
 class _ServiceContext:
     service_url: str
     auth_token: str
+    repo_id: str | None
     repo_root: Path | None
     config: RepoConfig | None
 
 
-def _load_repo_token(repo_root: Path, config: RepoConfig) -> str:
+def _load_repo_env(repo_root: Path, config: RepoConfig) -> dict[str, str]:
     env_path = repo_root / config.local_env_file
-    if env_path.exists():
-        for line in env_path.read_text(encoding="utf-8").splitlines():
-            if line.startswith("COORD_AUTH_TOKEN="):
-                return line.split("=", 1)[1].strip()
-    return ""
+    return read_env_file(env_path)
+
+
+def _clean_repo_id(value: str | None) -> str | None:
+    if value is None:
+        return None
+    repo_id = value.strip()
+    if repo_id and repo_id not in _PLACEHOLDER_REPO_IDS:
+        return repo_id
+    return None
 
 
 def _resolve_service() -> _ServiceContext | None:
@@ -292,22 +302,31 @@ def _resolve_service() -> _ServiceContext | None:
         config_path = repo_root / ".coordination" / "config.toml"
         if config_path.exists():
             config = RepoConfig.load(config_path)
-            token = _load_repo_token(repo_root, config) or os.environ.get(
+            repo_env = _load_repo_env(repo_root, config)
+            token = repo_env.get("COORD_AUTH_TOKEN") or os.environ.get(
                 "COORD_AUTH_TOKEN", ""
+            )
+            repo_id = (
+                _clean_repo_id(config.repo_id)
+                or _clean_repo_id(repo_env.get("COORD_REPO_ID"))
+                or _clean_repo_id(os.environ.get("COORD_REPO_ID"))
             )
             return _ServiceContext(
                 service_url=config.service_url.rstrip("/"),
                 auth_token=token,
+                repo_id=repo_id,
                 repo_root=repo_root,
                 config=config,
             )
 
     url = os.environ.get("COORD_API_URL")
     token = os.environ.get("COORD_AUTH_TOKEN", "")
+    repo_id = _clean_repo_id(os.environ.get("COORD_REPO_ID"))
     if url:
         return _ServiceContext(
             service_url=url.rstrip("/"),
             auth_token=token,
+            repo_id=repo_id,
             repo_root=None,
             config=None,
         )
@@ -317,21 +336,32 @@ def _resolve_service() -> _ServiceContext | None:
 def _scope_repo_id(ctx: _ServiceContext) -> str | None:
     """The repo id a repo-local client should scope its views to (issue #30).
 
-    Prefers the ``repo_id`` in ``.coordination/config.toml`` (the canonical
-    per-repo identity ``coord init`` writes), falling back to a ``COORD_REPO_ID``
-    env override. Returns None when neither is set -- the single-repo
+    Prefers the ``repo_id`` resolved by ``_resolve_service`` from
+    ``.coordination/config.toml`` (the canonical per-repo identity ``coord
+    init`` writes), then ``.coordination/local.env``, then an exported
+    ``COORD_REPO_ID``. Returns None when none is set -- the single-repo
     deployment shape, where scoping is a no-op and every claim is in view.
+    Template placeholder values are treated as unset.
     """
-    if ctx.config is not None and ctx.config.repo_id:
-        return ctx.config.repo_id
-    env = os.environ.get("COORD_REPO_ID", "").strip()
-    return env or None
+    candidates = (ctx.repo_id, os.environ.get("COORD_REPO_ID"))
+    for candidate in candidates:
+        repo_id = _clean_repo_id(candidate)
+        if repo_id:
+            return repo_id
+    return None
 
 
-def _auth_headers(ctx: _ServiceContext) -> dict[str, str]:
+def _auth_headers(
+    ctx: _ServiceContext, engineer: str | None = None
+) -> dict[str, str]:
+    headers: dict[str, str] = {}
     if ctx.auth_token:
-        return {"Authorization": f"Bearer {ctx.auth_token}"}
-    return {}
+        headers["Authorization"] = f"Bearer {ctx.auth_token}"
+    if engineer:
+        stripped = engineer.strip()
+        if stripped:
+            headers["X-Coord-Engineer"] = stripped
+    return headers
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +404,7 @@ def run_status(_args) -> int:
     if scope:
         count_params["repo"] = scope
     claim_count: int | str = "?"
+    token_warning: str | None = None
     try:
         c = httpx.get(
             f"{ctx.service_url}/claims",
@@ -381,6 +412,10 @@ def run_status(_args) -> int:
             headers=_auth_headers(ctx),
             timeout=3.0,
         )
+        # v0.43: the server flags an unscoped per-engineer token here so the
+        # human running `coord status` sees the same deprecation nudge the
+        # agent gets as a coord_notice.
+        token_warning = c.headers.get("x-coord-token-warning")
         if c.status_code == 200:
             data = c.json()
             claim_count = int(data.get("count", len(data.get("claims", []))))
@@ -406,6 +441,8 @@ def run_status(_args) -> int:
     print(f"Repo scope: {scope_label}")
     print(f"Symbol validation: {symbol_label} (server COORD_REPO_ROOT)")
     print(f"Active claims: {claim_count}")
+    if token_warning:
+        print(f"Token warning: {token_warning}")
     return 0 if ready_state == "ready" else 1
 
 
@@ -432,7 +469,14 @@ def run_claims(args) -> int:
     explicit_repo = getattr(args, "repo", None)
     if explicit_repo:
         params["repo"] = explicit_repo
-    elif not getattr(args, "all_repos", False):
+    elif getattr(args, "all_repos", False):
+        # v0.42: send the operator-wide opt-out explicitly rather than just
+        # omitting ``repo``. A repo-scoped token then gets an honest 403
+        # ("this token cannot access all repos") instead of being silently
+        # narrowed to its own repo. Harmless for an unscoped/operator token
+        # (the server returns every repo either way).
+        params["all_repos"] = "true"
+    else:
         scope = _scope_repo_id(ctx)
         if scope:
             params["repo"] = scope
@@ -441,7 +485,7 @@ def run_claims(args) -> int:
         response = httpx.get(
             f"{ctx.service_url}/claims",
             params=params,
-            headers=_auth_headers(ctx),
+            headers=_auth_headers(ctx, args.engineer),
             timeout=5.0,
         )
     except httpx.HTTPError as exc:
@@ -498,7 +542,7 @@ def run_release(args) -> int:
             "DELETE",
             f"{ctx.service_url}/claims/{args.claim_id}",
             params={"engineer": engineer},
-            headers=_auth_headers(ctx),
+            headers=_auth_headers(ctx, engineer),
             timeout=5.0,
         )
     except httpx.HTTPError as exc:
