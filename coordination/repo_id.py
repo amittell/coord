@@ -1,15 +1,20 @@
 """Central repo-id validation / normalization (#61).
 
 A repo identifier buckets claims on a shared multi-repo coord service and
-scopes a repo-bound token. It enters the system from several places -- the
-``coord tokens create --repo <id>`` CLI, an OIDC repo claim, a request
-``repo=`` param/body, and ``COORD_REPO_ID`` -- and enforcement is by
-*comparison* (``token_repo`` vs the request value). Without a single shared
-rule, a malformed or non-canonical id (trailing slash, doubled slash, control
-chars, absurd length) is accepted as long as it happens to match on both
-sides, and two spellings of "the same" repo become distinct buckets. This
-module is the one validator every ingress calls so ids are well-formed and
-canonical, and a bad one fails fast with the same clear error everywhere.
+scopes a repo-bound token. Enforcement is by *comparison* (``token_repo`` vs
+the request value), so without a single shared rule a malformed or
+non-canonical id (trailing slash, doubled slash, control chars, absurd length)
+is accepted as long as it happens to match on both sides, and two spellings of
+"the same" repo become distinct buckets.
+
+This module is the shared validator the SERVER-side ingresses call so ids are
+well-formed and canonical and a bad one fails fast with the same clear error:
+the ``coord tokens create --repo <id>`` CLI, the OIDC repo claim, a request
+``repo=`` param/body, and the token store (``create_engineer_token`` and
+rotation). Client env readers of ``COORD_REPO_ID`` (the MCP wrapper and
+``coord`` CLI) forward their value to the server, which validates it -- so a
+malformed client env var is rejected at the boundary rather than silently
+bucketed, without the client needing to duplicate the grammar.
 """
 
 from __future__ import annotations
