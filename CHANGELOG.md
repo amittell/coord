@@ -5,9 +5,21 @@ All notable changes to this project are documented in this file.
 The format is based on Keep a Changelog and this project adheres to
 Semantic Versioning.
 
-## [Unreleased]
+## [0.44.0] - 2026-07-05
 
 ### Added
+
+- Postgres HA backend + stateless multi-replica (#54). coord can run 3
+  stateless replicas against a shared in-cluster Postgres (MVCC) instead of a
+  single pod on single-writer SQLite, so deploys are zero-downtime. The backend
+  is chosen by `COORD_DATABASE_URL`: `sqlite://` (default) is byte-for-byte
+  unchanged for local dev and the test suite; `postgresql://` selects
+  `PostgresStore`, a `Database` subclass that translates the SQLite dialect on
+  the fly and serializes conflict detection with per-repo
+  `pg_advisory_xact_lock` transactions, with background loops behind a DB leader
+  lease. All repo-scoping (v0.42/0.43) and the repo-id validator (#61) apply to
+  the Postgres path via inheritance + dialect translation. Ships dormant: the
+  live prod cutover is operator-gated (see `docs/runbooks/coord-ha-cutover.md`).
 
 - Central repo-id validator/normalizer (#61). A new `coordination/repo_id.py`
   `normalize_repo_id()` is the one rule every ingress applies -- `coord tokens

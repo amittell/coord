@@ -42,7 +42,14 @@ from pathlib import Path
 from typing import Any
 
 import aiosqlite
-import asyncpg
+
+try:
+    import asyncpg
+except ModuleNotFoundError:  # the driver is only needed for the Postgres
+    # backend; the SQLite path and the pure SQL-translation layer
+    # (translate/_skip_noncode) import fine without it, so a dev/test env
+    # with only [dev] installed can still exercise the translation tests.
+    asyncpg = None
 
 from coordination.db import _BOUND_CONN, Database, _LOCK_SKIPPED
 
@@ -120,7 +127,7 @@ async def _get_pool(dsn: str) -> asyncpg.Pool:
         # waited, in which case we must not create (and leak) a second one.
         if _POOL is not None and not _stale(loop, dsn):
             return _POOL
-        if _stale(loop, dsn):
+        if _POOL is not None and _stale(loop, dsn):
             try:
                 _POOL.terminate()
             except Exception:
