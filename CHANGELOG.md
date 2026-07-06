@@ -5,6 +5,32 @@ All notable changes to this project are documented in this file.
 The format is based on Keep a Changelog and this project adheres to
 Semantic Versioning.
 
+## [Unreleased]
+
+### Added
+
+- SQLite write-scaling for high-concurrency single-node deployments (keeps
+  SQLite; an alternative to the Postgres cutover). Two changes, both measured
+  against the real server under load:
+  - **Activity-ping coalescing** (`COORD_ACTIVITY_PING_MIN_INTERVAL_SEC`,
+    default 30s). Most reads (`list_claims` / `check_conflicts`) also write a
+    liveness "ping"; at hundreds of agents that write-on-read is the dominant
+    write load. Coalescing pings per (session, repo) to at most once per
+    interval cut `SQLITE_BUSY` errors ~70% in load tests. Best-effort, well
+    under the 1800s idle timeout; set 0 to restore write-every-read.
+  - **In-process writer queue** (`COORD_SQLITE_WRITER_QUEUE`, default on for
+    SQLite). All writes funnel through one persistent writer connection under
+    an async lock instead of a fresh connection per op, so concurrent writers
+    queue in-process instead of fighting SQLite's single write lock -- making
+    `SQLITE_BUSY` (dropped coordination writes) impossible. Reentrancy-safe
+    (a write inside a `transaction()` reuses the bound connection) and
+    connection-reuse also removes the per-op connect+PRAGMA cost. At realistic
+    concurrency (200 agents) it matched throughput, cut p99 latency ~43%, and
+    eliminated dropped writes (20 -> 0). No-op for the Postgres backend.
+  - New `sqlite_writes_total` and `sqlite_writer_wait_seconds_total` metrics so
+    an operator can see write throughput and writer-lock contention and decide
+    if the write path needs further work.
+
 ## [0.44.0] - 2026-07-05
 
 ### Added
