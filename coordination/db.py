@@ -942,14 +942,16 @@ class Database:
     async def aclose(self) -> None:
         """Close the shared writer connection on shutdown. Acquires
         ``_writer_lock`` (bounded) so an in-flight write finishes before the
-        connection closes underneath it; after the timeout the connection is
-        dropped anyway so shutdown can never hang on a wedged writer."""
+        connection closes underneath it. If a wedged writer holds the lock
+        past the timeout, the handle is FORGOTTEN rather than closed --
+        closing it under the in-flight writer could tear its transaction;
+        forgetting it just stops reuse, and process teardown reaps the FD."""
         try:
             async with asyncio.timeout(5):
                 async with self._writer_lock:
                     await self._drop_writer()
         except TimeoutError:
-            await self._drop_writer()
+            self._writer_conn = None
 
     @asynccontextmanager
     async def _write(self):

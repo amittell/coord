@@ -106,3 +106,14 @@ async def test_zero_interval_writes_every_read(clock) -> None:
     await svc._maybe_touch("sess-a", "org/repo")
     await svc._maybe_touch("sess-a", "org/repo")
     assert len(svc.db.calls) == 2
+
+
+async def test_last_ping_is_hard_bounded_under_fresh_churn(clock) -> None:
+    # Even when every entry is fresh (nothing age-prunes), crossing the
+    # high-water mark evicts the oldest down to the cap -- the dict cannot
+    # grow without bound under high session churn (Copilot round 7, PR #66).
+    svc = _svc(interval=3600, idle=0)  # idle=0: no clamp; everything stays fresh
+    for i in range(8193):
+        clock[0] += 0.001  # distinct, monotonically newer stamps
+        await svc._maybe_touch(f"sess-{i}", "org/repo")
+    assert len(svc._last_ping) <= 4097  # cap + the entry just added

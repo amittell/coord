@@ -426,14 +426,22 @@ class CoordinationService:
         # coalesce onto one write (checking after would let interleaved tasks
         # all pass the staleness check and ping in duplicate).
         self._last_ping[key] = nowm
-        # Bounded: entries older than the interval are semantically dead
-        # weight (they would ping anyway on next touch), so pruning them
-        # changes no behaviour. Keeps the dict from growing without bound as
-        # session ids rotate on a long-lived process.
-        if len(self._last_ping) > 4096:
+        # Hard-bounded: past the high-water mark, first drop entries older
+        # than the interval (semantically dead weight -- they would ping
+        # anyway on next touch), then, if churn keeps everything fresh, evict
+        # the oldest down to the cap. Evicting a fresh entry merely allows
+        # one extra ping (harmless liveness), so the bound costs nothing
+        # semantically. Trigger at 2x the cap so the O(n) pass amortizes
+        # instead of running on every touch at steady-state high churn.
+        if len(self._last_ping) > 8192:
             self._last_ping = {
                 k: v for k, v in self._last_ping.items() if (nowm - v) < interval
             }
+            if len(self._last_ping) > 4096:
+                for k, _v in sorted(
+                    self._last_ping.items(), key=lambda kv: kv[1]
+                )[: len(self._last_ping) - 4096]:
+                    del self._last_ping[k]
         try:
             await self.db.touch_session_activity(session_id, repo=repo)
         except BaseException:
