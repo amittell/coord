@@ -71,6 +71,44 @@ If `loaded:` points at a real file but `auth:` is `<absent>`, the file carries t
 
 Restart the editor/CLI so the next `coord-mcp` child picks up the change. The committed `.mcp.json` does not need to be edited; placeholders are the right value for that file.
 
+## Scoped `local.env` token ignored; `coord_notice` nag persists
+
+Symptom: every repo has a repo-scoped token in `.coordination/local.env`, yet
+MCP tool results still carry the "token is not bound to a repo" `coord_notice`
+(or claims land under the wrong repo scope).
+
+Cause: the inverse of the placeholder problem above. `_load_local_env` only
+overrides env vars that are **unset or a known placeholder** — a *real* value
+in the MCP child's environment always wins over `local.env`. The usual culprit
+is a global editor config that injects one token for every project, e.g.
+Claude Code's `~/.claude.json`:
+
+```json
+"mcpServers": {
+  "coord": {
+    "command": "coord-mcp",
+    "env": {
+      "COORD_AUTH_TOKEN": "coordt_...unscoped...",
+      "COORD_REPO_ID": "owner/some-repo"
+    }
+  }
+}
+```
+
+That env block rides along into every repo's `coord-mcp`, silently shadowing
+each repo's scoped token (and pinning every session's repo id to one repo).
+
+Fix: set the global value to the placeholder and delete any global repo pin,
+so per-repo `local.env` wins again:
+
+```json
+"env": { "COORD_AUTH_TOKEN": "set-me" }
+```
+
+Verify per repo with `env -u COORD_AUTH_TOKEN -u COORD_REPO_ID coord status` —
+it should print that repo's `Repo scope:` line with no token warning. Restart
+editor sessions to pick up the change; then revoke the old shared token.
+
 ## MCP wrapper picks up the wrong service URL
 
 Symptom: MCP tools connect to `http://127.0.0.1:8080` even though the team's `COORD_API_URL` is the cluster URL.

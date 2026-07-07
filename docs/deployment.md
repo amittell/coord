@@ -251,6 +251,12 @@ Drop the scoped token into that repo's gitignored `.coordination/local.env` as
 `COORD_AUTH_TOKEN=...`. Rotation (`coord tokens rotate`) carries the repo
 forward, so a rotated scoped token stays scoped.
 
+`local.env` only overrides env vars that are unset or placeholders, so a real
+`COORD_AUTH_TOKEN` in a global editor config (e.g. Claude Code's
+`~/.claude.json` `mcpServers.coord.env`) silently shadows every repo's scoped
+token. Keep such global blocks on the `set-me` placeholder — see
+"Scoped `local.env` token ignored" in `troubleshooting.md`.
+
 In remote mode, create scoped tokens on the coord server/service. Running
 `coord tokens create` from the application checkout would only write a local
 SQLite DB that the remote service does not read.
