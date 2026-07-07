@@ -2,7 +2,7 @@
 
 Status: operational runbook for the coord HA re-architecture
 (`docs/designs/coord-ha-rearchitecture.md`, Section 8). Last reviewed
-2026-06-30.
+2026-07-07.
 
 > **WARNING -- ArgoCD (learned from the 2026-07-05 v0.44.0 incident):** the HA
 > manifests live in `deploy/k8s/ha-cutover/`, deliberately OUTSIDE ArgoCD's
