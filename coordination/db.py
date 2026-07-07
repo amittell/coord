@@ -1060,7 +1060,14 @@ class Database:
                     await conn.commit()
                     metrics.sqlite_writes_total.inc()
                 except BaseException:
-                    await conn.rollback()
+                    try:
+                        await conn.rollback()
+                    except Exception:
+                        # Mirror _write(): a failed rollback may leave the
+                        # shared writer connection poisoned -- drop it so the
+                        # next write reopens fresh instead of wedging all
+                        # future writes on a broken handle.
+                        await self.aclose()
                     raise
                 finally:
                     for held in reversed(_TXN_ENG_LOCKS.get() or []):

@@ -160,7 +160,8 @@ auth_failures_total = Counter(
 # is the bottleneck (consider lightening create_claims, or Postgres).
 sqlite_writes_total = Counter(
     "sqlite_writes_total",
-    "Total single-statement writes committed through the SQLite writer path.",
+    "Total write commits through the SQLite writer path (a commit may span "
+    "multiple statements, e.g. a claim-grant unit-of-work).",
 )
 sqlite_writer_wait_seconds_total = Counter(
     "sqlite_writer_wait_seconds_total",
