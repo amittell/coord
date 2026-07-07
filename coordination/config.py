@@ -46,10 +46,10 @@ class Settings(BaseSettings):
     # connection + an in-process lock instead of a fresh connection per write.
     # SQLite is single-writer; connection-per-op makes concurrent writers
     # fight over the lock (SQLITE_BUSY storms under load). Funnelling writes
-    # through one connection removes that contention (SQLITE_BUSY becomes
-    # impossible -- coordination writes are never dropped) and also skips the
-    # per-op connect+PRAGMA cost, so it is faster at low/moderate concurrency
-    # too. No-op for the Postgres backend (MVCC). Default on for SQLite; set
+    # through one connection removes that contention on the funnelled write
+    # paths (zero dropped writes in load tests) and also skips the per-op
+    # connect+PRAGMA cost, so it is faster at low/moderate concurrency too.
+    # No-op for the Postgres backend (MVCC). Default on for SQLite; set
     # false to restore connection-per-op.
     sqlite_writer_queue: bool = True
     # Filing a release request shortens the holder's claim TTL to

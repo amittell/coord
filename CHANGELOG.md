@@ -21,8 +21,9 @@ Semantic Versioning.
   - **In-process writer queue** (`COORD_SQLITE_WRITER_QUEUE`, default on for
     SQLite). All writes funnel through one persistent writer connection under
     an async lock instead of a fresh connection per op, so concurrent writers
-    queue in-process instead of fighting SQLite's single write lock -- making
-    `SQLITE_BUSY` (dropped coordination writes) impossible. Reentrancy-safe
+    queue in-process instead of fighting SQLite's single write lock --
+    eliminating `SQLITE_BUSY` (dropped coordination writes) on the funnelled
+    write paths (zero dropped writes in load tests). Reentrancy-safe
     (a write inside a `transaction()` reuses the bound connection) and
     connection-reuse also removes the per-op connect+PRAGMA cost. At realistic
     concurrency (200 agents) it matched throughput, cut p99 latency ~43%, and

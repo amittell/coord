@@ -934,7 +934,11 @@ class Database:
         - queue on, outside a transaction: acquire ``_writer_lock`` and use the
           one shared persistent writer connection, commit + release on exit.
           Concurrent writers queue in-process instead of fighting SQLite's
-          write lock, so ``SQLITE_BUSY`` cannot happen.
+          write lock, so the funnelled paths cannot hit ``SQLITE_BUSY``. (A
+          few legacy write paths -- e.g. ``release_for_session``'s
+          ``BEGIN IMMEDIATE`` block -- still open their own connections and
+          can BUSY under extreme contention; migrate them here as the
+          ``sqlite_writer_wait_seconds_total`` metric warrants.)
         - queue on, INSIDE a ``transaction()`` (``_BOUND_CONN`` set): reuse the
           bound connection and DEFER -- the outer transaction already holds the
           lock and owns the commit, so we neither re-lock (no deadlock) nor
@@ -945,8 +949,15 @@ class Database:
             try:
                 conn.row_factory = aiosqlite.Row
                 await _configure_sqlite(conn)
-                yield conn
-                await conn.commit()
+                try:
+                    yield conn
+                    await conn.commit()
+                except BaseException:
+                    try:
+                        await conn.rollback()
+                    except Exception:
+                        pass
+                    raise
             finally:
                 await conn.close()
             return

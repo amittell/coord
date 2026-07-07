@@ -726,7 +726,14 @@ class _PGConnAdapter:
 class PostgresStore(Database):
     """asyncpg-backed :class:`Database` (design Sections 5-7)."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, writer_queue: bool = False) -> None:
+        # ``writer_queue`` is accepted for signature compatibility with
+        # ``Database(path, writer_queue=...)`` construction and deliberately
+        # IGNORED: the in-process writer serialization is a SQLite
+        # single-writer concern; Postgres is MVCC and its writes must not be
+        # serialized through one connection (nor touch the SQLite-specific
+        # shared-writer plumbing). super() is called without it so the
+        # inherited flag stays False.
         super().__init__(path)
         url = os.environ.get("COORD_DATABASE_URL", "")
         # asyncpg understands postgresql:// and postgres:// DSNs directly.

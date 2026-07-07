@@ -405,14 +405,34 @@ class CoordinationService:
         if not session_id:
             return
         interval = self.settings.activity_ping_min_interval_sec
-        if interval > 0:
-            key = (session_id, repo)
-            last = self._last_ping.get(key)
-            nowm = _time.monotonic()
-            if last is not None and (nowm - last) < interval:
-                return
-            self._last_ping[key] = nowm
-        await self.db.touch_session_activity(session_id, repo=repo)
+        if interval <= 0:
+            await self.db.touch_session_activity(session_id, repo=repo)
+            return
+        key = (session_id, repo)
+        last = self._last_ping.get(key)
+        nowm = _time.monotonic()
+        if last is not None and (nowm - last) < interval:
+            return
+        # Stamp BEFORE the await so concurrent callers of the same session
+        # coalesce onto one write (checking after would let interleaved tasks
+        # all pass the staleness check and ping in duplicate).
+        self._last_ping[key] = nowm
+        # Bounded: entries older than the interval are semantically dead
+        # weight (they would ping anyway on next touch), so pruning them
+        # changes no behaviour. Keeps the dict from growing without bound as
+        # session ids rotate on a long-lived process.
+        if len(self._last_ping) > 4096:
+            self._last_ping = {
+                k: v for k, v in self._last_ping.items() if (nowm - v) < interval
+            }
+        try:
+            await self.db.touch_session_activity(session_id, repo=repo)
+        except BaseException:
+            # The write did not land -- roll the stamp back so the next call
+            # retries immediately instead of being suppressed for a full
+            # interval on the strength of a failed ping.
+            self._last_ping.pop(key, None)
+            raise
 
     async def count_queued_for(
         self, engineer: str, *, repo: str | None = None
