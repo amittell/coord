@@ -7,6 +7,10 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+(none recorded yet)
+
+## [0.45.0] - 2026-07-07
+
 ### Added
 
 - SQLite write-scaling for high-concurrency single-node deployments (keeps
