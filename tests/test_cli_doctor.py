@@ -103,6 +103,62 @@ def test_check_service_unauthenticated_failure_explains_insecure_flag(monkeypatc
     assert "COORD_ALLOW_INSECURE_NO_AUTH" in auth_result.hint
 
 
+def test_check_service_remote_token_401_explains_server_side_creation(
+    monkeypatch, tmp_path
+):
+    captured: list[httpx.Request] = []
+    transport = _mock_transport(captured, {"/readyz": 200, "/claims": 401})
+    monkeypatch.setattr(
+        cli_doctor.httpx,
+        "get",
+        lambda url, **kw: httpx.Client(transport=transport).get(url, **kw),
+    )
+    config = _config(tmp_path)
+    config.repo_id = "amittell/requesthub"
+
+    results = cli_doctor._check_service(config, token="local-only-token")
+
+    auth_result = results[1]
+    assert auth_result.label == "auth token works"
+    assert auth_result.ok is False
+    assert "not known to http://coord.example" in auth_result.hint
+    assert "do not run 'coord tokens create' from this repo checkout" in auth_result.hint
+    assert "local SQLite DB" in auth_result.hint
+    assert (
+        "kubectl -n coord exec deploy/coord -- coord tokens create "
+        "\"<engineer>\" --repo amittell/requesthub"
+    ) in auth_result.hint
+
+
+def test_remote_mode_local_db_warning_points_at_local_only_tokens(tmp_path):
+    config = _config(tmp_path)
+    config.repo_id = "amittell/requesthub"
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "coordination.db").write_text("not a real sqlite db", encoding="utf-8")
+
+    results = cli_doctor._check_remote_mode_local_db(tmp_path, config)
+
+    assert len(results) == 1
+    warning = results[0]
+    assert warning.ok is False
+    assert warning.level == "warn"
+    assert "data/coordination.db exists" in warning.detail
+    assert "local-only tokens" in warning.hint
+    assert "http://coord.example will never see them" in warning.hint
+    assert "coord tokens create \"<engineer>\" --repo amittell/requesthub" in warning.hint
+
+
+def test_local_mode_ignores_repo_local_coordination_db(tmp_path):
+    config = _config(tmp_path)
+    config.mode = "local"
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "coordination.db").write_text("local mode", encoding="utf-8")
+
+    assert cli_doctor._check_remote_mode_local_db(tmp_path, config) == []
+
+
 def test_check_service_unreachable_reports_both(monkeypatch, tmp_path):
     def raising_get(url, **kw):
         raise httpx.ConnectError("no route to host")

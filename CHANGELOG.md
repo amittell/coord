@@ -31,6 +31,26 @@ Semantic Versioning.
   - New `sqlite_writes_total` and `sqlite_writer_wait_seconds_total` metrics so
     an operator can see write throughput and writer-lock contention and decide
     if the write path needs further work.
+## [0.44.1] - 2026-07-05
+
+### Fixed
+
+- Remote-mode token creation is now fail-closed by default. Running
+  `coord tokens create` inside a repo configured with `mode = "remote"` refuses
+  the implicit local SQLite write unless the operator passes `--local-db`,
+  `--database-path`, or `COORD_DATABASE_PATH`. The error explains that local
+  tokens are not known to the remote service and prints server-side,
+  repo-scoped `kubectl exec ... coord tokens create ... --repo ...` guidance.
+
+- `coord doctor` now detects `data/coordination.db` inside remote-mode repos and
+  warns that the DB likely contains local-only tokens. Remote auth failures also
+  get a more explicit hint: create the token on the coord server/service, prefer
+  a repo-scoped token, then paste it into `.coordination/local.env`.
+
+### Documentation
+
+- Deployment and troubleshooting docs now call out the local-checkout token trap
+  and show the server-side repo-scoped token creation flow.
 
 ## [0.44.0] - 2026-07-05
 

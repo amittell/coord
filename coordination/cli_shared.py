@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shlex
 import stat
 import sys
 
@@ -69,6 +70,29 @@ def parse_duration(value: str, *, allow_zero: bool = False) -> timedelta:
             f"Invalid duration {value!r}: must be greater than zero."
         )
     return count * _DURATION_UNITS[match.group(2)]
+
+
+def format_repo_scoped_token_create_command(
+    engineer: str, repo_id: str | None
+) -> str:
+    """Return a copy-pasteable scoped-token creation command.
+
+    Used in human hints where the safe default should be repo-scoped. A
+    placeholder engineer stays visually placeholder-like; real engineer ids
+    are shell-quoted when needed, and leading-dash ids use argparse's ``--``
+    separator so the command remains valid.
+    """
+    repo = repo_id or "<owner/name>"
+    repo_arg = repo if repo.startswith("<") and repo.endswith(">") else shlex.quote(repo)
+    if engineer == "<engineer>":
+        who = '"<engineer>"'
+        starts_dash = False
+    else:
+        starts_dash = engineer.startswith("-")
+        who = shlex.quote(engineer)
+    if starts_dash:
+        return f"coord tokens create --repo {repo_arg} -- {who}"
+    return f"coord tokens create {who} --repo {repo_arg}"
 
 
 def coord_home() -> Path:

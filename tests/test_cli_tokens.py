@@ -27,6 +27,7 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -73,6 +74,81 @@ def _read_row(db_path: Path, sql: str, params: tuple) -> tuple | None:
             return await cur.fetchone()
 
     return asyncio.run(_go())
+
+
+def _seed_remote_mode_repo(repo: Path, repo_id: str = "amittell/requesthub") -> None:
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
+    coord = repo / ".coordination"
+    coord.mkdir()
+    (coord / "config.toml").write_text(
+        "version = 1\n"
+        'tool = "claude"\n'
+        'mode = "remote"\n'
+        'service_url = "http://coord.kebabrack.lan"\n'
+        'ownership_file = ".coordination/owners.yaml"\n'
+        'local_env_file = ".coordination/local.env"\n'
+        f'repo_id = "{repo_id}"\n',
+        encoding="utf-8",
+    )
+
+
+def test_create_refuses_implicit_local_db_in_remote_mode_repo(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo = tmp_path / "app"
+    repo.mkdir()
+    _seed_remote_mode_repo(repo)
+    monkeypatch.chdir(repo)
+    monkeypatch.delenv("COORD_DATABASE_PATH", raising=False)
+
+    rc = cli.main(["tokens", "create", "alex/claude/main"])
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "coordt_" not in captured.out
+    assert "Refusing to create a local SQLite token" in captured.err
+    assert "http://coord.kebabrack.lan will not know that token" in captured.err
+    assert (
+        "kubectl -n coord exec deploy/coord -- coord tokens create "
+        "alex/claude/main --repo amittell/requesthub"
+    ) in captured.err
+    assert "--local-db" in captured.err
+    assert not (repo / "data" / "coordination.db").exists()
+
+
+def test_create_database_path_is_explicit_local_db_opt_in(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo = tmp_path / "app"
+    repo.mkdir()
+    _seed_remote_mode_repo(repo)
+    monkeypatch.chdir(repo)
+    monkeypatch.delenv("COORD_DATABASE_PATH", raising=False)
+    db_path = tmp_path / "server.sqlite"
+
+    rc = cli.main(
+        [
+            "tokens",
+            "create",
+            "alex/claude/main",
+            "--repo",
+            "amittell/requesthub",
+            "--database-path",
+            str(db_path),
+            "--json",
+        ]
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["engineer"] == "alex/claude/main"
+    assert payload["repo"] == "amittell/requesthub"
+    assert payload["token"].startswith(cli_tokens.TOKEN_PREFIX)
+    assert db_path.exists()
 
 
 def test_create_prints_raw_token_once(
