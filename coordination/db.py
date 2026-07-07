@@ -904,11 +904,24 @@ class Database:
         return aiosqlite.connect(self.path)
 
     async def _ensure_writer(self) -> aiosqlite.Connection:
-        """Lazily open the single shared writer connection (configured once)."""
+        """Lazily open the single shared writer connection (configured once).
+
+        Only reachable with the writer queue on, which is a plain-SQLite
+        concern (PostgresStore forces the flag off), so connecting via
+        aiosqlite directly -- the connection must outlive a context-manager
+        block -- is correct here. Close on a failed setup so retries cannot
+        leak file descriptors."""
         if self._writer_conn is None:
             conn = await aiosqlite.connect(self.path)
-            conn.row_factory = aiosqlite.Row
-            await _configure_sqlite(conn)
+            try:
+                conn.row_factory = aiosqlite.Row
+                await _configure_sqlite(conn)
+            except BaseException:
+                try:
+                    await conn.close()
+                except Exception:
+                    pass
+                raise
             self._writer_conn = conn
         return self._writer_conn
 
@@ -945,8 +958,12 @@ class Database:
           commit early (no torn unit-of-work).
         """
         if not self._writer_queue:
-            conn = await aiosqlite.connect(self.path)
-            try:
+            # Go through self._connect() -- the overridable backend seam -- so
+            # the Postgres store's adapter connection is used there, exactly
+            # like every other per-op method. (Connecting via aiosqlite
+            # directly here broke the PG backend, whose _connect() returns an
+            # async context manager, not an awaitable connection.)
+            async with self._connect() as conn:
                 conn.row_factory = aiosqlite.Row
                 await _configure_sqlite(conn)
                 try:
@@ -958,8 +975,6 @@ class Database:
                     except Exception:
                         pass
                     raise
-            finally:
-                await conn.close()
             return
         bound = _BOUND_CONN.get()
         if bound is not None:
