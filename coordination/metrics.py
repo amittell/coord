@@ -154,6 +154,24 @@ auth_failures_total = Counter(
     "Total inbound requests rejected for missing or invalid bearer token.",
 )
 
+# v0.44 scale: SQLite writer-queue observability. writes_total gives write
+# throughput; writer_wait_seconds_total is cumulative time spent waiting for
+# the single-writer lock -- if it climbs fast relative to wall time the writer
+# is the bottleneck (consider lightening create_claims, or Postgres).
+sqlite_writes_total = Counter(
+    "sqlite_writes_total",
+    "Write commits through the funnelled SQLite writer-queue path (a commit "
+    "may span multiple statements, e.g. a claim-grant unit-of-work). Stays 0 "
+    "when COORD_SQLITE_WRITER_QUEUE is off and excludes the few legacy write "
+    "paths that still open their own connections.",
+)
+sqlite_writer_wait_seconds_total = Counter(
+    "sqlite_writer_wait_seconds_total",
+    "Cumulative seconds spent waiting to acquire the SQLite writer lock. Only "
+    "meaningful with COORD_SQLITE_WRITER_QUEUE on -- 0 with the queue off "
+    "means unmeasured, not uncontended.",
+)
+
 http_requests_total = Counter(
     "http_requests_total",
     "Total HTTP requests handled, by method, path template, and status code.",

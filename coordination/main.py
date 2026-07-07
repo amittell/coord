@@ -232,6 +232,12 @@ async def lifespan(app: FastAPI):
                 await t
             except asyncio.CancelledError:
                 pass
+        # v0.44: close the shared SQLite writer connection (no-op when the
+        # writer queue is off / on the Postgres backend).
+        try:
+            await get_service().db.aclose()
+        except Exception:  # pragma: no cover - best-effort shutdown
+            logger.debug("db.aclose on shutdown failed", exc_info=True)
         await _shutdown_lsp_pool()
 
 

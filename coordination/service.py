@@ -389,6 +389,67 @@ class CoordinationService:
     # await enrichment deterministically:
     # ``await asyncio.gather(*service._enrichment_tasks)``.
     _enrichment_tasks: set[asyncio.Task[None]] = field(default_factory=set)
+    # v0.44 scale: per-(session, repo) monotonic timestamp of the last
+    # activity ping actually written, for coalescing (see _maybe_touch).
+    _last_ping: dict[tuple[str, str | None], float] = field(default_factory=dict)
+
+    async def _maybe_touch(self, session_id: str | None, repo: str | None) -> None:
+        """Activity ping with v0.44 coalescing. Most reads write a liveness
+        ping (``touch_session_activity``); at hundreds of agents that
+        write-on-read is the dominant SQLite write load. When
+        ``activity_ping_min_interval_sec > 0`` a (session, repo) is pinged at
+        most once per interval (best-effort, in-process); intervening pings
+        are skipped. A ping is liveness only -- coalescing or dropping one is
+        safe, it just delays idle-expiry of an already-idle session slightly.
+        """
+        if not session_id:
+            return
+        interval = self.settings.activity_ping_min_interval_sec
+        if interval <= 0:
+            await self.db.touch_session_activity(session_id, repo=repo)
+            return
+        # Defensive clamp: coalescing must never out-pace idle expiry, or a
+        # read-only session could be expired as idle between pings. Half the
+        # idle window guarantees at least ~2 ping opportunities per window; a
+        # misconfigured interval degrades to more frequent pings, not false
+        # expiry. (idle_timeout_sec == 0 disables idle expiry entirely, so no
+        # clamp is needed there.)
+        idle = self.settings.idle_timeout_sec
+        if idle > 0:
+            interval = min(interval, max(1, idle // 2))
+        key = (session_id, repo)
+        last = self._last_ping.get(key)
+        nowm = _time.monotonic()
+        if last is not None and (nowm - last) < interval:
+            return
+        # Stamp BEFORE the await so concurrent callers of the same session
+        # coalesce onto one write (checking after would let interleaved tasks
+        # all pass the staleness check and ping in duplicate).
+        self._last_ping[key] = nowm
+        # Hard-bounded: past the high-water mark, first drop entries older
+        # than the interval (semantically dead weight -- they would ping
+        # anyway on next touch), then, if churn keeps everything fresh, evict
+        # the oldest down to the cap. Evicting a fresh entry merely allows
+        # one extra ping (harmless liveness), so the bound costs nothing
+        # semantically. Trigger at 2x the cap so the O(n) pass amortizes
+        # instead of running on every touch at steady-state high churn.
+        if len(self._last_ping) > 8192:
+            self._last_ping = {
+                k: v for k, v in self._last_ping.items() if (nowm - v) < interval
+            }
+            if len(self._last_ping) > 4096:
+                for k, _v in sorted(
+                    self._last_ping.items(), key=lambda kv: kv[1]
+                )[: len(self._last_ping) - 4096]:
+                    del self._last_ping[k]
+        try:
+            await self.db.touch_session_activity(session_id, repo=repo)
+        except BaseException:
+            # The write did not land -- roll the stamp back so the next call
+            # retries immediately instead of being suppressed for a full
+            # interval on the strength of a failed ping.
+            self._last_ping.pop(key, None)
+            raise
 
     async def count_queued_for(
         self, engineer: str, *, repo: str | None = None
@@ -677,7 +738,7 @@ class CoordinationService:
         # needs to keep its claims warm.
         if session_ids:
             for sid in session_ids:
-                await self.db.touch_session_activity(sid, repo=repo)
+                await self._maybe_touch(sid, repo)
         active = await self.db.list_active_claims_rows(exclude_engineer=engineer)
         # Repo-scoped check (v0.4.0): only consider claims from the same
         # repo as the caller. NULL repo forms its own legacy bucket so
@@ -883,9 +944,7 @@ class CoordinationService:
         # liveness signal -- bump last_activity for every claim this
         # session already holds before we decide what's stale.
         if body.session_id:
-            await self.db.touch_session_activity(
-                body.session_id, repo=body.repo
-            )
+            await self._maybe_touch(body.session_id, body.repo)
         rules = await self._rules()
         patterns = [c.pattern for c in body.claims]
         for pat in patterns:
@@ -2177,7 +2236,7 @@ class CoordinationService:
         # repo-scoped reader cannot refresh another repo's claims via a
         # shared session id (v0.42).
         if session_id:
-            await self.db.touch_session_activity(session_id, repo=repo)
+            await self._maybe_touch(session_id, repo)
         if active_only:
             rows = await self.db.list_active_claims_rows(exclude_engineer=None)
         else:
@@ -3440,4 +3499,7 @@ class CoordinationService:
 
 def build_service() -> CoordinationService:
     s = get_settings()
-    return CoordinationService(db=Database(s.database_path), settings=s)
+    return CoordinationService(
+        db=Database(s.database_path, writer_queue=s.sqlite_writer_queue),
+        settings=s,
+    )

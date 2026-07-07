@@ -118,11 +118,15 @@ def test_create_refuses_implicit_local_db_in_remote_mode_repo(
     assert not (repo / "data" / "coordination.db").exists()
 
 
+@pytest.mark.sqlite_only
 def test_create_database_path_is_explicit_local_db_opt_in(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    # sqlite_only: asserts --database-path materializes a local SQLite file
+    # (db_path.exists()), which by design never happens on the PG backend.
+    # This was the sole test-postgres failure on main since v0.44.1.
     repo = tmp_path / "app"
     repo.mkdir()
     _seed_remote_mode_repo(repo)

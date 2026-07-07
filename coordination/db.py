@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import sys
+import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -13,6 +14,8 @@ from typing import Any
 from uuid import uuid4
 
 import aiosqlite
+
+from coordination import metrics
 
 from coordination.repo_id import normalize_repo_id
 
@@ -867,8 +870,15 @@ class Database:
             return object.__new__(PostgresStore)
         return object.__new__(cls)
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, writer_queue: bool = False) -> None:
         self.path = path
+        # v0.44 scale: when True, all single-statement writes funnel through
+        # one persistent connection under ``_writer_lock`` (see _write) instead
+        # of a fresh connection per op, removing SQLite write-lock contention
+        # under high concurrency. Opened lazily.
+        self._writer_queue = writer_queue
+        self._writer_conn: aiosqlite.Connection | None = None
+        self._writer_lock = asyncio.Lock()
         # In-process per-engineer locks for the active-claim cap (design
         # 5.3). The cap is per-engineer and GLOBAL across repos, so the
         # per-repo grant lock does not cover it. On SQLite a single writer
@@ -892,6 +902,126 @@ class Database:
         store.
         """
         return aiosqlite.connect(self.path)
+
+    async def _ensure_writer(self) -> aiosqlite.Connection:
+        """Lazily open the single shared writer connection (configured once).
+
+        Only reachable with the writer queue on, which is a plain-SQLite
+        concern (PostgresStore forces the flag off), so connecting via
+        aiosqlite directly -- the connection must outlive a context-manager
+        block -- is correct here. Close on a failed setup so retries cannot
+        leak file descriptors."""
+        if self._writer_conn is None:
+            conn = await aiosqlite.connect(self.path)
+            try:
+                conn.row_factory = aiosqlite.Row
+                await _configure_sqlite(conn)
+            except BaseException:
+                try:
+                    await conn.close()
+                except Exception:
+                    pass
+                raise
+            self._writer_conn = conn
+        return self._writer_conn
+
+    async def _drop_writer(self) -> None:
+        """Close and forget the shared writer connection. Idempotent. The
+        caller must already hold ``_writer_lock`` (poison recovery inside
+        ``_write``/``transaction``) or otherwise have exclusive access --
+        this method deliberately takes no lock so those paths cannot
+        deadlock on the non-reentrant asyncio.Lock."""
+        conn = self._writer_conn
+        self._writer_conn = None
+        if conn is not None:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+
+    async def aclose(self) -> None:
+        """Close the shared writer connection on shutdown. Acquires
+        ``_writer_lock`` (bounded) so an in-flight write finishes before the
+        connection closes underneath it. If a wedged writer holds the lock
+        past the timeout, the handle is FORGOTTEN rather than closed --
+        closing it under the in-flight writer could tear its transaction;
+        forgetting it just stops reuse, and process teardown reaps the FD."""
+        try:
+            async with asyncio.timeout(5):
+                async with self._writer_lock:
+                    await self._drop_writer()
+        except TimeoutError:
+            self._writer_conn = None
+
+    @asynccontextmanager
+    async def _write(self):
+        """Yield a ready (row_factory + pragmas) connection for a single
+        autocommit write, and OWN the commit -- the caller only runs its
+        ``execute``(s); ``_write`` commits on clean exit and rolls back on
+        error. This ownership is what makes it reentrancy-safe.
+
+        Three modes:
+        - queue off: fresh connection per op (legacy), commit + close here.
+        - queue on, outside a transaction: acquire ``_writer_lock`` and use the
+          one shared persistent writer connection, commit + release on exit.
+          Concurrent writers queue in-process instead of fighting SQLite's
+          write lock, so the funnelled paths cannot hit ``SQLITE_BUSY``. (A
+          few legacy write paths -- e.g. ``release_for_session``'s
+          ``BEGIN IMMEDIATE`` block -- still open their own connections and
+          can BUSY under extreme contention; migrate them here as the
+          ``sqlite_writer_wait_seconds_total`` metric warrants.)
+        - queue on, INSIDE a ``transaction()`` (``_BOUND_CONN`` set): reuse the
+          bound connection and DEFER -- the outer transaction already holds the
+          lock and owns the commit, so we neither re-lock (no deadlock) nor
+          commit early (no torn unit-of-work).
+        """
+        if not self._writer_queue:
+            # Go through self._connect() -- the overridable backend seam -- so
+            # the Postgres store's adapter connection is used there, exactly
+            # like every other per-op method. (Connecting via aiosqlite
+            # directly here broke the PG backend, whose _connect() returns an
+            # async context manager, not an awaitable connection.)
+            async with self._connect() as conn:
+                conn.row_factory = aiosqlite.Row
+                await _configure_sqlite(conn)
+                try:
+                    yield conn
+                    await conn.commit()
+                except BaseException:
+                    try:
+                        await conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+            return
+        bound = _BOUND_CONN.get()
+        if bound is not None:
+            # Inside a write transaction that already holds the lock and owns
+            # commit -- reuse its connection, defer commit/unlock to it.
+            yield bound
+            return
+        _wait_start = time.perf_counter()
+        await self._writer_lock.acquire()
+        metrics.sqlite_writer_wait_seconds_total.inc(
+            time.perf_counter() - _wait_start
+        )
+        try:
+            conn = await self._ensure_writer()
+            try:
+                yield conn
+                await conn.commit()
+                metrics.sqlite_writes_total.inc()
+            except BaseException:
+                try:
+                    await conn.rollback()
+                except Exception:
+                    # Connection may be poisoned -- drop it so the next write
+                    # reopens a fresh one rather than reusing a broken handle.
+                    # (_drop_writer, not aclose: we already hold _writer_lock.)
+                    await self._drop_writer()
+                raise
+        finally:
+            self._writer_lock.release()
 
     async def init(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -940,6 +1070,48 @@ class Database:
             yield existing
             return
         await self.init()
+        # v0.44 scale: when the writer queue is on, every write unit-of-work
+        # runs on the one shared writer connection under ``_writer_lock`` --
+        # so concurrent grants queue in-process instead of each opening a
+        # connection and fighting SQLite's write lock (SQLITE_BUSY). Inner
+        # writes reuse the bound connection via _acquire (not _write), so
+        # there is no reentrant re-acquire of the lock.
+        if self._writer_queue:
+            # Same wait accounting as _write(): transaction() carries the
+            # heaviest units-of-work (claim grants), so under-reporting its
+            # lock waits would hide contention exactly where it matters.
+            _wait_start = time.perf_counter()
+            await self._writer_lock.acquire()
+            metrics.sqlite_writer_wait_seconds_total.inc(
+                time.perf_counter() - _wait_start
+            )
+            try:
+                conn = await self._ensure_writer()
+                token = _BOUND_CONN.set(conn)
+                held_eng_token = _TXN_ENG_LOCKS.set([])
+                try:
+                    yield conn
+                    await conn.commit()
+                    metrics.sqlite_writes_total.inc()
+                except BaseException:
+                    try:
+                        await conn.rollback()
+                    except Exception:
+                        # Mirror _write(): a failed rollback may leave the
+                        # shared writer connection poisoned -- drop it so the
+                        # next write reopens fresh instead of wedging all
+                        # future writes on a broken handle. (_drop_writer,
+                        # not aclose: we already hold _writer_lock.)
+                        await self._drop_writer()
+                    raise
+                finally:
+                    for held in reversed(_TXN_ENG_LOCKS.get() or []):
+                        held.release()
+                    _TXN_ENG_LOCKS.reset(held_eng_token)
+                    _BOUND_CONN.reset(token)
+            finally:
+                self._writer_lock.release()
+            return
         async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
@@ -2842,12 +3014,9 @@ class Database:
         if repo is not None:
             sql += " AND repo IS ?"
             params.append(repo)
-        async with self._connect() as conn:
-            conn.row_factory = aiosqlite.Row
-            await _configure_sqlite(conn)
+        async with self._write() as conn:
             cur = await conn.execute(sql, params)
-            await conn.commit()
-            return cur.rowcount or 0
+            return cur.rowcount or 0  # _write owns the commit
 
     async def pending_requests_for_session(
         self, session_id: str, *, repo: str | None = None, limit: int = 100
@@ -3008,9 +3177,7 @@ class Database:
         now = _utcnow()
         await self.init()
         released_ids: list[str] = []
-        async with self._connect() as conn:
-            conn.row_factory = aiosqlite.Row
-            await _configure_sqlite(conn)
+        async with self._write() as conn:
             n = 0
             for cid in claim_ids:
                 if engineer:
@@ -3026,7 +3193,7 @@ class Database:
                 if cur.rowcount and cur.rowcount > 0:
                     released_ids.append(cid)
                     n += cur.rowcount
-            await conn.commit()
+            # _write owns the commit
         # Detach the released claims from any coexisting partners
         # BEFORE cascade-resolve, so a partner that's about to receive
         # a coexist-related event sees a clean graph rather than a

@@ -288,3 +288,20 @@ async def test_all_static_dml_parses_on_pg(tmp_path: Path) -> None:
         await pool.release(raw)
 
     assert not failures, "non-parsing translations:\n" + "\n".join(failures)
+
+
+def test_postgres_store_accepts_writer_queue_kwarg(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression (PR #66 Copilot review): build_service constructs
+    ``Database(path, writer_queue=...)`` unconditionally; with a Postgres DSN
+    that dispatches to PostgresStore, whose __init__ must accept the kwarg
+    (and ignore it -- the in-process writer serialization is a SQLite
+    concern, so the inherited flag must stay False)."""
+    from coordination.db import Database
+    from coordination.pg_backend import PostgresStore
+
+    monkeypatch.setenv("COORD_DATABASE_URL", "postgresql://u:p@localhost/x")
+    store = Database(tmp_path / "db.sqlite", writer_queue=True)
+    assert isinstance(store, PostgresStore)
+    assert store._writer_queue is False  # SQLite-only concern, forced off

@@ -32,6 +32,30 @@ class Settings(BaseSettings):
     # they continue to use TTL only. Set to 0 to disable idle expiry
     # cluster-wide.
     idle_timeout_sec: int = 1800
+    # v0.44 scale: activity-ping coalescing. On a busy shared service most
+    # reads (list_claims / check_conflicts) also write a liveness "ping"
+    # (touch last_activity); at hundreds of agents that write-on-read is the
+    # dominant write load and the main SQLite lock-contention source. When
+    # > 0, a session's ping is written at most once per this many seconds
+    # (best-effort, in-process); intervening pings are skipped. 0 keeps the
+    # write-every-read behaviour. Must stay well under idle_timeout_sec, or a
+    # read-only session could idle-expire between coalesced pings; the service
+    # defensively clamps the effective interval to idle_timeout_sec / 2 when
+    # idle expiry is enabled, so a misconfiguration degrades to more frequent
+    # pings rather than false idle expiry. Default 30s: liveness accurate to
+    # 30s, far under the 1800s idle timeout, and removes the write-on-read
+    # amplification out of the box.
+    activity_ping_min_interval_sec: int = 30
+    # v0.44 scale: serialize SQLite writes through one persistent writer
+    # connection + an in-process lock instead of a fresh connection per write.
+    # SQLite is single-writer; connection-per-op makes concurrent writers
+    # fight over the lock (SQLITE_BUSY storms under load). Funnelling writes
+    # through one connection removes that contention on the funnelled write
+    # paths (zero dropped writes in load tests) and also skips the per-op
+    # connect+PRAGMA cost, so it is faster at low/moderate concurrency too.
+    # No-op for the Postgres backend (MVCC). Default on for SQLite; set
+    # false to restore connection-per-op.
+    sqlite_writer_queue: bool = True
     # Filing a release request shortens the holder's claim TTL to
     # min(remaining, this value). Forces a near-term decision: the
     # holder either responds (approve/deny) or the shortened TTL
