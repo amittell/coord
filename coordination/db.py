@@ -925,8 +925,12 @@ class Database:
             self._writer_conn = conn
         return self._writer_conn
 
-    async def aclose(self) -> None:
-        """Close the shared writer connection on shutdown. Idempotent."""
+    async def _drop_writer(self) -> None:
+        """Close and forget the shared writer connection. Idempotent. The
+        caller must already hold ``_writer_lock`` (poison recovery inside
+        ``_write``/``transaction``) or otherwise have exclusive access --
+        this method deliberately takes no lock so those paths cannot
+        deadlock on the non-reentrant asyncio.Lock."""
         conn = self._writer_conn
         self._writer_conn = None
         if conn is not None:
@@ -934,6 +938,18 @@ class Database:
                 await conn.close()
             except Exception:
                 pass
+
+    async def aclose(self) -> None:
+        """Close the shared writer connection on shutdown. Acquires
+        ``_writer_lock`` (bounded) so an in-flight write finishes before the
+        connection closes underneath it; after the timeout the connection is
+        dropped anyway so shutdown can never hang on a wedged writer."""
+        try:
+            async with asyncio.timeout(5):
+                async with self._writer_lock:
+                    await self._drop_writer()
+        except TimeoutError:
+            await self._drop_writer()
 
     @asynccontextmanager
     async def _write(self):
@@ -999,7 +1015,8 @@ class Database:
                 except Exception:
                     # Connection may be poisoned -- drop it so the next write
                     # reopens a fresh one rather than reusing a broken handle.
-                    await self.aclose()
+                    # (_drop_writer, not aclose: we already hold _writer_lock.)
+                    await self._drop_writer()
                 raise
         finally:
             self._writer_lock.release()
@@ -1081,8 +1098,9 @@ class Database:
                         # Mirror _write(): a failed rollback may leave the
                         # shared writer connection poisoned -- drop it so the
                         # next write reopens fresh instead of wedging all
-                        # future writes on a broken handle.
-                        await self.aclose()
+                        # future writes on a broken handle. (_drop_writer,
+                        # not aclose: we already hold _writer_lock.)
+                        await self._drop_writer()
                     raise
                 finally:
                     for held in reversed(_TXN_ENG_LOCKS.get() or []):
