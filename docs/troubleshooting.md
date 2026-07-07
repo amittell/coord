@@ -220,3 +220,25 @@ Cause (v0.10.0 only): the v0.10 implementation installed custom SIGTERM/SIGINT h
 Fix in v0.11.0: drops the explicit signal handlers entirely. Marker cleanup runs from `atexit` only, which fires for both clean exits and signal-driven shutdowns through the interpreter's normal path. FastMCP keeps full ownership of signal disposition.
 
 If you're seeing this on a v0.10.0 client: upgrade to v0.11.0+ and restart the parent agent. As a one-off recovery, fall back to the `coord` CLI (`coord release ...`) which doesn't go through the MCP child.
+
+## Slow or failing writes under many concurrent agents
+
+Symptoms: `database is locked` / `SQLITE_BUSY` errors in server logs, or
+latency spikes on `claim_files` when hundreds of agents hit one service.
+
+Since v0.45 the defaults already mitigate this: liveness pings coalesce to one
+write per `COORD_ACTIVITY_PING_MIN_INTERVAL_SEC` (default 30s) per session, and
+hot-path writes funnel through an in-process writer queue
+(`COORD_SQLITE_WRITER_QUEUE=true`), so concurrent writers queue instead of
+fighting SQLite's write lock. Check both are on, then watch two counters on
+`/metrics`:
+
+- `sqlite_writes_total` -- write throughput through the funnelled path.
+- `sqlite_writer_wait_seconds_total` -- time spent waiting for the writer
+  lock. If this climbs fast relative to wall time, the single writer is the
+  bottleneck: the next levers are lightening `create_claims` or the dormant
+  Postgres backend (`docs/runbooks/coord-ha-cutover.md`).
+
+To rule the new machinery in or out during debugging, both have instant
+rollback: `COORD_SQLITE_WRITER_QUEUE=false` restores connection-per-op writes
+and `COORD_ACTIVITY_PING_MIN_INTERVAL_SEC=0` restores write-every-read pings.

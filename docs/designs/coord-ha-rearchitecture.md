@@ -1,7 +1,20 @@
 # coord HA re-architecture: Postgres + stateless multi-replica
 
-Status: DRAFT v2 (2026-06-29) -- revised after review by Codex, the RepoPrompt
-oracle, and a fresh code-review agent. See Section 14 for the review outcome.
+Status: IMPLEMENTED, SHIPPED DORMANT, CUTOVER SHELVED (2026-07-07). The
+backend merged in v0.44.0 (#54): ``coordination/pg_backend.py`` selected by a
+``postgresql://`` ``COORD_DATABASE_URL``, validated by the ``test-postgres``
+CI job, cutover manifests in ``deploy/k8s/ha-cutover/`` (deliberately outside
+ArgoCD's watched path after the 2026-07-05 premature-activation incident),
+live cutover operator-gated per ``docs/runbooks/coord-ha-cutover.md``. The
+cutover itself is SHELVED: v0.45.0's SQLite write-scaling (activity-ping
+coalescing + in-process writer queue) was chosen as the scale path after load
+tests showed it eliminates dropped writes at 200-300-agent concurrency.
+Revisit when ``sqlite_writer_wait_seconds_total`` climbs fast relative to
+wall time or topology needs multi-replica.
+
+Prior status: DRAFT v2 (2026-06-29) -- revised after review by Codex, the
+RepoPrompt oracle, and a fresh code-review agent. See Section 14 for the
+review outcome.
 
 Verdict from review: the direction (Postgres + stateless replicas + per-repo
 advisory lock + client retry) is correct, but there are correctness gaps that
