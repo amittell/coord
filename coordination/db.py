@@ -1043,13 +1043,22 @@ class Database:
         # writes reuse the bound connection via _acquire (not _write), so
         # there is no reentrant re-acquire of the lock.
         if self._writer_queue:
-            async with self._writer_lock:
+            # Same wait accounting as _write(): transaction() carries the
+            # heaviest units-of-work (claim grants), so under-reporting its
+            # lock waits would hide contention exactly where it matters.
+            _wait_start = time.perf_counter()
+            await self._writer_lock.acquire()
+            metrics.sqlite_writer_wait_seconds_total.inc(
+                time.perf_counter() - _wait_start
+            )
+            try:
                 conn = await self._ensure_writer()
                 token = _BOUND_CONN.set(conn)
                 held_eng_token = _TXN_ENG_LOCKS.set([])
                 try:
                     yield conn
                     await conn.commit()
+                    metrics.sqlite_writes_total.inc()
                 except BaseException:
                     await conn.rollback()
                     raise
@@ -1058,6 +1067,8 @@ class Database:
                         held.release()
                     _TXN_ENG_LOCKS.reset(held_eng_token)
                     _BOUND_CONN.reset(token)
+            finally:
+                self._writer_lock.release()
             return
         async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
