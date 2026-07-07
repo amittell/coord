@@ -38,9 +38,13 @@ class Settings(BaseSettings):
     # dominant write load and the main SQLite lock-contention source. When
     # > 0, a session's ping is written at most once per this many seconds
     # (best-effort, in-process); intervening pings are skipped. 0 keeps the
-    # write-every-read behaviour. Safe to set well below idle_timeout_sec.
-    # Default 30s: liveness accurate to 30s, far under the 1800s idle timeout,
-    # and removes the write-on-read amplification out of the box.
+    # write-every-read behaviour. Must stay well under idle_timeout_sec, or a
+    # read-only session could idle-expire between coalesced pings; the service
+    # defensively clamps the effective interval to idle_timeout_sec / 2 when
+    # idle expiry is enabled, so a misconfiguration degrades to more frequent
+    # pings rather than false idle expiry. Default 30s: liveness accurate to
+    # 30s, far under the 1800s idle timeout, and removes the write-on-read
+    # amplification out of the box.
     activity_ping_min_interval_sec: int = 30
     # v0.44 scale: serialize SQLite writes through one persistent writer
     # connection + an in-process lock instead of a fresh connection per write.

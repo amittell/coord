@@ -19,7 +19,9 @@ Semantic Versioning.
     interval cut `SQLITE_BUSY` errors ~70% in load tests. Best-effort, well
     under the 1800s idle timeout; set 0 to restore write-every-read.
   - **In-process writer queue** (`COORD_SQLITE_WRITER_QUEUE`, default on for
-    SQLite). All writes funnel through one persistent writer connection under
+    SQLite). The hot-path writes (activity pings, claim release, and every
+    `transaction()` unit-of-work incl. claim grants) funnel through one
+    persistent writer connection under
     an async lock instead of a fresh connection per op, so concurrent writers
     queue in-process instead of fighting SQLite's single write lock --
     eliminating `SQLITE_BUSY` (dropped coordination writes) on the funnelled

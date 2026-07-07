@@ -408,6 +408,15 @@ class CoordinationService:
         if interval <= 0:
             await self.db.touch_session_activity(session_id, repo=repo)
             return
+        # Defensive clamp: coalescing must never out-pace idle expiry, or a
+        # read-only session could be expired as idle between pings. Half the
+        # idle window guarantees at least ~2 ping opportunities per window; a
+        # misconfigured interval degrades to more frequent pings, not false
+        # expiry. (idle_timeout_sec == 0 disables idle expiry entirely, so no
+        # clamp is needed there.)
+        idle = self.settings.idle_timeout_sec
+        if idle > 0:
+            interval = min(interval, max(1, idle // 2))
         key = (session_id, repo)
         last = self._last_ping.get(key)
         nowm = _time.monotonic()

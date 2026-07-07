@@ -160,12 +160,16 @@ auth_failures_total = Counter(
 # is the bottleneck (consider lightening create_claims, or Postgres).
 sqlite_writes_total = Counter(
     "sqlite_writes_total",
-    "Total write commits through the SQLite writer path (a commit may span "
-    "multiple statements, e.g. a claim-grant unit-of-work).",
+    "Write commits through the funnelled SQLite writer-queue path (a commit "
+    "may span multiple statements, e.g. a claim-grant unit-of-work). Stays 0 "
+    "when COORD_SQLITE_WRITER_QUEUE is off and excludes the few legacy write "
+    "paths that still open their own connections.",
 )
 sqlite_writer_wait_seconds_total = Counter(
     "sqlite_writer_wait_seconds_total",
-    "Cumulative seconds spent waiting to acquire the SQLite writer lock.",
+    "Cumulative seconds spent waiting to acquire the SQLite writer lock. Only "
+    "meaningful with COORD_SQLITE_WRITER_QUEUE on -- 0 with the queue off "
+    "means unmeasured, not uncontended.",
 )
 
 http_requests_total = Counter(
