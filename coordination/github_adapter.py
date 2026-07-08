@@ -55,17 +55,36 @@ def _headers(token: str) -> dict[str, str]:
     }
 
 
+def _sanitize_inline(value: str) -> str:
+    """Neutralise a claim-supplied value for one-line markdown interpolation.
+
+    Every interpolated field in the bounce comment is engineer-controlled
+    (claim descriptions, patterns, branch names, file paths), so it must
+    not be able to alter the comment's structure or trigger live GitHub
+    rendering. Backticks are stripped so a value cannot terminate the code
+    span it is rendered inside, and all whitespace runs (including
+    newlines, which would break the list layout or open fresh markdown
+    blocks) collapse to single spaces.
+    """
+
+    return " ".join(value.replace("`", "").split())
+
+
 def _render_body(detail: dict[str, Any]) -> str:
     """Render the markdown comment body for a ``push_bounced`` detail.
 
     The first line is the hidden marker so the dedup scan can find this
     comment again. The visible body names the pushing engineer/branch
     and lists each blocking holder with its claim metadata and files.
+    Every interpolated value passes through :func:`_sanitize_inline` and
+    is rendered inside a code span, so a hostile claim description or
+    file path cannot inject mentions (``@org/team`` notification spam),
+    links, images, or HTML into the PR thread.
     """
 
-    repo = str(detail.get("repo") or "")
-    pushing_engineer = str(detail.get("pushing_engineer") or "")
-    pushing_branch = str(detail.get("pushing_branch") or "")
+    repo = _sanitize_inline(str(detail.get("repo") or ""))
+    pushing_engineer = _sanitize_inline(str(detail.get("pushing_engineer") or ""))
+    pushing_branch = _sanitize_inline(str(detail.get("pushing_branch") or ""))
     bounced = detail.get("bounced") or []
 
     lines: list[str] = [MARKER]
@@ -79,24 +98,32 @@ def _render_body(detail: dict[str, Any]) -> str:
     lines.append("")
 
     for entry in bounced:
-        holder_engineer = str(entry.get("holder_engineer") or "")
-        holder_branch = str(entry.get("holder_branch") or "")
-        holder_pattern = str(entry.get("holder_pattern") or "")
-        holder_description = str(entry.get("holder_description") or "")
+        holder_engineer = _sanitize_inline(str(entry.get("holder_engineer") or ""))
+        holder_branch = _sanitize_inline(str(entry.get("holder_branch") or ""))
+        holder_pattern = _sanitize_inline(str(entry.get("holder_pattern") or ""))
+        holder_description = _sanitize_inline(
+            str(entry.get("holder_description") or "")
+        )
         files = entry.get("files") or []
 
-        header = f"### {holder_engineer}"
+        # The engineer name lives in a code span too: a heading renders
+        # markdown, so a name like ``@org/team`` would otherwise ping.
+        header = f"### `{holder_engineer}`" if holder_engineer else "###"
         if holder_branch:
             header += f" (`{holder_branch}`)"
         lines.append(header)
         if holder_pattern:
             lines.append(f"- claim: `{holder_pattern}`")
         if holder_description:
-            lines.append(f"- description: {holder_description}")
+            # Rendered as a code span: inside backticks GitHub does not
+            # resolve @mentions, links, images, or HTML.
+            lines.append(f"- description: `{holder_description}`")
         if files:
             lines.append("- files:")
             for path in files:
-                lines.append(f"  - `{path}`")
+                clean_path = _sanitize_inline(str(path))
+                if clean_path:
+                    lines.append(f"  - `{clean_path}`")
         lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"

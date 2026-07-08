@@ -12,6 +12,11 @@ on:
         description: "Image version tag (e.g. v0.1.0-rc1). Used as the image tag; :latest is NOT pushed on manual runs."
         required: true
         type: string
+      overwrite:
+        description: "Republish over an existing image tag. Off by default: a dispatch whose tag already exists in the registry fails instead of silently replacing the published bits."
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write       # needed for softprops/action-gh-release on tag pushes
@@ -93,6 +98,30 @@ jobs:
             exit 1
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      # Republish guard for manual dispatches. A dispatch takes its image
+      # tag verbatim from inputs.version with no tie to pyproject.toml or a
+      # git tag, so dispatching an already-released version would push new
+      # bits (built from whatever ref was selected) over the existing
+      # registry tag. Digest-pinned consumers are unaffected, but anyone
+      # consuming the plain version tag (the GitHub Release body advertises
+      # image:tag; the ha-cutover repin instruction is tag-oriented) would
+      # silently get different code under the same version. Fail fast when
+      # the tag already exists unless the operator explicitly opted in via
+      # the overwrite input. Runs after the registry login above so private
+      # registries resolve; imagetools inspect exits non-zero for a missing
+      # manifest, which is the "safe to publish" case.
+      - name: Refuse to republish an existing image tag (manual dispatch)
+        if: github.event_name == 'workflow_dispatch' && inputs.overwrite != true
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          VERSION: ${{ steps.version.outputs.tag }}
+        run: |
+          if docker buildx imagetools inspect "${IMAGE}:${VERSION}" >/dev/null 2>&1; then
+            echo "::error::${IMAGE}:${VERSION} already exists in the registry; re-run with overwrite=true to intentionally replace it" >&2
+            exit 1
+          fi
+          echo "${IMAGE}:${VERSION} not present in the registry; safe to publish."
 
       # Build the tag list.
       #  - tag push:           push both :<version> and :latest

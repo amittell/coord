@@ -109,6 +109,12 @@ class JsonFormatter(logging.Formatter):
         # base keys above. ``_NOISE_RECORD_ATTRS`` is dropped: uvicorn
         # attaches a ``color_message`` (the ANSI-coloured variant of
         # ``msg``) to its records, which is pure terminal noise in JSON.
+        # The probe runs with ``allow_nan=False`` because Python's default
+        # rendering of non-finite floats (``NaN``/``Infinity``) is not
+        # valid JSON: strict parsers in the aggregation pipeline (Loki's
+        # JSON stage, jq) would reject the whole line. Non-finite values
+        # fall back to their ``repr`` (e.g. ``"nan"``) like any other
+        # unserialisable extra.
         for key, value in record.__dict__.items():
             if (
                 key in _STANDARD_RECORD_ATTRS
@@ -119,12 +125,12 @@ class JsonFormatter(logging.Formatter):
             if key in payload:
                 continue
             try:
-                json.dumps(value)
+                json.dumps(value, allow_nan=False)
             except (TypeError, ValueError):
                 value = repr(value)
             payload[key] = value
 
-        return json.dumps(payload, separators=(",", ":"))
+        return json.dumps(payload, separators=(",", ":"), allow_nan=False)
 
 
 def _env_flag(name: str, *, default: bool) -> bool:
