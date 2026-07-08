@@ -2,7 +2,7 @@
 
 Status: operational runbook for the coord HA re-architecture
 (`docs/designs/coord-ha-rearchitecture.md`, Section 8). Last reviewed
-2026-07-07.
+2026-07-08.
 
 > **WARNING -- ArgoCD (learned from the 2026-07-05 v0.44.0 incident):** the HA
 > manifests live in `deploy/k8s/ha-cutover/`, deliberately OUTSIDE ArgoCD's
@@ -34,12 +34,30 @@ carried across.
 - [ ] The dual-backend coord image (selects backend via `COORD_DATABASE_URL`,
       `sqlite://` default unchanged) is built, reviewed, released, and the tag
       is known. The current prod image still runs SQLite.
-- [ ] The Postgres `StatefulSet`, its `Secret` (connection URL), PVC, and
-      `NetworkPolicy` are applied and the pod is `Ready`. coord creates its
+- [ ] The cutover image actually bundles the Postgres driver. Images built
+      before the Dockerfile installed `requirements-postgres.txt` (v0.45.0 and
+      earlier) do NOT ship asyncpg and CrashLoop the moment
+      `COORD_DATABASE_URL` is set. Verify, and repin the image line in
+      `deploy/k8s/ha-cutover/deployment.yaml` to this verified release:
+
+  ```sh
+  docker run --rm ghcr.io/amittell/coord:<cutover-tag>@sha256:<digest> \
+    python -c "import asyncpg; print('asyncpg', asyncpg.__version__)"
+  ```
+
+- [ ] The real `coord-pg` Secret is created (sealed-secrets / External Secrets
+      / Vault, or imperatively -- see
+      `deploy/k8s/ha-cutover/secret.example.yaml` for the required keys and a
+      bootstrap command). Never `kubectl apply` the example file itself: its
+      placeholder values would clobber the live credentials.
+- [ ] The Postgres `StatefulSet`, PVC, and `NetworkPolicy`
+      (`deploy/k8s/ha-cutover/postgres.yaml` -- it deliberately contains no
+      Secret) are applied and the pod is `Ready`. coord creates its
       consolidated v1 schema on first connect; the database is otherwise empty.
 - [ ] `scripts/migrate_tokens_ownership.py` is present on the machine that has
       both (a) read access to the live SQLite file and (b) network access to
-      Postgres, with `psql` installed.
+      Postgres, with `psql` and the `sqlite3` CLI installed (the CLI is only
+      needed locally; the coord image does not ship it).
 - [ ] You know the target `COORD_DATABASE_URL` (the value in the PG Secret).
 - [ ] A low-traffic maintenance window is agreed and the two human operators
       are aware their ~40 agents will briefly 503 and then re-announce.
@@ -50,7 +68,10 @@ Set shared variables (adjust to your environment):
 
 ```sh
 NS=coord                      # kubernetes namespace
-SQLITE_POD=$(kubectl -n "$NS" get pod -l app=coord -o jsonpath='{.items[0].metadata.name}')
+# Pods are labeled app.kubernetes.io/name=coord (see the Deployment manifests);
+# there is no bare `app=coord` label.
+SQLITE_POD=$(kubectl -n "$NS" get pod -l app.kubernetes.io/name=coord -o jsonpath='{.items[0].metadata.name}')
+test -n "$SQLITE_POD" || { echo 'no coord pod found'; exit 1; }
 SQLITE_PATH=/data/coordination.db
 PG_URL='postgresql://coord:PASSWORD@coord-postgres:5432/coord'   # from the PG Secret
 ```
@@ -64,8 +85,17 @@ both your migration source and a rollback artifact.
 
 ```sh
 # Use the SQLite backup API for a consistent copy even while coord is running.
-kubectl -n "$NS" exec "$SQLITE_POD" -- \
-  sqlite3 "$SQLITE_PATH" ".backup '/data/coordination.pre-cutover.db'"
+# The image ships the Python stdlib sqlite3 module but NOT the sqlite3 CLI
+# (python:slim + git only), so drive the backup through python -c.
+kubectl -n "$NS" exec "$SQLITE_POD" -- python -c "
+import sqlite3
+src = sqlite3.connect('$SQLITE_PATH')
+dst = sqlite3.connect('/data/coordination.pre-cutover.db')
+with dst:
+    src.backup(dst)
+dst.close()
+src.close()
+"
 
 kubectl -n "$NS" cp "$SQLITE_POD:/data/coordination.pre-cutover.db" \
   ./coordination.pre-cutover.db
@@ -84,9 +114,16 @@ auto-coexist / auto-narrow / PR-comment notification is lost.
 
 ```sh
 # Inspect how many rows are still pending/failed (not yet delivered/exhausted).
-kubectl -n "$NS" exec "$SQLITE_POD" -- \
-  sqlite3 "$SQLITE_PATH" \
-  "SELECT status, count(*) FROM webhook_outbox GROUP BY status;"
+# Read-only URI mode; the sqlite3 CLI is not in the image, so use python -c.
+kubectl -n "$NS" exec "$SQLITE_POD" -- python -c "
+import sqlite3
+db = sqlite3.connect('file:$SQLITE_PATH?mode=ro', uri=True)
+for status, count in db.execute(
+    'SELECT status, count(*) FROM webhook_outbox GROUP BY status'
+):
+    print(status, count)
+db.close()
+"
 ```
 
 - [ ] Wait until `pending` reaches 0 (the delivery loop drains on its normal
@@ -177,6 +214,8 @@ kubectl -n argocd patch application coord-prod --type merge \
   -p '{"spec":{"syncPolicy":null}}'
 
 # The HA manifest set lives OUTSIDE ArgoCD's watched path on purpose.
+# postgres.yaml deliberately contains no coord-pg Secret, so this apply can
+# never clobber the real credentials created in step 0.
 kubectl -n "$NS" apply -f deploy/k8s/ha-cutover/postgres.yaml
 kubectl -n "$NS" apply -f deploy/k8s/ha-cutover/pdb.yaml
 kubectl -n "$NS" apply -f deploy/k8s/ha-cutover/deployment.yaml
@@ -198,8 +237,8 @@ returns to being the source of truth for the now-Postgres prod.
 
 ```sh
 # 5a. Each replica is healthy and pointed at Postgres.
-kubectl -n "$NS" get pods -l app=coord -o wide
-kubectl -n "$NS" logs -l app=coord --tail=50 | grep -iE 'postgres|schema|listen'
+kubectl -n "$NS" get pods -l app.kubernetes.io/name=coord -o wide
+kubectl -n "$NS" logs -l app.kubernetes.io/name=coord --tail=50 | grep -iE 'postgres|schema|listen'
 
 # 5b. End-to-end claim round-trip through the Service (use a real token).
 #     Replace HOST and TOKEN as appropriate for your ingress.
@@ -220,6 +259,15 @@ psql "$PG_URL" -c "SELECT engineer, count(*) FROM engineer_tokens WHERE revoked_
       run on exactly one replica (leader election / `FOR UPDATE SKIP LOCKED`),
       not three -- check logs for duplicate webhook deliveries (there must be
       none).
+
+> **Deploying the leader-lease fix later:** the first deploy of a release
+> that changes the leader-lease logic should be a scale-to-zero bounce
+> (`kubectl -n "$NS" scale deploy/coord --replicas=0`, wait for 0 ready,
+> then scale back to 3) rather than a RollingUpdate if background-loop
+> continuity matters. A rolling deploy overlaps replicas running the old
+> and the fixed lease logic: the loops can double-run or stall until the
+> stale lease TTL expires. A bounce guarantees a single lease generation,
+> at the cost of a brief 503 window that client retry already covers.
 
 Cutover is complete once 5 is fully checked.
 

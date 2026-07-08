@@ -3,7 +3,12 @@
 # 2026-07-05 incident note in docs/runbooks/coord-ha-cutover.md).
 # NOTE: the release workflow only bumps deploy/k8s/prod/, so the image pin
 # here drifts. REPIN to the current release (copy the image line from
-# deploy/k8s/prod/deployment.yaml) as part of cutover step 0.
+# deploy/k8s/prod/deployment.yaml) as part of cutover step 0 -- but ONLY to
+# a release whose image bundles the Postgres driver (built from a Dockerfile
+# that installs requirements-postgres.txt). Images v0.45.0 and earlier do
+# NOT ship asyncpg and CrashLoop the moment COORD_DATABASE_URL is set.
+# Verify before the maintenance window (runbook step 0):
+#   docker run --rm <image> python -c "import asyncpg"
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -39,6 +44,8 @@ spec:
         - name: ghcr-pull
       containers:
         - name: coord
+          # This v0.45.0 pin predates the image bundling asyncpg -- it CANNOT
+          # speak Postgres. Repin per the header note before cutover.
           image: ghcr.io/amittell/coord:v0.45.0@sha256:a55e767f783e2fc1ee3a9bee3c8dc107f077221533f6348030b03d431acc1f33
           imagePullPolicy: IfNotPresent
           ports:
