@@ -384,7 +384,12 @@ async def validate_id_token(
        what kills ``alg: none`` and algorithm-confusion attacks.
     2. Resolve the signing key from the JWKS (one forced refetch on a
        kid miss, see :func:`_find_jwk`).
-    3. ``jwt.decode`` verifies signature, audience and issuer.
+    3. ``jwt.decode`` verifies signature and audience. The issuer is
+       checked by hand with the same trailing-slash tolerance the
+       discovery check uses (issuer URLs are locations, not bytes) --
+       PyJWT's built-in iss check is an exact string compare, which
+       would fail every login when the operator configures
+       COORD_OIDC_ISSUER with a trailing slash the IdP does not emit.
        exp/iat presence is required but their time check is done by
        hand against ``now`` so tests can inject a clock (PyJWT has no
        clock parameter); leeway is 60s either way.
@@ -418,21 +423,35 @@ async def validate_id_token(
             key=key,
             algorithms=[alg],
             audience=client_id,
-            issuer=issuer,
             leeway=60,
             options={
-                "require": ["exp", "iat"],
-                # Time checks are done manually below so the test
-                # suite can inject ``now``; everything else (signature,
-                # aud, iss, required-claims presence) stays in PyJWT.
+                "require": ["exp", "iat", "iss"],
+                # Time and issuer checks are done manually below (the
+                # test suite injects ``now``; the issuer compare needs
+                # trailing-slash tolerance); everything else (signature,
+                # aud, required-claims presence) stays in PyJWT.
                 "verify_exp": False,
                 "verify_iat": False,
+                "verify_iss": False,
             },
         )
     except jwt.PyJWTError as exc:
         raise OIDCValidationError(
             f"ID token failed validation: {exc}"
         ) from exc
+
+    # Issuer check, by hand, with the one tolerated difference the
+    # discovery check (fetch_metadata) also allows: trailing slashes.
+    # An operator who configures the issuer with a trailing slash
+    # passes discovery (rstrip compare) but PyJWT's exact-string iss
+    # check would then reject every single login at the callback --
+    # a confusing distance between cause and symptom.
+    iss = claims.get("iss")
+    if not isinstance(iss, str) or iss.rstrip("/") != issuer.rstrip("/"):
+        raise OIDCValidationError(
+            f"ID token issuer {iss!r} does not match the configured "
+            f"issuer {issuer!r}."
+        )
 
     ref = time.time() if now is None else now
     leeway = 60
@@ -501,9 +520,13 @@ def map_claim_to_engineer(
                 "unverified; coord will not map it to an engineer."
             )
     if not allow_any and allowed:
-        # Email values are already lowercased above; other claim types
-        # compare exactly against the (lowercase-normalised) allowlist.
-        if value not in allowed:
+        # The allowlist is lowercase-normalised at parse time
+        # (Settings.oidc_allowed_principal_set), so fold the claim
+        # value the same way for the membership check. Email values
+        # are already lowercased above; other claim types keep their
+        # original casing for the engineer name but must not be
+        # un-allowlistable just because the IdP emits mixed case.
+        if value.lower() not in allowed:
             raise OIDCClaimError(
                 f"Principal {value!r} is not on the "
                 "COORD_OIDC_ALLOWED_PRINCIPALS allowlist."

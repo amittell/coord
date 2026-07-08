@@ -646,14 +646,21 @@ def _utcnow() -> str:
 
 def _ts_elapsed(ts: Any, ref: datetime) -> bool:
     """True when ``ts`` is a non-empty timestamp at or before ``ref``.
-    Unparseable values count as elapsed -- fail closed, because a
-    corrupt expiry must not turn into an immortal token."""
+    Naive timestamps (no timezone -- hand-edited or legacy rows) are
+    read as UTC instead of raising the naive-vs-aware TypeError, which
+    on the request auth path would turn a corrupt expires_at into a
+    500 rather than a 401. Unparseable values count as elapsed -- fail
+    closed, because a corrupt expiry must not turn into an immortal
+    token."""
     if not ts:
         return False
     try:
-        return datetime.fromisoformat(str(ts).replace("Z", "+00:00")) <= ref
-    except ValueError:
+        parsed = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
         return True
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed <= ref
 
 
 # SQLite waits this long (ms) for a contended write lock before raising
