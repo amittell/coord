@@ -36,16 +36,19 @@ from coordination.cli_shared import (
     ensure_managed_block,
     ensure_prettierignore_entries,
 )
+from coordination.envfile import read_env_file, update_env_file
 from coordination.repo_config import RepoConfig
 
 
 def _read_existing_token(local_env: Path) -> str:
-    if not local_env.exists():
-        return ""
-    for line in local_env.read_text(encoding="utf-8").splitlines():
-        if line.startswith("COORD_AUTH_TOKEN="):
-            return line.split("=", 1)[1].strip()
-    return ""
+    # Shared parser (coordination.envfile): tolerates a leading `export `,
+    # indentation and quotes, and applies last-assignment-wins -- exactly
+    # how the MCP wrapper, coord doctor, and the bash-sourced pre-push
+    # hook read this file. The old first-match ``startswith`` reader
+    # blanked `export`-prefixed tokens (rewriting the file with an empty
+    # COORD_AUTH_TOKEN) and silently regressed a rotated token appended
+    # below a stale one.
+    return read_env_file(local_env).get("COORD_AUTH_TOKEN", "")
 
 
 def _rewrite_local_env(
@@ -54,15 +57,22 @@ def _rewrite_local_env(
     token: str,
     repo_id: str | None = None,
 ) -> None:
-    local_env.parent.mkdir(parents=True, exist_ok=True)
-    body = (
-        f"COORD_API_URL={service_url}\n"
-        f"COORD_SERVICE_URL={service_url}\n"
-        f"COORD_AUTH_TOKEN={token}\n"
-    )
+    """Refresh the coord-managed keys of local.env in place.
+
+    Unmanaged keys (COORD_USER, COORD_BRANCH, COORD_REPO_ROOT, and every
+    other key the MCP wrapper bootstraps from this file -- see
+    ``coordination.mcp_server._LOCAL_ENV_KEYS``) plus comments and blank
+    lines are preserved verbatim; only the URL/token/repo-id lines coord
+    owns are rewritten.
+    """
+    updates = {
+        "COORD_API_URL": service_url,
+        "COORD_SERVICE_URL": service_url,
+        "COORD_AUTH_TOKEN": token,
+    }
     if repo_id:
-        body += f"COORD_REPO_ID={repo_id}\n"
-    local_env.write_text(body, encoding="utf-8")
+        updates["COORD_REPO_ID"] = repo_id
+    update_env_file(local_env, updates)
 
 
 def run_upgrade(args) -> int:
@@ -84,6 +94,13 @@ def run_upgrade(args) -> int:
     config = RepoConfig.load(config_path)
     local_env = repo_root / ".coordination" / "local.env"
     token = _read_existing_token(local_env)
+    if local_env.exists() and not token:
+        print(
+            "Warning: no COORD_AUTH_TOKEN found in .coordination/local.env; "
+            "the refreshed file keeps it empty. Paste a token there if "
+            "clients should authenticate.",
+            file=sys.stderr,
+        )
     # Backfill: pre-v0.3 configs have no repo_id. Re-detect from git remote
     # so existing repos pick up a repo identifier on their next upgrade.
     from coordination.cli_init import _detect_repo_id
@@ -125,12 +142,16 @@ def run_upgrade(args) -> int:
     # is the fix for the class of CI breakage where an onboarded repo's
     # `prettier --check` rejected coord's 2-space .mcp.json.
     prettier_targets: list[str] = []
+    wiring_failed = False
     mcp_json = repo_root / ".mcp.json"
     if mcp_json.exists() or config.tool == "claude":
-        _update_mcp_json(mcp_json)
+        if _update_mcp_json(mcp_json):
+            written.append(".mcp.json")
+            prettier_targets.append(".mcp.json")
+        else:
+            wiring_failed = True
         ensure_managed_block(repo_root / "CLAUDE.md", CLAUDE_SNIPPET)
-        written.extend([".mcp.json", "CLAUDE.md (managed block)"])
-        prettier_targets.append(".mcp.json")
+        written.append("CLAUDE.md (managed block)")
 
     codex_cfg = repo_root / ".codex" / "config.toml"
     if codex_cfg.exists() or config.tool == "codex":
@@ -140,12 +161,15 @@ def run_upgrade(args) -> int:
 
     cursor_cfg = repo_root / ".cursor" / "mcp.json"
     if cursor_cfg.exists() or config.tool == "cursor":
-        _update_mcp_json(cursor_cfg)
+        if _update_mcp_json(cursor_cfg):
+            written.append(".cursor/mcp.json")
+            prettier_targets.append(".cursor/mcp.json")
+        else:
+            wiring_failed = True
         ensure_managed_block(
             repo_root / ".cursor" / "rules" / "coordination.mdc", CURSOR_RULE
         )
-        written.extend([".cursor/mcp.json", ".cursor/rules/coordination.mdc"])
-        prettier_targets.append(".cursor/mcp.json")
+        written.append(".cursor/rules/coordination.mdc")
 
     if ensure_prettierignore_entries(repo_root, prettier_targets):
         written.append(".prettierignore (managed block)")
@@ -184,4 +208,11 @@ def run_upgrade(args) -> int:
     print("  .coordination/owners.yaml")
     print("  COORD_AUTH_TOKEN")
     _warn_tracked_wiring_commit_risk(repo_root, written)
+    if wiring_failed:
+        print(
+            "One or more MCP configs could not be refreshed (see warnings "
+            "above). Fix or remove the file(s) and re-run 'coord upgrade'.",
+            file=sys.stderr,
+        )
+        return 1
     return 0

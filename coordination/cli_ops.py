@@ -17,6 +17,13 @@ from coordination.repo_config import RepoConfig
 
 
 _PLACEHOLDER_REPO_IDS = {"set-me", "example-org/example-repo"}
+_PLACEHOLDER_TOKENS = {"set-me"}
+
+# Human-readable token provenance labels, surfaced by `coord status` so an
+# operator debugging a 401 knows WHICH token the CLI authenticated with.
+_TOKEN_FROM_ENV = "from environment"
+_TOKEN_FROM_LOCAL_ENV = "from .coordination/local.env"
+_TOKEN_UNSET = "not set"
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +287,7 @@ class _ServiceContext:
     repo_id: str | None
     repo_root: Path | None
     config: RepoConfig | None
+    token_source: str = _TOKEN_UNSET
 
 
 def _load_repo_env(repo_root: Path, config: RepoConfig) -> dict[str, str]:
@@ -296,6 +304,33 @@ def _clean_repo_id(value: str | None) -> str | None:
     return None
 
 
+def _clean_token(value: str | None) -> str:
+    """Normalise a candidate auth token: strip whitespace and treat the
+    ``set-me`` template placeholder as unset, exactly as the MCP wrapper's
+    ``_headers`` / ``_load_local_env`` do."""
+    if value is None:
+        return ""
+    token = value.strip()
+    if token in _PLACEHOLDER_TOKENS:
+        return ""
+    return token
+
+
+def _resolve_token(repo_env: dict[str, str]) -> tuple[str, str]:
+    """Resolve (token, source) with the same precedence as the MCP wrapper:
+    a real exported COORD_AUTH_TOKEN wins over .coordination/local.env, and
+    placeholder values lose everywhere. The CLI historically did the
+    reverse (local.env beat the environment), so `coord status` could pass
+    with one token while coord-mcp 401'd with another."""
+    env_token = _clean_token(os.environ.get("COORD_AUTH_TOKEN"))
+    if env_token:
+        return env_token, _TOKEN_FROM_ENV
+    file_token = _clean_token(repo_env.get("COORD_AUTH_TOKEN"))
+    if file_token:
+        return file_token, _TOKEN_FROM_LOCAL_ENV
+    return "", _TOKEN_UNSET
+
+
 def _resolve_service() -> _ServiceContext | None:
     repo_root = find_repo_root()
     if repo_root is not None:
@@ -303,9 +338,7 @@ def _resolve_service() -> _ServiceContext | None:
         if config_path.exists():
             config = RepoConfig.load(config_path)
             repo_env = _load_repo_env(repo_root, config)
-            token = repo_env.get("COORD_AUTH_TOKEN") or os.environ.get(
-                "COORD_AUTH_TOKEN", ""
-            )
+            token, token_source = _resolve_token(repo_env)
             repo_id = (
                 _clean_repo_id(config.repo_id)
                 or _clean_repo_id(repo_env.get("COORD_REPO_ID"))
@@ -317,10 +350,11 @@ def _resolve_service() -> _ServiceContext | None:
                 repo_id=repo_id,
                 repo_root=repo_root,
                 config=config,
+                token_source=token_source,
             )
 
     url = os.environ.get("COORD_API_URL")
-    token = os.environ.get("COORD_AUTH_TOKEN", "")
+    token = _clean_token(os.environ.get("COORD_AUTH_TOKEN"))
     repo_id = _clean_repo_id(os.environ.get("COORD_REPO_ID"))
     if url:
         return _ServiceContext(
@@ -329,6 +363,7 @@ def _resolve_service() -> _ServiceContext | None:
             repo_id=repo_id,
             repo_root=None,
             config=None,
+            token_source=_TOKEN_FROM_ENV if token else _TOKEN_UNSET,
         )
     return None
 
@@ -404,6 +439,7 @@ def run_status(_args) -> int:
     if scope:
         count_params["repo"] = scope
     claim_count: int | str = "?"
+    claims_ok = False
     token_warning: str | None = None
     try:
         c = httpx.get(
@@ -419,6 +455,7 @@ def run_status(_args) -> int:
         if c.status_code == 200:
             data = c.json()
             claim_count = int(data.get("count", len(data.get("claims", []))))
+            claims_ok = True
         else:
             claim_count = f"status {c.status_code}"
     except httpx.HTTPError as exc:
@@ -440,10 +477,17 @@ def run_status(_args) -> int:
     print(f"Version: {version}")
     print(f"Repo scope: {scope_label}")
     print(f"Symbol validation: {symbol_label} (server COORD_REPO_ROOT)")
+    # Token provenance: real env beats local.env (placeholders lose), the
+    # same precedence the MCP wrapper applies. Naming the source here lets
+    # an operator see WHICH token a 401 above was authenticated with.
+    print(f"Token: {ctx.token_source}")
     print(f"Active claims: {claim_count}")
     if token_warning:
         print(f"Token warning: {token_warning}")
-    return 0 if ready_state == "ready" else 1
+    # A dead token must not exit 0 just because /readyz answered: scripts
+    # gate on this exit code as a wiring check, and an auth failure on the
+    # /claims probe is a broken wiring outcome.
+    return 0 if ready_state == "ready" and claims_ok else 1
 
 
 # ---------------------------------------------------------------------------
