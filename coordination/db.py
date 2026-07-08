@@ -1625,6 +1625,8 @@ class Database:
         new_end_col: int | None,
         resolved_by: str,
         new_pattern: str | None,
+        guard_new_path_collision: bool = False,
+        repo: str | None = None,
     ) -> bool:
         """v0.31 wave 2: apply a detected rename atomically.
 
@@ -1632,19 +1634,28 @@ class Database:
 
         1. read the matching ``claim_symbols`` row (old span + parent,
            needed for the audit trail);
-        2. update its ``symbol_name``, span columns, and
+        2. when ``guard_new_path_collision`` is set, re-check that no
+           OTHER active symbol-scope claim in the same ``repo`` bucket
+           already holds the new symbol path on this file, and abort
+           (False, nothing written) when one does. The rename sweep's
+           Python-side collision check reads a snapshot on a separate
+           connection, so without this in-transaction recheck a
+           concurrent grant landing between the sweep's read and this
+           write would let the rename manufacture exactly the
+           double-grant the guard exists to prevent;
+        3. update its ``symbol_name``, span columns, and
            ``resolved_by``;
-        3. update ``claims.pattern`` when ``new_pattern`` is not None
+        4. update ``claims.pattern`` when ``new_pattern`` is not None
            (today the pattern is the file path and never embeds the
            symbol, so the sweep always passes None -- the column update
            exists for any future pattern scheme that does embed it);
-        4. insert the ``claim_symbol_renames`` audit row.
+        5. insert the ``claim_symbol_renames`` audit row.
 
         Partial application is impossible: any failure rolls the whole
         transaction back. Returns False (with nothing written) when no
         ``claim_symbols`` row matches ``(claim_id, file_path,
         old_symbol_name)`` -- e.g. a concurrent release or a second
-        sweep racing this one.
+        sweep racing this one -- or when the collision guard fires.
         """
         await self.init()
         async with self._connect() as conn:
@@ -1676,6 +1687,33 @@ class Database:
                     if parent
                     else new_symbol_name
                 )
+                if guard_new_path_collision:
+                    # Same active-row semantics as get_symbol_rows_on_file
+                    # (released_at IS NULL, scope_type='symbol', null-safe
+                    # repo bucket), but evaluated on THIS connection inside
+                    # the BEGIN IMMEDIATE write transaction so no grant can
+                    # commit between the check and the UPDATE below. The
+                    # rename keeps the stored parent, so the collision key
+                    # is (file_path, parent, new leaf).
+                    cur = await conn.execute(
+                        """
+                        SELECT 1
+                        FROM claim_symbols cs
+                        JOIN claims c ON c.id = cs.claim_id
+                        WHERE cs.file_path = ?
+                          AND cs.claim_id != ?
+                          AND c.released_at IS NULL
+                          AND c.scope_type = 'symbol'
+                          AND cs.symbol_name = ?
+                          AND cs.parent_symbol IS ?
+                          AND c.repo IS ?
+                        LIMIT 1
+                        """,
+                        (file_path, claim_id, new_symbol_name, parent, repo),
+                    )
+                    if await cur.fetchone() is not None:
+                        await conn.rollback()
+                        return False
                 await conn.execute(
                     """
                     UPDATE claim_symbols
