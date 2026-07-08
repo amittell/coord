@@ -1,3 +1,9 @@
+# The env values below are the documented placeholders that coord-mcp
+# treats as "unset": at startup the wrapper loads the real service URL,
+# bearer token, and repo id from the gitignored .coordination/local.env
+# (written by `coord init`). Keep the placeholders as-is; put real
+# credentials only in .coordination/local.env. A real value exported in
+# the launching shell still wins over both.
 [mcp_servers.coord]
 command = "coord-mcp"
 args = []
@@ -5,6 +11,7 @@ enabled = true
 required = false
 tool_timeout_sec = 30
 
-# Set in your shell (recommended):
-#   export COORD_API_URL="https://YOUR_COORD_SERVICE.example"
-#   export COORD_AUTH_TOKEN="..."
+[mcp_servers.coord.env]
+COORD_API_URL = "http://127.0.0.1:8080"
+COORD_AUTH_TOKEN = "set-me"
+COORD_REPO_ID = "example-org/example-repo"

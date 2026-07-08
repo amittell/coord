@@ -71,7 +71,7 @@ coord-mcp
 
 ```bash
 export COORD_API_URL=http://127.0.0.1:8080
-export COORD_AUTH_TOKEN="$(cut -d= -f2 /path/to/your-app/.coordination/local.env)"
+export COORD_AUTH_TOKEN="$(grep '^COORD_AUTH_TOKEN=' /path/to/your-app/.coordination/local.env | cut -d= -f2-)"
 coord-mcp
 ```
 
