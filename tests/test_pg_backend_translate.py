@@ -298,10 +298,16 @@ def test_postgres_store_accepts_writer_queue_kwarg(
     that dispatches to PostgresStore, whose __init__ must accept the kwarg
     (and ignore it -- the in-process writer serialization is a SQLite
     concern, so the inherited flag must stay False)."""
+    import coordination.pg_backend as pg_backend
     from coordination.db import Database
     from coordination.pg_backend import PostgresStore
 
     monkeypatch.setenv("COORD_DATABASE_URL", "postgresql://u:p@localhost/x")
+    # PostgresStore now fails fast at construction when asyncpg is not
+    # importable; this test asserts the writer_queue kwarg contract, not
+    # driver presence, so stub the module when the postgres extra is absent.
+    if pg_backend.asyncpg is None:
+        monkeypatch.setattr(pg_backend, "asyncpg", object())
     store = Database(tmp_path / "db.sqlite", writer_queue=True)
     assert isinstance(store, PostgresStore)
     assert store._writer_queue is False  # SQLite-only concern, forced off
