@@ -360,10 +360,10 @@ class Settings(BaseSettings):
     @property
     def oidc_allowed_principal_set(self) -> frozenset[str]:
         """Parsed allowlist: split on commas, strip whitespace, drop
-        empties, lowercase. Lowercasing here means operators can paste
-        mixed-case emails and they still match the lowercased email
-        claim; non-email principals should be configured in the exact
-        (lowercase) form the IdP emits."""
+        empties, lowercase. Membership checks case-fold the claim value
+        the same way (oidc.map_claim_to_engineer), so operators can
+        paste principals in whatever case they like and an IdP that
+        emits mixed case still matches."""
         return frozenset(
             p.strip().lower()
             for p in self.oidc_allowed_principals.split(",")

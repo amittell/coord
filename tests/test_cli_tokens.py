@@ -317,7 +317,12 @@ def test_revoke_unknown_id_exits_nonzero(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    # The DB must exist (a missing DB file is a distinct rc=2 error
+    # since the exit-code-2 contract was implemented), so seed it with
+    # an unrelated token first.
     db_path = tmp_path / "db.sqlite"
+    _run(["tokens", "create", "alex/claude/main"], db_path, monkeypatch)
+    capsys.readouterr()
     rc = _run(
         ["tokens", "revoke", "00000000-0000-0000-0000-000000000000"],
         db_path,
@@ -604,7 +609,12 @@ def test_rotate_unknown_id_maps_to_not_found_message(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    # The DB must exist (a missing DB file is a distinct rc=2 error
+    # since the exit-code-2 contract was implemented), so seed it with
+    # an unrelated token first.
     db_path = tmp_path / "db.sqlite"
+    _run(["tokens", "create", "alex/claude/main"], db_path, monkeypatch)
+    capsys.readouterr()
     bogus = "00000000-0000-0000-0000-000000000000"
     rc = _run(["tokens", "rotate", bogus], db_path, monkeypatch)
     assert rc == 1

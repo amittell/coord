@@ -4,6 +4,36 @@ from dataclasses import dataclass
 from pathlib import Path
 import tomllib
 
+# TOML basic-string escapes (TOML v1.0 section on strings). Backslash and
+# double quote would otherwise terminate/corrupt the quoted value; the
+# control characters are forbidden raw inside basic strings, so a value
+# carrying any of them would serialise to a config.toml that tomllib can
+# no longer parse -- and RepoConfig.load's callers swallow that parse
+# error, silently disabling remote-mode protections.
+_TOML_ESCAPES = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "\b": "\\b",
+    "\t": "\\t",
+    "\n": "\\n",
+    "\f": "\\f",
+    "\r": "\\r",
+}
+
+
+def _toml_str(value: str) -> str:
+    """Serialise ``value`` as a TOML basic string, escaping everything a
+    bare f-string interpolation would emit unparseably."""
+    out: list[str] = []
+    for ch in value:
+        if ch in _TOML_ESCAPES:
+            out.append(_TOML_ESCAPES[ch])
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append(f"\\u{ord(ch):04X}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
+
 
 @dataclass
 class RepoConfig:
@@ -32,13 +62,13 @@ class RepoConfig:
     def to_toml(self) -> str:
         body = (
             f"version = {self.version}\n"
-            f'tool = "{self.tool}"\n'
-            f'mode = "{self.mode}"\n'
-            f'service_url = "{self.service_url}"\n'
-            f'ownership_file = "{self.ownership_file}"\n'
-            f'local_env_file = "{self.local_env_file}"\n'
+            f"tool = {_toml_str(self.tool)}\n"
+            f"mode = {_toml_str(self.mode)}\n"
+            f"service_url = {_toml_str(self.service_url)}\n"
+            f"ownership_file = {_toml_str(self.ownership_file)}\n"
+            f"local_env_file = {_toml_str(self.local_env_file)}\n"
         )
         if self.repo_id:
-            body += f'repo_id = "{self.repo_id}"\n'
+            body += f"repo_id = {_toml_str(self.repo_id)}\n"
         return body
 
