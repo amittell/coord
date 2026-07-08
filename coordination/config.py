@@ -169,6 +169,17 @@ class Settings(BaseSettings):
     # cross-repo escape hatch (keep one, or an operator loses all-repo access).
     # Default False so existing deployments are unaffected on upgrade.
     require_scoped_token: bool = False
+    # ``enforce_engineer_identity``: bind the ``engineer`` named on mutating
+    # requests (claim release, queue cancel, request respond) to the
+    # authenticated per-engineer token identity. ``warn`` (default) honors
+    # the request but logs the mismatch and stamps an
+    # ``X-Coord-Identity-Warning`` response header -- live fleets share one
+    # token across several agent identities, so hard enforcement is opt-in.
+    # ``enforce`` rejects a mismatching engineer with 403 and defaults an
+    # omitted engineer to the token's own identity so destructive updates
+    # always carry an ownership predicate. Shared operator tokens (and
+    # no-auth deployments) are exempt in both modes.
+    enforce_engineer_identity: str = "warn"
     # ``warn_unscoped_token`` (v0.43): the middle-ground nudge before
     # ``require_scoped_token`` is turned on. When True, a request made with
     # an UNSCOPED per-engineer token (repo IS NULL) is still honored, but the

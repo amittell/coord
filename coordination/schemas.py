@@ -303,15 +303,11 @@ class PromoteHotspotRequest(BaseModel):
 
     action: str = Field(..., description="'shared_file' or 'split'")
     pattern: str = Field(..., min_length=1)
-    repo: str | None = Field(
-        default=None,
-        description=(
-            "Informational only -- ownership rules are global per coord "
-            "instance today. Recorded in the response so the operator "
-            "can correlate with the dashboard row that triggered the "
-            "promote."
-        ),
-    )
+    # No ``repo`` field: ownership rules are global per coord instance
+    # (the route is operator-only for exactly that reason), so accepting
+    # and echoing a repo would misrepresent the write as repo-scoped.
+    # Clients still sending the retired field are ignored (pydantic's
+    # default extra-field handling).
     note: str | None = Field(
         default=None,
         description=(

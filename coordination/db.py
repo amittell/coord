@@ -1236,6 +1236,23 @@ class Database:
         """
         return True
 
+    async def release_leader_lease(
+        self, *, lease_name: str, holder_id: str
+    ) -> bool:
+        """Voluntarily give up the background-loop leader lease on
+        graceful shutdown.
+
+        On SQLite the single writer process is unconditionally the
+        leader and no lease row exists (see
+        :meth:`acquire_leader_lease`), so this is a no-op returning
+        True. The Postgres backend overrides it with a holder-guarded
+        DELETE so a draining pod hands leadership off immediately on a
+        rolling deploy instead of leaving its lease row to block every
+        other replica until the TTL expires. ``lease_name`` and
+        ``holder_id`` are ignored on SQLite.
+        """
+        return True
+
     @asynccontextmanager
     async def _acquire(self):
         """Yield ``(conn, owns)`` for a single Database operation.
@@ -3161,6 +3178,25 @@ class Database:
             row = await cur.fetchone()
         return (False, None) if row is None else (True, row["repo"])
 
+    async def request_claim_holder(
+        self, request_id: str
+    ) -> tuple[bool, str | None]:
+        """``(exists, holder_engineer)`` for a request id, via its target
+        claim. Powers the API-layer holder-authorization check on
+        POST /requests/{id}/respond: only the claim's holder (or an
+        operator token) may decide a request against it."""
+        await self.init()
+        async with self._connect() as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                "SELECT c.engineer AS engineer FROM requests r "
+                "JOIN claims c ON c.id = r.claim_id WHERE r.id = ?",
+                (request_id,),
+            )
+            row = await cur.fetchone()
+        return (False, None) if row is None else (True, row["engineer"])
+
     async def queue_entry_repo(self, queue_id: str) -> tuple[bool, str | None]:
         """``(exists, repo)`` for a claim_queue entry id."""
         await self.init()
@@ -4648,15 +4684,26 @@ class Database:
             rows = await cur.fetchall()
             return [dict(r) for r in rows]
 
-    async def list_recent_claims(self, limit: int = 200) -> list[dict[str, Any]]:
+    async def list_recent_claims(
+        self, limit: int = 200, *, repo: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Most recent claims regardless of state. ``repo`` applies the
+        scope filter in SQL so the LIMIT window is per-repo: filtering
+        after the LIMIT would let another repo's rows crowd a scoped
+        token's history out of the global window entirely. ``repo=None``
+        keeps the legacy all-repos window."""
         await self.init()
+        sql = "SELECT * FROM claims"
+        params: list[Any] = []
+        if repo is not None:
+            sql += " WHERE repo IS ?"
+            params.append(repo)
+        sql += " ORDER BY datetime(created_at) DESC LIMIT ?"
+        params.append(limit)
         async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
-            cur = await conn.execute(
-                "SELECT * FROM claims ORDER BY datetime(created_at) DESC LIMIT ?",
-                (limit,),
-            )
+            cur = await conn.execute(sql, params)
             rows = await cur.fetchall()
             await conn.commit()
             return [dict(r) for r in rows]

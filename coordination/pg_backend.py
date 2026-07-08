@@ -939,6 +939,27 @@ class PostgresStore(Database):
                     return True
                 return False
 
+    async def release_leader_lease(
+        self, *, lease_name: str, holder_id: str
+    ) -> bool:
+        """Delete the lease row iff this process still holds it, so a
+        draining leader hands leadership off immediately on graceful
+        shutdown (rolling deploys) instead of blocking every other
+        replica until the TTL expires. The holder guard means a row
+        already re-acquired by another replica is left untouched.
+        Returns True when a row was actually deleted."""
+        await self.init()
+        pool = await _get_pool(self._dsn)
+        async with pool.acquire() as raw:
+            await self._set_search_path(raw)
+            status = await raw.execute(
+                "DELETE FROM coord_leader_lease "
+                "WHERE lease_name = $1 AND holder_id = $2",
+                lease_name,
+                holder_id,
+            )
+        return _parse_rowcount(status) > 0
+
 
 def _schema_for_path(path: Path) -> str:
     """Deterministic, valid PG identifier private to one store path. Tests

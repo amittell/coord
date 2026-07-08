@@ -78,10 +78,13 @@ Example response:
 {
   "status": "ready",
   "version": "0.1.0",
-  "auth_mode": "bearer",
-  "database_path": "data/coordination.db"
+  "auth_mode": "bearer"
 }
 ```
+
+The payload deliberately omits server-internal details such as the database
+filesystem path: the endpoint is unauthenticated, so it exposes only what
+probes and doctor checks consume (`status`, `version`, `auth_mode`).
 
 ## `GET /meta`
 
