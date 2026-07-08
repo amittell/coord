@@ -326,8 +326,12 @@ def _unscoped_token_warning(engineer: str | None) -> str:
 async def _count_http_requests(request: Request, call_next):
     """Increment ``http_requests_total`` after each response. Uses the
     matched route template (e.g. ``/claims/{claim_id}``) for the ``path``
-    label so cardinality stays bounded; falls back to the raw URL path
-    if routing did not attach a matched route (404s, /metrics itself)."""
+    label so cardinality stays bounded; requests that did not match a
+    route (404s) collapse to the constant ``<unmatched>`` label. Using
+    the raw URL path there would let an unauthenticated scanner mint one
+    permanent series per probed path (series live for the process
+    lifetime), growing memory and the /metrics scrape body without
+    bound."""
     response = await call_next(request)
     # #30 slice 2/3: advertise the repo a scoped token was pinned to, so an
     # operator who dropped a token into the wrong repo's local.env can see
@@ -349,7 +353,7 @@ async def _count_http_requests(request: Request, call_next):
             getattr(request.state, "engineer", None)
         )
     route = request.scope.get("route")
-    path_label = getattr(route, "path", None) or request.url.path
+    path_label = getattr(route, "path", None) or "<unmatched>"
     metrics.http_requests_total.inc(
         method=request.method,
         path=path_label,

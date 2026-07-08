@@ -4556,11 +4556,18 @@ class Database:
         requester_engineer: str | None = None,
         claim_id: str | None = None,
         decision: str | None = None,
+        repo: str | None = None,
         limit: int = 200,
     ) -> list[dict[str, Any]]:
         """Return requests filtered by the given criteria. Joined with
         the holder's claim row so callers can render holder/pattern
-        without an extra round trip."""
+        without an extra round trip.
+
+        When ``repo`` is given, only requests whose holder claim belongs
+        to that repo are returned. The filter must run in SQL (before
+        LIMIT): on a busy shared service other repos' rows would
+        otherwise consume the LIMIT window and a repo-scoped viewer
+        would see a silently truncated (or empty) list."""
         await self.init()
         clauses: list[str] = []
         args: list[Any] = []
@@ -4573,6 +4580,9 @@ class Database:
         if decision:
             clauses.append("r.decision = ?")
             args.append(decision)
+        if repo is not None:
+            clauses.append("c.repo IS ?")
+            args.append(repo)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         sql = f"""
             SELECT r.*, c.engineer AS holder_engineer, c.pattern AS holder_pattern,
@@ -4648,15 +4658,26 @@ class Database:
             rows = await cur.fetchall()
             return [dict(r) for r in rows]
 
-    async def list_recent_claims(self, limit: int = 200) -> list[dict[str, Any]]:
+    async def list_recent_claims(
+        self, limit: int = 200, *, repo: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Return the most recent claims, newest first.
+
+        When ``repo`` is given, the scope filter runs in SQL before the
+        LIMIT so a repo-scoped viewer's window is not consumed by other
+        repos' rows on a shared service."""
         await self.init()
+        sql = "SELECT * FROM claims"
+        params: list[Any] = []
+        if repo is not None:
+            sql += " WHERE repo IS ?"
+            params.append(repo)
+        sql += " ORDER BY datetime(created_at) DESC LIMIT ?"
+        params.append(limit)
         async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
-            cur = await conn.execute(
-                "SELECT * FROM claims ORDER BY datetime(created_at) DESC LIMIT ?",
-                (limit,),
-            )
+            cur = await conn.execute(sql, params)
             rows = await cur.fetchall()
             await conn.commit()
             return [dict(r) for r in rows]

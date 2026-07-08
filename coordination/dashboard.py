@@ -217,12 +217,14 @@ def _recent_activity(
 # Aesthetic: phosphor terminal × Bloomberg ops console × Edward Tufte.
 # Dense, monospace, sharp edges, color reserved for signal not decoration.
 # Type pairing: Major Mono Display for ALL-CAPS structural headings,
-# JetBrains Mono for everything else. Both are free Google Fonts and
-# distinct from the usual Inter/Space-Grotesk/Roboto defaults.
+# JetBrains Mono for everything else -- used when locally installed,
+# falling back to ui-monospace/monospace otherwise. Deliberately NOT
+# fetched from Google Fonts: an @import on this auth-gated ops surface
+# phones home viewer IPs/timing to a third party on every fresh browser
+# session and is dead weight on air-gapped or egress-restricted
+# deployments (the documented k8s prod posture).
 
 _CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Major+Mono+Display&family=JetBrains+Mono:wght@300;400;500;700&display=swap');
-
 :root {
   --bg: #0a0806;
   --bg-2: #0f0c08;
@@ -1045,19 +1047,21 @@ async def render_dashboard(
 
     rows = await svc.list_claims(active_only=True)
     conflicts = await svc.db.recent_conflicts(500, repo=viewer_repo)
-    recent = await svc.db.list_recent_claims(500)
-    # #55: a repo-scoped viewer sees only its repo. rows/recent are filtered
-    # before activity is derived; the repo-aware DB calls (including the
-    # stale-engineer panel, scoped in v0.42) take viewer_repo directly.
-    # Only the webhook panel is global operational data (not repo-tagged)
-    # and is left unscoped.
+    recent = await svc.db.list_recent_claims(500, repo=viewer_repo)
+    # #55: a repo-scoped viewer sees only its repo. Every windowed DB call
+    # (recent claims, release requests, queue, conflicts, hotspots, the
+    # stale-engineer panel) takes viewer_repo directly so the repo filter
+    # runs in SQL before LIMIT -- filtering after the fetch would let other
+    # repos' rows consume the window on a busy shared service and silently
+    # under-report a scoped viewer's panels. rows/repos come from unlimited
+    # queries, so a Python filter is safe there. Only the webhook panel is
+    # global operational data (not repo-tagged) and is left unscoped.
     if viewer_repo is not None:
         rows = [c for c in rows if c.get("repo") == viewer_repo]
-        recent = [c for c in recent if c.get("repo") == viewer_repo]
     activity = _recent_activity(claims=recent, conflicts=conflicts, now=now)
     repos = await svc.db.list_repos()
     idle_timeout_sec = svc.settings.idle_timeout_sec
-    requests = await svc.list_requests(limit=200)
+    requests = await svc.list_requests(limit=200, repo=viewer_repo)
     auto_resolutions = await svc.db.count_auto_resolutions_since(
         window_hours=24, repo=viewer_repo
     )
@@ -1067,12 +1071,12 @@ async def render_dashboard(
     hotspot_rows = await svc.db.hotspot_files(
         days=30, min_attempts=5, limit=10, repo=viewer_repo
     )
-    queued_rows = await svc.db.list_queued_with_holder(state="waiting", limit=100)
+    queued_rows = await svc.db.list_queued_with_holder(
+        state="waiting", repo=viewer_repo, limit=100
+    )
     webhook_stats = await svc.db.webhook_delivery_stats(window_hours=24)
     if viewer_repo is not None:
         repos = [r for r in repos if r.get("repo") == viewer_repo]
-        requests = [q for q in requests if q.get("holder_repo") == viewer_repo]
-        queued_rows = [q for q in queued_rows if q.get("repo") == viewer_repo]
     stale_engineer_days = svc.settings.stale_engineer_days
     if stale_engineer_days > 0:
         # v0.42: scope the stale-holder panel to the viewer's repo so a
@@ -1113,10 +1117,14 @@ async def render_dashboard(
     # pending release-request target, and which (repo, pattern) pairs are held
     # by more than one engineer at once (legitimate symbol-level coexistence,
     # but worth flagging so the operator can see the friction at a glance).
-    release_targets: set[tuple[str, str]] = {
-        (str(rq.get("holder_engineer") or ""), str(rq.get("requested_pattern") or ""))
+    # Keyed on the request's claim_id (an exact join) rather than
+    # (holder, pattern): on a multi-repo service the tuple key cross-flagged
+    # an engineer's same-named claim in an unrelated repo as "release asked".
+    release_targets: set[str] = {
+        str(rq.get("claim_id"))
         for rq in requests
         if str(rq.get("decision") or "pending") == "pending"
+        and rq.get("claim_id")
     }
     pattern_holders: dict[tuple[str, str], set[str]] = defaultdict(set)
     for _claim in rows:
@@ -1298,9 +1306,9 @@ async def render_dashboard(
             _key = (str(r.get("repo") or ""), str(r.get("pattern") or ""))
             _contended = len(pattern_holders.get(_key, set())) > 1
             _release_asked = (
-                str(r.get("engineer") or ""),
-                str(r.get("pattern") or ""),
-            ) in release_targets
+                r.get("id") is not None
+                and str(r.get("id")) in release_targets
+            )
             flags = ""
             if _release_asked:
                 flags += '<span class="pill release-asked">release asked</span> '
@@ -1464,7 +1472,11 @@ async def render_dashboard(
                 f"<td>{_esc(r.get('repo')) or '<span class=muted>—</span>'}</td>"
                 f"<td><span class='pattern'>{_esc(r.get('pattern'))}</span></td>"
                 f"<td>{end_html}</td>"
-                f"<td class='muted'>{_esc(_ago(r.get('released_at') or r.get('expires_at'), now))}</td>"
+                # "updated" for a still-active claim is its last activity
+                # (or creation), never expires_at: a future timestamp hits
+                # _ago's negative-delta branch and renders the literal
+                # "now" for every active claim regardless of real age.
+                f"<td class='muted'>{_esc(_ago(r.get('released_at') or r.get('last_activity') or r.get('created_at'), now))}</td>"
                 "</tr>"
             )
     else:
@@ -1703,16 +1715,15 @@ async def render_dashboard(
             engineer = str(se.get("engineer") or "?")
             age = _ago(se.get("last_activity"), now)
             count = int(se.get("active_claim_count") or 0)
-            # Link the engineer name to ?engineer=NAME so the operator
-            # can drill into the existing activity surface that already
-            # honours the query parameter.
-            link = (
-                f'<a class="seengineer" href="?engineer={_esc(engineer)}">'
-                f'{_esc(engineer)}</a>'
-            )
+            # Plain text, not a link: the dashboard route ignores an
+            # ``engineer`` query parameter (only the v0.28 backpressure
+            # middleware ever read it, and v0.42 restricted even that to
+            # authenticated identities), so an ``?engineer=NAME`` href
+            # just reloaded the identical page.
+            name_html = f'<span class="seengineer">{_esc(engineer)}</span>'
             stale_lines.append(
                 '<div class="serow">'
-                f'<div class="sename">{link}</div>'
+                f'<div class="sename">{name_html}</div>'
                 f'<div class="seage">{_esc(age)}</div>'
                 f'<div class="secount">{count}</div>'
                 '</div>'
