@@ -40,9 +40,29 @@ REPO_ID="${COORD_REPO_ID:-}"
 # Empty-array expansion under `set -u` is unbound on bash 3.2 (the macOS
 # system bash), so guard with the ${var+...} fallback whenever we expand
 # CURL_AUTH below.
+# The Authorization header travels via a private curl config file (mktemp
+# creates it 0600), never on the curl command line: argv is world-readable
+# through `ps` for the duration of each request -- and the hook runs one
+# curl per pushed file -- so a bearer token passed as
+# `-H "Authorization: Bearer ..."` could be harvested by any local user on
+# a shared host. The token reaches python3 via the environment (also not
+# visible to other users), not argv, for the same reason.
 CURL_AUTH=()
+CURL_AUTH_CFG=""
 if [[ -n "${TOKEN}" ]]; then
-  CURL_AUTH=(-H "Authorization: Bearer ${TOKEN}")
+  CURL_AUTH_CFG="$(mktemp "${TMPDIR:-/tmp}/coord-pre-push.XXXXXX")"
+  chmod 600 "${CURL_AUTH_CFG}"
+  trap 'rm -f "${CURL_AUTH_CFG}"' EXIT
+  COORD_HOOK_TOKEN="${TOKEN}" python3 - > "${CURL_AUTH_CFG}" <<'PY'
+import os
+
+token = os.environ["COORD_HOOK_TOKEN"]
+# curl config quoting: escape backslash and double quote so a pathological
+# token cannot break out of the quoted parameter value.
+token = token.replace("\\", "\\\\").replace('"', '\\"')
+print('header = "Authorization: Bearer %s"' % token)
+PY
+  CURL_AUTH=(--config "${CURL_AUTH_CFG}")
 fi
 
 if ! command -v jq >/dev/null 2>&1; then
@@ -204,8 +224,27 @@ import os
 import sys
 
 pid = int(sys.argv[1])
-if pid <= 0 or os.name != "nt":
+if pid <= 0:
     sys.exit(1)
+
+if os.name != "nt":
+    # The shell's `kill -0` already returned success for any process this
+    # user may signal; landing here means it failed, which conflates ESRCH
+    # (no such process) with EPERM (alive but owned by another user).
+    # Re-probe and treat EPERM as live so a coord-mcp session started
+    # under a different UID (service account, containerized agent sharing
+    # the worktree) keeps its /conflicts self-exclusion instead of being
+    # pruned as dead -- pruning it would false-positive the push against
+    # the agent's own claims.
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        sys.exit(1)
+    except PermissionError:
+        sys.exit(0)
+    except OSError:
+        sys.exit(1)
+    sys.exit(0)
 
 try:
     import ctypes
@@ -250,9 +289,11 @@ PY
     if ! [[ "${pid_field}" =~ ^[0-9]+$ ]]; then
       continue
     fi
-    # Liveness probe. POSIX shells can use kill -0 directly; Git Bash on
-    # Windows cannot reliably resolve native Python PIDs, so fall back to
-    # a tiny Win32 process-exit-code check there.
+    # Liveness probe. `kill -0` answers directly for processes this user
+    # may signal; the python3 fallback distinguishes EPERM (alive, owned
+    # by another user -> live) from ESRCH (gone -> dead) on POSIX, and on
+    # Git Bash for Windows -- which cannot reliably resolve native Python
+    # PIDs -- uses a tiny Win32 process-exit-code check instead.
     if ! coord_pid_is_live "${pid_field}"; then
       continue
     fi
