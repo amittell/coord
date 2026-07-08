@@ -2761,12 +2761,14 @@ class CoordinationService:
         requester_engineer: str | None = None,
         claim_id: str | None = None,
         decision: str | None = None,
+        repo: str | None = None,
         limit: int = 200,
     ) -> list[dict[str, Any]]:
         return await self.db.list_requests(
             requester_engineer=requester_engineer,
             claim_id=claim_id,
             decision=decision,
+            repo=repo,
             limit=limit,
         )
 

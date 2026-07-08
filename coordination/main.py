@@ -385,8 +385,12 @@ def _unscoped_token_warning(engineer: str | None) -> str:
 async def _count_http_requests(request: Request, call_next):
     """Increment ``http_requests_total`` after each response. Uses the
     matched route template (e.g. ``/claims/{claim_id}``) for the ``path``
-    label so cardinality stays bounded; falls back to the raw URL path
-    if routing did not attach a matched route (404s, /metrics itself)."""
+    label so cardinality stays bounded; requests that did not match a
+    route (404s) collapse to the constant ``<unmatched>`` label. Using
+    the raw URL path there would let an unauthenticated scanner mint one
+    permanent series per probed path (series live for the process
+    lifetime), growing memory and the /metrics scrape body without
+    bound."""
     try:
         response = await call_next(request)
     except Exception:
@@ -396,7 +400,7 @@ async def _count_http_requests(request: Request, call_next):
         # requests error-rate dashboards care about) vanish from the
         # metric and an exception storm reads as a 0% error rate.
         route = request.scope.get("route")
-        path_label = getattr(route, "path", None) or request.url.path
+        path_label = getattr(route, "path", None) or "<unmatched>"
         metrics.http_requests_total.inc(
             method=request.method,
             path=path_label,
@@ -431,7 +435,7 @@ async def _count_http_requests(request: Request, call_next):
     if _identity_warning:
         response.headers["X-Coord-Identity-Warning"] = _identity_warning
     route = request.scope.get("route")
-    path_label = getattr(route, "path", None) or request.url.path
+    path_label = getattr(route, "path", None) or "<unmatched>"
     metrics.http_requests_total.inc(
         method=request.method,
         path=path_label,

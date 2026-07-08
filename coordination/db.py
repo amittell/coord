@@ -4899,11 +4899,18 @@ class Database:
         requester_engineer: str | None = None,
         claim_id: str | None = None,
         decision: str | None = None,
+        repo: str | None = None,
         limit: int = 200,
     ) -> list[dict[str, Any]]:
         """Return requests filtered by the given criteria. Joined with
         the holder's claim row so callers can render holder/pattern
-        without an extra round trip."""
+        without an extra round trip.
+
+        When ``repo`` is given, only requests whose holder claim belongs
+        to that repo are returned. The filter must run in SQL (before
+        LIMIT): on a busy shared service other repos' rows would
+        otherwise consume the LIMIT window and a repo-scoped viewer
+        would see a silently truncated (or empty) list."""
         await self.init()
         clauses: list[str] = []
         args: list[Any] = []
@@ -4916,6 +4923,9 @@ class Database:
         if decision:
             clauses.append("r.decision = ?")
             args.append(decision)
+        if repo is not None:
+            clauses.append("c.repo IS ?")
+            args.append(repo)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         sql = f"""
             SELECT r.*, c.engineer AS holder_engineer, c.pattern AS holder_pattern,
@@ -4994,11 +5004,12 @@ class Database:
     async def list_recent_claims(
         self, limit: int = 200, *, repo: str | None = None
     ) -> list[dict[str, Any]]:
-        """Most recent claims regardless of state. ``repo`` applies the
-        scope filter in SQL so the LIMIT window is per-repo: filtering
-        after the LIMIT would let another repo's rows crowd a scoped
-        token's history out of the global window entirely. ``repo=None``
-        keeps the legacy all-repos window."""
+        """Most recent claims regardless of state, newest first. ``repo``
+        applies the scope filter in SQL before the LIMIT so the window is
+        per-repo: filtering after the LIMIT would let another repo's rows
+        crowd a scoped viewer's history out of the global window entirely
+        on a shared service. ``repo=None`` keeps the legacy all-repos
+        window."""
         await self.init()
         sql = "SELECT * FROM claims"
         params: list[Any] = []
