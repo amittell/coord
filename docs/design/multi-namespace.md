@@ -1,6 +1,6 @@
 # Multi-namespace coordination
 
-Status: proposal, targeting v0.28
+Status: design-gated, unversioned. The repo-scoped-visibility half was delivered by the v0.42 repo-bound tokens (see [repo-scoped-tokens.md](./repo-scoped-tokens.md)); the remaining namespace-isolation decisions below still want settling before code (see [roadmap.md](./roadmap.md)).
 Author: Alex Mittell
 Date: 2026-06-03
 

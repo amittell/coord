@@ -71,7 +71,7 @@ When to reach for them:
 When file-scope is still the right call:
 
 - Small files where the whole content effectively moves together.
-- Files in languages without a v0.14 parser (Python, Go land in v0.15; everything else stays file-scope).
+- Files in languages without a symbol parser. Coverage is broad since v0.33 -- TypeScript (v0.14), Python and Go (v0.15), plus JavaScript, Rust, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift, and Scala (v0.33), each via a tree-sitter backend (the optional `[symbols]` extra) with a regex fallback -- but anything outside those 14 languages stays file-scope.
 - Edits that touch imports, top-level statements outside any declared symbol, or anything that changes module shape. Symbol claims do NOT cover module-level code -- you need a file claim for that, even if you also hold a symbol claim on the same file.
 
 Passing `symbols` on `claim_files` (a `dict[str, list[str]]` keyed by file path, values are symbol names within that file) flips the claim to `scope_type='symbol'`. Without `symbols`, behaviour is identical to pre-v0.14.
@@ -198,7 +198,7 @@ claim_files(
 )
 ```
 
-When the holder releases (manual `release_claims`, TTL expiry, request approval, or a `narrowed` / `coexist` decision), the service drains the FIFO and auto-grants the next entry. Multiple queued requesters are served in arrival order. The server caps `wait_seconds` at 600s; pass `0` (or omit) to preserve the immediate-409 behaviour from v0.13-v0.20. The MCP wrapper accepts `wait_seconds` directly on `claim_files`; the same field exists on `POST /claims` (see [./api-reference.md](./api-reference.md)).
+When the holder releases (manual `release_claims`, TTL expiry, request approval, or a `narrowed` / `coexist` decision), the service drains the FIFO and auto-grants the next entry. Multiple queued requesters are served in arrival order. The server rejects `wait_seconds` values above 600 with a `422` validation error (it does not clamp); pass `0` (or omit) to preserve the immediate-409 behaviour from v0.13-v0.20. The MCP wrapper accepts `wait_seconds` directly on `claim_files`; the same field exists on `POST /claims` (see [./api-reference.md](./api-reference.md)).
 
 ### Priority hints (v0.25+)
 
@@ -435,7 +435,7 @@ export COORD_WEBHOOK_EVENTS=auto-promote,auto-demote,queue_grant
 
 Filtering happens at enqueue time inside `fire_webhook`, so excluded events never hit the outbox at all -- there's no retry pressure from a receiver that doesn't care about, say, `claim_granted`. Empty or unset means "all events"; this is the recommended starting point when you're still figuring out which events your receiver actually needs.
 
-Slack and GitHub PR adapters that turn these payloads into channel messages and PR comments are queued as v0.27.x follow-ups; until then, every receiver is a small custom integration.
+The GitHub PR-comment adapter shipped in v0.34: set `COORD_GITHUB_TOKEN` and bounced pushes (`push_bounced` events) are posted as de-duplicated comments on the open PR for the bounced branch (`COORD_GITHUB_API_BASE` for GitHub Enterprise). A Slack adapter remains parked; a Slack receiver is still a small custom integration.
 
 ## Queue QoS and housekeeping (v0.28+)
 

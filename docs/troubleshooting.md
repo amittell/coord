@@ -233,7 +233,7 @@ Fix in v0.10.0: `coord-mcp` writes its `session_id` to `<repo_root>/.coordinatio
 
 `sessions.live` is local runtime state used by the pre-push hook to identify the current MCP session. Older coord versions could leave a dead-PID row behind when an agent process was killed instead of exiting cleanly.
 
-Fix in v0.33.1: coord now compacts `sessions.live` under a repo-local lock when `coord-mcp` starts or exits, and `coord doctor` prunes stale rows immediately when it can rewrite the file. If doctor still warns, inspect permissions on `.coordination/sessions.live`; the pre-push hook still skips dead PIDs, so the warning is hygiene rather than a coordination break.
+Fix in v0.35.1: coord now compacts `sessions.live` under a repo-local lock when `coord-mcp` starts or exits, and `coord doctor` prunes stale rows immediately when it can rewrite the file. If doctor still warns, inspect permissions on `.coordination/sessions.live`; the pre-push hook still skips dead PIDs, so the warning is hygiene rather than a coordination break.
 
 ## `coord doctor` reports regex fallback for symbol parsers
 
