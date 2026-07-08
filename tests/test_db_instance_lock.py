@@ -105,7 +105,14 @@ def test_acquire_lock_subprocess_contention(tmp_path: Path) -> None:
         assert str(child_pid) in msg
     finally:
         release_marker.write_text("go")
-        proc.wait(timeout=5)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            # A wedged child must never outlive the test: kill it so it
+            # cannot orphan (and trip the make-test pgrep guard), and do
+            # not let TimeoutExpired mask the primary assertion failure.
+            proc.kill()
+            proc.wait()
 
 
 @_POSIX_ONLY

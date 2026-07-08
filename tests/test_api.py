@@ -1555,6 +1555,22 @@ async def test_queue_disabled_when_wait_seconds_omitted(
     # Legacy 409 (or 200 with conflicts depending on the path); claim
     # ids must be empty either way.
     assert rr.json().get("claim_ids", None) == [] or rr.status_code == 409
+    # The docstring's second half: the plain-409 path must not enqueue.
+    # A silently inserted zero-wait claim_queue row would later be
+    # auto-granted on release even though bob never asked to wait.
+    rq = await client.get(
+        "/requests?queued=true&requester=bob", headers=_AUTH
+    )
+    assert rq.status_code == 200, rq.text
+    queued_rows = [
+        row
+        for row in rq.json().get("requests", [])
+        if row.get("requester_engineer") == "bob"
+    ]
+    assert queued_rows == [], (
+        f"wait_seconds omitted must not insert a claim_queue row; got "
+        f"{queued_rows}"
+    )
 
 
 @pytest.mark.asyncio
@@ -1636,14 +1652,19 @@ async def test_queue_grants_in_fifo_order_on_release(
     assert bob_result.get("claim_ids"), (
         f"bob should be auto-granted; got {bob_result}"
     )
-    # Carol either got auto-granted in turn (after bob releases, but he
-    # didn't here) or her wait timed out into a conflict payload. In
-    # this test we don't release bob, so carol times out with the
-    # conflict shape (and her wait_seconds is large enough that she
-    # may still be waiting -- the test asserts her result is well-formed
-    # either way).
-    assert carol_result.get("claim_ids", []) == [] or carol_result.get(
-        "claim_ids"
+    # Carol must NOT be granted: _drain_queue_for pops every waiter on
+    # the released claim, grants bob (head of FIFO), then re-runs the
+    # conflict check for carol against the post-release world -- she now
+    # conflicts with bob's fresh claim, so her queue entry is marked
+    # expired and her long-poll returns the conflict payload with no
+    # claim ids. Pin both halves so a double-grant regression fails.
+    assert carol_result.get("claim_ids") == [], (
+        f"carol must not be granted while bob holds the file; got "
+        f"{carol_result}"
+    )
+    assert carol_result.get("conflicts"), (
+        f"carol's expired wait must surface the conflict payload; got "
+        f"{carol_result}"
     )
 
 

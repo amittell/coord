@@ -1585,8 +1585,17 @@ def test_is_live_pid_true_for_current_process() -> None:
 
 def test_is_live_pid_false_for_dead_process() -> None:
     """Spawn a real subprocess, wait for it to exit, then verify
-    _is_live_pid returns False for its PID. POSIX guarantees no PID
-    reuse until the parent reaps, which subprocess.wait() does."""
+    _is_live_pid returns False for its PID.
+
+    Note on PID reuse: the POSIX reservation works the other way round
+    from what one might hope -- the PID is guaranteed reserved only
+    UNTIL the parent reaps the zombie, and subprocess.wait() is exactly
+    that reap, so afterwards the OS is free to hand the PID out again.
+    (Keeping an unreaped zombie would not help either: os.kill(pid, 0)
+    reports a zombie as live.) The test therefore relies on Linux/macOS
+    allocating PIDs sequentially rather than immediately recycling the
+    one just freed, which makes a false positive vanishingly unlikely in
+    the instant between wait() and the assertion, not impossible."""
     proc = subprocess.Popen([sys.executable, "-c", "pass"])
     proc.wait()
     assert mcp_server._is_live_pid(proc.pid) is False

@@ -33,12 +33,9 @@ try:
 except ImportError:  # pragma: no cover - depends on install state
     _TREESITTER_AVAILABLE = False
 
-# The dispatcher registration for ``.cs`` is wired separately (in
-# ``__init__.py``). These tests call each backend's ``extract`` directly via
-# :func:`_extract` so they stand alone regardless of registration state; a
-# dedicated test below covers the dispatcher path and skips until ``.cs`` is
-# registered.
-_CS_REGISTERED = ".cs" in symbols.supported_extensions()
+# These tests call each backend's ``extract`` directly via :func:`_extract`
+# so they stand alone; a dedicated test below covers the dispatcher path and
+# pins that ``.cs`` stays registered in ``__init__.py``.
 
 
 # ---------------------------------------------------------------------------
@@ -221,13 +218,14 @@ def test_using_directives_only(backend) -> None:
 def test_dispatcher_routes_cs_extension() -> None:
     """A ``.cs`` file path must dispatch to the C# backend and return symbols.
 
-    Skipped until the dispatcher registration for ``.cs`` is wired in
-    ``__init__.py`` (done by a separate integrator). Once registered this pins
-    that ``extract_symbols`` routes ``.cs`` content to a C# backend.
+    ``.cs`` is registered in the dispatcher (v0.33); asserted unconditionally
+    so a dropped registration turns the suite red rather than silently
+    skipping.
     """
 
-    if not _CS_REGISTERED:
-        pytest.skip(".cs not yet registered in the dispatcher")
+    assert ".cs" in symbols.supported_extensions(), (
+        ".cs must stay registered in the dispatcher extension map"
+    )
     symbols._CACHE.clear()
     src = "public class Dispatched\n{\n}\n"
     result = extract_symbols("foo.cs", src)
