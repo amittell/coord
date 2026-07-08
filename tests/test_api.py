@@ -78,7 +78,9 @@ async def test_readyz_reports_metadata(client: AsyncClient) -> None:
     body = r.json()
     assert body["status"] == "ready"
     assert body["auth_mode"] == "bearer"
-    assert body["database_path"].endswith("db.sqlite")
+    # The unauthenticated probe must not leak server-internal filesystem
+    # layout (audit: info-disclosure).
+    assert "database_path" not in body
 
 
 @pytest.mark.asyncio

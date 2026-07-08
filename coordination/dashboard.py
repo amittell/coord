@@ -1585,11 +1585,13 @@ async def render_dashboard(
                 action_name = (
                     "shared_file" if tag == "shared" else "split"
                 )
+                # No "repo" in the documentary payload: the promote
+                # endpoint's ownership write is deployment-global and the
+                # request model no longer carries a repo field.
                 payload_json = json.dumps(
                     {
                         "action": action_name,
                         "pattern": str(row.get("pattern") or ""),
-                        "repo": row.get("repo"),
                     },
                     separators=(",", ":"),
                 )
