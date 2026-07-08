@@ -202,12 +202,19 @@ def _check_service(config: RepoConfig, token: str) -> list[CheckResult]:
             )
         )
     except httpx.HTTPError as exc:
+        # ``hint`` from the try block is only bound after the /claims
+        # response returns, so it must not be referenced here: /readyz
+        # succeeded moments ago but the /claims probe itself failed
+        # (timeout, connection reset mid-request). Use a hint specific
+        # to that flapping-service situation.
         out.append(
             CheckResult(
                 label,
                 False,
                 str(exc),
-                hint,
+                "The service answered /readyz but the /claims probe failed "
+                "mid-request; it may be restarting or flapping. Re-run "
+                "'coord doctor'.",
             )
         )
     return out
