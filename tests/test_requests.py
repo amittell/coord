@@ -323,8 +323,8 @@ async def test_shortened_ttl_expiry_cascades_to_request(
         )
         await conn.commit()
 
-    n = await svc.db.expire_stale_claims()
-    assert n == 1
+    expired = await svc.db.expire_stale_claims()
+    assert expired == [cid]
 
     final = await svc.get_request(req["id"])
     assert final is not None
@@ -353,8 +353,8 @@ async def test_release_session_resolves_open_requests(
         reason="block",
         urgency="high",
     )
-    n = await svc.db.release_for_session("bulk-sess")
-    assert n == 1
+    released = await svc.db.release_for_session("bulk-sess")
+    assert released == [cid]
 
     final = await svc.get_request(req["id"])
     assert final is not None
@@ -382,8 +382,8 @@ async def test_release_claims_cascades_open_requests_to_resolved(
         urgency="normal",
     )
     # Holder voluntarily releases (e.g. via release_claims).
-    n = await svc.db.release_claims([cid], engineer="alice")
-    assert n == 1
+    released = await svc.db.release_claims([cid], engineer="alice")
+    assert released == [cid]
 
     final = await svc.get_request(req["id"])
     assert final is not None

@@ -175,9 +175,12 @@ async def lifespan(app: FastAPI):
             leader = await _is_background_leader()
             if leader:
                 try:
-                    await get_service().db.expire_stale_claims(
-                        idle_timeout_sec=settings.idle_timeout_sec
-                    )
+                    # Service-layer sweep: closes TTL/idle-expired claims
+                    # AND drains the FIFO queue behind each of them, so a
+                    # waiter queued behind a claim whose (possibly
+                    # request_release-shortened) TTL fires here is granted
+                    # instead of burning its whole wait_seconds.
+                    await get_service().expire_stale_claims()
                 except Exception:  # pragma: no cover - background cleanup failures are logged
                     logger.exception("Failed to expire stale claims")
                 # Reap queue rows by their own expires_at so a waiter
@@ -2447,8 +2450,13 @@ async def release_session(
 
     A repo-scoped token releases only that repo's claims within the
     session (#30 slice 2/3), so it cannot tear down another repo's work
-    that happens to share a session id."""
-    n = await get_service().db.release_for_session(
+    that happens to share a session id.
+
+    Routed through the service layer (not db.release_for_session
+    directly) so every released claim drains its FIFO queue -- waiters
+    queued behind this session's claims are granted here exactly like
+    an explicit release would grant them."""
+    n = await get_service().release_session(
         session_id, repo=_token_repo(request)
     )
     return {"released": n}

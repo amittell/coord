@@ -825,8 +825,9 @@ async def test_release_for_session_releases_all_claims_in_session(
         session_id="sess-different",
     )
 
-    n = await repo_service.db.release_for_session("sess-cleanup")
-    assert n == 3, f"expected 3 releases, got {n}"
+    released = await repo_service.db.release_for_session("sess-cleanup")
+    assert len(released) == 3, f"expected 3 releases, got {released}"
+    assert set(released) == {"cid_r1", "cid_r2", "cid_r3"}
 
     remaining = await repo_service.db.list_active_claims_rows()
     remaining_ids = {r["id"] for r in remaining}
@@ -929,10 +930,10 @@ async def test_idle_session_claims_get_expired(
         last_activity=stale_iso,
     )
 
-    n = await idle_service.db.expire_stale_claims(
+    expired = await idle_service.db.expire_stale_claims(
         idle_service.settings.idle_timeout_sec
     )
-    assert n >= 1
+    assert "idle-cid" in expired
     rows = await idle_service.db.list_active_claims_rows()
     assert "idle-cid" not in {r["id"] for r in rows}
 

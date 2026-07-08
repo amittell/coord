@@ -365,6 +365,25 @@ def _drop_waiter(queue_id: str) -> None:
     _QUEUE_WAITERS.pop(queue_id, None)
 
 
+def _consume_finalise_result(task: asyncio.Task) -> None:
+    """Consume the outcome of an orphaned queue-wait finalise task.
+
+    Attached only when the awaiting handler was cancelled mid-finalise
+    (a second disconnect signal): the shielded task keeps running so
+    the queue row still reaches a terminal state, and this callback
+    retrieves its result so a failure is logged instead of surfacing
+    as 'Task exception was never retrieved' at GC time."""
+
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error(
+            "queue-wait finalise failed after handler cancellation: %s",
+            exc,
+        )
+
+
 @dataclass
 class CoordinationService:
     db: Database
@@ -762,7 +781,7 @@ class CoordinationService:
             err = _validate_pattern_syntax(pat)
             if err:
                 raise ValueError(err)
-        await self.db.expire_stale_claims(self.settings.idle_timeout_sec)
+        await self.expire_stale_claims()
         # Activity ping: a session that's actively checking conflicts is
         # still alive even if it isn't creating new claims, so refresh
         # last_activity for everything it currently holds before we
@@ -981,7 +1000,7 @@ class CoordinationService:
         *,
         auto_promote_allowed: bool = True,
     ) -> CreateClaimsResponse:
-        await self.db.expire_stale_claims(self.settings.idle_timeout_sec)
+        await self.expire_stale_claims()
         # Activity ping: making a claim is the strongest possible
         # liveness signal -- bump last_activity for every claim this
         # session already holds before we decide what's stale.
@@ -2354,7 +2373,7 @@ class CoordinationService:
         session_id: str | None = None,
         repo: str | None = None,
     ) -> list[dict[str, Any]]:
-        await self.db.expire_stale_claims(self.settings.idle_timeout_sec)
+        await self.expire_stale_claims()
         # Activity ping: an agent reading the claim list is still alive,
         # so keep its claims warm. No-op when session_id is unset
         # (legacy / non-MCP callers). ``repo`` scopes the warm-up so a
@@ -2585,7 +2604,7 @@ class CoordinationService:
         # inherit the shortened deadline that request_release imposed on the
         # holder's original claim.
         min_expires_at = _expires_at(self.settings.default_ttl_hours)
-        return await self.db.respond_to_request(
+        row = await self.db.respond_to_request(
             request_id=request_id,
             decision=decision,
             actor_engineer=actor_engineer,
@@ -2596,6 +2615,19 @@ class CoordinationService:
             coexist_symbols=coexist_symbols,
             min_expires_at=min_expires_at,
         )
+        if row is None:
+            return None
+        # Drain the FIFO queue for every claim this decision actually
+        # closed ('approved' releases the holder's claim; 'narrowed'
+        # releases the original before opening the tighter one).
+        # Without this, waiters queued behind that claim would burn
+        # their whole wait_seconds against scope that is already free.
+        # The key is private DB->service transport: popped here (with a
+        # default, since the responded-late path never releases) so it
+        # never reaches the API response.
+        for cid in row.pop("_released_claim_ids", []):
+            await self._drain_queue_for(cid)
+        return row
 
     async def _validate_symbol_coexist(
         self,
@@ -2778,16 +2810,48 @@ class CoordinationService:
             await asyncio.sleep(poll_interval_seconds)
 
     async def release_claims(self, claim_ids: list[str], engineer: str | None) -> int:
-        n = await self.db.release_claims(claim_ids, engineer)
-        for _ in range(n):
+        released_ids = await self.db.release_claims(claim_ids, engineer)
+        for _ in released_ids:
             metrics.claims_released_total.inc()
-        # v0.21: drain the FIFO queue against every input id.
-        # _drain_queue_for is idempotent -- if the id wasn't really
-        # released (wrong engineer, already gone), pop_next_waiting
-        # returns None and the call is a no-op.
-        for cid in claim_ids:
+        # v0.21: drain the FIFO queue -- but only for the ids that were
+        # actually released. Draining an id that did not close (wrong
+        # engineer, already released, unknown) would pop every waiter
+        # behind the still-active claim, re-conflict each of them
+        # against the unchanged holder, and expel the whole queue with
+        # immediate 409s despite the wait_seconds they asked for.
+        for cid in released_ids:
             await self._drain_queue_for(cid)
-        return n
+        return len(released_ids)
+
+    async def release_session(
+        self, session_id: str, *, repo: str | None = None
+    ) -> int:
+        """End-of-session bulk release, routed through the service
+        layer so every claim the session held drains its FIFO queue.
+        ``POST /sessions/{id}/release`` is the protocol-recommended
+        cleanup call, so waiters queued behind any of the session's
+        claims must be granted here exactly like an explicit
+        release_claims would. Returns the number of claims closed."""
+        released_ids = await self.db.release_for_session(
+            session_id, repo=repo
+        )
+        for cid in released_ids:
+            await self._drain_queue_for(cid)
+        return len(released_ids)
+
+    async def expire_stale_claims(self) -> list[str]:
+        """TTL/idle sweep plus FIFO-queue drain for every claim the
+        sweep actually closed. request_release exists to shorten the
+        holder's TTL; when that shortened TTL fires, the waiters queued
+        behind the claim must be granted rather than burning their full
+        wait_seconds against scope that is already free. Returns the
+        expired claim ids."""
+        expired_ids = await self.db.expire_stale_claims(
+            self.settings.idle_timeout_sec
+        )
+        for cid in expired_ids:
+            await self._drain_queue_for(cid)
+        return expired_ids
 
     async def cancel_queue_request(
         self,
@@ -2985,21 +3049,90 @@ class CoordinationService:
                     break
         finally:
             _drop_waiter(entry["id"])
+            # Terminal DB transition, INSIDE the finally so it runs on
+            # every exit path -- most importantly CancelledError, which
+            # the ASGI server raises into this handler when the
+            # long-polling client disconnects. The old placement (after
+            # the try block) was skipped on cancellation, leaking the
+            # row in state='waiting' forever: it counted against the
+            # per-engineer and per-repo queue caps and stayed poppable
+            # by a future drain, minting a real claim for a requester
+            # who was long gone. v0.26: skip when the requester
+            # cancelled -- the row is already 'cancelled' and must not
+            # be re-labelled 'expired'.
+            if granted_cid is None and not was_cancelled:
+                finalise = asyncio.ensure_future(
+                    self._finalise_queue_wait(entry["id"])
+                )
+                try:
+                    adopted = await asyncio.shield(finalise)
+                except asyncio.CancelledError:
+                    # A(nother) cancellation landed while finalising.
+                    # The shielded task keeps running to completion in
+                    # the background so the row still reaches a
+                    # terminal state; consume its outcome so a failure
+                    # doesn't warn unretrieved at GC time.
+                    finalise.add_done_callback(_consume_finalise_result)
+                    raise
+                if adopted is not None:
+                    granted_cid = adopted
 
         if granted_cid:
+            grant_warnings: list[str] = []
+            if len(body.claims) > 1:
+                # The v0.21 queue enqueues only the single conflicted
+                # item, so a wait_seconds grant covers ONE pattern of
+                # this batch; every other item -- including ones that
+                # never conflicted, since a batch with any conflict
+                # inserts nothing -- was NOT claimed. Name them so the
+                # caller does not edit files it never reserved.
+                # Deliberately a warning rather than a re-attempt of
+                # the remaining items: a response carrying claim_ids
+                # plus non-empty conflicts reads as failure to every
+                # existing client.
+                uncovered = sorted(
+                    {
+                        item.pattern
+                        for item in body.claims
+                        if item is not target_item
+                    }
+                )
+                grant_warnings.append(
+                    f"queued grant is PARTIAL: it covers only "
+                    f"{target_item.pattern!r}. Not reserved: "
+                    f"{uncovered}. Claim these separately before "
+                    "editing them."
+                )
             return CreateClaimsResponse(
                 claim_ids=[granted_cid],
                 conflicts=[],
-                warnings=[],
+                warnings=grant_warnings,
                 options=[],
             )
-        # Mark expired in case the loop ran out of time without a state
-        # change (DB still 'waiting' or 'in_progress'). Idempotent: a
-        # row that is already terminal stays terminal. v0.26: skip when
-        # the requester cancelled -- otherwise we'd clobber the
-        # 'cancelled' state with 'expired'.
-        if not was_cancelled:
-            await self.db.mark_queue_expired(entry["id"])
+        return None
+
+    async def _finalise_queue_wait(self, queue_id: str) -> str | None:
+        """Drive a finished long-poll wait (timeout, client disconnect,
+        or a verdictless wake) to a terminal DB state.
+
+        Attempts the waiting/in_progress -> expired transition first.
+        When that loses -- rowcount 0 because the row is already
+        terminal -- the row is re-read: if an in-flight drain won the
+        race and marked it granted, the granted claim id is returned so
+        the caller adopts the grant instead of surfacing a 409 for a
+        claim that now exists in the requester's name. Returns None
+        when the row was expired here or was already terminal without
+        a grant."""
+        expired = await self.db.mark_queue_expired(queue_id)
+        if expired:
+            return None
+        row = await self.db.get_queue_entry(queue_id)
+        if (
+            row is not None
+            and row.get("state") == "granted"
+            and row.get("granted_claim_id")
+        ):
+            return str(row["granted_claim_id"])
         return None
 
     async def _drain_queue_for(self, released_claim_id: str) -> None:
@@ -3072,7 +3205,31 @@ class CoordinationService:
                 continue
             if resp.claim_ids:
                 granted_cid = resp.claim_ids[0]
-                await self.db.mark_queue_granted(entry["id"], granted_cid)
+                granted = await self.db.mark_queue_granted(
+                    entry["id"], granted_cid
+                )
+                if not granted:
+                    # The waiter is gone: its timeout, a cancel, or the
+                    # queue reaper moved the row to a terminal state
+                    # while the grant re-issue was in flight. Finalising
+                    # anyway would mint a live claim for a requester who
+                    # was told there is no grant, blocking everyone else
+                    # until TTL/idle expiry. Release the claim(s) just
+                    # created -- through the service path, so any waiter
+                    # already queued behind the short-lived claim drains
+                    # too -- and keep draining: the freed scope may
+                    # satisfy the next waiter.
+                    logger.info(
+                        "FIFO drain: queue %s lost the grant race (row "
+                        "already terminal); releasing orphan claim %s",
+                        entry["id"],
+                        granted_cid,
+                    )
+                    await self.release_claims(
+                        list(resp.claim_ids),
+                        entry.get("requester_engineer"),
+                    )
+                    continue
                 _notify_waiter(
                     entry["id"], {"granted_claim_id": granted_cid}
                 )

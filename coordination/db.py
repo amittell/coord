@@ -2243,32 +2243,53 @@ class Database:
 
     async def mark_queue_granted(
         self, queue_id: str, granted_claim_id: str
-    ) -> None:
+    ) -> bool:
         """Finalise a queue entry whose drain attempt produced a real
         claim. The in-memory long-poll signal is fired by the service
-        layer; this method just persists the state transition."""
+        layer; this method just persists the state transition.
+
+        Guarded on the non-terminal states: a cancel, a waiter timeout,
+        or the queue reaper can move the row to 'cancelled'/'expired'
+        while the drain's grant re-issue is still in flight (LSP calls
+        and writer-lock waits make that window real), and overwriting
+        that terminal state would hand a live claim to a requester who
+        was already told there is no grant. Returns True when this call
+        performed the transition; False means the grant lost the race
+        and the caller must release the claim it just created."""
         await self.init()
         async with self._connect() as conn:
             await _configure_sqlite(conn)
-            await conn.execute(
+            cur = await conn.execute(
                 "UPDATE claim_queue SET state = 'granted', "
-                "granted_claim_id = ? WHERE id = ?",
+                "granted_claim_id = ? WHERE id = ? "
+                "AND state IN ('waiting', 'in_progress')",
                 (granted_claim_id, queue_id),
             )
             await conn.commit()
+            return (cur.rowcount or 0) > 0
 
-    async def mark_queue_expired(self, queue_id: str) -> None:
+    async def mark_queue_expired(self, queue_id: str) -> bool:
         """Mark a queue entry as expired (wait_seconds elapsed without
         a grant, or the drain attempt re-conflicted). The long-poll on
-        the requester side surfaces the original 409 to the caller."""
+        the requester side surfaces the original 409 to the caller.
+
+        Guarded on the non-terminal states so a waiter timeout racing
+        an in-flight drain cannot clobber a 'granted' row (or a
+        requester's 'cancelled' one). Returns True when this call
+        performed the transition; False means the row was already
+        terminal -- the waiter side re-reads the row and adopts a
+        granted claim instead of surfacing a 409 for scope it now
+        holds."""
         await self.init()
         async with self._connect() as conn:
             await _configure_sqlite(conn)
-            await conn.execute(
-                "UPDATE claim_queue SET state = 'expired' WHERE id = ?",
+            cur = await conn.execute(
+                "UPDATE claim_queue SET state = 'expired' WHERE id = ? "
+                "AND state IN ('waiting', 'in_progress')",
                 (queue_id,),
             )
             await conn.commit()
+            return (cur.rowcount or 0) > 0
 
     async def cancel_queue_entry(
         self,
@@ -3232,11 +3253,12 @@ class Database:
 
     async def release_for_session(
         self, session_id: str, *, repo: str | None = None
-    ) -> int:
+    ) -> list[str]:
         """Release every active claim that was created with the given
-        session_id, regardless of engineer name. Returns the count of
-        rows actually closed. Intended for end-of-work cleanup so an
-        agent process can reliably tear down everything it produced
+        session_id, regardless of engineer name. Returns the ids of the
+        rows actually closed so the service layer can drain the FIFO
+        queue behind each of them. Intended for end-of-work cleanup so
+        an agent process can reliably tear down everything it produced
         even when it spawned subagents under multiple engineer names.
 
         ``repo`` (#30 slice 2/3) scopes the release: when set, only claims
@@ -3245,7 +3267,7 @@ class Database:
         (operator) releases the whole session as before.
         """
         if not session_id:
-            return 0
+            return []
         now = _utcnow()
         await self.init()
         # SELECT and UPDATE in a single BEGIN IMMEDIATE transaction so
@@ -3271,15 +3293,12 @@ class Database:
                     upd_params: list[Any] = [now, session_id]
                     if repo is not None:
                         upd_params.append(repo)
-                    cur = await conn.execute(
+                    await conn.execute(
                         "UPDATE claims SET released_at = ? "
                         "WHERE session_id = ? AND released_at IS NULL"
                         + repo_clause,
                         upd_params,
                     )
-                    n = cur.rowcount or 0
-                else:
-                    n = 0
                 await conn.commit()
             except Exception:
                 await conn.rollback()
@@ -3295,7 +3314,7 @@ class Database:
             await self.cascade_resolve_requests_for_claim(
                 cid, release_kind="session-bulk", actor_engineer=None
             )
-        return n
+        return to_close
 
     async def claim_repo(self, claim_id: str) -> tuple[bool, str | None]:
         """Scope-guard lookup: ``(exists, repo)`` for a claim id (#30 s2/3).
@@ -3368,12 +3387,19 @@ class Database:
             row = await cur.fetchone()
         return (False, None) if row is None else (True, row["repo"])
 
-    async def release_claims(self, claim_ids: list[str], engineer: str | None = None) -> int:
+    async def release_claims(
+        self, claim_ids: list[str], engineer: str | None = None
+    ) -> list[str]:
+        """Stamp ``released_at`` on each claim the caller may release.
+        Returns the ids actually released -- engineer-mismatched,
+        unknown, and already-released ids are absent -- so the service
+        layer can drain the FIFO queue for exactly the claims that
+        really closed. Draining for a no-op release would expel every
+        queued waiter behind a still-active claim."""
         now = _utcnow()
         await self.init()
         released_ids: list[str] = []
         async with self._write() as conn:
-            n = 0
             for cid in claim_ids:
                 if engineer:
                     cur = await conn.execute(
@@ -3387,7 +3413,6 @@ class Database:
                     )
                 if cur.rowcount and cur.rowcount > 0:
                     released_ids.append(cid)
-                    n += cur.rowcount
             # _write owns the commit
         # Detach the released claims from any coexisting partners
         # BEFORE cascade-resolve, so a partner that's about to receive
@@ -3402,7 +3427,7 @@ class Database:
             await self.cascade_resolve_requests_for_claim(
                 cid, release_kind="voluntary", actor_engineer=engineer
             )
-        return n
+        return released_ids
 
     async def release_active_claims_for_engineers(
         self, engineers: list[str], *, now_iso: str | None = None
@@ -3445,12 +3470,18 @@ class Database:
             await conn.commit()
             return (cur.rowcount or 0) > 0
 
-    async def expire_stale_claims(self, idle_timeout_sec: int = 0) -> int:
+    async def expire_stale_claims(self, idle_timeout_sec: int = 0) -> list[str]:
         """Close claims whose hard TTL has passed, plus any
         session-tagged claim whose ``last_activity`` is older than
         ``idle_timeout_sec``. Idle expiration only fires when both the
         timeout is positive AND the row has a non-NULL last_activity,
         so legacy NULL-session claims keep their TTL-only behaviour.
+
+        Returns the ids of the claims actually closed so the service
+        layer can drain the FIFO queue behind each of them -- a
+        request_release call exists precisely to shorten the holder's
+        TTL, and when that shortened TTL fires the waiters queued
+        behind the claim must be granted, not stranded.
         """
         now = _utcnow()
         cutoff = datetime.now(UTC)
@@ -3512,12 +3543,11 @@ class Database:
                     if r["ttl_shortened"]:
                         ttl_shortened_ids.add(str(r["id"]))
         if not to_close:
-            return 0
+            return []
 
         async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
-            n = 0
             actually_closed: list[str] = []
             for cid, guard_col, guard_val in to_close:
                 # guard_col is one of two literals set above, never caller
@@ -3532,7 +3562,6 @@ class Database:
                 )
                 if cur.rowcount and cur.rowcount > 0:
                     actually_closed.append(cid)
-                    n += cur.rowcount
             await conn.commit()
 
         # Detach before cascade-resolve so a partner that's about to
@@ -3544,7 +3573,7 @@ class Database:
             await self.cascade_resolve_requests_for_claim(
                 cid, release_kind=kind, actor_engineer=None
             )
-        return n
+        return actually_closed
 
     async def purge_released_symbol_rows(
         self,
@@ -4241,6 +4270,12 @@ class Database:
         # populate (new claim id, original pattern, etc.) so the
         # responded audit event records the full transition.
         extra_detail: dict[str, Any] = {}
+        # Claim ids this decision actually closed ('approved' releases
+        # the holder's claim; 'narrowed' releases the original before
+        # opening the tighter one). Returned to the service layer under
+        # the private ``_released_claim_ids`` key so it can drain the
+        # FIFO queue for exactly the claims that really closed.
+        released_claim_ids: list[str] = []
         async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
@@ -4290,11 +4325,13 @@ class Database:
                 )
 
                 if decision == "approved":
-                    await conn.execute(
+                    rel_cur = await conn.execute(
                         "UPDATE claims SET released_at = ? "
                         "WHERE id = ? AND released_at IS NULL",
                         (now, req["claim_id"]),
                     )
+                    if rel_cur.rowcount and rel_cur.rowcount > 0:
+                        released_claim_ids.append(str(req["claim_id"]))
                 elif decision == "denied":
                     # Restore the original TTL so the holder isn't
                     # punished for the request having shortened it.
@@ -4314,6 +4351,11 @@ class Database:
                         now=now,
                         min_expires_at=min_expires_at,
                     )
+                    # Private marker from _apply_narrowed -- popped
+                    # before extra_detail lands in the responded audit
+                    # event so the event shape stays unchanged.
+                    if extra_detail.pop("_released_original", False):
+                        released_claim_ids.append(str(req["claim_id"]))
                 elif decision == "coexist":
                     extra_detail = await self._apply_coexist(
                         conn,
@@ -4353,7 +4395,13 @@ class Database:
                 "SELECT * FROM requests WHERE id = ?", (request_id,)
             )
             row = await cur.fetchone()
-            return dict(row) if row else None
+            if row is None:
+                return None
+            result = dict(row)
+            # Private transport for the service layer's queue drain --
+            # popped there, never serialized into an API response.
+            result["_released_claim_ids"] = released_claim_ids
+            return result
 
     @staticmethod
     async def _apply_narrowed(
@@ -4383,7 +4431,7 @@ class Database:
         # proceed to insert the new claim so the responder isn't left
         # in a half-finished state, but the transaction-level outcome
         # is the same either way.
-        await conn.execute(
+        rel_cur = await conn.execute(
             "UPDATE claims SET released_at = ? "
             "WHERE id = ? AND released_at IS NULL",
             (now, original_claim_id),
@@ -4440,6 +4488,13 @@ class Database:
             "original_pattern": str(orig["pattern"]),
             "original_claim_id": original_claim_id,
             "new_claim_id": new_claim_id,
+            # Private marker for the caller's queue drain: True when the
+            # release UPDATE above actually closed the original claim.
+            # respond_to_request pops it before recording extra_detail
+            # in the responded audit event.
+            "_released_original": bool(
+                rel_cur.rowcount and rel_cur.rowcount > 0
+            ),
         }
 
     @staticmethod

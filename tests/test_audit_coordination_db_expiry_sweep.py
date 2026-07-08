@@ -118,7 +118,7 @@ async def test_sweep_respects_extend_between_snapshot_and_release(
     released = await db.expire_stale_claims()
     db.armed = False
 
-    assert released == 0, (
+    assert released == [], (
         "the sweep force-released a claim whose TTL was extended after "
         "the expiry snapshot"
     )
@@ -148,7 +148,7 @@ async def test_sweep_respects_activity_ping_between_snapshot_and_release(
     released = await db.expire_stale_claims(idle_timeout_sec=60)
     db.armed = False
 
-    assert released == 0, (
+    assert released == [], (
         "the sweep idle-released a claim that pinged after the snapshot"
     )
     rows = await db.list_active_claims_rows()
@@ -164,7 +164,7 @@ async def test_sweep_still_releases_genuinely_expired_claims(
     )
     keeper = await _mk_claim(db, pattern="src/other.py")
 
-    assert await db.expire_stale_claims() == 1
+    assert await db.expire_stale_claims() == [cid]
     rows = await db.list_active_claims_rows()
     assert [r["id"] for r in rows] == [keeper]
     assert cid not in {r["id"] for r in rows}
@@ -194,7 +194,7 @@ async def test_malformed_expires_at_fails_closed_everywhere(
     assert count == 1
     assert soonest is not None
 
-    assert await db.expire_stale_claims() == 1
+    assert await db.expire_stale_claims() == [bad]
     async_rows = await db.list_active_claims_rows()
     assert [r["id"] for r in async_rows] == [good]
     # The corrupt row is now soft-released, not left active forever.
@@ -241,7 +241,7 @@ async def test_purge_released_symbol_rows_reaps_children(
             ),
         )
 
-    assert await db.release_claims([released_cid]) == 1
+    assert await db.release_claims([released_cid]) == [released_cid]
 
     # Inside the retention window: nothing is reaped yet.
     counts = await db.purge_released_symbol_rows(older_than_sec=3600)
