@@ -100,13 +100,17 @@ EXPECTED_TOKEN_COLUMNS = (
     "request_count",
     "last_source_ip",
     "last_user_agent",
+    "repo",
 )
 EXPECTED_OWNERSHIP_COLUMNS = ("id", "yaml_text", "updated_at")
 
 # coord schema version this script was written against (matches
 # CURRENT_SCHEMA_VERSION in coordination/db.py at authoring time). Used only to
-# emit a warning if the source DB is newer than we know about.
-KNOWN_SCHEMA_VERSION = 18
+# emit a warning if the source DB is newer than we know about. Kept in lockstep
+# by tests/test_audit_coordination_hardening.py, which asserts equality against
+# coordination.db.CURRENT_SCHEMA_VERSION so this constant cannot silently
+# drift when a new migration lands.
+KNOWN_SCHEMA_VERSION = 19
 
 # Ephemeral tables that MUST never appear in the generated SQL. Asserted by the
 # self-test; documented here as the contract.
@@ -384,7 +388,7 @@ def self_test() -> int:
             """
             CREATE TABLE schema_version (id INTEGER PRIMARY KEY CHECK (id = 1),
                 version INTEGER NOT NULL);
-            INSERT INTO schema_version (id, version) VALUES (1, 18);
+            INSERT INTO schema_version (id, version) VALUES (1, 19);
 
             CREATE TABLE engineer_tokens (
                 id TEXT PRIMARY KEY,
@@ -399,7 +403,8 @@ def self_test() -> int:
                 rotation_grace_until TEXT,
                 request_count INTEGER NOT NULL DEFAULT 0,
                 last_source_ip TEXT,
-                last_user_agent TEXT
+                last_user_agent TEXT,
+                repo TEXT
             );
 
             CREATE TABLE ownership_config (
@@ -416,12 +421,12 @@ def self_test() -> int:
             );
             """
         )
-        # Token with a single-quote in the description (escaping check) plus
-        # NULLs in the nullable columns.
+        # Token with a single-quote in the description (escaping check), a
+        # v19 repo scope, plus NULLs in the nullable columns.
         conn.execute(
             "INSERT INTO engineer_tokens (id, engineer, token_sha256, "
-            "description, created_at, request_count) VALUES "
-            "(?, ?, ?, ?, ?, ?)",
+            "description, created_at, request_count, repo) VALUES "
+            "(?, ?, ?, ?, ?, ?, ?)",
             (
                 "tok-1",
                 "alex",
@@ -429,6 +434,7 @@ def self_test() -> int:
                 "alex's laptop",
                 "2026-06-29T12:00:00Z",
                 7,
+                "amittell/coord",
             ),
         )
         conn.execute(
@@ -487,6 +493,19 @@ def self_test() -> int:
         check(
             "engineer = EXCLUDED.engineer" in token_block,
             "token mutable columns should be refreshed on conflict",
+        )
+        # The v19 repo scope column migrates like any other source column.
+        check(
+            "repo = EXCLUDED.repo" in token_block,
+            "repo column should be refreshed on conflict",
+        )
+        check("'amittell/coord'" in sql, "repo scope value missing from insert")
+        # A source at the current schema must generate zero warnings: any
+        # WARNING here means EXPECTED_TOKEN_COLUMNS or KNOWN_SCHEMA_VERSION
+        # has drifted behind coordination/db.py.
+        check(
+            "-- WARNING:" not in sql,
+            "current-schema source should generate no header warnings",
         )
         # Single quotes doubled.
         check("'alex''s laptop'" in sql, "single-quote escaping failed")

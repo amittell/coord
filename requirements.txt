@@ -4,8 +4,8 @@
 #   python3.12 -m venv /tmp/coord-scratch
 #   /tmp/coord-scratch/bin/pip install .
 #   /tmp/coord-scratch/bin/pip freeze
-# then drop the "multi-agent-coordination" self-reference line and
-# copy the rest here.
+# then drop the "coord-mcp-server" self-reference line (the project's
+# own distribution name from pyproject.toml) and copy the rest here.
 #
 # The OPTIONAL OpenTelemetry tracing stack is pinned separately in
 # requirements-otel.txt so this base lockfile carries no tracing
