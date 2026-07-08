@@ -291,11 +291,20 @@ async def test_touch_records_activity_metadata(tmp_path: Path) -> None:
     raw = "coordt_" + "m" * 64
     await db.create_engineer_token("alex/claude/main", _sha256(raw))
 
+    # min_interval_sec=0 disables coalescing: this test pins the
+    # per-touch metadata recording, not the v0.45.x flush cadence
+    # (covered in tests/test_audit_coordination_db_write_paths.py).
     await db.touch_engineer_token(
-        _sha256(raw), source_ip="203.0.113.7", user_agent="coord-mcp/0.29"
+        _sha256(raw),
+        source_ip="203.0.113.7",
+        user_agent="coord-mcp/0.29",
+        min_interval_sec=0,
     )
     await db.touch_engineer_token(
-        _sha256(raw), source_ip="203.0.113.8", user_agent="coord-mcp/0.29"
+        _sha256(raw),
+        source_ip="203.0.113.8",
+        user_agent="coord-mcp/0.29",
+        min_interval_sec=0,
     )
 
     row = await db.lookup_engineer_token(_sha256(raw))
@@ -314,10 +323,14 @@ async def test_touch_without_metadata_keeps_last_seen(tmp_path: Path) -> None:
     raw = "coordt_" + "n" * 64
     await db.create_engineer_token("alex/claude/main", _sha256(raw))
 
+    # min_interval_sec=0: pin per-touch semantics (see note above).
     await db.touch_engineer_token(
-        _sha256(raw), source_ip="203.0.113.7", user_agent="coord-mcp/0.29"
+        _sha256(raw),
+        source_ip="203.0.113.7",
+        user_agent="coord-mcp/0.29",
+        min_interval_sec=0,
     )
-    await db.touch_engineer_token(_sha256(raw))
+    await db.touch_engineer_token(_sha256(raw), min_interval_sec=0)
 
     row = await db.lookup_engineer_token(_sha256(raw))
     assert row is not None

@@ -366,6 +366,11 @@ async def test_activity_capture_records_source_ip_and_count(
     from coordination.deps import get_service
 
     svc = get_service()
+    # Disable touch coalescing for this instance: the test drives two
+    # back-to-back requests and asserts both are recorded, which needs
+    # write-every-touch (coalescing would defer the second touch's
+    # count/IP until the next flushed write).
+    svc.db.TOKEN_TOUCH_MIN_INTERVAL_SEC = 0.0
     raw = "coordt_" + "6" * 64
     await svc.db.create_engineer_token(
         "alex/claude/main", _sha256(raw), description="activity"
