@@ -38,13 +38,15 @@ SQLite stores:
 - ownership YAML
 - forwards-only schema migration history in the `schema_version` table
 
-The schema has reached v6 as of coord v0.11.0. Migrations run inside a `BEGIN IMMEDIATE` transaction at process startup so concurrent processes serialise on the write lock instead of racing.
+The schema is forwards-only and has reached v19 as of coord v0.42.0 (nullable `engineer_tokens.repo` for repo-bound tokens; earlier milestones: v6 request/coexist columns in v0.11, v8 symbol scopes in v0.14, v13 webhook outbox in v0.27, v14-v15 per-engineer tokens in v0.29.x, v17 GitHub PR-comment coordination in v0.34, v18 symbol-coexist in v0.35). Migrations run inside a `BEGIN IMMEDIATE` transaction at process startup so concurrent processes serialise on the write lock instead of racing.
 
 The v6 columns (`requests.requested_scope` and `claims.coexists_with`, both nullable) underpin the v0.11 `narrowed` and `coexist` decision verbs. `coexists_with` stores a JSON array of partner claim ids; the conflict check excludes any candidate claim that's referenced by one of the caller's session's claims (so a coexist pair sees each other as cooperative, not adversarial).
 
 Schema v8 (v0.14) adds two columns on `claims` -- `scope_type TEXT NOT NULL DEFAULT 'file'` and `narrowable BOOLEAN NOT NULL DEFAULT 1` -- plus a `claim_symbols` join table (`claim_id`, `file_path`, `symbol_name`, `symbol_kind`) for per-claim symbol enumeration. `scope_type='file'` is the legacy whole-file claim; `scope_type='symbol'` covers only the named declarations and leaves imports / module-level statements uncovered. The conflict pipeline gains a post-filter on path-intersection results: two symbol-scope claims with disjoint symbol sets resolve as `AUTO_COEXIST` (both granted, no request filed, audit event `auto-coexist`), and a symbol-scope requester arriving against an existing narrowable file claim resolves as `AUTO_NARROW` (both granted, holder gets a `pending_requests` notice, audit event `auto-narrow`). Both decisions bypass the `requests` table because the resolution is mechanical and free of policy ambiguity. v0.19 extends the TypeScript parser to walk recursively into nested class declarations so `Outer::Inner::method` symbol claims validate end-to-end for TS as well as Python; Go's receiver-as-parent extraction (v0.16) remains the deepest nesting that applies because Go has no nested class model. v0.20 adds hotspot detection: a read-only signal computed from `conflict_log` and exposed at `GET /metrics/hotspots` and on the dashboard panel (auto-promote queued for v0.21). See [./design/sub-file-claims.md](./design/sub-file-claims.md) for the full spec, parser strategy, and migration notes.
 
 WAL mode is enabled so reads and writes behave better under normal team concurrency.
+
+Write path at scale (v0.45): reads open short-lived per-operation connections (WAL keeps them concurrent), while hot-path writes -- activity pings, claim release, and every `transaction()` unit-of-work including claim grants -- funnel through one persistent writer connection guarded by an in-process async lock (`COORD_SQLITE_WRITER_QUEUE`, default on). Concurrent writers queue in-process instead of fighting SQLite's single write lock, which eliminates `SQLITE_BUSY` failures on those paths under hundreds of concurrent agents. Complementing that, the liveness ping most reads used to write on every call is coalesced to once per `COORD_ACTIVITY_PING_MIN_INTERVAL_SEC` (default 30s, clamped to half the idle timeout) per session. Two counters -- `sqlite_writes_total` and `sqlite_writer_wait_seconds_total` -- expose write throughput and writer-lock contention.
 
 At startup the service takes an advisory `fcntl.flock` on `<database_path>.lock`, a sibling file in the same directory as the SQLite database. The lock is held for the process lifetime and auto-releases on exit, so a second coord process pointed at the same DB refuses to start with a clear error rather than silently racing on in-process caches. Set `COORD_DISABLE_INSTANCE_LOCK=true` to bypass (NFS-backed volumes, debugging). Note: flock is advisory and depends on the underlying filesystem honouring it. Native Linux kernels (production containers) enforce it across processes and containers; Docker Desktop on Mac and Windows does not propagate flock across containers sharing a host bind mount, so dev-time on those hosts should rely on orchestrator-level single-replica constraints instead.
 
@@ -184,4 +186,10 @@ Less ideal:
 - strict transactional guarantees across many concurrent writers
 - cross-region HA requirements
 
-If you outgrow SQLite or need stronger guarantees, keep the HTTP and MCP contracts and replace the storage layer first.
+If you outgrow SQLite even with the v0.45 write-scaling, that replacement
+already exists: a Postgres backend (`coordination/pg_backend.py`, a `Database`
+subclass that translates the SQLite dialect on the fly and serialises grants
+with per-repo `pg_advisory_xact_lock`) supports stateless multi-replica HA. It
+ships dormant -- selected only by a `postgresql://` `COORD_DATABASE_URL`, with
+an operator-gated cutover (`docs/runbooks/coord-ha-cutover.md`) -- and the
+HTTP and MCP contracts are identical on both backends.

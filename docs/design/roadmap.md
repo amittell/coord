@@ -15,9 +15,28 @@ Note: the v0.34.0 (GitHub PR-comment integration) and v0.35.0 (symbol-level coex
 
 Client-side repo scoping: the MCP ``list_claims`` / ``check_conflicts`` wrappers and the ``coord claims`` CLI now pass ``COORD_REPO_ID`` by default (with an ``all_repos`` opt-out), and ``coord status`` splits the misleading ``Repo-aware:`` line into a client ``Repo scope:`` and a server ``Symbol validation:``. Advisory only -- a stale client that omits ``repo`` still saw all repos, which motivated the server-side enforcement below.
 
-### v0.42.0 (in review, #56 + #57) -- Server-enforced repo scoping via repo-bound tokens (#30 slice 2/3, #55)
+### v0.42.0 (shipped, #56-#60) -- Server-enforced repo scoping via repo-bound tokens (#30 slice 2/3, #55)
 
 Makes repo isolation a server-side authorization boundary: a nullable ``engineer_tokens.repo`` (schema v19) binds a token to a repo, and every authenticated repo-tagged endpoint (reads, id-addressed writes, dashboard) is scoped from auth, not from a client-supplied ``repo``. Version-independent -- even an un-upgraded ``coord-mcp`` is enforced once its ``local.env`` carries a scoped token. Includes the dashboard-mint escalation fix and an opt-in ``COORD_REQUIRE_SCOPED_TOKEN`` to make scoping mandatory. Design + rollout in ``docs/design/repo-scoped-tokens.md`` and ``docs/deployment.md``. Delivers the Multi-namespace arc's repo-scoped-visibility half without taking on the namespace-isolation decisions.
+
+### v0.43.0-v0.45.0 (shipped) -- deprecation nudge, dormant HA, SQLite write-scaling
+
+- **v0.43.0**: soft-deprecation of unscoped per-engineer tokens
+  (``COORD_WARN_UNSCOPED_TOKEN``, warn-and-honor via ``coord_notice`` /
+  ``coord status``) plus agent/human docs for repo-scoped tokens.
+- **v0.44.0/v0.44.1** (#54, #61): the Postgres HA backend landed **merged but
+  dormant** -- ``PostgresStore`` selected only by a ``postgresql://``
+  ``COORD_DATABASE_URL``, cutover manifests in ``deploy/k8s/ha-cutover/``
+  outside ArgoCD's watched path, live cutover operator-gated per
+  ``docs/runbooks/coord-ha-cutover.md``. Also the central repo-id validator
+  (#61) and remote-token guardrails (v0.44.1).
+- **v0.45.0**: **SQLite write-scaling chosen as the scale path instead of the
+  Postgres cutover** -- activity-ping coalescing
+  (``COORD_ACTIVITY_PING_MIN_INTERVAL_SEC``) + an in-process writer queue
+  (``COORD_SQLITE_WRITER_QUEUE``), load-tested at 200-300 concurrent agents
+  (p99 -43%, dropped writes 20 -> 0), observable via ``sqlite_writes_total`` /
+  ``sqlite_writer_wait_seconds_total``. The Postgres path stays shelved until
+  those metrics say otherwise.
 
 ### Operator approval workflow (next scoped feature, unversioned)
 
@@ -26,7 +45,7 @@ A ``pending_promotion`` row that an operator approves from the dashboard, bridgi
 ### Design-gated (no firm version -- write the design doc first)
 
 - **Multi-namespace coordination** -- one instance serving multiple repos / teams. Issue #30 (above) is the first concrete demand signal and delivers the repo-scoped-visibility half; the remaining namespace decisions (URL shape, isolation level, tenant tokens) still want ``docs/design/multi-namespace.md`` settled before code. Candidate items in the Multi-namespace section below.
-- **Postgres backend** -- the large bet that gates a whole tier of optimizations (NOTIFY-driven queue grant, partitioned conflict_log, read-replica dashboard). Pull the trigger when topology shifts to multi-replica / high-throughput. Full detail and the dependent optimizations in the Large bets section below.
+- **Postgres cutover** -- the backend itself is BUILT and merged-dormant as of v0.44.0 (see above); what remains design/ops-gated is the live cutover and the tier of optimizations it unlocks (NOTIFY-driven queue grant, partitioned conflict_log, read-replica dashboard). Trigger: ``sqlite_writer_wait_seconds_total`` climbing fast relative to wall time despite the v0.45 write-scaling, or topology shifting to multi-replica. Runbook: ``docs/runbooks/coord-ha-cutover.md``.
 
 ### Parked (unsized, no demand signal yet)
 

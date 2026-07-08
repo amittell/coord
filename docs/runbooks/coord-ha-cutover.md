@@ -2,7 +2,17 @@
 
 Status: operational runbook for the coord HA re-architecture
 (`docs/designs/coord-ha-rearchitecture.md`, Section 8). Last reviewed
-2026-06-30.
+2026-07-07.
+
+> **WARNING -- ArgoCD (learned from the 2026-07-05 v0.44.0 incident):** the HA
+> manifests live in `deploy/k8s/ha-cutover/`, deliberately OUTSIDE ArgoCD's
+> watched path (`deploy/k8s/prod/`). Never move them into the watched path
+> ahead of the cutover: ArgoCD auto-applies on merge, and doing so activated
+> the cutover prematurely against an image that could not speak Postgres,
+> 401ing the whole fleet. During the cutover itself, ArgoCD's
+> `selfHeal` will fight any manual `kubectl apply` that diverges from
+> `deploy/k8s/prod/` -- disable auto-sync first (step 4) and re-enable it only
+> after the prod manifest in git matches the HA state.
 
 This is a **hard-drain** cutover, not a clean break and not a live canary.
 There must be **no window where a SQLite-backed pod and a Postgres-backed pod
@@ -161,12 +171,21 @@ Postgres Secret; `coord-data` PVC removed; `replicas: 3`;
 minAvailable:2`):
 
 ```sh
-# Whatever your delivery is -- ArgoCD sync, or a direct apply of the HA manifests.
-kubectl -n "$NS" apply -f deploy/k8s/prod/postgres.yaml
-kubectl -n "$NS" apply -f deploy/k8s/prod/pdb.yaml
-kubectl -n "$NS" apply -f deploy/k8s/prod/deployment.yaml
+# Disable ArgoCD auto-sync first, or selfHeal reverts the manual applies
+# back to the SQLite manifest still in deploy/k8s/prod/.
+kubectl -n argocd patch application coord-prod --type merge \
+  -p '{"spec":{"syncPolicy":null}}'
+
+# The HA manifest set lives OUTSIDE ArgoCD's watched path on purpose.
+kubectl -n "$NS" apply -f deploy/k8s/ha-cutover/postgres.yaml
+kubectl -n "$NS" apply -f deploy/k8s/ha-cutover/pdb.yaml
+kubectl -n "$NS" apply -f deploy/k8s/ha-cutover/deployment.yaml
 kubectl -n "$NS" rollout status deploy/coord --timeout=300s
 ```
+
+Once the cutover is verified (step 5), land the HA manifests in
+`deploy/k8s/prod/` via a normal PR and re-enable ArgoCD auto-sync, so git
+returns to being the source of truth for the now-Postgres prod.
 
 - [ ] coord scaled to 0 and reported 0 ready **before** the PG-backed pods
       started (this is the split-brain guard -- verify the ordering held).

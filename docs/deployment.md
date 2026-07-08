@@ -208,6 +208,8 @@ The shared token has no grace-window mechanism; if you need zero-downtime rotati
 | `claims_released_total` | counter | - | Claims released (one tick per released id). |
 | `auth_failures_total` | counter | - | 401s raised by the bearer-token guard. |
 | `http_requests_total` | counter | `method`, `path`, `status` | Every response the app emits. `path` is the matched route template so cardinality is bounded. |
+| `sqlite_writes_total` | counter | - | Write commits through the funnelled SQLite writer-queue path (v0.45). Stays 0 when `COORD_SQLITE_WRITER_QUEUE` is off; excludes the few legacy write paths that still open their own connections. |
+| `sqlite_writer_wait_seconds_total` | counter | - | Cumulative seconds spent waiting for the SQLite writer lock (v0.45). Only meaningful with the writer queue on -- 0 with the queue off means unmeasured, not uncontended. If this climbs fast relative to wall time, the writer is the bottleneck (lighten `create_claims`, or consider the Postgres backend). |
 | `build_info` | gauge | `version` | Constant 1.0 with the running service version in the label. |
 
 ## Hosted multi-repo deployments (repo-scoped tokens)
@@ -317,7 +319,16 @@ clients aren't blind to work created the old way.
 
 ## Multi-instance detection
 
-The coordination service assumes single-writer semantics for its in-process caches and background cleanup loop. Running two live replicas against the same SQLite file is almost always a misconfiguration. To catch that at startup, the service takes an advisory `fcntl.flock(LOCK_EX | LOCK_NB)` on `<COORD_DATABASE_PATH>.lock` during lifespan initialisation. If the lock is already held, the process refuses to start with a message identifying the current holder's PID.
+The coordination service assumes single-writer semantics for its in-process caches and background cleanup loop (on the default SQLite backend). Running two live replicas against the same SQLite file is almost always a misconfiguration.
+
+Storage backends: the default is a single SQLite file, tuned for high agent
+concurrency since v0.45 (activity-ping coalescing + an in-process writer
+queue; see the `COORD_ACTIVITY_PING_MIN_INTERVAL_SEC` /
+`COORD_SQLITE_WRITER_QUEUE` settings). A Postgres backend for stateless
+multi-replica HA exists but ships dormant: it activates only when
+`COORD_DATABASE_URL` is a `postgresql://` DSN, and the live prod cutover is
+operator-gated per `docs/runbooks/coord-ha-cutover.md` (its manifests live in
+`deploy/k8s/ha-cutover/`, deliberately outside ArgoCD's watched path). To catch that at startup, the service takes an advisory `fcntl.flock(LOCK_EX | LOCK_NB)` on `<COORD_DATABASE_PATH>.lock` during lifespan initialisation. If the lock is already held, the process refuses to start with a message identifying the current holder's PID.
 
 - The lock file lives next to the database file (same directory, `.lock` suffix). Your volume mount must allow creating it.
 - The file descriptor is held for the process lifetime; `fcntl` auto-releases on fd close or process exit, so crashed instances do not leave a stale lease behind.
