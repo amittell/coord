@@ -64,7 +64,11 @@ def _load_local_env(start: Path | None = None) -> Path | None:
         try:
             text = env_file.read_text(encoding="utf-8")
         except OSError:
-            return None
+            # Unreadable file (permissions, transient NFS/SMB glitch):
+            # keep walking -- a readable local.env may still exist in a
+            # parent directory (monorepo layouts). Giving up here would
+            # start the wrapper with no token and 401 every tool call.
+            continue
         from coordination.envfile import parse_env
 
         for key, val in parse_env(text).items():
@@ -126,6 +130,39 @@ def _git_stdout(*args: str) -> str | None:
         return None
     value = completed.stdout.strip()
     return value or None
+
+
+def _client_repo_root() -> Path:
+    """Directory against which relative claim paths resolve for client-side
+    symbol validation.
+
+    Preference order mirrors what the server itself validates against:
+    ``COORD_REPO_ROOT`` when set (loaded from ``.coordination/local.env``
+    by ``_load_local_env``; template placeholders are treated as unset),
+    then the enclosing git checkout's toplevel, then ``Path.cwd()``. The
+    MCP process cwd is wherever the host launched it, which for git
+    worktrees / monorepo subdirectory launches / multi-checkout setups is
+    not necessarily the checkout the agent is editing -- resolving against
+    the configured repo root keeps the local fast-path aligned with the
+    server-side source of truth.
+    """
+    configured = os.environ.get("COORD_REPO_ROOT", "").strip()
+    if configured and configured not in _PLACEHOLDER_VALUES:
+        root = Path(configured)
+        try:
+            if root.is_dir():
+                return root
+        except OSError:
+            pass
+    toplevel = _git_stdout("rev-parse", "--show-toplevel")
+    if toplevel:
+        root = Path(toplevel)
+        try:
+            if root.is_dir():
+                return root
+        except OSError:
+            pass
+    return Path.cwd()
 
 
 def _current_branch_or_worktree() -> str | None:
@@ -355,6 +392,28 @@ def _with_token_notice(result: Any, response: httpx.Response) -> Any:
     return result
 
 
+def _structured_denial(r: httpx.Response) -> dict[str, Any] | None:
+    """Convert a 403/422 response into a structured tool result, or None.
+
+    Both statuses carry a server-authored ``detail`` the agent should read
+    and act on: 403 is the deliberate "honest" scoped-token rejection of
+    ``all_repos=True`` (or a repo mismatch on a write), 422 is a schema
+    bound the wrapper does not enforce client-side (e.g. ``wait_seconds``
+    capped at 600). ``raise_for_status`` would strip the body -- an
+    ``httpx.HTTPStatusError`` message contains only the status and URL --
+    so the model would see an opaque exception instead of the server's
+    carefully-worded reason.
+    """
+    if r.status_code not in (403, 422):
+        return None
+    payload = r.json()
+    result: dict[str, Any] = {
+        "error": payload.get("detail") if isinstance(payload, dict) else payload,
+        "status": r.status_code,
+    }
+    return _with_token_notice(result, r)
+
+
 @mcp.tool()
 async def list_claims(
     active_only: bool = True,
@@ -397,6 +456,9 @@ async def list_claims(
             headers=_headers(engineer),
             idempotent=True,
         )
+        denial = _structured_denial(r)
+        if denial is not None:
+            return denial
         r.raise_for_status()
         return _with_token_notice(r.json(), r)
 
@@ -443,6 +505,9 @@ async def check_conflicts(
             headers=_headers(engineer),
             idempotent=True,
         )
+        denial = _structured_denial(r)
+        if denial is not None:
+            return denial
         r.raise_for_status()
         return _with_token_notice(r.json(), r)
 
@@ -453,8 +518,9 @@ def _validate_symbols_locally(
     """Pre-validate symbol claims against the local working tree (v0.17).
 
     For each ``(file_path, [symbol_name, ...])`` pair, open the file from
-    disk (resolved against ``Path.cwd()`` -- the MCP wrapper runs in the
-    agent's checkout) and parse it with the same ``extract_symbols``
+    disk (resolved against ``_client_repo_root()``: ``COORD_REPO_ROOT``
+    when configured, else the enclosing git toplevel, else ``Path.cwd()``)
+    and parse it with the same ``extract_symbols``
     dispatcher the server uses. Any claimed symbol that isn't found is
     collected and reported as a single combined error string so the
     caller can short-circuit the POST and surface the typo without a
@@ -487,12 +553,12 @@ def _validate_symbols_locally(
     """
     if os.environ.get("COORD_DISABLE_CLIENT_VALIDATION", "").strip() == "1":
         return None
-    cwd = Path.cwd()
+    root = _client_repo_root()
     missing_by_file: dict[str, list[str]] = {}
     for raw_path, syms in symbols.items():
         if not syms:
             continue
-        file_path = cwd / raw_path
+        file_path = root / raw_path
         if not file_path.is_file():
             # Path may be about to be created; let the server adjudicate.
             continue
@@ -599,6 +665,12 @@ async def claim_files(
     ``narrowable`` keys from each ``claims[i]`` payload entry when they
     would be ``None`` or empty, so a pre-v0.14 server sees the exact
     same shape it always did.
+
+    This tool emits exactly two claim types: ``file`` (for ``patterns``,
+    optionally symbol-scoped) and ``shared_file`` (for ``shared_files``).
+    The HTTP schema's legacy ``module`` claim type is not reachable from
+    here; its one distinct effect (a non-narrowable claim) is available
+    via ``narrowable=False``.
     """
     # Decide which paths are symbol-scoped. A non-empty list in `symbols`
     # for a given path turns that path into a symbol-scope claim; empty
@@ -697,6 +769,9 @@ async def claim_files(
             )
         if r.status_code in (400, 409):
             return _with_token_notice(r.json(), r)
+        denial = _structured_denial(r)
+        if denial is not None:
+            return denial
         r.raise_for_status()
         return _with_token_notice(r.json(), r)
 
@@ -759,7 +834,7 @@ async def claim_refactor(
         body["wait_seconds"] = wait_seconds
     if urgency is not None:
         body["urgency"] = urgency
-    repo_id = os.environ.get("COORD_REPO_ID", "").strip()
+    repo_id = _repo_id()
     if repo_id:
         body["repo"] = repo_id
     body["session_id"] = _SESSION_ID
@@ -777,7 +852,9 @@ async def claim_refactor(
             # an exception: the agent should degrade to claim_files,
             # not crash its tool call.
             payload = r.json()
-            return {"error": payload.get("detail"), "status": 503}
+            return _with_token_notice(
+                {"error": payload.get("detail"), "status": 503}, r
+            )
         if r.status_code == 429:
             payload = r.json()
             return _with_token_notice(
@@ -790,6 +867,9 @@ async def claim_refactor(
             )
         if r.status_code in (400, 409):
             return _with_token_notice(r.json(), r)
+        denial = _structured_denial(r)
+        if denial is not None:
+            return denial
         r.raise_for_status()
         return _with_token_notice(r.json(), r)
 
@@ -807,7 +887,7 @@ async def release_claims(claim_ids: list[str], engineer: str | None = None) -> d
             idempotent=False,
         )
         r.raise_for_status()
-        return r.json()
+        return _with_token_notice(r.json(), r)
 
 
 @mcp.tool()
@@ -830,7 +910,7 @@ async def pending_requests(session_id: str | None = None) -> dict[str, Any]:
             idempotent=True,
         )
         r.raise_for_status()
-        return r.json()
+        return _with_token_notice(r.json(), r)
 
 
 @mcp.tool()
@@ -893,9 +973,12 @@ async def request_release(
             idempotent=False,
         )
         if r.status_code in (404, 409):
-            return r.json()
+            return _with_token_notice(r.json(), r)
+        denial = _structured_denial(r)
+        if denial is not None:
+            return denial
         r.raise_for_status()
-        return r.json()
+        return _with_token_notice(r.json(), r)
 
 
 @mcp.tool()
@@ -955,7 +1038,7 @@ async def respond_to_request(
             idempotent=False,
         )
         r.raise_for_status()
-        return r.json()
+        return _with_token_notice(r.json(), r)
 
 
 @mcp.tool()
@@ -966,12 +1049,12 @@ async def wait_for_request(
     state (approved / denied / expired / resolved) or ``timeout``
     elapses. Useful when an earlier ``request_release`` was fired
     with ``wait_seconds=0``."""
-    # Server-side wait via re-issuing GET with no client-side polling
-    # complexity -- the API doesn't expose a wait endpoint, so we poll
-    # /requests/{id} ourselves with a sleep loop and bail at deadline.
-    import asyncio as _asyncio
-
-    deadline = _asyncio.get_event_loop().time() + max(0, timeout)
+    # The API doesn't expose a wait endpoint, so we poll /requests/{id}
+    # ourselves with a sleep loop and bail at deadline. The deadline is
+    # checked after each poll completes, so a slow final request (10s
+    # client timeout plus retries) can overrun ``timeout`` by up to one
+    # request cycle.
+    deadline = time.monotonic() + max(0, timeout)
     poll_interval = 1.0
     async with httpx.AsyncClient(timeout=10.0) as client:
         while True:
@@ -983,20 +1066,21 @@ async def wait_for_request(
                 idempotent=True,
             )
             if r.status_code == 404:
-                return r.json()
+                return _with_token_notice(r.json(), r)
             r.raise_for_status()
             row = r.json()
             if row.get("decision") and row["decision"] != "pending":
-                return row
-            if _asyncio.get_event_loop().time() >= deadline:
-                return row
-            await _asyncio.sleep(poll_interval)
+                return _with_token_notice(row, r)
+            if time.monotonic() >= deadline:
+                return _with_token_notice(row, r)
+            await asyncio.sleep(poll_interval)
 
 
 @mcp.tool()
 async def my_requests(
     decision: str = "pending",
     queued: bool | None = None,
+    engineer: str | None = None,
 ) -> dict[str, Any]:
     """List requests this engineer has filed, filtered by decision
     state. Defaults to ``pending`` so the most useful answer ('what
@@ -1010,26 +1094,41 @@ async def my_requests(
     are waiting on without a second call. ``None`` (default) or
     ``False`` preserves the v0.21 request shape byte-identically so
     pre-v0.22 servers see no difference.
+
+    ``engineer`` selects whose requests to list and MUST match the
+    name used at claim time for queue rows to show up: the server
+    filters queued entries strictly by the ``engineer`` passed to
+    ``claim_files`` (the queue row's ``requester_engineer``). When
+    omitted, falls back to ``COORD_REQUESTER`` / ``COORD_USER`` /
+    ``"agent"`` -- fine for ``request_release`` rows (which use the
+    same env chain) but wrong for queue rows whenever the claim-time
+    engineer differs from the env, so pass it explicitly when
+    checking ``queued=True``.
     """
-    requester = os.environ.get("COORD_REQUESTER", "").strip() or os.environ.get(
-        "COORD_USER", ""
-    ).strip() or "agent"
+    requester = (engineer or "").strip() or os.environ.get(
+        "COORD_REQUESTER", ""
+    ).strip() or os.environ.get("COORD_USER", "").strip() or "agent"
     params: dict[str, Any] = {"requester": requester}
     if decision:
         params["decision"] = decision
     if queued is not None and queued:
         params["queued"] = "true"
+    # Forward-compat: claim_files stamps every queue row with this
+    # process's session id, so a server that additionally matches queued
+    # rows by session_id can surface them even when the requester name
+    # doesn't line up. Pre-support servers ignore the extra param.
+    params["session_id"] = _SESSION_ID
     async with httpx.AsyncClient(timeout=30.0) as client:
         r = await _request_with_retry(
             client,
             "GET",
             f"{_base_url()}/requests",
             params=params,
-            headers=_headers(),
+            headers=_headers(engineer),
             idempotent=True,
         )
         r.raise_for_status()
-        return r.json()
+        return _with_token_notice(r.json(), r)
 
 
 @mcp.tool()
@@ -1052,7 +1151,7 @@ async def release_session(session_id: str | None = None) -> dict[str, Any]:
             idempotent=False,
         )
         r.raise_for_status()
-        return r.json()
+        return _with_token_notice(r.json(), r)
 
 
 @mcp.tool()
@@ -1079,7 +1178,7 @@ async def cancel_queue_request(
             idempotent=False,
         )
         r.raise_for_status()
-        return r.json()
+        return _with_token_notice(r.json(), r)
 
 
 # ---------------------------------------------------------------------------
@@ -1362,7 +1461,7 @@ def _acquire_marker_lock(parent: Path) -> Path | None:
             try:
                 age = time.time() - lock.stat().st_mtime
                 if age >= _MARKER_LOCK_STALE_SECONDS:
-                    lock.rmdir()
+                    _break_stale_marker_lock(lock)
                     continue
             except OSError:
                 pass
@@ -1371,6 +1470,57 @@ def _acquire_marker_lock(parent: Path) -> Path | None:
             time.sleep(_MARKER_LOCK_POLL_SECONDS)
         except OSError:
             return None
+
+
+def _break_stale_marker_lock(lock: Path) -> None:
+    """Remove a stale lock dir without racing a concurrent breaker.
+
+    A bare ``lock.rmdir()`` here is a TOCTOU: two contenders can both
+    stat the same stale lock, the first rmdirs it and mkdirs a FRESH
+    lock, and the second then rmdirs that fresh (empty) dir -- leaving
+    both believing they hold the lock and reintroducing the sessions.live
+    read-modify-write race the lock exists to close. Instead the breaker
+    RENAMES the lock dir to a unique path first: rename of a given dir
+    can only succeed for one contender (the loser gets ENOENT), and the
+    winner then re-checks staleness on the dir it now exclusively owns.
+    If the rename turns out to have grabbed a lock that was freshly
+    re-created between the caller's stat and the rename, it is renamed
+    back into place so the real holder keeps it.
+
+    Best-effort like everything else around the marker: every OSError is
+    swallowed and the caller simply retries or times out.
+    """
+    claimed = lock.with_name(
+        f"{lock.name}.break.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+    )
+    try:
+        os.rename(lock, claimed)
+    except OSError:
+        # Another contender broke (or is breaking) it first.
+        return
+    try:
+        still_stale = (
+            time.time() - claimed.stat().st_mtime >= _MARKER_LOCK_STALE_SECONDS
+        )
+    except OSError:
+        still_stale = False
+    if still_stale:
+        try:
+            claimed.rmdir()
+        except OSError:
+            pass
+        return
+    # We grabbed a live lock (re-created after our stat). Put it back.
+    try:
+        os.rename(claimed, lock)
+    except OSError:
+        # A third contender already mkdir'd a new lock at the original
+        # path. Drop the stolen dir; its owner's release rmdir will
+        # ENOENT harmlessly and the next acquire proceeds normally.
+        try:
+            claimed.rmdir()
+        except OSError:
+            pass
 
 
 def _release_marker_lock(lock: Path | None) -> None:

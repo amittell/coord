@@ -14,13 +14,19 @@ def _git_ls_files_sync(repo_root: Path, scope: str | None = None) -> list[str]:
     cmd = ["git", "-C", str(repo_root), "ls-files"]
     if scope:
         cmd += ["--", scope]
-    proc = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=120,
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        # git missing from the image, or hung on a slow volume. This runs
+        # on the live claim/conflict path, so degrade to the heuristic
+        # overlap fallback (empty list) instead of surfacing a 500.
+        return []
     if proc.returncode != 0:
         return []
     text = proc.stdout.strip()
@@ -175,7 +181,7 @@ def _parse_char_class(seg: str, start: int) -> tuple[str, int] | None:
     return None
 
 
-def _synthesize_candidate(pattern: str) -> str | None:
+def _synthesize_candidate(pattern: str, star_fill: str = "x") -> str | None:
     """Synthesize a single concrete path that `pattern` would match.
 
     Strategy:
@@ -183,9 +189,13 @@ def _synthesize_candidate(pattern: str) -> str | None:
       (e.g. `ds0`, `ds1`, ...). Since pathspec treats `**` as matching zero or
       more directories, substituting a single placeholder directory is a valid
       concrete instance of the pattern.
-    - `*` (within a segment, not crossing `/`) is replaced with the literal
-      placeholder `x`. A run of consecutive `*` characters within a segment
-      collapses to a single `x`.
+    - `*` (within a segment, not crossing `/`) is replaced with ``star_fill``
+      (default: the literal placeholder `x`). A run of consecutive `*`
+      characters within a segment collapses to a single substitution. Since
+      `*` matches any run of non-`/` characters (including the empty run),
+      any `/`-free fill keeps the candidate matched by this pattern's own
+      PathSpec; `heuristic_overlap` exploits this by borrowing literal
+      fragments from the peer pattern as fills.
     - `?` is replaced with `a`.
     - `[...]` character classes are parsed and replaced with a literal member
       of the class (for negated classes, a character guaranteed NOT in the
@@ -231,7 +241,7 @@ def _synthesize_candidate(pattern: str) -> str | None:
             elif c == "*":
                 while i < n and seg[i] == "*":
                     i += 1
-                chars.append("x")
+                chars.append(star_fill)
             elif c == "?":
                 chars.append("a")
                 i += 1
@@ -248,16 +258,84 @@ def _synthesize_candidate(pattern: str) -> str | None:
     return "/".join(out_segments)
 
 
+def _has_glob_wildcard(norm: str) -> bool:
+    """True when a normalized pattern contains any glob wildcard token."""
+    return any(c in norm for c in "*?[")
+
+
+# Upper bound on borrowed star fills per direction in `heuristic_overlap`.
+# Patterns are short (claim path globs), so this is generous in practice;
+# it exists to keep pathological inputs from turning the heuristic into a
+# quadratic candidate storm on the hot claim/conflict path.
+_MAX_STAR_FILLS = 8
+
+
+def _star_fills_from_peer(peer_norm: str) -> list[str]:
+    """Literal fills to try in place of `*` when probing overlap with a peer.
+
+    Extracts every contiguous literal run from the peer's normalized pattern
+    segments (wildcard tokens split runs; `**` segments contribute nothing)
+    and prepends the empty fill. Substituting these for `*` produces extra
+    self-matching candidates that stand a chance of ALSO satisfying the
+    peer's literal prefix/suffix requirements -- the class of overlap the
+    single `x` placeholder provably misses (`src/*_test.py` vs
+    `src/test_*.py` only collide on paths embedding the peer's `test_`
+    text).
+    """
+    fragments: set[str] = set()
+    for seg in peer_norm.split("/"):
+        if seg in ("", "**"):
+            continue
+        run: list[str] = []
+        i = 0
+        n = len(seg)
+        while i < n:
+            c = seg[i]
+            if c == "[":
+                parsed = _parse_char_class(seg, i)
+                if parsed is not None:
+                    if run:
+                        fragments.add("".join(run))
+                        run = []
+                    i = parsed[1]
+                    continue
+                run.append(c)
+                i += 1
+            elif c in ("*", "?"):
+                if run:
+                    fragments.add("".join(run))
+                    run = []
+                i += 1
+            else:
+                run.append(c)
+                i += 1
+        if run:
+            fragments.add("".join(run))
+    return ["", *sorted(fragments)[: _MAX_STAR_FILLS - 1]]
+
+
 def heuristic_overlap(a: str, b: str) -> bool:
     """Decide whether two patterns can overlap without a repo file list.
 
-    Strategy: each pattern generates exactly ONE synthetic concrete path that
-    it provably matches (via `_synthesize_candidate`, which replaces each
-    wildcard token with a deterministic literal). The patterns overlap iff
-    either synthetic path is also matched by the peer's PathSpec. This uses
+    Strategy: each pattern generates synthetic concrete paths that it
+    provably matches (via `_synthesize_candidate`, which replaces each
+    wildcard token with a deterministic literal); the patterns overlap when
+    any synthetic path is also matched by the peer's PathSpec. This uses
     pathspec's native `**` handling (zero or more directories) so it behaves
-    correctly at arbitrary depth and for arbitrary numbers of `**` segments,
-    with O(1) candidates per side.
+    correctly at arbitrary depth and for arbitrary numbers of `**` segments.
+
+    A synthetic-path hit is SUFFICIENT but not NECESSARY evidence of
+    overlap, so the answer is exact for `True` but `False` can be a false
+    negative. When only one side is a glob the single-candidate probe is
+    exact (the concrete side is itself the only path it matches). For
+    glob-vs-glob, each `*` is additionally re-filled with literal fragments
+    borrowed from the peer pattern (and with the empty string), which
+    catches prefix/suffix collisions such as `src/*_test.py` vs
+    `src/test_*.py` (both match `src/test_x_test.py`). Pairs whose only
+    common paths require several DISTINCT fragments interleaved across one
+    `*`, or fragments absent from either pattern's literal text, can still
+    be missed; the repo-file-list path in `compute_overlap` remains the
+    exact check.
 
     Empty patterns are rejected and return False (there is no file a truly
     empty pattern could match, so claiming overlap is indefensible).
@@ -288,6 +366,23 @@ def heuristic_overlap(a: str, b: str) -> bool:
         return True
     if cand_a is not None and spec_b.match_file(cand_a):
         return True
+
+    # Glob-vs-glob only: the `x` placeholder cannot witness overlaps that
+    # hinge on the peer's literal text, so retry each side's `*` positions
+    # with fragments borrowed from the peer (plus the empty fill). Every
+    # candidate is still matched by its own pattern by construction, so a
+    # peer-side hit remains exact evidence of overlap; concrete-vs-glob
+    # pairs never reach this block because the single-candidate probe is
+    # already exact for them.
+    if _has_glob_wildcard(na) and _has_glob_wildcard(nb):
+        for fill in _star_fills_from_peer(nb):
+            cand = _synthesize_candidate(a, star_fill=fill)
+            if cand is not None and spec_b.match_file(cand):
+                return True
+        for fill in _star_fills_from_peer(na):
+            cand = _synthesize_candidate(b, star_fill=fill)
+            if cand is not None and spec_a.match_file(cand):
+                return True
     return False
 
 
