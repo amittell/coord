@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from conftest import seam_connection
 from coordination.db import Database
 from coordination.main import app
 
@@ -2130,10 +2131,7 @@ async def test_auto_demote_removes_dormant_entry(
     assert list_coord_managed_shared_files(after) == []
 
     # Audit row was recorded with the expected detail shape.
-    import aiosqlite
-
-    async with aiosqlite.connect(svc.db.path) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with seam_connection(svc.db) as conn:
         cur = await conn.execute(
             "SELECT event_type, detail FROM request_events "
             "WHERE event_type = 'auto-demote'"
@@ -2856,20 +2854,19 @@ async def _backdate_queue_entry(
 ) -> None:
     """Rewrite a claim_queue row's ``enqueued_at`` to N seconds in the past
     so the age boost can be exercised deterministically (no real sleeps).
-    Uses raw aiosqlite because no public Database helper backdates queue
-    rows -- this is a v0.26 test fixture, not a production code path.
+    Routes through the backend-agnostic ``seam_connection`` helper because no
+    public Database helper backdates queue rows -- this is a v0.26 test
+    fixture, not a production code path.
     """
-    import aiosqlite
     from datetime import UTC, datetime, timedelta
 
     past = datetime.now(UTC) - timedelta(seconds=seconds_ago)
     past_iso = past.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    async with aiosqlite.connect(db.path) as conn:
+    async with seam_connection(db) as conn:
         await conn.execute(
             "UPDATE claim_queue SET enqueued_at = ? WHERE id = ?",
             (past_iso, queue_id),
         )
-        await conn.commit()
 
 
 @pytest.mark.asyncio
@@ -3739,16 +3736,13 @@ async def test_long_poll_wakes_on_cancellation(
 
 
 async def _outbox_rows(db_path: str, event_type: str | None = None) -> list[dict[str, Any]]:
-    """Return outbox rows directly via aiosqlite.
+    """Return outbox rows directly via the backend-agnostic test DB seam.
 
     The delivery loop is not running in these tests; we are exercising
     the emission path only (fire_webhook -> enqueue_webhook), so reading
     the table directly is the most precise observation point.
     """
-    import aiosqlite
-
-    async with aiosqlite.connect(db_path) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with seam_connection(Database(Path(db_path))) as conn:
         if event_type is None:
             cur = await conn.execute(
                 "SELECT * FROM webhook_outbox ORDER BY created_at ASC"

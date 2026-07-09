@@ -17,7 +17,6 @@ Pins the fixes for three findings against ``coordination/cli_tokens.py``:
 
 from __future__ import annotations
 
-import aiosqlite
 import asyncio
 import json
 import subprocess
@@ -25,7 +24,9 @@ from pathlib import Path
 
 import pytest
 
+from conftest import seam_connection
 from coordination import cli
+from coordination.db import Database
 
 
 def _run(argv: list[str], db_path: Path, monkeypatch: pytest.MonkeyPatch) -> int:
@@ -46,18 +47,17 @@ def _create_token(
 
 
 def _rewrite_token_id(db_path: Path, old_id: str, new_id: str) -> None:
-    """Force a token id through the ``aiosqlite`` seam (redirected to the
-    Postgres schema under the PG harness) -- the only way to manufacture
-    two tokens sharing an 8-char id prefix, since uuid4 collisions cannot
-    be provoked."""
+    """Force a token id through ``conftest.seam_connection`` (the store's
+    own ``_connect`` seam, so the write lands in whichever backend the
+    suite runs) -- the only way to manufacture two tokens sharing an
+    8-char id prefix, since uuid4 collisions cannot be provoked."""
 
     async def _go() -> None:
-        async with aiosqlite.connect(str(db_path)) as conn:
+        async with seam_connection(Database(db_path)) as conn:
             await conn.execute(
                 "UPDATE engineer_tokens SET id = ? WHERE id = ?",
                 (new_id, old_id),
             )
-            await conn.commit()
 
     asyncio.run(_go())
 

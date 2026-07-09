@@ -19,10 +19,10 @@ import json
 from pathlib import Path
 from typing import Any
 
-import aiosqlite
 import httpx
 import pytest
 
+from conftest import seam_connection
 from coordination import mcp_server
 from coordination.config import Settings
 from coordination.db import Database
@@ -168,8 +168,7 @@ async def test_enqueue_picks_item_by_pattern_and_symbols(
     # is fine -- the assertion is on what was enqueued.
     assert not result.claim_ids or result.warnings
 
-    async with aiosqlite.connect(db_path) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with seam_connection(db) as conn:
         cur = await conn.execute(
             "SELECT pattern, symbols FROM claim_queue "
             "WHERE requester_engineer = 'bob'"

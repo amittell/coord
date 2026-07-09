@@ -2,9 +2,9 @@
 
 Covers every branch of the ``check_overlap`` decision table from
 ``docs/design/sub-file-claims.md`` plus the auto-resolution side-effect
-helper. Fixtures use ``aiosqlite`` directly to flip ``scope_type`` and
-``narrowable`` on inserted claims, since the production insert path
-treats both as defaulted columns.
+helper. Fixtures use the backend-agnostic ``seam_connection`` helper to
+flip ``scope_type`` and ``narrowable`` on inserted claims, since the
+production insert path treats both as defaulted columns.
 """
 from __future__ import annotations
 
@@ -15,10 +15,10 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-import aiosqlite
 import pytest
 
-from coordination.db import Database, _configure_sqlite
+from conftest import seam_connection
+from coordination.db import Database
 from coordination.overlap_symbols import (
     OverlapKind,
     OverlapResult,
@@ -75,12 +75,10 @@ async def _seed_file_claim(
         session_id=session_id,
     )
     if not narrowable:
-        async with aiosqlite.connect(db.path) as conn:
-            await _configure_sqlite(conn)
+        async with seam_connection(db) as conn:
             await conn.execute(
                 "UPDATE claims SET narrowable = 0 WHERE id = ?", (cid,)
             )
-            await conn.commit()
     return cid
 
 
@@ -106,12 +104,10 @@ async def _seed_symbol_claim(
         repo=repo,
         session_id=session_id,
     )
-    async with aiosqlite.connect(db.path) as conn:
-        await _configure_sqlite(conn)
+    async with seam_connection(db) as conn:
         await conn.execute(
             "UPDATE claims SET scope_type = 'symbol' WHERE id = ?", (cid,)
         )
-        await conn.commit()
     rows: list[tuple[str, str, str, str, str]] = []
     for f, syms in symbols_by_file.items():
         for s in syms:
@@ -121,9 +117,7 @@ async def _seed_symbol_claim(
 
 
 async def _load_claim(db: Database, claim_id: str) -> dict[str, Any]:
-    async with aiosqlite.connect(db.path) as conn:
-        conn.row_factory = aiosqlite.Row
-        await _configure_sqlite(conn)
+    async with seam_connection(db) as conn:
         cur = await conn.execute("SELECT * FROM claims WHERE id = ?", (claim_id,))
         row = await cur.fetchone()
         assert row is not None, f"claim {claim_id!r} not found"
@@ -410,9 +404,7 @@ async def _count_auto_events(
     holder_claim_id: str,
     requester_claim_id: str,
 ) -> int:
-    async with aiosqlite.connect(db.path) as conn:
-        conn.row_factory = aiosqlite.Row
-        await _configure_sqlite(conn)
+    async with seam_connection(db) as conn:
         cur = await conn.execute(
             """
             SELECT COUNT(*) AS n FROM request_events

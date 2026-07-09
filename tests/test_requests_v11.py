@@ -24,11 +24,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
-import aiosqlite
 import pytest
 
+from conftest import seam_connection
 from coordination.config import Settings
-from coordination.db import Database, _configure_sqlite
+from coordination.db import Database
 from coordination.service import CoordinationService
 
 
@@ -178,8 +178,7 @@ async def test_narrowed_closes_original_and_opens_new_with_inherited_ttl(
     assert result["decision"] == "narrowed"
 
     # Original claim is released.
-    async with aiosqlite.connect(db.path) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with seam_connection(db) as conn:
         cur = await conn.execute("SELECT * FROM claims WHERE id = ?", (cid,))
         row = await cur.fetchone()
     assert row is not None
@@ -413,8 +412,7 @@ async def test_releasing_a_coexisting_claim_detaches_partner(
     await db.release_claims([bob_cid], engineer="bob")
 
     # Holder's coexists_with no longer references bob.
-    async with aiosqlite.connect(db.path) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with seam_connection(db) as conn:
         cur = await conn.execute(
             "SELECT coexists_with FROM claims WHERE id = ?", (holder_cid,)
         )
@@ -480,8 +478,7 @@ async def test_releasing_a_coexisting_claim_with_remaining_partners_keeps_others
     # is set up (the DB layer doesn't auto-build full transitive closures
     # at coexist time; that's a service-layer choice for v0.11). We test
     # that detach respects existing edges it didn't create.
-    async with aiosqlite.connect(db.path) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with seam_connection(db) as conn:
         cur = await conn.execute(
             "SELECT coexists_with FROM claims WHERE id = ?", (b_cid,)
         )
@@ -504,13 +501,11 @@ async def test_releasing_a_coexisting_claim_with_remaining_partners_keeps_others
             "UPDATE claims SET coexists_with = ? WHERE id = ?",
             (json.dumps(c_partners), c_cid),
         )
-        await conn.commit()
 
     # Release A.
     await db.release_claims([a_cid], engineer="alice")
 
-    async with aiosqlite.connect(db.path) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with seam_connection(db) as conn:
         cur = await conn.execute(
             "SELECT coexists_with FROM claims WHERE id = ?", (b_cid,)
         )
@@ -697,8 +692,7 @@ async def test_create_request_stamps_ttl_shortened_on_claim(db: Database) -> Non
         new_claim_expires_at=shortened,
     )
 
-    async with aiosqlite.connect(db.path) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with seam_connection(db) as conn:
         cur = await conn.execute(
             "SELECT ttl_shortened FROM claims WHERE id = ?", (cid,)
         )
@@ -735,8 +729,7 @@ async def test_denied_resets_ttl_shortened(db: Database) -> None:
         actor_session_id=None,
     )
 
-    async with aiosqlite.connect(db.path) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with seam_connection(db) as conn:
         cur = await conn.execute(
             "SELECT expires_at, ttl_shortened FROM claims WHERE id = ?", (cid,)
         )
@@ -773,13 +766,11 @@ async def _seed_symbol_claim(
         description="symbol holder",
         ttl_hours=ttl_hours,
     )
-    async with aiosqlite.connect(db.path) as conn:
-        await _configure_sqlite(conn)
+    async with seam_connection(db) as conn:
         await conn.execute(
             "UPDATE claims SET scope_type = 'symbol', narrowable = 0 WHERE id = ?",
             (cid,),
         )
-        await conn.commit()
     rows: list[tuple[str, str, str, str, str, str | None]] = []
     for raw in symbols:
         if "::" in raw:

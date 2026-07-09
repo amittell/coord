@@ -1,11 +1,12 @@
 """Tests for the v0.27.1 ``coord outbox`` operator CLI.
 
-Each test seeds rows into a tmp ``webhook_outbox`` through the
-``aiosqlite`` seam (the connection the PG test harness redirects to the
-Postgres schema, so the seed lands in whichever backend the suite runs),
-monkeypatches ``COORD_DATABASE_PATH`` so ``cli_outbox`` picks up the tmp
-DB through ``Settings``, and invokes the parsed subcommand through
-``coordination.cli.build_parser``.
+Each test seeds rows into a tmp ``webhook_outbox`` through
+``conftest.seam_connection`` (the backend-agnostic test DB accessor that
+routes seeds/reads through the store's own ``_connect`` seam, so the seed
+lands in whichever backend the suite runs against with no
+``aiosqlite.connect`` monkeypatch), monkeypatches ``COORD_DATABASE_PATH``
+so ``cli_outbox`` picks up the tmp DB through ``Settings``, and invokes
+the parsed subcommand through ``coordination.cli.build_parser``.
 
 The reason for going through ``build_parser`` rather than crafting an
 ``argparse.Namespace`` by hand is that the parser surface is part of
@@ -15,7 +16,6 @@ missing default before the user does.
 
 from __future__ import annotations
 
-import aiosqlite
 import asyncio
 import json
 from datetime import UTC, datetime, timedelta
@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import seam_connection
 from coordination.cli import build_parser
 from coordination.db import Database
 
@@ -84,10 +85,10 @@ def _insert_row(
     delivered = delivered_at if status == "delivered" else None
 
     async def _go() -> None:
-        # aiosqlite.connect is the seam the PG test harness redirects to the
-        # Postgres schema, so this seed lands in whichever backend the suite
-        # is running against (raw sqlite3 would only ever see the local file).
-        async with aiosqlite.connect(str(path)) as conn:
+        # seam_connection routes through the store's own _connect seam, so
+        # this seed lands in whichever backend the suite runs against (raw
+        # sqlite3 would only ever see the local file) with no monkeypatch.
+        async with seam_connection(Database(path)) as conn:
             await conn.execute(
                 "INSERT INTO webhook_outbox "
                 "(id, url, event_type, payload_json, hmac_signature, "
@@ -106,7 +107,6 @@ def _insert_row(
                     delivered,
                 ),
             )
-            await conn.commit()
 
     asyncio.run(_go())
 
@@ -114,8 +114,7 @@ def _insert_row(
 def _get_row(path: Path, row_id: str) -> dict[str, object] | None:
     """Return the row with id ``row_id`` as a dict, or None if missing."""
     async def _go() -> dict[str, object] | None:
-        async with aiosqlite.connect(str(path)) as conn:
-            conn.row_factory = aiosqlite.Row
+        async with seam_connection(Database(path)) as conn:
             cur = await conn.execute(
                 "SELECT * FROM webhook_outbox WHERE id = ?", (row_id,)
             )
@@ -127,7 +126,7 @@ def _get_row(path: Path, row_id: str) -> dict[str, object] | None:
 
 def _count_all(path: Path) -> int:
     async def _go() -> int:
-        async with aiosqlite.connect(str(path)) as conn:
+        async with seam_connection(Database(path)) as conn:
             cur = await conn.execute("SELECT COUNT(*) FROM webhook_outbox")
             row = await cur.fetchone()
             return int(row[0])
@@ -341,12 +340,11 @@ def test_retry_exhausted_separate_from_failed(
     # (The failed row already moved to pending; re-fail it so the
     # selector has work to do.)
     async def _refail() -> None:
-        async with aiosqlite.connect(str(db_path)) as conn:
+        async with seam_connection(Database(db_path)) as conn:
             await conn.execute(
                 "UPDATE webhook_outbox SET status='failed', retry_count=2, "
                 "last_error='HTTP 503' WHERE id = 'f1'"
             )
-            await conn.commit()
 
     asyncio.run(_refail())
 

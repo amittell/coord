@@ -18,10 +18,10 @@ import hashlib
 import logging
 from pathlib import Path
 
-import aiosqlite
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from conftest import seam_connection
 from coordination import metrics
 from coordination.main import OWNERSHIP_MAX_BODY_BYTES, app
 
@@ -263,13 +263,12 @@ async def test_list_recent_claims_filters_repo_before_limit(
     db = get_service().db
     # Make the repo-B claim strictly newer so an unscoped limit-1 window
     # is filled entirely by repo B.
-    async with aiosqlite.connect(db.path) as conn:
+    async with seam_connection(db) as conn:
         await conn.execute(
             "UPDATE claims SET created_at = datetime(created_at, '+1 hour') "
             "WHERE repo = ?",
             (REPO_B,),
         )
-        await conn.commit()
 
     newest = await db.list_recent_claims(1)
     assert [r["repo"] for r in newest] == [REPO_B]

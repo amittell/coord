@@ -27,9 +27,9 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-import aiosqlite
 import pytest
 
+from conftest import seam_connection
 from coordination import metrics
 from coordination.db import Database
 
@@ -52,7 +52,7 @@ def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Database:
 async def _committed_rows(db: Database, table: str) -> list[tuple]:
     """Read via an INDEPENDENT connection so only committed data is visible
     (WAL readers never see another connection's open write transaction)."""
-    async with aiosqlite.connect(db.path) as conn:
+    async with seam_connection(db) as conn:
         cur = await conn.execute(f"SELECT * FROM {table} ORDER BY 1")
         return [tuple(r) for r in await cur.fetchall()]
 

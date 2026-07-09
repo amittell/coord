@@ -13,11 +13,11 @@ still counts as elapsed (fail closed).
 
 from __future__ import annotations
 
-import aiosqlite
 import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 
+from conftest import seam_connection
 from coordination.db import Database, _ts_elapsed
 from coordination.tokens import (
     _elapsed,
@@ -88,13 +88,12 @@ def test_derive_status_naive_grace_window_reads_as_utc() -> None:
 # --- resolve_engineer_token: corrupt expiry is a 401, not a 500 --------------
 
 
-async def _corrupt_expiry(db_path: Path, token_id: str, value: str) -> None:
-    async with aiosqlite.connect(str(db_path)) as conn:
+async def _corrupt_expiry(db: Database, token_id: str, value: str) -> None:
+    async with seam_connection(db) as conn:
         await conn.execute(
             "UPDATE engineer_tokens SET expires_at = ? WHERE id = ?",
             (value, token_id),
         )
-        await conn.commit()
 
 
 def test_resolve_token_with_naive_expiry_does_not_raise(
@@ -111,12 +110,12 @@ def test_resolve_token_with_naive_expiry_does_not_raise(
             "alex/claude/main", sha256_token(raw)
         )
         # Future naive timestamp: still authenticates, read as UTC.
-        await _corrupt_expiry(db_path, token_id, "2999-01-01T00:00:00")
+        await _corrupt_expiry(db, token_id, "2999-01-01T00:00:00")
         resolved = await db.resolve_engineer_token(sha256_token(raw))
         assert resolved is not None
         assert resolved["status"] == "ok"
         # Past naive timestamp: expired, not a crash.
-        await _corrupt_expiry(db_path, token_id, "2000-01-01T00:00:00")
+        await _corrupt_expiry(db, token_id, "2000-01-01T00:00:00")
         resolved = await db.resolve_engineer_token(sha256_token(raw))
         assert resolved is not None
         assert resolved["status"] == "expired"

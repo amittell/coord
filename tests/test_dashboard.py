@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import seam_connection
 from coordination import deps
 from coordination.config import Settings
 from coordination.dashboard import (
@@ -102,11 +103,10 @@ async def _insert_claim_raw(
     Database.insert_claims_batch always stamps created_at = now, so it can't
     be used to seed the 24h activity window with old claims.
     """
-    import aiosqlite
     from uuid import uuid4
 
     cid = claim_id or str(uuid4())
-    async with aiosqlite.connect(svc.db.path) as conn:
+    async with seam_connection(svc.db) as conn:
         await conn.execute(
             """
             INSERT INTO claims (
@@ -127,7 +127,6 @@ async def _insert_claim_raw(
                 released_at,
             ),
         )
-        await conn.commit()
     return cid
 
 
@@ -141,10 +140,9 @@ async def _insert_conflict_raw(
     resolution: str | None = None,
 ) -> None:
     """Insert a conflict_log row with a controlled created_at."""
-    import aiosqlite
     from uuid import uuid4
 
-    async with aiosqlite.connect(svc.db.path) as conn:
+    async with seam_connection(svc.db) as conn:
         await conn.execute(
             """
             INSERT INTO conflict_log (
@@ -153,7 +151,6 @@ async def _insert_conflict_raw(
             """,
             (str(uuid4()), claim_id, attempted_by, attempted_pattern, resolution, created_at),
         )
-        await conn.commit()
 
 
 async def _insert_claim(
@@ -556,14 +553,11 @@ async def test_dashboard_renders_repos_panel(svc: CoordinationService) -> None:
         expires_at=expires,
     )
     # Tag this raw insert with a repo by updating the row directly.
-    import aiosqlite
-
-    async with aiosqlite.connect(svc.db.path) as conn:
+    async with seam_connection(svc.db) as conn:
         await conn.execute(
             "UPDATE claims SET repo = ? WHERE engineer = 'alice'",
             ("example-org/bastionx",),
         )
-        await conn.commit()
 
     cid = await _insert_claim_raw(
         svc,
@@ -572,12 +566,11 @@ async def test_dashboard_renders_repos_panel(svc: CoordinationService) -> None:
         created_at=fresh,
         expires_at=expires,
     )
-    async with aiosqlite.connect(svc.db.path) as conn:
+    async with seam_connection(svc.db) as conn:
         await conn.execute(
             "UPDATE claims SET repo = ? WHERE id = ?",
             ("amittell/coord", cid),
         )
-        await conn.commit()
 
     html_out = await render_dashboard()
     # Lowercase "repositories" header in the new aesthetic.
@@ -916,7 +909,6 @@ async def test_dashboard_active_claims_show_symbol_names_for_symbol_scope(
     symbol-scope claims, the symbol names render inline so an operator
     can tell which parts of a file are locked without a round trip to
     the API."""
-    import aiosqlite
     from uuid import uuid4
 
     cid = await _insert_claim(
@@ -925,11 +917,10 @@ async def test_dashboard_active_claims_show_symbol_names_for_symbol_scope(
     # Flip the claim to symbol scope and seed two symbols. The DB layer
     # tolerates this composition: scope_type lives on claims, the symbol
     # list lives on claim_symbols.
-    async with aiosqlite.connect(svc.db.path) as conn:
+    async with seam_connection(svc.db) as conn:
         await conn.execute(
             "UPDATE claims SET scope_type = 'symbol' WHERE id = ?", (cid,)
         )
-        await conn.commit()
     await svc.db.insert_claim_symbols(
         rows=[
             (str(uuid4()), cid, "src/auth/login.ts", "handleLogin", "function", None),
@@ -957,17 +948,15 @@ async def test_dashboard_symbol_spans_render_line_ranges_and_lsp_marker(
     line range inline, with a subtle ``lsp`` marker only when the span
     came from a language server. Rows with NULL spans (pre-v16 rows, no
     repo root) render the bare name exactly as before."""
-    import aiosqlite
     from uuid import uuid4
 
     cid = await _insert_claim(
         svc, engineer="alice", pattern="src/auth/login.ts"
     )
-    async with aiosqlite.connect(svc.db.path) as conn:
+    async with seam_connection(svc.db) as conn:
         await conn.execute(
             "UPDATE claims SET scope_type = 'symbol' WHERE id = ?", (cid,)
         )
-        await conn.commit()
     await svc.db.insert_claim_symbols(
         rows=[
             # Parser-resolved span: lines only, columns NULL.
@@ -1050,8 +1039,6 @@ async def test_dashboard_renders_hotspots_panel(
     """v0.20: dashboard "hotspot files (30d)" panel renders rows with
     suggested-action tags driven by attempt-count thresholds."""
     from uuid import uuid4
-    import aiosqlite
-    from coordination.db import _configure_sqlite
 
     # Holder claim so the conflict_log JOIN finds a repo.
     await svc.db.insert_claims_batch(
@@ -1070,8 +1057,7 @@ async def test_dashboard_renders_hotspots_panel(
 
     # 25 attempts on router.ts (-> "promote to shared_file"), 7 on
     # middleware.ts (-> "monitor"). cold.ts has 3 attempts (-> filtered).
-    async with aiosqlite.connect(svc.db.path) as conn:
-        await _configure_sqlite(conn)
+    async with seam_connection(svc.db) as conn:
         recent = _recent_iso()
         for i in range(25):
             await conn.execute(
@@ -1089,7 +1075,6 @@ async def test_dashboard_renders_hotspots_panel(
                 (str(uuid4()), "holder-w", f"eng-{i}",
                  "src/middleware.ts", recent),
             )
-        await conn.commit()
 
     html_out = await render_dashboard()
 
@@ -1112,8 +1097,6 @@ async def test_dashboard_hotspot_action_link_present(
     """v0.21: hotspot rows that pass the actionable thresholds render
     an "apply" link; pure-monitor rows do not."""
     from uuid import uuid4
-    import aiosqlite
-    from coordination.db import _configure_sqlite
 
     await svc.db.insert_claims_batch(
         engineer="alice",
@@ -1131,8 +1114,7 @@ async def test_dashboard_hotspot_action_link_present(
 
     # 25 attempts on promote.ts (-> "promote to shared_file"),
     # 7 on monitor.ts (-> "monitor").
-    async with aiosqlite.connect(svc.db.path) as conn:
-        await _configure_sqlite(conn)
+    async with seam_connection(svc.db) as conn:
         recent = _recent_iso()
         for i in range(25):
             await conn.execute(
@@ -1150,7 +1132,6 @@ async def test_dashboard_hotspot_action_link_present(
                 (str(uuid4()), "h-monitor", f"eng-{i}",
                  "src/monitor.ts", recent),
             )
-        await conn.commit()
 
     html_out = await render_dashboard()
 
@@ -1353,8 +1334,6 @@ async def test_dashboard_renders_stale_engineers_panel(
     ``list_claims`` -- the dashboard calls that on its way in -- and
     the row would be released before ``list_stale_engineers`` saw it.
     """
-    import aiosqlite
-
     svc.settings = svc.settings.model_copy(update={"idle_timeout_sec": 0})
 
     # Seed one stale engineer (15 days old) and one fresh engineer.
@@ -1379,12 +1358,11 @@ async def test_dashboard_renders_stale_engineers_panel(
         session_id="session-fresh",
     )
     backdated = _iso(datetime.now(UTC) - timedelta(days=15))
-    async with aiosqlite.connect(svc.db.path) as conn:
+    async with seam_connection(svc.db) as conn:
         await conn.execute(
             "UPDATE claims SET last_activity = ? WHERE id = ?",
             (backdated, "stale-1"),
         )
-        await conn.commit()
 
     html_out = await render_dashboard()
 
@@ -1556,14 +1534,11 @@ async def test_dashboard_scoped_viewer_hotspots_scoped(
     svc: CoordinationService,
 ) -> None:
     from uuid import uuid4
-    import aiosqlite
-    from coordination.db import _configure_sqlite
 
     await _seed_repo_claim(svc, "ha", "src/hot-a.py", "amittell/repo-a")
     await _seed_repo_claim(svc, "hb", "src/hot-b.py", "amittell/repo-b")
     recent = _recent_iso()
-    async with aiosqlite.connect(svc.db.path) as conn:
-        await _configure_sqlite(conn)
+    async with seam_connection(svc.db) as conn:
         for claim_id, pat in (("ha", "src/hot-a.py"), ("hb", "src/hot-b.py")):
             for i in range(25):
                 await conn.execute(
@@ -1572,7 +1547,6 @@ async def test_dashboard_scoped_viewer_hotspots_scoped(
                     "VALUES (?, ?, ?, ?, NULL, ?)",
                     (str(uuid4()), claim_id, f"e{i % 6}", pat, recent),
                 )
-        await conn.commit()
 
     html_out = await render_dashboard(viewer_repo="amittell/repo-a")
     hotspots = html_out[html_out.index("hotspot files (30d)"):]

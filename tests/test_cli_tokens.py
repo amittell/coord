@@ -22,7 +22,6 @@ Three properties matter:
 
 from __future__ import annotations
 
-import aiosqlite
 import asyncio
 from datetime import UTC, datetime, timedelta
 import json
@@ -31,7 +30,9 @@ import subprocess
 
 import pytest
 
+from conftest import seam_connection
 from coordination import cli, cli_tokens
+from coordination.db import Database
 
 
 def _run(argv: list[str], db_path: Path, monkeypatch: pytest.MonkeyPatch) -> int:
@@ -46,30 +47,34 @@ def _parse_z(ts: str) -> datetime:
 
 
 def _force_expire(db_path: Path, token_id: str) -> None:
-    """Backdate a token's expiry through the ``aiosqlite`` seam. The CLI only
-    accepts future durations, so manufacturing an already-expired token has
-    to go under the hood. Using ``aiosqlite`` (not raw ``sqlite3``) means the
-    PG test harness redirects this write to the Postgres schema the store
-    reads, so the backdate lands in whichever backend the suite runs."""
+    """Backdate a token's expiry through the store's own DB seam. The CLI only
+    accepts future durations, so manufacturing an already-expired token has to
+    go under the hood. Routing the write through ``seam_connection`` (the
+    backend-dispatched ``Database._connect`` seam) lands the backdate in
+    whichever backend the suite runs -- the local SQLite file by default, the
+    ``PostgresStore`` schema under the PG harness -- with no ``aiosqlite``
+    monkeypatch. The commit is handled by the context manager on clean exit."""
     async def _go() -> None:
-        async with aiosqlite.connect(str(db_path)) as conn:
+        db = Database(db_path)
+        async with seam_connection(db) as conn:
             await conn.execute(
                 "UPDATE engineer_tokens SET expires_at = ? WHERE id = ?",
                 ("2000-01-01T00:00:00Z", token_id),
             )
-            await conn.commit()
 
     asyncio.run(_go())
 
 
 def _read_row(db_path: Path, sql: str, params: tuple) -> tuple | None:
-    """Read a single row through the ``aiosqlite`` seam (redirected to the
-    Postgres schema under the PG harness). Returns the backend's native row
-    object (a sqlite3 tuple, or an asyncpg Record that indexes by position),
-    so callers compare by index rather than tuple-equality to stay backend
-    agnostic."""
+    """Read a single row through the store's own DB seam (the
+    backend-dispatched ``Database._connect``, which lands on the local SQLite
+    file by default and on the ``PostgresStore`` schema under the PG harness).
+    Returns the backend's native row object (an ``aiosqlite.Row`` or an asyncpg
+    Record, both of which index by position), so callers compare by index
+    rather than tuple-equality to stay backend agnostic."""
     async def _go() -> tuple | None:
-        async with aiosqlite.connect(str(db_path)) as conn:
+        db = Database(db_path)
+        async with seam_connection(db) as conn:
             cur = await conn.execute(sql, params)
             return await cur.fetchone()
 
@@ -274,10 +279,11 @@ def test_revoke_kills_lookup(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """The CLI is synchronous (it wraps each subcommand in ``asyncio.run``),
-    so this test reads the DB back through the ``aiosqlite`` seam (which the
-    PG harness redirects to the Postgres schema) to confirm revoke flipped
-    ``revoked_at`` -- rows are compared by index so the assertions hold on a
-    sqlite3 tuple or an asyncpg Record alike."""
+    so this test reads the DB back through the store's own DB seam (the
+    backend-dispatched ``Database._connect``, which lands on SQLite by default
+    and on the Postgres schema under the PG harness) to confirm revoke flipped
+    ``revoked_at`` -- rows are compared by index so the assertions hold on an
+    ``aiosqlite.Row`` or an asyncpg Record alike."""
     db_path = tmp_path / "db.sqlite"
     _run(
         ["tokens", "create", "alex/claude/main", "--json"],
