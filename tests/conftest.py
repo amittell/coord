@@ -36,6 +36,8 @@ identically on either backend.
 
 from __future__ import annotations
 
+import asyncio
+import gc
 import os
 import warnings
 from contextlib import asynccontextmanager
@@ -99,6 +101,73 @@ def seam_conn():
     Returns the context-manager factory itself, so a single fixture serves any
     number of connections within a test."""
     return seam_connection
+
+
+def _is_coordination_task(task: "asyncio.Task") -> bool:
+    """True when ``task`` is running a coroutine defined in the
+    ``coordination`` package (so the drain below only touches this
+    project's fire-and-forget tasks, never pytest-asyncio's own)."""
+    coro = task.get_coro()
+    code = getattr(coro, "cr_code", None) or getattr(coro, "gi_code", None)
+    return code is not None and "coordination/" in code.co_filename
+
+
+@pytest.fixture(autouse=True)
+async def _drain_coord_bg_tasks():
+    """After every test, drain coordination's fire-and-forget background
+    tasks and reap the LSP pool while the event loop is still alive.
+
+    ``CoordinationService`` schedules callsite enrichment
+    (``_enrich_claim_callsites``) as a fire-and-forget task that awaits an
+    LSP ``references`` round-trip. That round-trip reads from a language
+    server subprocess's stdout via an asyncio ``StreamReader``. When a test
+    leaves such a task pending, pytest-asyncio's loop close cancels it via
+    ``_cancel_all_tasks`` -- but a coroutine suspended on a subprocess-backed
+    reader cannot reliably complete cancellation during loop teardown (the
+    reader's EOF is delivered by the very loop that is shutting down), so
+    ``_cancel_all_tasks`` waits on it forever and the whole run hangs. It is
+    the SQLite/LSP twin of the asyncpg hang ``_pg_drain_pool`` guards
+    against, and it stayed silent until ``pytest-timeout`` turned it into a
+    hard failure. Production is unaffected: the ``asyncio.wait_for`` bound on
+    each LSP request fires normally on a healthy loop.
+
+    Draining here -- on the still-healthy loop, where cancellation is
+    delivered normally -- lets those tasks unwind before the loop closes.
+    Every step is time-bounded and error-swallowed so the fixture can never
+    itself hang or fail a test, and it only touches tasks whose coroutine
+    lives in ``coordination`` so pytest-asyncio's machinery is left alone.
+    Inert when nothing was scheduled."""
+    yield
+    loop = asyncio.get_running_loop()
+    me = asyncio.current_task()
+    lingering = [
+        obj
+        for obj in gc.get_objects()
+        if isinstance(obj, asyncio.Task)
+        and obj is not me
+        and not obj.done()
+        and obj.get_loop() is loop
+        and _is_coordination_task(obj)
+    ]
+    for task in lingering:
+        task.cancel()
+    if lingering:
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*lingering, return_exceptions=True), 5
+            )
+        except (Exception, asyncio.CancelledError):  # noqa: BLE001
+            pass
+    try:
+        from coordination import lsp as _lsp
+    except Exception:  # noqa: BLE001 - import guard
+        return
+    if _lsp._POOL is not None:
+        try:
+            await asyncio.wait_for(_lsp._POOL.shutdown_all(), 5)
+        except (Exception, asyncio.CancelledError):  # noqa: BLE001
+            pass
+        _lsp._reset_pool()
 
 
 def pytest_collection_modifyitems(
