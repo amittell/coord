@@ -16,6 +16,17 @@ class Settings(BaseSettings):
     auth_token: str | None = None
     allow_insecure_no_auth: bool = False
     repo_root: Path | None = None
+    # ``repo_root_repo``: declares which repo id (``owner/name``) the
+    # single ``repo_root`` checkout represents. On a shared multi-repo
+    # service the rename auto-follow sweep walks ACTIVE claims from
+    # every repo but resolves their file paths against this one
+    # checkout; when set, the sweep only follows claims whose ``repo``
+    # matches (NULL-repo legacy claims are excluded too), so a claim
+    # from another repo whose relative path happens to exist under
+    # this root can never be "renamed" based on the wrong repo's file
+    # content. Unset (default) preserves the single-repo behaviour:
+    # every claim is swept against ``repo_root``.
+    repo_root_repo: str | None = None
     repo_scope: str | None = None
     api_url: str = "http://127.0.0.1:8080"
     host: str = "0.0.0.0"

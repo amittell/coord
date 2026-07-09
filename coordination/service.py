@@ -1968,6 +1968,19 @@ class CoordinationService:
         if not root or not root.is_dir():
             return 0
         active = await self.db.list_active_claims_rows(exclude_engineer=None)
+        # Multi-repo guard: the sweep resolves claim file paths against the
+        # ONE checkout at ``repo_root``, but on a shared service the active
+        # claims span every repo. When ``repo_root_repo`` declares which
+        # repo id that checkout represents, only claims tagged with that
+        # repo are swept -- a claim from another repo whose relative path
+        # happens to exist under this root must never be "renamed" based on
+        # this repo's file content. NULL-repo legacy claims are excluded
+        # too: their provenance is unknown, and a wrong follow rewrites
+        # claim rows. Unset preserves the single-repo behaviour (sweep
+        # everything).
+        root_repo = self.settings.repo_root_repo
+        if root_repo:
+            active = [r for r in active if r.get("repo") == root_repo]
         symbol_claims = [
             r for r in active if r.get("scope_type") == "symbol"
         ][:max_claims]

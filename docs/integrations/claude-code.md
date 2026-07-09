@@ -36,7 +36,7 @@ pip install -e .
 
 ## 3. Add project MCP config manually
 
-Copy `templates/.mcp.json.example` into the application repo as `.mcp.json`, then fill in the service URL and token.
+Copy `templates/.mcp.json.example` into the application repo as `.mcp.json` and leave the placeholder values (`set-me`, `http://127.0.0.1:8080`, `example-org/example-repo`) exactly as they are: the MCP wrapper recognizes them as unset and falls back to the real values in the gitignored `.coordination/local.env`. Putting real tokens or URLs into `.mcp.json` both commits a secret and shadows every engineer's per-machine `local.env` configuration.
 
 Example:
 

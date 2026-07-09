@@ -34,6 +34,10 @@ x-coord-queue-depth: 2
 
 A value of ``0`` means the engineer has no queued waiters; the header is still emitted to make the "no backpressure" signal explicit.
 
+### `X-Coord-Identity-Warning` (v0.46+)
+
+When the service runs with `COORD_ENFORCE_ENGINEER_IDENTITY=warn` (the default), a mutating request whose `engineer` field does not match the authenticated per-engineer token's identity is still honored, but the response carries an ``X-Coord-Identity-Warning`` header naming both identities so the misconfigured client is discoverable before enforcement. With `COORD_ENFORCE_ENGINEER_IDENTITY=enforce` the same mismatch is rejected with `403` instead. An omitted `engineer` defaults to the token's own identity in both modes; shared-token and no-auth deployments never see the header. Rollout guide: [docs/deployment.md](deployment.md).
+
 ## Rate limiting (v0.30.0+)
 
 Three env knobs, all default ``0`` (disabled); limits key on the request-body engineer:
@@ -522,6 +526,8 @@ The holder responds to an open request. Four decisions:
 `coexist_symbols` (v0.35) is the symbol-scoped alternative to `coexist_pattern`: a dict mapping file path to the list of symbol paths the requester is granted a sibling claim on. The requester's new claim is created `scope_type='symbol'` with exactly those symbols, so a later third claim collides only on the granted symbols and auto-coexists elsewhere. Valid only when BOTH the holder's claim and the requester's original claim are symbol-scoped; the granted symbols must be a subset of the requester's claimed symbols and disjoint from the holder's (else `400`).
 
 A late respond (after the request has already terminalised) is recorded as a `responded-late` audit event but does not change state.
+
+Holder authorization (v0.46+): when the caller authenticates with a per-engineer token, only the target claim's holder may decide a request filed against it -- a requester cannot file a release request and self-approve it. A non-holder per-engineer token gets `403` regardless of `COORD_ENFORCE_ENGINEER_IDENTITY` mode. Shared operator tokens (and no-auth deployments) are exempt so dashboard and operator flows keep working. Fleets whose per-engineer token identity deliberately differs from the claim-holder engineer name should pass the optional `engineer` argument on the MCP `respond_to_request` tool.
 
 ## `GET /requests` (v0.9.0+, extended in v0.22.0)
 
