@@ -4,7 +4,15 @@ from pydantic import BaseModel, Field
 
 
 class ClaimItem(BaseModel):
-    type: str = Field(..., description="module | file | shared_file")
+    type: str = Field(
+        ...,
+        description=(
+            "file | shared_file. 'module' is a legacy value kept for "
+            "direct HTTP API compatibility; it is not reachable via the "
+            "MCP tools and behaves like a non-narrowable claim outside "
+            "the shared-TTL rules."
+        ),
+    )
     pattern: str
     symbols: list[str] | None = Field(
         default=None,
@@ -23,9 +31,10 @@ class ClaimItem(BaseModel):
         description=(
             "Optional flag (v0.14+) controlling whether an incoming "
             "symbol-scope claim is allowed to auto-narrow this row. "
-            "Defaults: file claims True, shared_file False, module False, "
-            "symbol-scope claims always non-narrowable. Explicit False on "
-            "a normal file claim forces the legacy 409+request flow."
+            "Defaults: file claims True, shared_file False, legacy module "
+            "claims False, symbol-scope claims always non-narrowable. "
+            "Explicit False on a normal file claim forces the legacy "
+            "409+request flow."
         ),
     )
 

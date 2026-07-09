@@ -30,7 +30,11 @@ from coordination.repo_id import InvalidRepoId, normalize_repo_id
 from coordination.cli_shared import parse_duration
 from coordination.config import get_settings
 from coordination.dashboard import render_dashboard
-from coordination.db import _LOCK_SKIPPED, acquire_instance_lock
+from coordination.db import (
+    _LOCK_SKIPPED,
+    _postgres_url_selected,
+    acquire_instance_lock,
+)
 from coordination.deps import get_service
 from coordination.tokens import generate_raw_token, sha256_token
 from coordination.logging import (
@@ -95,10 +99,9 @@ async def lifespan(app: FastAPI):
     # The flock instance lock detects a second SQLite writer on one file; it
     # is meaningless across pods sharing a Postgres (design Section 7). In PG
     # mode bypass it (return the sentinel) -- multiple replicas are expected.
-    if settings.database_url and (
-        settings.database_url.startswith("postgresql://")
-        or settings.database_url.startswith("postgres://")
-    ):
+    # Backend selection uses the same predicate ``Database.__new__`` dispatches
+    # on, so the lock decision can never drift from which store actually opens.
+    if _postgres_url_selected() is not None:
         app.state.instance_lock_fd = _LOCK_SKIPPED
     else:
         app.state.instance_lock_fd = acquire_instance_lock(settings.database_path)
@@ -192,6 +195,27 @@ async def lifespan(app: FastAPI):
                     await get_service().db.expire_stale_queue_entries()
                 except Exception:  # pragma: no cover - background cleanup failures are logged
                     logger.exception("Failed to expire stale queue entries")
+                # Garbage-collect the claim_symbols / callsites / renames
+                # child rows of long-released claims. Claims themselves are
+                # soft-released and kept as the audit trail, but their
+                # symbol child rows have no other reaper and would grow the
+                # store unbounded (and bloat the per-file index scans the
+                # symbol-overlap checks walk). Leader-only like the other
+                # DB-mutating sweeps; 0 disables.
+                if settings.symbol_purge_after_sec > 0:
+                    try:
+                        purged = await get_service().db.purge_released_symbol_rows(
+                            older_than_sec=settings.symbol_purge_after_sec
+                        )
+                        if any(purged.values()):
+                            logger.info(
+                                "Purged symbol rows of released claims: %s",
+                                purged,
+                            )
+                    except Exception:  # pragma: no cover - background cleanup failures are logged
+                        logger.exception(
+                            "Failed to purge released-claim symbol rows"
+                        )
             # v0.31 wave 2: rename auto-follow sweep piggybacks on the
             # cleanup cadence rather than running its own task -- one
             # background heartbeat, two cheap jobs. Gated on
@@ -2639,6 +2663,7 @@ async def list_requests(
     decision: str | None = Query(default=None),
     queued: bool = Query(default=False),
     state: str | None = Query(default=None),
+    session_id: str | None = Query(default=None),
     request: Request = None,  # type: ignore[assignment]
     _: None = Depends(require_auth),
 ) -> dict:
@@ -2653,6 +2678,13 @@ async def list_requests(
     (defaults to ``waiting``; pass an empty string is not supported --
     omit the param to keep the default). ``requester`` continues to
     apply, filtering queue rows by ``requester_engineer``.
+
+    ``session_id`` widens the ``queued=true`` requester filter: rows
+    whose ``requester_session_id`` matches are included even when their
+    ``requester_engineer`` differs from ``requester``, so an MCP client
+    whose engineer name changed since enqueue time still sees its own
+    queue entries. Ignored on the legacy (non-queued) branch, which
+    already scopes by requester name only.
     """
     token_repo = _token_repo(request)
     if queued:
@@ -2663,6 +2695,7 @@ async def list_requests(
         # repos' rows crowd a scoped token's own entries out entirely.
         rows = await get_service().db.list_queued_with_holder(
             engineer=requester,
+            session_id=session_id,
             state=state or "waiting",
             repo=token_repo,
         )

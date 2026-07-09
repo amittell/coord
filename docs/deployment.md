@@ -149,6 +149,8 @@ coord tokens list
 coord tokens revoke <token-id>
 ```
 
+`coord tokens rotate` and `coord tokens revoke` accept either the full token id or any unambiguous prefix of at least 8 characters -- exactly the width of the TOKEN ID column that `coord tokens list` prints, so the visible column value always resolves. An ambiguous prefix lists the candidates and exits non-zero without touching anything. All the `coord tokens` subcommands take `--database-path` to target a non-default SQLite file; `rotate`/`revoke` against a missing database file are a distinct exit-code-2 error (nothing to mutate), while `list` reports "No tokens issued" without creating an empty file.
+
 The raw token is printed exactly once at creation; only its sha256 lands in the database. Tokens created without `--expires-in` never expire (matching pre-v0.29.4 behavior). In a remote-mode repo, `coord tokens create` refuses the default local SQLite write unless you pass `--local-db`, `--database-path`, or `COORD_DATABASE_PATH`; that opt-in is for operators intentionally writing a server-side/local database, not for normal remote token creation.
 
 From v0.29.5 the same lifecycle is available in the dashboard: engineers logged in with a per-engineer token manage their own tokens (list, revoke, create with a capped expiry), and a shared-token session gets the operator view over all tokens.
@@ -193,7 +195,7 @@ The shared token has no grace-window mechanism; if you need zero-downtime rotati
 ## Observability
 
 - stdout/stderr: standard uvicorn logs at the level set by `COORD_LOG_LEVEL`.
-- `/readyz`: includes version, auth mode, and database path for quick probing.
+- `/readyz`: includes status, version, and auth mode for quick probing. The database filesystem path is deliberately NOT exposed: the endpoint is unauthenticated, so it reports only what probes and doctor checks consume.
 - `/meta`: name, version, auth mode, and whether `COORD_REPO_ROOT` is configured.
 - `/metrics`: Prometheus-style text exposition (`text/plain; version=0.0.4`). Exposed unauthenticated by convention so standard Prometheus scrapers work without custom headers. If you need to restrict it, front the service with a reverse proxy that gates `/metrics` separately from the rest of the API.
 - Per-request IDs: every response carries an `X-Request-ID` header. If the client sends one on the request the service echoes it; otherwise the service mints a 16-character hex id. Use it to correlate a client error with a specific server-side log line.
@@ -305,6 +307,30 @@ unscoped by design). Set `COORD_WARN_UNSCOPED_TOKEN=false` to silence it.
 Typical rollout: ship with the warning on, let agents rotate to scoped tokens as
 they notice the notice, then flip `COORD_REQUIRE_SCOPED_TOKEN=true` once the fleet
 is clean.
+
+### Engineer identity: bind mutations to the token (v0.46+)
+
+Per-engineer tokens authenticate a caller, but mutating requests also carry an
+`engineer` field naming who is acting -- and historically nothing tied the two
+together, so any authenticated agent could act under another engineer's name.
+`COORD_ENFORCE_ENGINEER_IDENTITY` controls the binding:
+
+- `warn` (default): a mismatch between the request's named engineer and the
+  authenticated per-engineer token identity is honored, but logged server-side
+  and echoed back in an `X-Coord-Identity-Warning` response header so the
+  misconfigured client is discoverable before enforcement.
+- `enforce`: a mismatch is rejected with 403. An omitted engineer defaults to
+  the token's own identity in both modes, so well-behaved clients need no
+  change.
+
+Independently of the mode, `POST /requests/{id}/respond` applies an immediate
+holder-authorization rule for per-engineer tokens: only the target claim's
+holder may decide a request filed against it, so a requester cannot file a
+release request and self-approve it. Shared operator tokens (and no-auth
+deployments) are exempt so dashboard and operator flows keep working. Fleets
+whose token identity deliberately differs from the claim-holder engineer name
+should pass the optional `engineer` argument on the MCP `respond_to_request`
+tool (or stay on `warn` until names converge).
 
 ### Rollout safety: drain legacy NULL-repo claims first
 

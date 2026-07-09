@@ -73,7 +73,10 @@ jobs:
     # actually gated on every PR rather than validated by local runs alone.
     services:
       postgres:
-        image: postgres:16
+        # Pinned to the same digest as deploy/k8s/ha-cutover/postgres.yaml so
+        # CI exercises exactly the Postgres build prod runs; a floating tag
+        # would let the two silently diverge. Bump both together.
+        image: postgres:16.14@sha256:be01cf82fc7dbba824acf0a82e150b4b360f3ff93c6631d7844af431e841a95c
         env:
           POSTGRES_USER: coord
           POSTGRES_PASSWORD: coord
@@ -203,3 +206,10 @@ jobs:
           tags: coord:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # The HA cutover requires the shipped image to carry the asyncpg
+      # driver (requirements-postgres.txt). Assert it imports inside the
+      # built artifact -- a requirements regression must fail here, not at
+      # PostgresStore startup in the maintenance window.
+      - name: Smoke-test image (asyncpg + package importable)
+        run: docker run --rm --entrypoint python coord:ci -c "import asyncpg, coordination"

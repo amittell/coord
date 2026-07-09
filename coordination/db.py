@@ -2179,12 +2179,20 @@ class Database:
                 # for an integer epoch comparison; if enqueued_at is
                 # malformed the inner strftime returns NULL and the
                 # COALESCE keeps the age at 0 (no boost), so the v0.25
-                # behaviour is preserved on bad data.
+                # behaviour is preserved on bad data. That NULL-on-
+                # malformed degradation is SQLite-only: on the Postgres
+                # backend the translated text::timestamptz cast raises
+                # (SQLSTATE 22007) on a malformed non-NULL enqueued_at
+                # instead of degrading. Rows written by this codebase
+                # are always well-formed, so the divergence only matters
+                # for hand-edited data.
                 #
                 # v0.28: when ``priority_decay_sec`` > 0, subtract one
                 # rank level per ``decay_sec`` seconds in the queue. The
                 # MAX(0, ...) inside the inner CAST clamps the integer
-                # division to be non-negative on malformed timestamps;
+                # division to be non-negative on malformed timestamps
+                # (again SQLite-only -- see the v0.26 note above for the
+                # Postgres divergence);
                 # the outer MAX(_prio_rank, 1) at ORDER BY time floors
                 # the effective rank at 'low'=1 so a very old entry
                 # still pops in declared FIFO order against equally
@@ -3137,6 +3145,7 @@ class Database:
         self,
         *,
         engineer: str | None = None,
+        session_id: str | None = None,
         state: str | None = "waiting",
         repo: str | None = None,
         limit: int = 100,
@@ -3148,6 +3157,13 @@ class Database:
         queue state when ``state`` is set (default 'waiting' so the
         operator-facing endpoint only sees live entries; pass None to
         include granted/expired for forensic queries).
+
+        ``session_id`` widens (ORs) the requester filter: a row matches
+        when its ``requester_engineer`` equals ``engineer`` OR its
+        ``requester_session_id`` equals ``session_id``, so an MCP client
+        whose engineer name has drifted since enqueue time (renamed
+        worker, regenerated identity) still sees its own queue entries.
+        With only ``session_id`` set the filter is session-only.
 
         The join is LEFT so a queue row whose holder has been
         cascade-deleted still surfaces with NULL holder fields rather
@@ -3163,9 +3179,17 @@ class Database:
         )
         clauses: list[str] = []
         params: list[Any] = []
-        if engineer:
+        if engineer and session_id:
+            clauses.append(
+                "(cq.requester_engineer = ? OR cq.requester_session_id = ?)"
+            )
+            params.extend([engineer, session_id])
+        elif engineer:
             clauses.append("cq.requester_engineer = ?")
             params.append(engineer)
+        elif session_id:
+            clauses.append("cq.requester_session_id = ?")
+            params.append(session_id)
         if state:
             clauses.append("cq.state = ?")
             params.append(state)

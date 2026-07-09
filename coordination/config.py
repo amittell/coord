@@ -24,6 +24,17 @@ class Settings(BaseSettings):
     max_claim_files: int = 100
     max_claim_ratio: float = 0.2
     cleanup_interval_sec: int = 900
+    # Retention window for the symbol child tables (claim_symbols /
+    # claim_symbol_callsites / claim_symbol_renames) of RELEASED claims.
+    # Claims are soft-released (the row is kept for audit) and the child
+    # tables have no ON DELETE CASCADE, so without a reaper every symbol
+    # claim ever made leaves its child rows behind permanently. The
+    # background cleanup loop purges child rows of claims released at
+    # least this many seconds ago (leader-only, same cadence as
+    # cleanup_interval_sec). Default 24h -- comfortably past any audit or
+    # dashboard view that joins symbols of recently released claims. Set
+    # to 0 to disable the purge and keep child rows forever.
+    symbol_purge_after_sec: int = 86400
     default_ttl_hours: int = 4
     shared_ttl_hours: int = 2
     # Session-tagged claims auto-release when their holder has been

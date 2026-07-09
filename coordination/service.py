@@ -2384,7 +2384,12 @@ class CoordinationService:
         if active_only:
             rows = await self.db.list_active_claims_rows(exclude_engineer=None)
         else:
-            rows = await self.db.list_recent_claims(200)
+            # Push the repo scope into the SQL query so the 200-row window
+            # is per-repo: filtering after the LIMIT would let another
+            # repo's rows crowd a scoped viewer's history out of the
+            # global window entirely on a shared multi-repo service. The
+            # route-level post-filter stays as belt-and-braces.
+            rows = await self.db.list_recent_claims(200, repo=repo)
         if engineer:
             rows = [r for r in rows if r["engineer"] == engineer]
         if module_substring:
@@ -2934,14 +2939,31 @@ class CoordinationService:
         # the lock is released before the wait loop below.
         first_conflict = conflicts[0]
         blocking_claim_id = first_conflict.conflicting_claim.id
-        # Find the requester ClaimItem that produced this conflict by
-        # matching the your_pattern field; falling back to the first
-        # claim item if matching fails. Either way one item is enqueued.
+        # Find the requester ClaimItem that produced this conflict.
+        # Prefer a match on BOTH the pattern and the symbol set: a batch
+        # may legitimately carry two items with the same pattern but
+        # different symbols (e.g. two symbol scopes on one file), and a
+        # pattern-only first-match would enqueue the wrong item's
+        # symbols/narrowable. Fall back to pattern-only, then to the
+        # first claim item. Either way one item is enqueued.
+        conflict_symbols = (
+            list(first_conflict.your_symbols)
+            if first_conflict.your_symbols
+            else None
+        )
         target_item = body.claims[0]
-        for item in body.claims:
-            if item.pattern == first_conflict.your_pattern:
-                target_item = item
-                break
+        pattern_matches = [
+            item
+            for item in body.claims
+            if item.pattern == first_conflict.your_pattern
+        ]
+        if pattern_matches:
+            target_item = pattern_matches[0]
+            for item in pattern_matches:
+                item_symbols = list(item.symbols) if item.symbols else None
+                if item_symbols == conflict_symbols:
+                    target_item = item
+                    break
 
         async with self._quota_lock:
             engineer_queue_limit = self.settings.max_queued_per_engineer

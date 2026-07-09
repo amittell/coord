@@ -228,8 +228,17 @@ async def test_queued_listing_pushes_token_repo_into_query(
     svc = get_service()
     seen: list[dict] = []
 
-    async def rec_list(*, engineer=None, state="waiting", repo=None, limit=100):
-        seen.append({"engineer": engineer, "state": state, "repo": repo})
+    async def rec_list(
+        *, engineer=None, session_id=None, state="waiting", repo=None, limit=100
+    ):
+        seen.append(
+            {
+                "engineer": engineer,
+                "session_id": session_id,
+                "state": state,
+                "repo": repo,
+            }
+        )
         return []
 
     monkeypatch.setattr(svc.db, "list_queued_with_holder", rec_list)

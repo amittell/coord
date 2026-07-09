@@ -179,8 +179,9 @@ sqlite_writes_total = Counter(
     "sqlite_writes_total",
     "Write commits through the funnelled SQLite writer-queue path (a commit "
     "may span multiple statements, e.g. a claim-grant unit-of-work). Stays 0 "
-    "when COORD_SQLITE_WRITER_QUEUE is off and excludes the few legacy write "
-    "paths that still open their own connections.",
+    "when COORD_SQLITE_WRITER_QUEUE is off. Off-funnel write paths that still "
+    "open their own connections are NOT counted; the authoritative list lives "
+    "in Database._write's docstring (coordination/db.py).",
 )
 sqlite_writer_wait_seconds_total = Counter(
     "sqlite_writer_wait_seconds_total",

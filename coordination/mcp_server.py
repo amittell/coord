@@ -989,6 +989,7 @@ async def respond_to_request(
     narrowed_pattern: str = "",
     coexist_pattern: str = "",
     coexist_symbols: dict[str, list[str]] | None = None,
+    engineer: str | None = None,
 ) -> dict[str, Any]:
     """Approve, deny, narrow, or coexist on a release request filed
     against your claim.
@@ -1014,6 +1015,13 @@ async def respond_to_request(
       outside the pair. Cooperative not enforced -- imports and shared
       module-level state are still on the agents to handle.
 
+    ``engineer`` names the responding holder explicitly. Normally omit
+    it: the server defaults the actor to the authenticated token
+    identity. Pass it only when your per-engineer token identity
+    differs from the engineer name your claims were created under
+    (renamed worker fleets), otherwise the holder-authorization check
+    on the server would 403 the response.
+
     The decision and any pattern fields are audit-logged so the
     requester (and operators) can read the reasoning later.
     """
@@ -1022,6 +1030,8 @@ async def respond_to_request(
         "session_id": _SESSION_ID,
         "note": note or None,
     }
+    if engineer:
+        body["engineer"] = engineer
     if narrowed_pattern:
         body["narrowed_pattern"] = narrowed_pattern
     if coexist_pattern:
@@ -1034,7 +1044,7 @@ async def respond_to_request(
             "POST",
             f"{_base_url()}/requests/{request_id}/respond",
             json=body,
-            headers={**_headers(), "Content-Type": "application/json"},
+            headers={**_headers(engineer), "Content-Type": "application/json"},
             idempotent=False,
         )
         r.raise_for_status()
