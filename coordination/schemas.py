@@ -204,6 +204,23 @@ class ConflictCheckResponse(BaseModel):
     suggestion: str | None = None
 
 
+class ConflictBatchRequest(BaseModel):
+    """One-request conflict check used by the managed pre-push hook.
+
+    The legacy ``GET /conflicts`` endpoint accepts repeated ``pattern`` query
+    parameters, but a large push can exceed proxy/request-line limits.  This
+    JSON form keeps the same service semantics while allowing thousands of
+    paths in a bounded request body.
+    """
+
+    patterns: list[str] = Field(min_length=1, max_length=5000)
+    engineer: str = Field(min_length=1)
+    repo: str | None = None
+    all_repos: bool = False
+    session_ids: list[str] = Field(default_factory=list, max_length=1000)
+    branch: str | None = None
+
+
 class ReleaseClaimsRequest(BaseModel):
     claim_ids: list[str]
     engineer: str | None = None

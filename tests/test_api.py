@@ -62,6 +62,12 @@ async def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncClient
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
 
+    # v0.45's writer queue owns a persistent aiosqlite worker thread.
+    # Close it while pytest-asyncio's loop is still alive; clearing the
+    # lru_cache alone drops the object but lets the worker report back to an
+    # already-closed loop during interpreter/fixture teardown.
+    if deps.get_service.cache_info().currsize:
+        await deps.get_service().db.aclose()
     deps.get_service.cache_clear()
 
 
@@ -462,6 +468,49 @@ async def test_conflicts_endpoint_filters_by_repo(client: AsyncClient) -> None:
     )
     assert r.status_code == 200, r.text
     assert r.json()["has_conflicts"] is True
+
+
+@pytest.mark.asyncio
+async def test_conflicts_batch_matches_get_semantics(client: AsyncClient) -> None:
+    """The body-based hook endpoint checks every path in one request."""
+    h = {"Authorization": "Bearer test-token"}
+    r = await client.post(
+        "/claims",
+        headers=h,
+        json={
+            "engineer": "holder",
+            "repo": "amittell/coord",
+            "session_id": "holder-session",
+            "claims": [{"type": "module", "pattern": "src/claimed/**"}],
+        },
+    )
+    assert r.status_code == 200, r.text
+
+    r = await client.post(
+        "/conflicts/batch",
+        headers=h,
+        json={
+            "patterns": ["src/free.py", "src/claimed/file.py"],
+            "engineer": "pusher",
+            "repo": "amittell/coord",
+            "session_ids": ["pusher-session"],
+            "branch": "feature/batched-hook",
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["has_conflicts"] is True
+    assert {c["pattern"] for c in body["conflicts"]} == {"src/claimed/**"}
+
+
+@pytest.mark.asyncio
+async def test_conflicts_batch_requires_patterns(client: AsyncClient) -> None:
+    r = await client.post(
+        "/conflicts/batch",
+        headers={"Authorization": "Bearer test-token"},
+        json={"patterns": [], "engineer": "pusher"},
+    )
+    assert r.status_code == 422
 
 
 @pytest.mark.asyncio

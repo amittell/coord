@@ -12,6 +12,16 @@ bug fixes and test hardening are listed after them.
 
 ### Added
 
+- `POST /conflicts/batch`, the JSON body equivalent of `GET /conflicts`, lets
+  the managed pre-push hook check the complete pushed file set in one network
+  round-trip. The hook falls back to the legacy per-file GET only for older
+  servers returning 404/405, eliminating the multi-minute per-file curl loop
+  reported in #67 without breaking mixed-version fleets.
+- New-branch push checks accept `COORD_PUSH_BASE_REF` (or branch-local Git
+  config `branch.<name>.coordPushBase`) and prefer a resolvable configured
+  tracking base before `origin/HEAD`. Integration-branch topics now diff only
+  their own changes instead of the full integration-vs-main delta (#68).
+
 - Engineer identity binding (`COORD_ENFORCE_ENGINEER_IDENTITY`,
   `warn` | `enforce`, default `warn`). Per-engineer tokens authenticate a
   caller, but mutating requests also name an acting `engineer`; nothing
@@ -58,6 +68,17 @@ bug fixes and test hardening are listed after them.
 
 ### Changed
 
+- Dashboard views now identify their effective repository/fleet scope, use
+  scope-aware empty states, keep wide tables contained on narrow screens, and
+  provide larger mobile controls and accessible refresh/table semantics.
+  Repo-scoped viewers no longer see fleet-wide webhook aggregates, while the
+  token table calls out unscoped all-repository credentials explicitly.
+  Passive dashboard polling no longer corrupts token usage telemetry;
+  operator token creation requires a repo or an explicit all-repositories
+  choice (and mandatory-scope deployments cannot mint unusable unscoped
+  tokens); keyboard focus resets the refresh timer while editing a form
+  auto-pauses it; and hotspot suggestions use real, CSRF-protected unscoped
+  operator forms instead of dead links.
 - CLI token precedence flip: `coord status` / `claims` / `release` now
   resolve `COORD_AUTH_TOKEN` the same way the MCP wrapper does -- a real
   exported environment variable wins over `.coordination/local.env`, and

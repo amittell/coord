@@ -248,9 +248,7 @@ async def test_heatmap_shows_prefix_bucket_counts(svc: CoordinationService) -> N
 
 async def test_remaining_shows_time_until_expiry(svc: CoordinationService) -> None:
     exp = _iso(datetime.now(UTC) + timedelta(hours=2, minutes=5))
-    await _insert_claim(
-        svc, engineer="alice", pattern="src/auth/**", expires_at=exp
-    )
+    await _insert_claim(svc, engineer="alice", pattern="src/auth/**", expires_at=exp)
     html_out = await render_dashboard()
     # Time-left cell shows "2h ..." or "1h ..." (clock drift). The new
     # dashboard renders it as plain text in a <td>, no <strong> wrap.
@@ -265,9 +263,7 @@ async def test_remaining_shows_expired_for_past_expiry(svc: CoordinationService)
     timeline picks the claim up at all.
     """
     past = _iso(datetime.now(UTC) - timedelta(hours=1))
-    await _insert_claim(
-        svc, engineer="alice", pattern="src/auth/**", expires_at=past
-    )
+    await _insert_claim(svc, engineer="alice", pattern="src/auth/**", expires_at=past)
     html_out = await render_dashboard()
     assert "no claim history yet" not in html_out.lower()
     assert "alice" in html_out
@@ -661,9 +657,7 @@ def test_resolution_released_when_voluntarily_released() -> None:
         "expires_at": "2026-05-02T16:00:00Z",
         "last_activity": "2026-05-02T11:59:00Z",
     }
-    status, _ = _resolution_for_conflict(
-        conflict={}, claim=claim, idle_timeout_sec=1800, now=now
-    )
+    status, _ = _resolution_for_conflict(conflict={}, claim=claim, idle_timeout_sec=1800, now=now)
     assert status == "released"
 
 
@@ -678,9 +672,7 @@ def test_resolution_ttl_expired_when_release_at_or_after_expires() -> None:
         "expires_at": "2026-05-02T10:00:00Z",  # released_at past TTL
         "last_activity": "2026-05-02T09:30:00Z",
     }
-    status, _ = _resolution_for_conflict(
-        conflict={}, claim=claim, idle_timeout_sec=1800, now=now
-    )
+    status, _ = _resolution_for_conflict(conflict={}, claim=claim, idle_timeout_sec=1800, now=now)
     assert status == "ttl-expired"
 
 
@@ -699,9 +691,7 @@ def test_resolution_idle_released_when_session_idle() -> None:
         "expires_at": "2026-05-02T20:00:00Z",
         "last_activity": "2026-05-02T10:00:00Z",
     }
-    status, _ = _resolution_for_conflict(
-        conflict={}, claim=claim, idle_timeout_sec=1800, now=now
-    )
+    status, _ = _resolution_for_conflict(conflict={}, claim=claim, idle_timeout_sec=1800, now=now)
     assert status == "idle-released"
 
 
@@ -713,9 +703,7 @@ def test_resolution_missing_when_claim_not_in_dict() -> None:
     from coordination.dashboard import _resolution_for_conflict
 
     now = datetime(2026, 5, 2, 12, 0, tzinfo=UTC)
-    status, _ = _resolution_for_conflict(
-        conflict={}, claim=None, idle_timeout_sec=1800, now=now
-    )
+    status, _ = _resolution_for_conflict(conflict={}, claim=None, idle_timeout_sec=1800, now=now)
     assert status == "missing"
 
 
@@ -727,9 +715,7 @@ async def test_dashboard_shows_holder_and_resolution_for_conflicts(
     'blocked' resolution pill. The pre-v0.8 dashboard surfaced none
     of these -- the resolution column was always empty and the holder
     side of the conflict was never named."""
-    holder_id = await _insert_claim(
-        svc, engineer="holder-alice", pattern="src/auth/**"
-    )
+    holder_id = await _insert_claim(svc, engineer="holder-alice", pattern="src/auth/**")
     await svc.db.log_conflict(
         claim_id=holder_id,
         attempted_by="bob",
@@ -812,9 +798,7 @@ async def test_dashboard_renders_requested_scope_column_in_requests_panel(
     """v0.11 added a `requested_scope` column between `their pattern`
     and `holder` so an operator can see what the requester actually
     needed (often a sub-pattern of what the holder claimed)."""
-    cid = await _insert_claim(
-        svc, engineer="holder-eve", pattern="src/api/**"
-    )
+    cid = await _insert_claim(svc, engineer="holder-eve", pattern="src/api/**")
     await svc.file_request(
         claim_id=cid,
         requester="bob",
@@ -838,9 +822,7 @@ async def test_dashboard_renders_narrowed_decision_pill(
 ) -> None:
     """A request resolved via `decision=narrowed` shows the narrowed
     pill (dashed phosphor) instead of the regular approved pill."""
-    cid = await _insert_claim(
-        svc, engineer="holder-narrow", pattern="src/auth/**"
-    )
+    cid = await _insert_claim(svc, engineer="holder-narrow", pattern="src/auth/**")
     req = await svc.file_request(
         claim_id=cid,
         requester="bob",
@@ -870,9 +852,7 @@ async def test_dashboard_renders_coexist_decision_pill(
 ) -> None:
     """A request resolved via `decision=coexist` shows the cyan
     coexist pill, distinct from approved/narrowed."""
-    cid = await _insert_claim(
-        svc, engineer="holder-coex", pattern="src/auth.py"
-    )
+    cid = await _insert_claim(svc, engineer="holder-coex", pattern="src/auth.py")
     req = await svc.file_request(
         claim_id=cid,
         requester="bob",
@@ -911,16 +891,12 @@ async def test_dashboard_active_claims_show_symbol_names_for_symbol_scope(
     the API."""
     from uuid import uuid4
 
-    cid = await _insert_claim(
-        svc, engineer="alice", pattern="src/auth/login.ts"
-    )
+    cid = await _insert_claim(svc, engineer="alice", pattern="src/auth/login.ts")
     # Flip the claim to symbol scope and seed two symbols. The DB layer
     # tolerates this composition: scope_type lives on claims, the symbol
     # list lives on claim_symbols.
     async with seam_connection(svc.db) as conn:
-        await conn.execute(
-            "UPDATE claims SET scope_type = 'symbol' WHERE id = ?", (cid,)
-        )
+        await conn.execute("UPDATE claims SET scope_type = 'symbol' WHERE id = ?", (cid,))
     await svc.db.insert_claim_symbols(
         rows=[
             (str(uuid4()), cid, "src/auth/login.ts", "handleLogin", "function", None),
@@ -950,29 +926,47 @@ async def test_dashboard_symbol_spans_render_line_ranges_and_lsp_marker(
     repo root) render the bare name exactly as before."""
     from uuid import uuid4
 
-    cid = await _insert_claim(
-        svc, engineer="alice", pattern="src/auth/login.ts"
-    )
+    cid = await _insert_claim(svc, engineer="alice", pattern="src/auth/login.ts")
     async with seam_connection(svc.db) as conn:
-        await conn.execute(
-            "UPDATE claims SET scope_type = 'symbol' WHERE id = ?", (cid,)
-        )
+        await conn.execute("UPDATE claims SET scope_type = 'symbol' WHERE id = ?", (cid,))
     await svc.db.insert_claim_symbols(
         rows=[
             # Parser-resolved span: lines only, columns NULL.
             (
-                str(uuid4()), cid, "src/auth/login.ts", "handleLogin",
-                "function", None, 3, None, 9, None, "parser",
+                str(uuid4()),
+                cid,
+                "src/auth/login.ts",
+                "handleLogin",
+                "function",
+                None,
+                3,
+                None,
+                9,
+                None,
+                "parser",
             ),
             # LSP-resolved span: full precision plus the marker.
             (
-                str(uuid4()), cid, "src/auth/login.ts", "validateCredentials",
-                "function", None, 12, 0, 20, 1, "lsp",
+                str(uuid4()),
+                cid,
+                "src/auth/login.ts",
+                "validateCredentials",
+                "function",
+                None,
+                12,
+                0,
+                20,
+                1,
+                "lsp",
             ),
             # Legacy six-column row: NULL spans, bare-name rendering.
             (
-                str(uuid4()), cid, "src/auth/login.ts", "legacyHelper",
-                "function", None,
+                str(uuid4()),
+                cid,
+                "src/auth/login.ts",
+                "legacyHelper",
+                "function",
+                None,
             ),
         ]
     )
@@ -1046,10 +1040,8 @@ async def test_dashboard_renders_hotspots_panel(
         branch="main",
         description="seed",
         items=[
-            ("holder-h", "file", "src/router.ts", "soft",
-             "2099-01-01T00:00:00Z"),
-            ("holder-w", "file", "src/middleware.ts", "soft",
-             "2099-01-01T00:00:00Z"),
+            ("holder-h", "file", "src/router.ts", "soft", "2099-01-01T00:00:00Z"),
+            ("holder-w", "file", "src/middleware.ts", "soft", "2099-01-01T00:00:00Z"),
         ],
         session_id="sess",
         repo="amittell/coord",
@@ -1064,16 +1056,14 @@ async def test_dashboard_renders_hotspots_panel(
                 "INSERT INTO conflict_log (id, claim_id, attempted_by, "
                 "attempted_pattern, resolution, created_at) "
                 "VALUES (?, ?, ?, ?, NULL, ?)",
-                (str(uuid4()), "holder-h", f"eng-{i % 6}",
-                 "src/router.ts", recent),
+                (str(uuid4()), "holder-h", f"eng-{i % 6}", "src/router.ts", recent),
             )
         for i in range(7):
             await conn.execute(
                 "INSERT INTO conflict_log (id, claim_id, attempted_by, "
                 "attempted_pattern, resolution, created_at) "
                 "VALUES (?, ?, ?, ?, NULL, ?)",
-                (str(uuid4()), "holder-w", f"eng-{i}",
-                 "src/middleware.ts", recent),
+                (str(uuid4()), "holder-w", f"eng-{i}", "src/middleware.ts", recent),
             )
 
     html_out = await render_dashboard()
@@ -1091,11 +1081,11 @@ async def test_dashboard_renders_hotspots_panel(
 
 
 @pytest.mark.asyncio
-async def test_dashboard_hotspot_action_link_present(
+async def test_dashboard_hotspot_action_form_is_operator_only(
     svc: CoordinationService,
 ) -> None:
     """v0.21: hotspot rows that pass the actionable thresholds render
-    an "apply" link; pure-monitor rows do not."""
+    a real operator form; pure-monitor rows and scoped viewers do not."""
     from uuid import uuid4
 
     await svc.db.insert_claims_batch(
@@ -1103,10 +1093,8 @@ async def test_dashboard_hotspot_action_link_present(
         branch="main",
         description="seed",
         items=[
-            ("h-promote", "file", "src/promote.ts", "soft",
-             "2099-01-01T00:00:00Z"),
-            ("h-monitor", "file", "src/monitor.ts", "soft",
-             "2099-01-01T00:00:00Z"),
+            ("h-promote", "file", "src/promote.ts", "soft", "2099-01-01T00:00:00Z"),
+            ("h-monitor", "file", "src/monitor.ts", "soft", "2099-01-01T00:00:00Z"),
         ],
         session_id="sess",
         repo="amittell/coord",
@@ -1121,41 +1109,56 @@ async def test_dashboard_hotspot_action_link_present(
                 "INSERT INTO conflict_log (id, claim_id, attempted_by, "
                 "attempted_pattern, resolution, created_at) "
                 "VALUES (?, ?, ?, ?, NULL, ?)",
-                (str(uuid4()), "h-promote", f"eng-{i % 6}",
-                 "src/promote.ts", recent),
+                (str(uuid4()), "h-promote", f"eng-{i % 6}", "src/promote.ts", recent),
             )
         for i in range(7):
             await conn.execute(
                 "INSERT INTO conflict_log (id, claim_id, attempted_by, "
                 "attempted_pattern, resolution, created_at) "
                 "VALUES (?, ?, ?, ?, NULL, ?)",
-                (str(uuid4()), "h-monitor", f"eng-{i}",
-                 "src/monitor.ts", recent),
+                (str(uuid4()), "h-monitor", f"eng-{i}", "src/monitor.ts", recent),
             )
 
-    html_out = await render_dashboard()
+    csrf = "c" * 64
+    html_out = await render_dashboard(
+        is_operator=True,
+        can_promote_hotspots=True,
+        csrf_token=csrf,
+    )
 
     # v0.36 reorder put the active-claims panel above hotspots, and these
     # files are also held as active claims, so scope the search to the
     # hotspots panel to find the hotspot row (not the claim row).
     assert "src/promote.ts" in html_out
-    hotspots_panel = html_out[html_out.index("hotspot files (30d)"):]
-    # Promote.ts row carries an apply link with the right action.
+    hotspots_panel = html_out[html_out.index("hotspot files (30d)") :]
+    # Promote.ts row carries a CSRF-protected apply form with the right action.
     promote_idx = hotspots_panel.index("src/promote.ts")
-    promote_row = hotspots_panel[promote_idx:promote_idx + 800]
+    promote_row = hotspots_panel[promote_idx : promote_idx + 800]
     assert 'class="hsapply"' in promote_row
-    assert 'data-action="shared_file"' in promote_row
+    assert 'action="/dashboard/hotspots/promote"' in promote_row
+    assert 'name="action" value="shared_file"' in promote_row
+    assert f'name="csrf_token" value="{csrf}"' in promote_row
+    assert 'href="#"' not in promote_row
 
     # Monitor.ts row exists but has NO apply link in its row slice.
     assert "src/monitor.ts" in html_out
     monitor_idx = hotspots_panel.index("src/monitor.ts")
-    monitor_row = hotspots_panel[monitor_idx:monitor_idx + 800]
+    monitor_row = hotspots_panel[monitor_idx : monitor_idx + 800]
     # The row must end before the next .hsrow div opens; scope the
     # apply-check to the cell containing this row's pattern.
     next_row_start = monitor_row.find('<div class="hsrow"', 1)
     if next_row_start > 0:
         monitor_row = monitor_row[:next_row_start]
     assert 'class="hsapply"' not in monitor_row
+
+    scoped = await render_dashboard(
+        viewer_engineer="alex/claude/main",
+        viewer_repo="amittell/coord",
+        csrf_token=csrf,
+    )
+    scoped_hotspots = scoped[scoped.index("hotspot files (30d)") :]
+    assert "src/promote.ts" in scoped_hotspots
+    assert "/dashboard/hotspots/promote" not in scoped_hotspots
 
 
 # ---------------------------------------------------------------------------
@@ -1177,8 +1180,7 @@ async def test_dashboard_renders_pending_queue_panel(
         branch="main",
         description="big refactor",
         items=[
-            ("holder-q1", "file", "src/router.ts", "soft",
-             "2099-01-01T00:00:00Z"),
+            ("holder-q1", "file", "src/router.ts", "soft", "2099-01-01T00:00:00Z"),
         ],
         session_id="sess-holder",
         repo="amittell/coord",
@@ -1394,9 +1396,7 @@ async def test_dashboard_hero_stats_are_live_first(svc: CoordinationService) -> 
     blocked now, waiting, repos) and no longer spends a slot on the static
     idle-timeout constant -- that moves to the status bar."""
     html_out = await render_dashboard()
-    stats = html_out[
-        html_out.index('class="stats"') : html_out.index('class="attention')
-    ]
+    stats = html_out[html_out.index('class="stats"') : html_out.index('class="attention')]
     for label in ("active claims", "blocked now", "waiting", "repos"):
         assert f">{label}</span>" in stats
     # idle-timeout is no longer a hero stat; it now lives in the status bar.
@@ -1452,21 +1452,33 @@ async def test_dashboard_flags_contended_and_release_asked_claims(
     future = _iso(now + timedelta(hours=2))
     # Two active claims on the same pattern by different engineers.
     await _insert_claim_raw(
-        svc, engineer="alice", pattern="services/shared.py",
-        created_at=fresh, expires_at=future,
+        svc,
+        engineer="alice",
+        pattern="services/shared.py",
+        created_at=fresh,
+        expires_at=future,
     )
     await _insert_claim_raw(
-        svc, engineer="bob", pattern="services/shared.py",
-        created_at=fresh, expires_at=future,
+        svc,
+        engineer="bob",
+        pattern="services/shared.py",
+        created_at=fresh,
+        expires_at=future,
     )
     # A third active claim that someone files a release request against.
     cid = await _insert_claim_raw(
-        svc, engineer="carol", pattern="services/lonely.py",
-        created_at=fresh, expires_at=future,
+        svc,
+        engineer="carol",
+        pattern="services/lonely.py",
+        created_at=fresh,
+        expires_at=future,
     )
     await svc.file_request(
-        claim_id=cid, requester="dave", requester_session_id=None,
-        reason="hot", urgency="normal",
+        claim_id=cid,
+        requester="dave",
+        requester_session_id=None,
+        reason="hot",
+        urgency="normal",
     )
     html_out = await render_dashboard()
     # Scope to the active-claims panel.
@@ -1488,16 +1500,13 @@ async def test_dashboard_includes_auto_refresh_script(
     assert "sessionStorage" in html_out  # scroll-position preservation
 
 
-
 # ---------------------------------------------------------------------------
 # repo-scoped dashboard viewer (#30 slice 2/3). A scoped-token session sees
 # only its repo; an operator (viewer_repo=None) sees everything (unchanged).
 # ---------------------------------------------------------------------------
 
 
-async def _seed_repo_claim(
-    svc: CoordinationService, cid: str, pattern: str, repo: str
-) -> None:
+async def _seed_repo_claim(svc: CoordinationService, cid: str, pattern: str, repo: str) -> None:
     await svc.db.insert_claims_batch(
         engineer="eng",
         branch=None,
@@ -1549,6 +1558,78 @@ async def test_dashboard_scoped_viewer_hotspots_scoped(
                 )
 
     html_out = await render_dashboard(viewer_repo="amittell/repo-a")
-    hotspots = html_out[html_out.index("hotspot files (30d)"):]
+    hotspots = html_out[html_out.index("hotspot files (30d)") :]
     assert "src/hot-a.py" in hotspots
     assert "src/hot-b.py" not in hotspots
+
+
+async def test_dashboard_scope_banner_and_empty_states_are_explicit(
+    svc: CoordinationService,
+) -> None:
+    scoped = await render_dashboard(viewer_repo="amittell/repo-a")
+    assert "Repository scope: amittell/repo-a" in scoped
+    assert "Fleet-wide data is hidden." in scoped
+    assert 'href="/dashboard/login">switch token / login</a>' in scoped
+    assert "no active claims in this repository" in scoped
+    assert "no recent conflict attempts logged in this repository" in scoped
+    # Webhook rows have no repo key, so their fleet aggregate is not safe to
+    # show under a repository-scoped token.
+    assert "<h2>webhook delivery" not in scoped
+
+    fleet = await render_dashboard()
+    assert '<strong class="scope-label">All repositories</strong>' in fleet
+    assert "Fleet-wide data is visible." in fleet
+    assert "no active claims across all repositories" in fleet
+
+
+async def test_dashboard_mobile_and_accessibility_contract(
+    svc: CoordinationService,
+) -> None:
+    html_out = await render_dashboard()
+
+    # The refresh affordance is a stateful control, not a navigation link.
+    assert '<button type="button" id="refresh-toggle"' in html_out
+    assert 'aria-pressed="false"' in html_out
+    assert "toggle.setAttribute('aria-pressed'" in html_out
+    assert '<a href="#" id="refresh-toggle"' not in html_out
+    assert "ae !== document.body" in html_out
+    assert "ae !== document.documentElement" in html_out
+    assert "ae !== toggle" in html_out
+    assert "left = SECS" in html_out
+    assert "document.addEventListener('input', pauseForFormEdit)" in html_out
+    assert "document.addEventListener('change', pauseForFormEdit)" in html_out
+
+    # Every semantic table has an accessible caption and a local horizontal
+    # scroll region, so wide data never forces document-level overflow.
+    assert html_out.count("<table") == html_out.count('<caption class="visually-hidden">')
+    assert html_out.count("<table") == html_out.count('class="table-scroll"')
+    assert "overflow-x: auto" in html_out
+    assert "@media (max-width: 640px)" in html_out
+    assert "min-height: 44px" in html_out
+    assert "font-size: 16px" in html_out
+    assert "@media (prefers-reduced-motion: reduce)" in html_out
+
+
+async def test_dashboard_labels_unavailable_conflict_details_as_retained_history(
+    svc: CoordinationService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cid = await _insert_claim(svc, engineer="holder", pattern="src/old.py")
+    await svc.db.log_conflict(
+        claim_id=cid,
+        attempted_by="requester",
+        attempted_pattern="src/old.py",
+        resolution=None,
+    )
+
+    async def no_retained_claim_details(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr(svc.db, "list_recent_claims", no_retained_claim_details)
+    html_out = await render_dashboard()
+    start = html_out.index("<h2>recent conflicts")
+    end = html_out.index("</section>", start)
+    panel = html_out[start:end]
+    assert "recent conflicts · retained history" in panel
+    assert "latest 500 attempts · claim details may age out" in panel
+    assert "retained history · details unavailable" in panel
+    assert ">missing</span>" not in panel

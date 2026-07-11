@@ -24,6 +24,7 @@ import re
 import secrets
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -58,9 +59,7 @@ async def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncClient
 
 
 @pytest.fixture()
-async def insecure_client(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> AsyncClient:
+async def insecure_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncClient:
     """Insecure no-auth deployment: every request authenticates as the
     anonymous outcome (ok, auth_kind None). Token management must be
     locked out -- there is no identity to bind tokens to."""
@@ -107,7 +106,12 @@ async def test_scoped_session_cannot_mint_unscoped_token(
     cookies = await _login(client, raw)
     r = await client.post(
         "/dashboard/tokens/create",
-        data={"description": "child-token", "csrf_token": cookies["coord_csrf"]},
+        data={
+            "description": "child-token",
+            "repo": "amittell/repo-b",
+            "all_repos": "1",
+            "csrf_token": cookies["coord_csrf"],
+        },
         cookies=cookies,
     )
     assert r.status_code == 200, r.text
@@ -120,9 +124,7 @@ async def _login(client: AsyncClient, token: str) -> dict[str, str]:
     """POST the login form and capture the session + csrf cookie pair.
     The client jar is cleared afterwards so each test passes cookies
     explicitly per request (deterministic, no jar accumulation)."""
-    r = await client.post(
-        "/dashboard/login", data={"token": token}, follow_redirects=False
-    )
+    r = await client.post("/dashboard/login", data={"token": token}, follow_redirects=False)
     assert r.status_code == 303, r.text
     cookies = {
         "coord_session": r.cookies["coord_session"],
@@ -170,6 +172,40 @@ async def test_csrf_hidden_input_present_in_rendered_forms(
     assert r.status_code == 200
     assert 'name="csrf_token"' in r.text
     assert cookies["coord_csrf"] in r.text
+
+
+async def test_dashboard_polling_does_not_touch_token_audit_fields(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Login records one browser use; passive 20-second dashboard renders
+    must not make an otherwise idle credential look continuously active."""
+    db = _svc().db
+    monkeypatch.setattr(db, "TOKEN_TOUCH_MIN_INTERVAL_SEC", 0.0)
+    raw, token_id = await _mint_engineer_token("alex/claude/main")
+    cookies = await _login(client, raw)
+
+    before = await db.get_engineer_token_by_id(token_id)
+    assert before is not None
+    assert before["request_count"] == 1
+    audit_before = (
+        before["last_used_at"],
+        before["request_count"],
+        before["last_source_ip"],
+        before["last_user_agent"],
+    )
+
+    for _ in range(3):
+        r = await client.get("/dashboard", cookies=cookies)
+        assert r.status_code == 200
+
+    after = await db.get_engineer_token_by_id(token_id)
+    assert after is not None
+    assert (
+        after["last_used_at"],
+        after["request_count"],
+        after["last_source_ip"],
+        after["last_user_agent"],
+    ) == audit_before
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +258,7 @@ async def test_operator_create_returns_one_time_page(
         "/dashboard/tokens/create",
         data={
             "engineer": "dana/claude/feature",
+            "repo": "amittell/coord",
             "description": "build box",
             "csrf_token": cookies["coord_csrf"],
         },
@@ -236,11 +273,9 @@ async def test_operator_create_returns_one_time_page(
     raw_minted = match.group(0)
 
     rows = await _token_rows()
-    assert any(
-        row["engineer"] == "dana/claude/feature"
-        and row["description"] == "build box"
-        for row in rows
-    )
+    minted_row = next(row for row in rows if row["engineer"] == "dana/claude/feature")
+    assert minted_row["description"] == "build box"
+    assert minted_row["repo"] == "amittell/coord"
 
     # The dashboard reload must not contain the raw value -- only the
     # sha256 hash was stored, so it cannot be re-rendered.
@@ -249,9 +284,7 @@ async def test_operator_create_returns_one_time_page(
     assert raw_minted not in r2.text
 
     # The minted token actually authenticates.
-    r3 = await client.get(
-        "/claims", headers={"Authorization": f"Bearer {raw_minted}"}
-    )
+    r3 = await client.get("/claims", headers={"Authorization": f"Bearer {raw_minted}"})
     assert r3.status_code == 200
 
 
@@ -267,6 +300,7 @@ async def test_per_engineer_create_forces_own_engineer(
         "/dashboard/tokens/create",
         data={
             "engineer": "someone-else/claude/main",
+            "repo": "amittell/coord",
             "csrf_token": cookies["coord_csrf"],
         },
         cookies=cookies,
@@ -275,9 +309,7 @@ async def test_per_engineer_create_forces_own_engineer(
     assert "shown exactly once" in r.text
 
     rows = await _token_rows()
-    assert not any(
-        row["engineer"] == "someone-else/claude/main" for row in rows
-    )
+    assert not any(row["engineer"] == "someone-else/claude/main" for row in rows)
     own = [r2 for r2 in rows if r2["engineer"] == "alex/claude/main"]
     assert len(own) == 2  # the session token + the freshly minted one
 
@@ -290,12 +322,118 @@ async def test_shared_session_create_requires_engineer(
 
     r = await client.post(
         "/dashboard/tokens/create",
-        data={"csrf_token": cookies["coord_csrf"]},
+        data={"repo": "amittell/coord", "csrf_token": cookies["coord_csrf"]},
         cookies=cookies,
     )
     assert r.status_code == 200
     assert "Engineer is required" in r.text
     assert len(await _token_rows()) == before
+
+
+async def test_unscoped_session_must_choose_token_scope(
+    client: AsyncClient,
+) -> None:
+    cookies = await _login(client, SHARED_TOKEN)
+    before = len(await _token_rows())
+
+    r = await client.post(
+        "/dashboard/tokens/create",
+        data={
+            "engineer": "dana/claude/feature",
+            "csrf_token": cookies["coord_csrf"],
+        },
+        cookies=cookies,
+    )
+    assert r.status_code == 200
+    assert "Repository is required" in r.text
+    assert "explicitly select all repositories" in r.text
+    assert len(await _token_rows()) == before
+
+
+async def test_unscoped_session_rejects_conflicting_scope_choices(
+    client: AsyncClient,
+) -> None:
+    cookies = await _login(client, SHARED_TOKEN)
+    before = len(await _token_rows())
+
+    r = await client.post(
+        "/dashboard/tokens/create",
+        data={
+            "engineer": "dana/claude/feature",
+            "repo": "amittell/coord",
+            "all_repos": "1",
+            "csrf_token": cookies["coord_csrf"],
+        },
+        cookies=cookies,
+    )
+    assert r.status_code == 200
+    assert "not both" in r.text
+    assert len(await _token_rows()) == before
+
+
+async def test_unscoped_session_rejects_invalid_repo_scope(
+    client: AsyncClient,
+) -> None:
+    cookies = await _login(client, SHARED_TOKEN)
+    before = len(await _token_rows())
+
+    r = await client.post(
+        "/dashboard/tokens/create",
+        data={
+            "engineer": "dana/claude/feature",
+            "repo": "bad//repo",
+            "csrf_token": cookies["coord_csrf"],
+        },
+        cookies=cookies,
+    )
+    assert r.status_code == 200
+    assert "owner/name" in r.text
+    assert len(await _token_rows()) == before
+
+
+async def test_required_scope_mode_cannot_mint_dead_unscoped_token(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("COORD_REQUIRE_SCOPED_TOKEN", "true")
+    cookies = await _login(client, SHARED_TOKEN)
+
+    dashboard = await client.get("/dashboard", cookies=cookies)
+    assert dashboard.status_code == 200
+    assert 'placeholder="owner/name (required)"' in dashboard.text
+    assert 'name="all_repos"' not in dashboard.text
+
+    rejected = await client.post(
+        "/dashboard/tokens/create",
+        data={
+            "engineer": "dana/claude/feature",
+            "all_repos": "1",
+            "csrf_token": cookies["coord_csrf"],
+        },
+        cookies=cookies,
+    )
+    assert rejected.status_code == 200
+    assert "requires repo-scoped tokens" in rejected.text
+    assert not any(
+        row["engineer"] == "dana/claude/feature"
+        for row in await _token_rows()
+    )
+
+    created = await client.post(
+        "/dashboard/tokens/create",
+        data={
+            "engineer": "dana/claude/feature",
+            "repo": "amittell/coord",
+            "csrf_token": cookies["coord_csrf"],
+        },
+        cookies=cookies,
+    )
+    assert created.status_code == 200
+    row = next(
+        row
+        for row in await _token_rows()
+        if row["engineer"] == "dana/claude/feature"
+    )
+    assert row["repo"] == "amittell/coord"
 
 
 async def test_expiring_session_must_set_expires_in(
@@ -310,7 +448,7 @@ async def test_expiring_session_must_set_expires_in(
 
     r = await client.post(
         "/dashboard/tokens/create",
-        data={"csrf_token": cookies["coord_csrf"]},
+        data={"repo": "amittell/coord", "csrf_token": cookies["coord_csrf"]},
         cookies=cookies,
     )
     assert r.status_code == 200
@@ -330,7 +468,11 @@ async def test_expiring_session_cannot_outlive_own_token(
 
     r = await client.post(
         "/dashboard/tokens/create",
-        data={"expires_in": "30d", "csrf_token": cookies["coord_csrf"]},
+        data={
+            "repo": "amittell/coord",
+            "expires_in": "30d",
+            "csrf_token": cookies["coord_csrf"],
+        },
         cookies=cookies,
     )
     assert r.status_code == 200
@@ -347,7 +489,11 @@ async def test_expiring_session_create_within_cap_succeeds(
 
     r = await client.post(
         "/dashboard/tokens/create",
-        data={"expires_in": "1d", "csrf_token": cookies["coord_csrf"]},
+        data={
+            "repo": "amittell/coord",
+            "expires_in": "1d",
+            "csrf_token": cookies["coord_csrf"],
+        },
         cookies=cookies,
     )
     assert r.status_code == 200
@@ -374,6 +520,7 @@ async def test_operator_create_with_bad_duration_shows_error(
         "/dashboard/tokens/create",
         data={
             "engineer": "dana/claude/feature",
+            "repo": "amittell/coord",
             "expires_in": "banana",
             "csrf_token": cookies["coord_csrf"],
         },
@@ -396,6 +543,7 @@ async def test_operator_create_without_expiry_is_uncapped(
         "/dashboard/tokens/create",
         data={
             "engineer": "dana/claude/feature",
+            "all_repos": "1",
             "csrf_token": cookies["coord_csrf"],
         },
         cookies=cookies,
@@ -406,6 +554,7 @@ async def test_operator_create_without_expiry_is_uncapped(
     minted = [r2 for r2 in rows if r2["engineer"] == "dana/claude/feature"]
     assert len(minted) == 1
     assert minted[0]["expires_at"] is None
+    assert minted[0]["repo"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -445,6 +594,44 @@ async def test_operator_panel_lists_all_tokens_including_revoked(
     # Operator view carries the engineer column.
     assert "alex/claude/main" in r.text
     assert "blair/claude/main" in r.text
+    assert 'name="repo" placeholder="owner/name (recommended)"' in r.text
+    assert 'name="all_repos" value="1"' in r.text
+    assert "high-privilege credential" in r.text
+
+
+async def test_operator_token_panel_labels_repository_scope(
+    client: AsyncClient,
+) -> None:
+    _, unscoped_id = await _mint_engineer_token("alex/claude/main")
+    _, scoped_id = await _mint_engineer_token("blair/claude/main", repo="amittell/repo-a")
+    cookies = await _login(client, SHARED_TOKEN)
+
+    r = await client.get("/dashboard", cookies=cookies)
+    assert r.status_code == 200
+    assert "<th>repo / scope</th>" in r.text
+    assert unscoped_id in r.text
+    assert scoped_id in r.text
+    assert "<span class='pill tok-unscoped'>unscoped</span>" in r.text
+    assert "all repositories</span>" in r.text
+    assert "amittell/repo-a</span>" in r.text
+
+
+async def test_repo_scoped_token_panel_does_not_show_other_token_scopes(
+    client: AsyncClient,
+) -> None:
+    raw, scoped_id = await _mint_engineer_token("alex/claude/main", repo="amittell/repo-a")
+    _, unscoped_id = await _mint_engineer_token("alex/claude/main")
+    _, other_repo_id = await _mint_engineer_token("alex/claude/main", repo="amittell/repo-b")
+    cookies = await _login(client, raw)
+
+    r = await client.get("/dashboard", cookies=cookies)
+    assert r.status_code == 200
+    assert "Repository scope: amittell/repo-a" in r.text
+    assert scoped_id in r.text
+    assert unscoped_id not in r.text
+    assert other_repo_id not in r.text
+    assert 'name="repo" value="amittell/repo-a"' in r.text
+    assert 'name="all_repos"' not in r.text
 
 
 # ---------------------------------------------------------------------------
@@ -563,6 +750,106 @@ async def test_revoke_missing_or_already_revoked_is_idempotent(
         follow_redirects=False,
     )
     assert r.status_code == 303
+
+
+# ---------------------------------------------------------------------------
+# POST /dashboard/hotspots/promote
+# ---------------------------------------------------------------------------
+
+
+async def test_operator_can_apply_hotspot_form(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    promote = AsyncMock(return_value="shared_files:\n  - src/router.ts\n")
+    monkeypatch.setattr(_svc(), "promote_hotspot", promote)
+    cookies = await _login(client, SHARED_TOKEN)
+
+    r = await client.post(
+        "/dashboard/hotspots/promote",
+        data={
+            "action": "shared_file",
+            "pattern": "src/router.ts",
+            "csrf_token": cookies["coord_csrf"],
+        },
+        cookies=cookies,
+        follow_redirects=False,
+    )
+    assert r.status_code == 303
+    assert r.headers["location"] == "/dashboard"
+    promote.assert_awaited_once_with(action="shared_file", pattern="src/router.ts", note=None)
+
+
+async def test_unscoped_per_engineer_can_apply_hotspot_in_live_auth_mode(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("COORD_REQUIRE_PER_ENGINEER_TOKEN", "true")
+    svc = _svc()
+    promote = AsyncMock(return_value="shared_files:\n  - src/router.ts\n")
+    monkeypatch.setattr(svc, "promote_hotspot", promote)
+    raw, _ = await _mint_engineer_token("operator/claude/main")
+    cookies = await _login(client, raw)
+
+    import coordination.main as main_mod
+
+    rendered = AsyncMock(return_value="<!doctype html><html></html>")
+    monkeypatch.setattr(main_mod, "render_dashboard", rendered)
+    dashboard = await client.get("/dashboard", cookies=cookies)
+    assert dashboard.status_code == 200
+    assert rendered.await_args.kwargs["can_promote_hotspots"] is True
+    assert rendered.await_args.kwargs["is_operator"] is False
+
+    r = await client.post(
+        "/dashboard/hotspots/promote",
+        data={
+            "action": "shared_file",
+            "pattern": "src/router.ts",
+            "csrf_token": cookies["coord_csrf"],
+        },
+        cookies=cookies,
+        follow_redirects=False,
+    )
+    assert r.status_code == 303
+    promote.assert_awaited_once_with(
+        action="shared_file", pattern="src/router.ts", note=None
+    )
+
+
+async def test_hotspot_form_requires_csrf(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    promote = AsyncMock(return_value="")
+    monkeypatch.setattr(_svc(), "promote_hotspot", promote)
+    cookies = await _login(client, SHARED_TOKEN)
+
+    r = await client.post(
+        "/dashboard/hotspots/promote",
+        data={"action": "split", "pattern": "src/router.ts"},
+        cookies=cookies,
+    )
+    assert r.status_code == 403
+    promote.assert_not_awaited()
+
+
+async def test_repo_scoped_session_cannot_apply_global_hotspot_form(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    promote = AsyncMock(return_value="")
+    monkeypatch.setattr(_svc(), "promote_hotspot", promote)
+    raw, _ = await _mint_engineer_token("alex/claude/main", repo="amittell/coord")
+    cookies = await _login(client, raw)
+
+    r = await client.post(
+        "/dashboard/hotspots/promote",
+        data={
+            "action": "shared_file",
+            "pattern": "src/router.ts",
+            "csrf_token": cookies["coord_csrf"],
+        },
+        cookies=cookies,
+    )
+    assert r.status_code == 403
+    assert "operator session" in r.text
+    promote.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

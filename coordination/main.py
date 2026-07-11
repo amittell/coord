@@ -48,6 +48,7 @@ from coordination.ownership import parse_ownership_yaml
 from coordination.service import LspUnavailable, RateLimitExceeded
 from coordination.schemas import (
     ClaimRefactorRequest,
+    ConflictBatchRequest,
     CreateClaimsRequest,
     ExtendClaimRequest,
     FileRequestRequest,
@@ -123,6 +124,13 @@ async def lifespan(app: FastAPI):
         try:
             yield
         finally:
+            # Disabling the background loops must not disable resource
+            # cleanup. The SQLite writer queue owns a persistent aiosqlite
+            # thread/connection that still needs an orderly shutdown.
+            try:
+                await get_service().db.aclose()
+            except Exception:  # pragma: no cover - best-effort shutdown
+                logger.debug("db.aclose on shutdown failed", exc_info=True)
             await _shutdown_lsp_pool()
         return
 
@@ -666,7 +674,10 @@ def _source_ip_from_request(request: Request) -> str | None:
 
 
 async def _authenticate_bearer(
-    request: Request, token: str | None
+    request: Request,
+    token: str | None,
+    *,
+    record_activity: bool = True,
 ) -> AuthOutcome:
     """Single source of truth for bearer authentication (v0.29.4).
 
@@ -685,6 +696,11 @@ async def _authenticate_bearer(
 
     Counts ``auth_failures_total`` on every 401 it produces; the
     misconfiguration 500 is not an auth failure and is not counted.
+
+    ``record_activity=False`` is reserved for passive dashboard renders.
+    The login POST records the browser session once; subsequent polling must
+    not overwrite the token audit fields every 20 seconds and make an idle
+    credential look active.
     """
     settings = get_settings()
 
@@ -748,14 +764,15 @@ async def _authenticate_bearer(
             # Best-effort activity capture. The auth path must never
             # 401 because the update failed (e.g. transient lock
             # contention), so a broad except is correct here.
-            try:
-                await service.db.touch_engineer_token(
-                    token_hash,
-                    source_ip=_source_ip_from_request(request),
-                    user_agent=request.headers.get("user-agent"),
-                )
-            except Exception:  # noqa: BLE001 - intentional swallow
-                pass
+            if record_activity:
+                try:
+                    await service.db.touch_engineer_token(
+                        token_hash,
+                        source_ip=_source_ip_from_request(request),
+                        user_agent=request.headers.get("user-agent"),
+                    )
+                except Exception:  # noqa: BLE001 - intentional swallow
+                    pass
             return AuthOutcome(
                 ok=True,
                 auth_kind="per_engineer",
@@ -1222,6 +1239,10 @@ async def _render_dashboard_for(
     return await render_dashboard(
         viewer_engineer=outcome.engineer,
         is_operator=outcome.auth_kind == "shared",
+        can_promote_hotspots=(
+            outcome.auth_kind in {"per_engineer", "shared"}
+            and outcome.token_repo is None
+        ),
         viewer_repo=outcome.token_repo,
         csrf_token=csrf,
         token_error=token_error,
@@ -1246,7 +1267,9 @@ async def dashboard(
     can scope itself (own tokens vs operator view).
     """
     token = _extract_bearer(authorization, request)
-    outcome = await _authenticate_bearer(request, token)
+    outcome = await _authenticate_bearer(
+        request, token, record_activity=False
+    )
     if outcome.ok:
         csrf, minted = _csrf_for_request(request)
         response = HTMLResponse(await _render_dashboard_for(outcome, csrf))
@@ -2023,8 +2046,8 @@ async def dashboard_tokens_create(
 ) -> Response:
     """Mint a per-engineer token from the dashboard's create form.
 
-    Form fields: ``engineer``, ``description``, ``expires_in``,
-    ``csrf_token``. Per-engineer sessions can only mint for
+    Form fields: ``engineer``, ``repo``, ``all_repos``, ``description``,
+    ``expires_in``, ``csrf_token``. Per-engineer sessions can only mint for
     themselves (the submitted engineer field is ignored) and, when
     their own session token expires, only tokens that expire no later
     -- self-service must never escalate lifetime. Shared-token
@@ -2058,6 +2081,49 @@ async def dashboard_tokens_create(
         if not engineer:
             return await _dashboard_with_token_error(
                 request, outcome, "Engineer is required to mint a token."
+            )
+
+    # Scoped sessions always pass their own scope through to child tokens;
+    # submitted repo/all_repos fields cannot widen it. Unscoped sessions
+    # must now choose a repository or explicitly opt into a fleet-wide
+    # credential. This keeps the dangerous legacy capability available for
+    # intentional operators without making it the dashboard's silent
+    # default.
+    new_token_repo: str | None
+    if outcome.token_repo is not None:
+        new_token_repo = outcome.token_repo
+    else:
+        requested_repo = _form_str(form, "repo")
+        all_repos_value = _form_str(form, "all_repos").lower()
+        explicit_all_repos = all_repos_value in {"1", "on", "true", "yes"}
+        if get_settings().require_scoped_token and explicit_all_repos:
+            return await _dashboard_with_token_error(
+                request,
+                outcome,
+                "This deployment requires repo-scoped tokens; choose one "
+                "repository instead of all repositories.",
+            )
+        if requested_repo and explicit_all_repos:
+            return await _dashboard_with_token_error(
+                request,
+                outcome,
+                "Choose either one repository or all repositories, not both.",
+            )
+        if requested_repo:
+            try:
+                new_token_repo = normalize_repo_id(requested_repo)
+            except InvalidRepoId as exc:
+                return await _dashboard_with_token_error(
+                    request, outcome, str(exc)
+                )
+        elif explicit_all_repos:
+            new_token_repo = None
+        else:
+            return await _dashboard_with_token_error(
+                request,
+                outcome,
+                "Repository is required. To mint a fleet-wide credential, "
+                "explicitly select all repositories.",
             )
 
     expires_at: datetime | None = None
@@ -2109,11 +2175,8 @@ async def dashboard_tokens_create(
             )
 
     # #30 slice 2/3: a repo-scoped session may only mint tokens bound to its
-    # own repo -- it must never be able to mint an unscoped (operator) token
-    # or one for another repo, which would be a privilege escalation. An
-    # operator (unscoped / shared) session has token_repo=None and keeps
-    # minting unscoped tokens as before.
-    new_token_repo = outcome.token_repo
+    # own repo -- it must never be able to mint an unscoped credential or one
+    # for another repo, which would be a privilege escalation.
     raw = generate_raw_token()
     token_id = await get_service().db.create_engineer_token(
         engineer,
@@ -2219,6 +2282,71 @@ async def dashboard_tokens_revoke(
                     )
     else:
         await db.revoke_engineer_token(token_id)
+
+    response = Response(status_code=303)
+    response.headers["Location"] = "/dashboard"
+    return response
+
+
+@app.post("/dashboard/hotspots/promote", response_class=HTMLResponse)
+async def dashboard_hotspot_promote(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """Apply one dashboard hotspot suggestion as an operator.
+
+    This form bridge gives the server-rendered dashboard a real action without
+    weakening the JSON API: it requires an authenticated shared/operator
+    session plus the dashboard's double-submit CSRF token. Repo-scoped
+    sessions are rejected because the ownership YAML mutation is
+    deployment-global; an unscoped per-engineer credential retains the same
+    global capability as the JSON endpoint in per-engineer-only deployments.
+    """
+    gate = await _authenticate_token_management(request, authorization)
+    if isinstance(gate, Response):
+        return gate
+    if gate.token_repo is not None:
+        return HTMLResponse(
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+            "<title>coord -- forbidden</title></head><body>"
+            "<p>Hotspot promotion requires an unscoped operator session.</p>"
+            "<p><a href=\"/dashboard\">back to dashboard</a></p>"
+            "</body></html>",
+            status_code=403,
+        )
+
+    form = await request.form()
+    csrf_value = form.get("csrf_token")
+    if not isinstance(csrf_value, str) or not _validate_dashboard_csrf(
+        request, csrf_value
+    ):
+        return _csrf_failure_response()
+
+    action = _form_str(form, "action")
+    pattern = _form_str(form, "pattern")
+    if action not in {"shared_file", "split"} or not pattern:
+        return HTMLResponse(
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+            "<title>coord -- invalid hotspot action</title></head><body>"
+            "<p>A hotspot action must name a pattern and use shared_file or "
+            "split.</p><p><a href=\"/dashboard\">back to dashboard</a></p>"
+            "</body></html>",
+            status_code=400,
+        )
+
+    try:
+        await get_service().promote_hotspot(
+            action=action, pattern=pattern, note=None
+        )
+    except ValueError as exc:
+        return HTMLResponse(
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+            "<title>coord -- hotspot action failed</title></head><body>"
+            f"<p>{html_mod.escape(str(exc))}</p>"
+            "<p><a href=\"/dashboard\">back to dashboard</a></p>"
+            "</body></html>",
+            status_code=400,
+        )
 
     response = Response(status_code=303)
     response.headers["Location"] = "/dashboard"
@@ -2459,6 +2587,39 @@ async def conflicts(
             all_repos=all_repos,
             session_ids=session_id,
             pushing_branch=branch,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return result.model_dump()
+
+
+@app.post("/conflicts/batch")
+async def conflicts_batch(
+    body: ConflictBatchRequest,
+    request: Request,
+    _: None = Depends(require_auth),
+) -> dict:
+    """Check every pushed path in one HTTP request.
+
+    This is the body-based twin of ``GET /conflicts``.  It exists for the
+    managed pre-push hook, where hundreds of per-file network round-trips are
+    both slow and prone to request-line limits when encoded into one GET.
+    Authentication, repo-scope enforcement, session self-exclusion and GitHub
+    push-bounce reporting are intentionally identical to the legacy route.
+    """
+    repo = _effective_read_repo(
+        request,
+        body.repo,
+        all_repos=body.all_repos,
+    )
+    try:
+        result = await get_service().check_conflicts(
+            patterns=body.patterns,
+            engineer=body.engineer,
+            repo=repo,
+            all_repos=body.all_repos,
+            session_ids=body.session_ids,
+            pushing_branch=body.branch,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

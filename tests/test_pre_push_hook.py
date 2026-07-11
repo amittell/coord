@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -120,6 +121,13 @@ def test_script_consumes_push_stdin_for_per_ref_diffs() -> None:
     assert "EMPTY_TREE" in PRE_PUSH_SCRIPT
 
 
+def test_script_prefers_batch_conflict_endpoint_with_legacy_fallback() -> None:
+    assert '"${COORD_URL}/conflicts/batch"' in PRE_PUSH_SCRIPT
+    assert '"${COORD_URL}/conflicts?pattern=${enc}' in PRE_PUSH_SCRIPT
+    assert '"${batch_status}" == "404"' in PRE_PUSH_SCRIPT
+    assert '"${batch_status}" == "405"' in PRE_PUSH_SCRIPT
+
+
 def test_script_sources_local_env_before_reading_config() -> None:
     # The hook must source .coordination/local.env before falling back
     # to env vars and defaults. Without this, a remote-mode repo would
@@ -229,7 +237,7 @@ def _extract_session_qs_block(script: str) -> str:
     # e2e test stays in lockstep with whatever the script actually does
     # (no copy-paste drift).
     start_marker = 'SESSION_QS=""'
-    end_marker = "while IFS= read -r file; do"
+    end_marker = "validate_conflict_response() {"
     start = script.index(start_marker)
     end = script.index(end_marker, start)
     return script[start:end]
@@ -334,7 +342,7 @@ def test_script_session_qs_e2e_empty_when_file_missing(tmp_path) -> None:
     assert result.stdout == "[]", result.stdout
 
 
-def _git(repo: Path, *args: str) -> None:
+def _git(repo: Path, *args: str) -> str:
     env = dict(os.environ)
     # Deterministic identity so commits succeed in a clean CI sandbox.
     env.update(
@@ -345,7 +353,7 @@ def _git(repo: Path, *args: str) -> None:
             "GIT_COMMITTER_EMAIL": "coord-test@example.com",
         }
     )
-    subprocess.run(
+    result = subprocess.run(
         ["git", *args],
         cwd=str(repo),
         env=env,
@@ -353,6 +361,151 @@ def _git(repo: Path, *args: str) -> None:
         capture_output=True,
         text=True,
     )
+    return result.stdout.strip()
+
+
+def _extract_diff_functions(script: str) -> str:
+    start = script.index("diff_names() {")
+    end = script.index('PUSH_INPUT=""', start)
+    return script[start:end]
+
+
+def test_new_branch_diff_honors_explicit_integration_base(tmp_path) -> None:
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("bash not available on this platform")
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+    _git(repo, "add", "seed.txt")
+    _git(repo, "commit", "-q", "-m", "seed")
+    _git(repo, "branch", "-M", "main")
+    main_sha = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "update-ref", "refs/remotes/origin/main", main_sha)
+    _git(
+        repo,
+        "symbolic-ref",
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/main",
+    )
+
+    _git(repo, "switch", "-q", "-c", "pre-prod")
+    (repo / "integration.txt").write_text("pre-prod\n", encoding="utf-8")
+    _git(repo, "add", "integration.txt")
+    _git(repo, "commit", "-q", "-m", "integration")
+    integration_sha = _git(repo, "rev-parse", "HEAD")
+    _git(
+        repo,
+        "update-ref",
+        "refs/remotes/origin/pre-prod",
+        integration_sha,
+    )
+
+    _git(repo, "switch", "-q", "-c", "feature")
+    (repo / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(repo, "add", "feature.txt")
+    _git(repo, "commit", "-q", "-m", "feature")
+    feature_sha = _git(repo, "rev-parse", "HEAD")
+
+    fragment = tmp_path / "diff-fragment.sh"
+    fragment.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'UPSTREAM="origin"\n'
+        'COORD_PUSH_BASE_REF="origin/pre-prod"\n'
+        'ZERO_SHA="0000000000000000000000000000000000000000"\n'
+        'EMPTY_TREE="$(git hash-object -t tree /dev/null)"\n'
+        f"{_extract_diff_functions(PRE_PUSH_SCRIPT)}"
+        f'diff_for_ref refs/heads/feature "{feature_sha}" '
+        'refs/heads/feature "${ZERO_SHA}"\n',
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [bash, str(fragment)],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["feature.txt"]
+
+
+def test_hook_batches_multiple_files_into_one_curl(tmp_path) -> None:
+    bash = shutil.which("bash")
+    jq = shutil.which("jq")
+    if not bash or not jq:
+        pytest.skip("bash and jq are required")
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "coord test")
+    _git(repo, "config", "user.email", "coord-test@example.com")
+    (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+    _git(repo, "add", "seed.txt")
+    _git(repo, "commit", "-q", "-m", "seed")
+    base_sha = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "switch", "-q", "-c", "feature")
+    (repo / "one.py").write_text("one\n", encoding="utf-8")
+    (repo / "two.py").write_text("two\n", encoding="utf-8")
+    _git(repo, "add", "one.py", "two.py")
+    _git(repo, "commit", "-q", "-m", "two files")
+    head_sha = _git(repo, "rev-parse", "HEAD")
+
+    coord_dir = repo / ".coordination"
+    coord_dir.mkdir()
+    (coord_dir / "local.env").write_text(
+        "COORD_API_URL=https://coord.test\n"
+        "COORD_REPO_ID=amittell/coord\n",
+        encoding="utf-8",
+    )
+    hook = coord_dir / "pre-push"
+    hook.write_text(PRE_PUSH_SCRIPT, encoding="utf-8")
+    hook.chmod(0o755)
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_curl = fake_bin / "curl"
+    fake_curl.write_text(
+        "#!/usr/bin/env bash\n"
+        'cat > "${CAPTURE_PAYLOAD}"\n'
+        'count=0; [[ -f "${CAPTURE_COUNT}" ]] && count="$(cat "${CAPTURE_COUNT}")"\n'
+        'printf "%s" "$((count + 1))" > "${CAPTURE_COUNT}"\n'
+        "printf '{\"has_conflicts\":false,\"conflicts\":[],\"safe_to_proceed\":true,\"safe\":true}\\n200'\n",
+        encoding="utf-8",
+    )
+    fake_curl.chmod(0o755)
+    capture_payload = tmp_path / "payload.json"
+    capture_count = tmp_path / "count"
+    env = dict(os.environ)
+    env.update(
+        {
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "CAPTURE_PAYLOAD": str(capture_payload),
+            "CAPTURE_COUNT": str(capture_count),
+        }
+    )
+    push_line = (
+        f"refs/heads/feature {head_sha} refs/heads/feature {base_sha}\n"
+    )
+    result = subprocess.run(
+        [bash, str(hook), "origin", "https://example.invalid/repo.git"],
+        cwd=repo,
+        input=push_line,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert capture_count.read_text(encoding="utf-8") == "1"
+    payload = json.loads(capture_payload.read_text(encoding="utf-8"))
+    assert payload["patterns"] == ["one.py", "two.py"]
+    assert payload["repo"] == "amittell/coord"
+    assert payload["branch"] == "feature"
 
 
 def test_shim_resolves_helper_from_main_root_in_linked_worktree(tmp_path) -> None:

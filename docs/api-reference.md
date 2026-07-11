@@ -256,6 +256,29 @@ curl "http://127.0.0.1:8080/conflicts?engineer=alex/claude/main&pattern=src/auth
   -H "Authorization: Bearer $COORD_AUTH_TOKEN"
 ```
 
+## `POST /conflicts/batch`
+
+Body-based equivalent of `GET /conflicts`, intended for pre-push checks with
+many paths. It applies the same authentication, repo scoping, session
+self-exclusion, and push-bounce reporting without one HTTP request per file or
+an oversized query string.
+
+```bash
+curl -X POST "http://127.0.0.1:8080/conflicts/batch" \
+  -H "Authorization: Bearer $COORD_AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "patterns": ["src/auth/login.ts", "src/auth/session.ts"],
+    "engineer": "alex/claude/main",
+    "repo": "amittell/coord",
+    "session_ids": ["current-mcp-session"],
+    "branch": "feature/auth"
+  }'
+```
+
+The managed hook tries this endpoint first and falls back to per-file
+`GET /conflicts` only when an older server returns 404 or 405.
+
 ## `GET /repos` (v0.3.0+)
 
 Per-repo activity summary. One row per distinct repo that has ever attached its identifier to a claim.

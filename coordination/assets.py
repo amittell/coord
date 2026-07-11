@@ -199,12 +199,59 @@ diff_names() {
   fi
 }
 
+new_branch_base_ref() {
+  local local_ref="$1"
+  local short_ref="${local_ref#refs/heads/}"
+  local configured="${COORD_PUSH_BASE_REF:-}"
+  local merge_ref=""
+  local merge_remote=""
+  local inferred=""
+
+  # Explicit override wins. It may be supplied by .coordination/local.env
+  # for integration-branch repos, or per branch in git config:
+  #   git config branch.<name>.coordPushBase origin/pre-prod
+  if [[ -z "${configured}" && "${short_ref}" != "${local_ref}" ]]; then
+    configured="$(git config --get "branch.${short_ref}.coordPushBase" 2>/dev/null || true)"
+  fi
+  if [[ -n "${configured}" ]]; then
+    if ! git rev-parse "${configured}" >/dev/null 2>&1; then
+      echo "coordination pre-push: configured push base does not resolve: ${configured}" >&2
+      return 1
+    fi
+    printf '%s\\n' "${configured}"
+    return 0
+  fi
+
+  # A preconfigured tracking base is the next-best signal. This is useful
+  # when a new topic branch intentionally tracks a long-lived integration
+  # branch. Ignore an inferred ref that is not present locally and continue
+  # to the backwards-compatible remote-HEAD fallback.
+  if [[ "${short_ref}" != "${local_ref}" ]]; then
+    merge_ref="$(git config --get "branch.${short_ref}.merge" 2>/dev/null || true)"
+    merge_remote="$(git config --get "branch.${short_ref}.remote" 2>/dev/null || true)"
+    if [[ -n "${merge_ref}" ]]; then
+      if [[ -z "${merge_remote}" || "${merge_remote}" == "." ]]; then
+        inferred="${merge_ref#refs/heads/}"
+      else
+        inferred="${merge_remote}/${merge_ref#refs/heads/}"
+      fi
+      if git rev-parse "${inferred}" >/dev/null 2>&1; then
+        printf '%s\\n' "${inferred}"
+        return 0
+      fi
+    fi
+  fi
+
+  printf '%s\\n' "${UPSTREAM}/HEAD"
+}
+
 diff_for_ref() {
   local local_ref="$1"
   local local_sha="$2"
   local remote_ref="$3"
   local remote_sha="$4"
   local base=""
+  local base_ref=""
 
   # Deleted refs have no local tree to inspect; nothing to claim against.
   if [[ -z "${local_sha}" || "${local_sha}" == "${ZERO_SHA}" ]]; then
@@ -217,13 +264,19 @@ diff_for_ref() {
     return
   fi
 
-  # First push of this branch: fall back to merge-base against the
-  # default branch, or against the empty tree if no remote HEAD yet.
+  # First push of this branch: prefer an explicit/configured integration
+  # base, then a resolvable tracking base, and only then remote HEAD. This
+  # prevents a one-file branch cut from pre-prod from checking the entire
+  # pre-prod-vs-main delta (#68). Fall back to the empty tree if no remote
+  # reference exists yet.
   # The empty tree is required for the very first push; triple-dot
   # diffs fail there because triple-dot needs a commit on each side.
-  if git rev-parse "${UPSTREAM}/HEAD" >/dev/null 2>&1; then
-    if ! base="$(git merge-base "${local_sha}" "${UPSTREAM}/HEAD")"; then
-      echo "coordination pre-push: could not find merge base for ${local_ref} and ${UPSTREAM}/HEAD" >&2
+  if ! base_ref="$(new_branch_base_ref "${local_ref}")"; then
+    return 1
+  fi
+  if git rev-parse "${base_ref}" >/dev/null 2>&1; then
+    if ! base="$(git merge-base "${local_sha}" "${base_ref}")"; then
+      echo "coordination pre-push: could not find merge base for ${local_ref} and ${base_ref}" >&2
       return 1
     fi
   else
@@ -319,6 +372,7 @@ fi
 # no live MCP sessions for this repo, in which case we fall through to
 # the existing engineer-name self-exclusion.
 SESSION_QS=""
+SESSION_IDS=""
 if [[ -f "${REPO_ROOT}/.coordination/sessions.live" ]]; then
   coord_pid_is_live() {
     local pid="$1"
@@ -403,38 +457,92 @@ PY
     if ! coord_pid_is_live "${pid_field}"; then
       continue
     fi
+    SESSION_IDS+="${session_field}"$'\\n'
     enc_sid="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${session_field}")"
     SESSION_QS+="&session_id=${enc_sid}"
   done < "${REPO_ROOT}/.coordination/sessions.live"
 fi
 
-while IFS= read -r file; do
-  [[ -z "${file}" ]] && continue
-  enc="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${file}")"
-  # Fail-closed on transport errors. Pre-v0.7 used '|| true' here, which
-  # made network glitches silently bypass the conflict check.
-  if ! resp="$(curl -fsS \\
-    ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} \\
-    "${COORD_URL}/conflicts?pattern=${enc}&engineer=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${ENGINEER}")${REPO_QS}${SESSION_QS}${BRANCH_QS}")"; then
-    echo "coordination pre-push: conflict check failed for ${file}; refusing to push" >&2
-    exit 1
-  fi
-  if ! has="$(printf '%s' "${resp}" | jq -r '.has_conflicts // false' 2>/dev/null)"; then
-    echo "coordination pre-push: invalid conflict-check response for ${file}; refusing to push" >&2
+validate_conflict_response() {
+  local resp="$1"
+  local context="$2"
+  local has=""
+  if ! has="$(printf '%s' "${resp}" | jq -r \\
+    'if (.has_conflicts | type) == "boolean" then .has_conflicts else error("missing boolean has_conflicts") end' \\
+    2>/dev/null)"; then
+    echo "coordination pre-push: invalid conflict-check response for ${context}; refusing to push" >&2
     printf '%s\\n' "${resp}" >&2
-    exit 1
+    return 1
   fi
   if [[ "${has}" == "true" ]]; then
-    echo "coordination pre-push: conflict reported for ${file}" >&2
+    echo "coordination pre-push: conflict reported for ${context}" >&2
     printf '%s\\n' "${resp}" | jq . >&2 || printf '%s\\n' "${resp}" >&2
-    exit 1
+    return 2
   fi
   if [[ "${has}" != "false" ]]; then
-    echo "coordination pre-push: unexpected conflict-check value for ${file}: ${has}" >&2
+    echo "coordination pre-push: unexpected conflict-check value for ${context}: ${has}" >&2
     printf '%s\\n' "${resp}" | jq . >&2 || printf '%s\\n' "${resp}" >&2
-    exit 1
+    return 1
   fi
-done <<< "${MODIFIED}"
+  return 0
+}
+
+legacy_conflict_check() {
+  local file=""
+  local enc=""
+  local resp=""
+  while IFS= read -r file; do
+    [[ -z "${file}" ]] && continue
+    enc="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${file}")"
+    # Fail-closed on transport errors. Pre-v0.7 used '|| true' here, which
+    # made network glitches silently bypass the conflict check.
+    if ! resp="$(curl -fsS \\
+      ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} \\
+      "${COORD_URL}/conflicts?pattern=${enc}&engineer=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${ENGINEER}")${REPO_QS}${SESSION_QS}${BRANCH_QS}")"; then
+      echo "coordination pre-push: conflict check failed for ${file}; refusing to push" >&2
+      return 1
+    fi
+    validate_conflict_response "${resp}" "${file}" || return $?
+  done <<< "${MODIFIED}"
+}
+
+# Modern servers accept the complete push as JSON, cutting a 300-file push
+# from 300 HTTP round-trips (plus per-file interpreter spawns) to one (#67).
+# A 404/405 means an older coord server; only that case falls back to the
+# legacy per-file GET contract. Every other error remains fail-closed.
+PATTERNS_JSON="$(printf '%s\\n' "${MODIFIED}" | jq -Rsc 'split("\\n") | map(select(length > 0))')"
+SESSION_IDS_JSON="$(printf '%s' "${SESSION_IDS}" | jq -Rsc 'split("\\n") | map(select(length > 0))')"
+BATCH_PAYLOAD="$(jq -cn \\
+  --argjson patterns "${PATTERNS_JSON}" \\
+  --arg engineer "${ENGINEER}" \\
+  --arg repo "${REPO_ID}" \\
+  --arg branch "${BRANCH}" \\
+  --argjson session_ids "${SESSION_IDS_JSON}" \\
+  '{patterns: $patterns, engineer: $engineer, session_ids: $session_ids}
+   + (if $repo == "" then {} else {repo: $repo} end)
+   + (if $branch == "" or $branch == "HEAD" then {} else {branch: $branch} end)')"
+
+if ! batch_raw="$(printf '%s' "${BATCH_PAYLOAD}" | curl -sS \\
+  ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} \\
+  -H "Content-Type: application/json" \\
+  --data-binary @- \\
+  -w $'\\n%{http_code}' \\
+  "${COORD_URL}/conflicts/batch")"; then
+  echo "coordination pre-push: batch conflict check failed; refusing to push" >&2
+  exit 1
+fi
+
+batch_status="${batch_raw##*$'\\n'}"
+batch_resp="${batch_raw%$'\\n'*}"
+if [[ "${batch_status}" == "404" || "${batch_status}" == "405" ]]; then
+  legacy_conflict_check || exit $?
+elif [[ "${batch_status}" == 2* ]]; then
+  validate_conflict_response "${batch_resp}" "pushed file batch" || exit $?
+else
+  echo "coordination pre-push: batch conflict check returned HTTP ${batch_status}; refusing to push" >&2
+  printf '%s\\n' "${batch_resp}" >&2
+  exit 1
+fi
 
 exit 0
 """
