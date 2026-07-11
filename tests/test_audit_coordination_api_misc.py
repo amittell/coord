@@ -261,13 +261,16 @@ async def test_list_recent_claims_filters_repo_before_limit(
     await _seed_claim(client, REPO_A, "src/a.py")
     await _seed_claim(client, REPO_B, "src/b.py")
     db = get_service().db
-    # Make the repo-B claim strictly newer so an unscoped limit-1 window
-    # is filled entirely by repo B.
+    # Make the ordering deterministic with backend-neutral ISO timestamps so
+    # this regression exercises the same query on SQLite and PostgreSQL.
     async with seam_connection(db) as conn:
         await conn.execute(
-            "UPDATE claims SET created_at = datetime(created_at, '+1 hour') "
-            "WHERE repo = ?",
-            (REPO_B,),
+            "UPDATE claims SET created_at = ? WHERE repo = ?",
+            ("2000-01-01T00:00:00+00:00", REPO_A),
+        )
+        await conn.execute(
+            "UPDATE claims SET created_at = ? WHERE repo = ?",
+            ("2100-01-01T00:00:00+00:00", REPO_B),
         )
 
     newest = await db.list_recent_claims(1)

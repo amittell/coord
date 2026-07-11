@@ -46,6 +46,7 @@ def test_token_is_not_inlined_on_curl_argv() -> None:
     assert 'CURL_AUTH=(--config "${CURL_AUTH_CFG}")' in PRE_PUSH_SCRIPT
     # ...that is created by mktemp and cleaned up on exit.
     assert "mktemp" in PRE_PUSH_SCRIPT
+    assert 'chmod 600 "${CURL_AUTH_CFG}"' in PRE_PUSH_SCRIPT
     assert "trap 'rm -f \"${CURL_AUTH_CFG}\"' EXIT" in PRE_PUSH_SCRIPT
     # The token reaches python3 via the environment, never argv.
     assert 'COORD_HOOK_TOKEN="${TOKEN}" python3' in PRE_PUSH_SCRIPT
@@ -72,7 +73,8 @@ def test_auth_block_e2e_writes_token_to_private_config_not_argv(
     """Run the real auth-block fragment with a token containing a double
     quote and a backslash. The curl argv (CURL_AUTH expansion) must not
     contain the token; the config file must hold the properly escaped
-    header line and be chmod 600."""
+    header line. The script's chmod 600 contract is verified through mode
+    bits on POSIX and statically on Windows, whose CRT synthesizes mode bits."""
     bash = _require_bash()
     _require_python3()
 
@@ -103,8 +105,13 @@ def test_auth_block_e2e_writes_token_to_private_config_not_argv(
     # argv carries only --config and a temp path; never the token.
     assert argv_lines[0] == "ARGV:--config"
     assert not any("sekret" in ln for ln in argv_lines)
-    # Config file is private to the pushing user.
-    assert perm_lines == ["PERM:0o600"]
+    # Config file is private to the pushing user. Windows' CRT reports
+    # synthetic POSIX mode bits (typically 0666) even after Git Bash's chmod,
+    # so st_mode can only verify the permission contract on POSIX. The static
+    # assertion above keeps the chmod itself pinned on every platform.
+    assert len(perm_lines) == 1
+    if os.name != "nt":
+        assert perm_lines == ["PERM:0o600"]
     # The header line is present with backslash and quote escaped per the
     # curl config quoting rules.
     assert cfg_lines == [

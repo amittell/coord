@@ -181,10 +181,13 @@ async def test_delivery_loop_not_started_when_neither_transport_configured(
 
 
 async def test_sqlite_release_leader_lease_is_a_true_noop(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from coordination.db import Database
 
+    # The PostgreSQL matrix exports COORD_DATABASE_URL globally, while this
+    # test deliberately pins the SQLite implementation's no-op contract.
+    monkeypatch.delenv("COORD_DATABASE_URL", raising=False)
     db = Database(tmp_path / "lease.sqlite")
     assert (
         await db.release_leader_lease(
