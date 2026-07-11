@@ -112,8 +112,25 @@ class Registry:
 
     def __init__(self) -> None:
         self._metrics: list[_Metric] = []
+        self._names: set[str] = set()
 
     def register(self, metric: _Metric) -> None:
+        """Register a metric, enforcing name uniqueness.
+
+        Duplicate names would render duplicate ``# HELP``/``# TYPE``
+        blocks for one family, which Prometheus rejects -- and a
+        rejected exposition drops the ENTIRE scrape, not just the
+        duplicate. Raise at registration time (import time for the
+        module-level singletons) so the mistake fails fast instead of
+        silently breaking monitoring at scrape time. This matches the
+        official client's ``Duplicated timeseries in CollectorRegistry``
+        behavior.
+        """
+        if metric.name in self._names:
+            raise ValueError(
+                f"duplicate metric name {metric.name!r} already registered"
+            )
+        self._names.add(metric.name)
         self._metrics.append(metric)
 
     def render(self) -> str:
@@ -162,8 +179,9 @@ sqlite_writes_total = Counter(
     "sqlite_writes_total",
     "Write commits through the funnelled SQLite writer-queue path (a commit "
     "may span multiple statements, e.g. a claim-grant unit-of-work). Stays 0 "
-    "when COORD_SQLITE_WRITER_QUEUE is off and excludes the few legacy write "
-    "paths that still open their own connections.",
+    "when COORD_SQLITE_WRITER_QUEUE is off. Off-funnel write paths that still "
+    "open their own connections are NOT counted; the authoritative list lives "
+    "in Database._write's docstring (coordination/db.py).",
 )
 sqlite_writer_wait_seconds_total = Counter(
     "sqlite_writer_wait_seconds_total",

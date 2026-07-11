@@ -207,6 +207,31 @@ Most common causes (all closed in v0.7.x):
 
 Run `coord doctor` -- the v0.7.1+ `.coordination/hooks/pre-push exists` check catches the most common partial-install variant.
 
+## A one-file new branch checks hundreds of unrelated files
+
+Symptom: the first push of a topic branch created from a long-lived integration
+branch (for example `pre-prod`) checks the entire integration-vs-default-branch
+delta.
+
+The managed hook normally infers the base from an existing remote ref. On a
+brand-new remote branch there is no remote SHA, so configure the intended base
+in `.coordination/local.env`:
+
+```bash
+COORD_PUSH_BASE_REF=origin/pre-prod
+```
+
+For a branch-specific setting that can stay in local Git config instead:
+
+```bash
+git config branch.my-feature.coordPushBase origin/pre-prod
+```
+
+The hook validates the configured ref, diffs from its merge-base, and fails
+closed when an explicit `COORD_PUSH_BASE_REF` does not resolve. Modern servers
+also receive the full file set through one `POST /conflicts/batch`; a 404/405
+from an older server triggers the compatible per-file fallback.
+
 ## `git stash -u` keeps wiping `.coordination/` files
 
 Symptom: every few hours `.coordination/config.toml`, `owners.yaml`, and `hooks/pre-push` disappear, but `local.env` survives.
@@ -233,7 +258,7 @@ Fix in v0.10.0: `coord-mcp` writes its `session_id` to `<repo_root>/.coordinatio
 
 `sessions.live` is local runtime state used by the pre-push hook to identify the current MCP session. Older coord versions could leave a dead-PID row behind when an agent process was killed instead of exiting cleanly.
 
-Fix in v0.33.1: coord now compacts `sessions.live` under a repo-local lock when `coord-mcp` starts or exits, and `coord doctor` prunes stale rows immediately when it can rewrite the file. If doctor still warns, inspect permissions on `.coordination/sessions.live`; the pre-push hook still skips dead PIDs, so the warning is hygiene rather than a coordination break.
+Fix in v0.35.1: coord now compacts `sessions.live` under a repo-local lock when `coord-mcp` starts or exits, and `coord doctor` prunes stale rows immediately when it can rewrite the file. If doctor still warns, inspect permissions on `.coordination/sessions.live`; the pre-push hook still skips dead PIDs, so the warning is hygiene rather than a coordination break.
 
 ## `coord doctor` reports regex fallback for symbol parsers
 

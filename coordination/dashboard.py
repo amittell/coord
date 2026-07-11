@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import html
-import json
 from collections import Counter, defaultdict
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -101,12 +100,16 @@ def _resolution_for_conflict(
       idle thresholds. Most often: the holder saw the conflict in
       ``pending_requests`` and called ``release_session`` / explicit
       release.
-    * ``missing`` -- conflict references a claim_id we don't have. The
-      claim aged out of the recent-claims window we fetch, or was
-      deleted manually. Surface so an operator notices schema drift.
+    * ``missing`` -- retained conflict history references a claim_id whose
+      details are unavailable in the recent-claims window (or were removed
+      manually). The rendered dashboard deliberately labels this as retained
+      history with unavailable details, not as a live claim that is "missing".
     """
     if claim is None:
-        return ("missing", "claim record not in recent window")
+        return (
+            "missing",
+            "retained conflict history; linked claim details unavailable",
+        )
 
     released = _parse_iso(claim.get("released_at"))
     expires = _parse_iso(claim.get("expires_at"))
@@ -181,9 +184,7 @@ def _recent_activity(
     """
     cutoff = now - timedelta(hours=window_hours)
 
-    fresh_claims = [
-        c for c in claims if (ts := _parse_iso(c.get("created_at"))) and ts >= cutoff
-    ]
+    fresh_claims = [c for c in claims if (ts := _parse_iso(c.get("created_at"))) and ts >= cutoff]
     fresh_conflicts = [
         c for c in conflicts if (ts := _parse_iso(c.get("created_at"))) and ts >= cutoff
     ]
@@ -197,9 +198,7 @@ def _recent_activity(
     top_modules: list[dict[str, Any]] = []
     for prefix, items in by_module.items():
         eng_set: set[str] = {str(name) for i in items if (name := i.get("engineer"))}
-        top_modules.append(
-            {"prefix": prefix, "count": len(items), "engineers": sorted(eng_set)}
-        )
+        top_modules.append({"prefix": prefix, "count": len(items), "engineers": sorted(eng_set)})
     top_modules.sort(key=lambda m: (-m["count"], m["prefix"]))
 
     return {
@@ -217,12 +216,14 @@ def _recent_activity(
 # Aesthetic: phosphor terminal × Bloomberg ops console × Edward Tufte.
 # Dense, monospace, sharp edges, color reserved for signal not decoration.
 # Type pairing: Major Mono Display for ALL-CAPS structural headings,
-# JetBrains Mono for everything else. Both are free Google Fonts and
-# distinct from the usual Inter/Space-Grotesk/Roboto defaults.
+# JetBrains Mono for everything else -- used when locally installed,
+# falling back to ui-monospace/monospace otherwise. Deliberately NOT
+# fetched from Google Fonts: an @import on this auth-gated ops surface
+# phones home viewer IPs/timing to a third party on every fresh browser
+# session and is dead weight on air-gapped or egress-restricted
+# deployments (the documented k8s prod posture).
 
 _CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Major+Mono+Display&family=JetBrains+Mono:wght@300;400;500;700&display=swap');
-
 :root {
   --bg: #0a0806;
   --bg-2: #0f0c08;
@@ -233,8 +234,8 @@ _CSS = """
   --hairline-bright: #443f30;
   --fg: #e6dec6;
   --fg-bright: #fdf6df;
-  --muted: #9b9173;
-  --muted-2: #6b6450;
+  --muted: #b8ad8d;
+  --muted-2: #8c8268;
   --phosphor: #7dffa6;
   --phosphor-dim: #36b074;
   --amber: #ffc257;
@@ -255,10 +256,13 @@ _CSS = """
 html, body {
   margin: 0;
   padding: 0;
+  width: 100%;
+  max-width: 100%;
+  overflow-x: hidden;
   background: var(--bg);
   color: var(--fg);
   font-family: var(--mono);
-  font-size: 13px;
+  font-size: 16px;
   line-height: 1.55;
   font-feature-settings: 'liga' 0, 'calt' 0;
   -webkit-font-smoothing: antialiased;
@@ -310,6 +314,8 @@ body::after {
 }
 
 main {
+  width: 100%;
+  min-width: 0;
   max-width: 1400px;
   margin: 0 auto;
   padding: calc(var(--grid) * 4) calc(var(--grid) * 3);
@@ -319,6 +325,7 @@ main {
 
 .statusbar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: calc(var(--grid) * 2);
   padding: calc(var(--grid) * 1.5) calc(var(--grid) * 2);
@@ -327,7 +334,7 @@ main {
   background: linear-gradient(180deg, var(--surface-2), var(--surface));
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.025), 0 8px 28px rgba(0, 0, 0, 0.35);
   margin-bottom: calc(var(--grid) * 4);
-  font-size: 12px;
+  font-size: 13px;
   color: var(--muted);
   letter-spacing: 0.04em;
   animation: panel-in 600ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
@@ -347,6 +354,59 @@ main {
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.35; }
+}
+
+/* The auth token defines what this page is allowed to reveal. Keep that
+   boundary visible while the operator scrolls; it is context, not a toast. */
+.scopebar {
+  position: sticky;
+  top: var(--grid);
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: calc(var(--grid) * 2);
+  min-width: 0;
+  margin: 0 0 calc(var(--grid) * 3);
+  padding: calc(var(--grid) * 1.5) calc(var(--grid) * 2);
+  border: 1px solid var(--hairline-bright);
+  border-left: calc(var(--rail) * 2) solid var(--phosphor-dim);
+  background: color-mix(in srgb, var(--surface-2) 94%, transparent);
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(10px);
+}
+.scopebar.repo-scoped { border-left-color: var(--amber); }
+.scopebar .scope-copy {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: calc(var(--grid)) calc(var(--grid) * 2);
+  min-width: 0;
+}
+.scopebar .scope-label {
+  color: var(--phosphor);
+  font-size: 15px;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+.scopebar.repo-scoped .scope-label { color: var(--amber); }
+.scopebar .scope-detail {
+  color: var(--fg);
+  font-size: 13px;
+}
+.scopebar a {
+  flex: 0 0 auto;
+  color: var(--cyan);
+  border: 1px solid currentColor;
+  padding: 7px 12px;
+  text-decoration: none;
+  font-size: 13px;
+  letter-spacing: 0.04em;
+}
+.scopebar a:hover,
+.scopebar a:focus-visible {
+  color: var(--phosphor);
+  box-shadow: var(--glow-green);
 }
 
 /* ----- Title ------------------------------------------------------------ */
@@ -376,7 +436,7 @@ main {
 
 .subtitle {
   color: var(--muted);
-  font-size: 12px;
+  font-size: 14px;
   letter-spacing: 0.06em;
   margin: 0 0 calc(var(--grid) * 4);
   max-width: 680px;
@@ -430,7 +490,7 @@ main {
 
 .stats .block .label {
   font-family: 'Major Mono Display', monospace;
-  font-size: 11px;
+  font-size: 12px;
   letter-spacing: 0.08em;
   color: var(--muted);
   text-transform: lowercase;
@@ -449,7 +509,7 @@ main {
 .stats .block .num.amber { color: var(--amber); text-shadow: var(--glow-amber); }
 .stats .block .num.red { color: var(--red); text-shadow: var(--glow-red); }
 .stats .block .delta {
-  font-size: 11px;
+  font-size: 13px;
   color: var(--muted);
   letter-spacing: 0.04em;
 }
@@ -457,6 +517,8 @@ main {
 /* ----- Panels (each section) -------------------------------------------- */
 
 .panel {
+  min-width: 0;
+  overflow: hidden;
   border: 1px solid var(--hairline-bright);
   border-left: var(--rail) solid var(--hairline-bright);
   background: var(--surface);
@@ -475,6 +537,7 @@ main {
 
 .panel header {
   display: flex;
+  min-width: 0;
   align-items: center;
   justify-content: space-between;
   padding: calc(var(--grid) * 1.5) calc(var(--grid) * 2);
@@ -483,7 +546,7 @@ main {
 }
 .panel header h2 {
   font-family: 'Major Mono Display', monospace;
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 400;
   letter-spacing: 0.1em;
   color: var(--fg-bright);
@@ -496,7 +559,8 @@ main {
   text-shadow: 0 0 8px rgba(127, 255, 161, 0.4);
 }
 .panel header .meta {
-  font-size: 11px;
+  min-width: 0;
+  font-size: 13px;
   color: var(--muted);
   letter-spacing: 0.04em;
 }
@@ -510,12 +574,13 @@ main {
 
 .row {
   display: grid;
+  min-width: 0;
   gap: calc(var(--grid) * 4);
   margin-bottom: calc(var(--grid) * 4);
 }
 .row.split-7-5 { grid-template-columns: 7fr 5fr; }
 .row.split-1-1 { grid-template-columns: 1fr 1fr; }
-.row > .panel { margin-bottom: 0; }
+.row > .panel { min-width: 0; margin-bottom: 0; }
 
 @media (max-width: 1100px) {
   .row.split-7-5, .row.split-1-1 { grid-template-columns: 1fr; }
@@ -527,12 +592,39 @@ main {
 table {
   border-collapse: collapse;
   width: 100%;
-  font-size: 12px;
+  min-width: 720px;
+  font-size: 14px;
+}
+.table-scroll {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: auto;
+  overscroll-behavior-inline: contain;
+  -webkit-overflow-scrolling: touch;
+}
+.table-scroll:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: -2px;
+}
+table.table-compact { min-width: 520px; }
+table.table-wide { min-width: 900px; }
+table.table-tokens { min-width: 1160px; }
+.visually-hidden {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0, 0, 0, 0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
 }
 thead th {
   font-family: 'Major Mono Display', monospace;
   font-weight: 400;
-  font-size: 10px;
+  font-size: 12px;
   letter-spacing: 0.12em;
   color: var(--muted);
   text-transform: lowercase;
@@ -560,7 +652,7 @@ tbody td code {
   color: var(--cyan);
   background: rgba(108, 240, 255, 0.06);
   padding: 1px 6px;
-  font-size: 11.5px;
+  font-size: 13px;
 }
 tbody td .heat {
   color: var(--phosphor);
@@ -597,7 +689,7 @@ tbody tr td.empty { padding: calc(var(--grid) * 3); }
   padding: 1px 8px;
   border: 1px solid currentColor;
   background: color-mix(in srgb, currentColor 12%, transparent);
-  font-size: 10px;
+  font-size: 11px;
   letter-spacing: 0.08em;
   text-transform: lowercase;
   font-family: var(--display);
@@ -629,7 +721,8 @@ tbody tr td.empty { padding: calc(var(--grid) * 3); }
 .pattern {
   font-family: 'JetBrains Mono', monospace;
   color: var(--fg-bright);
-  font-size: 11.5px;
+  font-size: 13px;
+  overflow-wrap: anywhere;
 }
 
 /* Section footer: tiny relative-time timestamp */
@@ -652,10 +745,11 @@ tbody tr td.empty { padding: calc(var(--grid) * 3); }
 }
 .top-modules li {
   display: grid;
+  min-width: 0;
   grid-template-columns: 4ch 1fr auto;
   gap: calc(var(--grid) * 2);
   padding: calc(var(--grid) * 1) calc(var(--grid) * 2);
-  font-size: 12px;
+  font-size: 14px;
   list-style: none;
   border-bottom: 1px solid var(--hairline);
 }
@@ -669,7 +763,9 @@ tbody tr td.empty { padding: calc(var(--grid) * 3); }
 .top-modules .prefix { color: var(--cyan); }
 .top-modules .engineers {
   color: var(--muted);
-  font-size: 11px;
+  min-width: 0;
+  font-size: 13px;
+  overflow-wrap: anywhere;
   text-align: right;
 }
 
@@ -689,6 +785,7 @@ tbody tr td.empty { padding: calc(var(--grid) * 3); }
 /* v0.18 auto-resolution heatmap */
 .heatmap .hrow {
   display: grid;
+  min-width: 0;
   grid-template-columns: 24ch 1fr 10ch;
   gap: calc(var(--grid) * 2);
   align-items: center;
@@ -730,6 +827,7 @@ tbody tr td.empty { padding: calc(var(--grid) * 3); }
 /* v0.20 hotspot files panel */
 .hotspots .hsrow {
   display: grid;
+  min-width: 0;
   grid-template-columns: 18ch minmax(0, 1fr) 14ch 16ch;
   gap: calc(var(--grid) * 2);
   align-items: center;
@@ -767,6 +865,8 @@ tbody tr td.empty { padding: calc(var(--grid) * 3); }
 .hotspots .hssuggest.sg-shared { color: var(--cyan); border-color: #2f5466; }
 .hotspots .hssuggest.sg-monitor { color: var(--muted-2); }
 .hotspots .hsapply {
+  display: inline-flex;
+  align-items: center;
   margin-left: calc(var(--grid));
   font-size: 9px;
   letter-spacing: 0.06em;
@@ -776,12 +876,17 @@ tbody tr td.empty { padding: calc(var(--grid) * 3); }
   text-decoration: none;
   color: inherit;
   opacity: 0.7;
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
 }
 .hotspots .hsapply:hover { opacity: 1; }
+.hotspots .hspromote { display: inline; margin: 0; }
 
 /* v0.22 pending queue panel */
 .queue .qrow {
   display: grid;
+  min-width: 0;
   grid-template-columns: 24ch 6ch 1fr;
   gap: calc(var(--grid) * 2);
   align-items: baseline;
@@ -811,6 +916,7 @@ tbody tr td.empty { padding: calc(var(--grid) * 3); }
 /* v0.28 stale engineers panel */
 .stale .serow {
   display: grid;
+  min-width: 0;
   grid-template-columns: 24ch 1fr 6ch;
   gap: calc(var(--grid) * 2);
   align-items: baseline;
@@ -834,6 +940,7 @@ tbody tr td.empty { padding: calc(var(--grid) * 3); }
 /* v0.27 webhook delivery panel */
 .webhooks .wbrow {
   display: grid;
+  min-width: 0;
   grid-template-columns: 24ch repeat(5, 1fr);
   gap: calc(var(--grid) * 2);
   align-items: baseline;
@@ -865,6 +972,11 @@ tbody tr td.empty { padding: calc(var(--grid) * 3); }
 .pill.tok-expired { color: var(--muted); }
 .pill.tok-grace-elapsed { color: var(--muted); }
 .pill.tok-revoked { color: var(--muted-2); text-decoration: line-through; }
+.pill.tok-unscoped {
+  color: var(--amber);
+  box-shadow: var(--glow-amber);
+}
+.token-scope-note { display: inline-block; margin-top: 4px; font-size: 12px; }
 .tokenbanner {
   margin: calc(var(--grid) * 2) calc(var(--grid) * 2) 0;
   padding: calc(var(--grid)) calc(var(--grid) * 1.5);
@@ -878,13 +990,14 @@ tbody tr td.empty { padding: calc(var(--grid) * 3); }
 .tokcreate button,
 .logoutform button {
   font: inherit;
-  font-size: 10px;
+  font-size: 13px;
   letter-spacing: 0.06em;
   text-transform: lowercase;
   background: transparent;
   color: var(--muted);
   border: 1px solid var(--hairline-bright);
-  padding: 1px 8px;
+  min-height: 32px;
+  padding: 5px 10px;
   cursor: pointer;
 }
 .tokrevoke button:hover { color: var(--red); border-color: var(--red); }
@@ -908,13 +1021,16 @@ tbody tr td.empty { padding: calc(var(--grid) * 3); }
 }
 .tokcreate input[type=text] {
   font: inherit;
-  font-size: 11px;
+  min-width: 0;
+  font-size: 14px;
   background: var(--bg);
   color: var(--fg);
   border: 1px solid var(--hairline-bright);
-  padding: 2px 8px;
+  padding: 7px 9px;
 }
 .tokcreate .tokself { color: var(--cyan); }
+.tokcreate .tokscope-choice { color: var(--amber); }
+.tokcreate .tokscope-note { font-size: 10px; color: var(--muted-2); }
 .logoutform { display: inline; margin: 0 0 0 auto; }
 
 /* v0.36 needs-attention rollup -- one-line answer to "anything for me?" */
@@ -928,7 +1044,8 @@ tbody tr td.empty { padding: calc(var(--grid) * 3); }
   border-left: var(--rail) solid var(--hairline-bright);
   background: var(--surface);
   color: var(--fg);
-  font-size: 12px;
+  min-width: 0;
+  font-size: 14px;
   letter-spacing: 0.04em;
   box-shadow: 0 8px 30px rgba(0, 0, 0, 0.28);
   animation: panel-in 700ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
@@ -965,12 +1082,104 @@ tbody tr.attn:hover td { background: color-mix(in srgb, var(--amber) 12%, transp
 
 /* v0.36 auto-refresh indicator in the status bar */
 .statusbar .refresh { margin-left: auto; color: var(--muted); }
-.statusbar .refresh a { text-decoration: none; color: var(--phosphor); }
-.statusbar .refresh a.rlive { text-shadow: var(--glow-green); }
-.statusbar .refresh a.rpaused { color: var(--amber); text-shadow: none; }
+.statusbar .refresh button {
+  min-height: 32px;
+  padding: 4px 9px;
+  border: 1px solid currentColor;
+  background: transparent;
+  color: var(--phosphor);
+  font: inherit;
+  cursor: pointer;
+}
+.statusbar .refresh button.rlive { text-shadow: var(--glow-green); }
+.statusbar .refresh button.rpaused { color: var(--amber); text-shadow: none; }
+.statusbar .refresh button:focus-visible { outline: 2px solid var(--cyan); }
 .statusbar .refresh #refresh-count {
   color: var(--fg-bright);
   font-variant-numeric: tabular-nums;
+}
+
+@supports (overflow: clip) {
+  html, body { overflow-x: clip; }
+}
+
+@media (max-width: 640px) {
+  main { padding: calc(var(--grid) * 2) calc(var(--grid) * 1.25); }
+  .statusbar {
+    align-items: flex-start;
+    gap: var(--grid) calc(var(--grid) * 1.5);
+    margin-bottom: calc(var(--grid) * 2);
+  }
+  .statusbar .sep { display: none; }
+  .statusbar .refresh {
+    flex-basis: 100%;
+    margin-left: 0;
+  }
+  .scopebar {
+    align-items: flex-start;
+    flex-direction: column;
+    top: 4px;
+  }
+  .scopebar .scope-copy { flex-direction: column; gap: 2px; }
+  .scopebar a,
+  .statusbar .refresh button,
+  .tokrevoke button,
+  .tokcreate button,
+  .logoutform button,
+  .hsapply,
+  input[type="text"] {
+    min-height: 44px;
+  }
+  .scopebar a { display: inline-flex; align-items: center; }
+  .title { font-size: clamp(23px, 8vw, 30px); overflow-wrap: anywhere; }
+  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .stats .block { min-width: 0; padding: calc(var(--grid) * 2); }
+  .stats .block .num { font-size: 34px; }
+  .attention { align-items: flex-start; flex-wrap: wrap; }
+  .panel header { align-items: flex-start; flex-wrap: wrap; gap: 4px 12px; }
+  .panel header .meta { flex-basis: 100%; overflow-wrap: anywhere; }
+  .secondary-mobile { display: none; }
+  table { min-width: 620px; }
+  table.table-compact { min-width: 0; }
+  table.table-wide { min-width: 620px; }
+  table.table-tokens { min-width: 640px; }
+  .top-modules li { grid-template-columns: 4ch minmax(0, 1fr); }
+  .top-modules .engineers { grid-column: 2; text-align: left; }
+  .heatmap .hrow {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: var(--grid);
+  }
+  .heatmap .hcells { grid-column: 1 / -1; grid-row: 2; }
+  .heatmap .htotal { grid-column: 2; grid-row: 1; }
+  .hotspots .hsrow {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: var(--grid);
+  }
+  .hotspots .hspattern { grid-column: 1 / -1; grid-row: 2; }
+  .hotspots .hssuggest { grid-column: 1 / -1; grid-row: 3; }
+  .queue .qrow { grid-template-columns: minmax(0, 1fr) auto; gap: var(--grid); }
+  .queue .qhead { grid-column: 1 / -1; white-space: normal; overflow-wrap: anywhere; }
+  .stale .serow { grid-template-columns: minmax(0, 1fr) auto; gap: var(--grid); }
+  .stale .seage { grid-column: 1 / -1; }
+  .webhooks { max-width: 100%; overflow-x: auto; }
+  .webhooks .wbrow { min-width: 620px; }
+  .tokcreate { align-items: stretch; }
+  .tokcreate label { width: 100%; flex-wrap: wrap; }
+  .tokcreate input[type="text"] { flex: 1 1 180px; max-width: 100%; }
+  .foot { flex-wrap: wrap; gap: var(--grid); }
+}
+
+@media (max-width: 360px) {
+  .stats { grid-template-columns: 1fr; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }
 """
 
@@ -987,20 +1196,38 @@ REFRESH_SCRIPT = """
   });
   var toggle = document.getElementById('refresh-toggle');
   var counter = document.getElementById('refresh-count');
+  function setPaused(next) {
+    paused = next;
+    left = SECS;
+    if (!toggle) return;
+    toggle.textContent = paused ? 'paused' : 'live';
+    toggle.className = paused ? 'rpaused' : 'rlive';
+    toggle.setAttribute('aria-pressed', paused ? 'true' : 'false');
+    toggle.setAttribute(
+      'aria-label',
+      paused ? 'Resume automatic refresh' : 'Pause automatic refresh'
+    );
+    toggle.setAttribute('data-state', paused ? 'paused' : 'live');
+    if (counter) counter.textContent = paused ? '--' : (SECS + 's');
+  }
   if (toggle) {
-    toggle.addEventListener('click', function (e) {
-      e.preventDefault();
-      paused = !paused;
-      left = SECS;
-      toggle.textContent = paused ? 'paused' : 'live';
-      toggle.className = paused ? 'rpaused' : 'rlive';
-      if (counter) counter.textContent = paused ? '--' : (SECS + 's');
+    toggle.addEventListener('click', function () {
+      setPaused(!paused);
     });
   }
+  function pauseForFormEdit(event) {
+    if (event.target && event.target.form) setPaused(true);
+  }
+  document.addEventListener('input', pauseForFormEdit);
+  document.addEventListener('change', pauseForFormEdit);
   setInterval(function () {
     if (paused || document.hidden) return;
     var ae = document.activeElement;
-    if (ae && /^(INPUT|TEXTAREA|BUTTON|SELECT)$/.test(ae.tagName)) return;
+    if (ae && ae !== document.body && ae !== document.documentElement && ae !== toggle) {
+      left = SECS;
+      if (counter) counter.textContent = SECS + 's';
+      return;
+    }
     left -= 1;
     if (counter) counter.textContent = left + 's';
     if (left <= 0) window.location.reload();
@@ -1009,10 +1236,10 @@ REFRESH_SCRIPT = """
 """
 
 
-def _pill(status: str, label: str) -> str:
+def _pill(status: str, label: str, *, display: str | None = None) -> str:
     return (
         f'<span class="pill {html.escape(status)}" title="{html.escape(label)}">'
-        f"{html.escape(status)}</span>"
+        f"{html.escape(display or status)}</span>"
     )
 
 
@@ -1025,6 +1252,7 @@ async def render_dashboard(
     *,
     viewer_engineer: str | None = None,
     is_operator: bool = False,
+    can_promote_hotspots: bool = False,
     viewer_repo: str | None = None,
     csrf_token: str | None = None,
     token_error: str | None = None,
@@ -1037,42 +1265,62 @@ async def render_dashboard(
     switches on the engineer-tokens panel -- scoped to the viewer's
     own tokens for the former, everyone's for the latter; both unset
     (the insecure no-auth mode, or pre-v0.29.5 callers) hides it.
-    ``csrf_token`` is embedded as a hidden field in every
-    state-changing form; ``token_error`` / ``token_success`` render
-    as a banner above the panel."""
+    ``can_promote_hotspots`` is the narrower global-write capability shared
+    and unscoped per-engineer sessions retain; it does not widen the token
+    management panel. ``csrf_token`` is embedded as a hidden field in every
+    state-changing form; ``token_error`` / ``token_success`` render as a
+    banner above the panel."""
     svc = get_service()
     now = datetime.now(UTC)
+    repo_scoped = viewer_repo is not None
+    scope_required = svc.settings.require_scoped_token
+    scope_empty_suffix = "in this repository" if repo_scoped else "across all repositories"
+    if repo_scoped:
+        scope_banner_html = (
+            '<aside class="scopebar repo-scoped" '
+            'aria-label="Dashboard data scope">'
+            '<div class="scope-copy">'
+            f'<strong class="scope-label">Repository scope: {_esc(viewer_repo)}</strong>'
+            '<span class="scope-detail">Fleet-wide data is hidden.</span>'
+            '</div><a href="/dashboard/login">switch token / login</a>'
+            "</aside>"
+        )
+    else:
+        scope_banner_html = (
+            '<aside class="scopebar fleet" aria-label="Dashboard data scope">'
+            '<div class="scope-copy">'
+            '<strong class="scope-label">All repositories</strong>'
+            '<span class="scope-detail">Fleet-wide data is visible.</span>'
+            '</div><a href="/dashboard/login">switch token / login</a>'
+            "</aside>"
+        )
 
     rows = await svc.list_claims(active_only=True)
     conflicts = await svc.db.recent_conflicts(500, repo=viewer_repo)
-    recent = await svc.db.list_recent_claims(500)
-    # #55: a repo-scoped viewer sees only its repo. rows/recent are filtered
-    # before activity is derived; the repo-aware DB calls (including the
-    # stale-engineer panel, scoped in v0.42) take viewer_repo directly.
-    # Only the webhook panel is global operational data (not repo-tagged)
-    # and is left unscoped.
+    recent = await svc.db.list_recent_claims(500, repo=viewer_repo)
+    # #55: a repo-scoped viewer sees only its repo. Every windowed DB call
+    # (recent claims, release requests, queue, conflicts, hotspots, the
+    # stale-engineer panel) takes viewer_repo directly so the repo filter
+    # runs in SQL before LIMIT -- filtering after the fetch would let other
+    # repos' rows consume the window on a busy shared service and silently
+    # under-report a scoped viewer's panels. rows/repos come from unlimited
+    # queries, so a Python filter is safe there. Webhook delivery rows are not
+    # repo-tagged, so that fleet aggregate is omitted for scoped viewers.
     if viewer_repo is not None:
         rows = [c for c in rows if c.get("repo") == viewer_repo]
-        recent = [c for c in recent if c.get("repo") == viewer_repo]
     activity = _recent_activity(claims=recent, conflicts=conflicts, now=now)
     repos = await svc.db.list_repos()
     idle_timeout_sec = svc.settings.idle_timeout_sec
-    requests = await svc.list_requests(limit=200)
-    auto_resolutions = await svc.db.count_auto_resolutions_since(
-        window_hours=24, repo=viewer_repo
+    requests = await svc.list_requests(limit=200, repo=viewer_repo)
+    auto_resolutions = await svc.db.count_auto_resolutions_since(window_hours=24, repo=viewer_repo)
+    auto_resolution_series = await svc.db.daily_auto_resolutions(days=30, repo=viewer_repo)
+    hotspot_rows = await svc.db.hotspot_files(days=30, min_attempts=5, limit=10, repo=viewer_repo)
+    queued_rows = await svc.db.list_queued_with_holder(state="waiting", repo=viewer_repo, limit=100)
+    webhook_stats = (
+        await svc.db.webhook_delivery_stats(window_hours=24) if viewer_repo is None else {}
     )
-    auto_resolution_series = await svc.db.daily_auto_resolutions(
-        days=30, repo=viewer_repo
-    )
-    hotspot_rows = await svc.db.hotspot_files(
-        days=30, min_attempts=5, limit=10, repo=viewer_repo
-    )
-    queued_rows = await svc.db.list_queued_with_holder(state="waiting", limit=100)
-    webhook_stats = await svc.db.webhook_delivery_stats(window_hours=24)
     if viewer_repo is not None:
         repos = [r for r in repos if r.get("repo") == viewer_repo]
-        requests = [q for q in requests if q.get("holder_repo") == viewer_repo]
-        queued_rows = [q for q in queued_rows if q.get("repo") == viewer_repo]
     stale_engineer_days = svc.settings.stale_engineer_days
     if stale_engineer_days > 0:
         # v0.42: scope the stale-holder panel to the viewer's repo so a
@@ -1084,9 +1332,7 @@ async def render_dashboard(
     else:
         stale_engineers = []
 
-    claims_by_id: dict[str, dict[str, Any]] = {
-        str(c["id"]): c for c in recent if c.get("id")
-    }
+    claims_by_id: dict[str, dict[str, Any]] = {str(c["id"]): c for c in recent if c.get("id")}
 
     # ---- big-number stats ------------------------------------------------
     open_conflicts = sum(
@@ -1113,16 +1359,19 @@ async def render_dashboard(
     # pending release-request target, and which (repo, pattern) pairs are held
     # by more than one engineer at once (legitimate symbol-level coexistence,
     # but worth flagging so the operator can see the friction at a glance).
-    release_targets: set[tuple[str, str]] = {
-        (str(rq.get("holder_engineer") or ""), str(rq.get("requested_pattern") or ""))
+    # Keyed on the request's claim_id (an exact join) rather than
+    # (holder, pattern): on a multi-repo service the tuple key cross-flagged
+    # an engineer's same-named claim in an unrelated repo as "release asked".
+    release_targets: set[str] = {
+        str(rq.get("claim_id"))
         for rq in requests
-        if str(rq.get("decision") or "pending") == "pending"
+        if str(rq.get("decision") or "pending") == "pending" and rq.get("claim_id")
     }
     pattern_holders: dict[tuple[str, str], set[str]] = defaultdict(set)
     for _claim in rows:
-        pattern_holders[
-            (str(_claim.get("repo") or ""), str(_claim.get("pattern") or ""))
-        ].add(str(_claim.get("engineer") or ""))
+        pattern_holders[(str(_claim.get("repo") or ""), str(_claim.get("pattern") or ""))].add(
+            str(_claim.get("engineer") or "")
+        )
 
     blocked_class = "red" if open_conflicts else "phosphor"
     waiting_class = "amber" if (waiting_total or pending_requests) else "phosphor"
@@ -1167,7 +1416,7 @@ async def render_dashboard(
             '<div class="attention clear">'
             '<span class="atag">all clear</span>'
             '<span class="abody">nothing is blocked, queued, or awaiting a '
-            "decision</span></div>"
+            f"decision {scope_empty_suffix}</span></div>"
         )
 
     # ---- repos table ------------------------------------------------------
@@ -1177,17 +1426,19 @@ async def render_dashboard(
             f"<td><span class='pattern'>{_esc(r['repo'])}</span></td>"
             f"<td class='num-col'>{r['active_claims']}</td>"
             f"<td class='num-col'>{r['claims_24h']}</td>"
-            f"<td class='num-col'>{r['engineers_24h']}</td>"
-            f"<td class='muted'><time datetime='{_esc(r['last_activity'])}' "
+            f"<td class='num-col secondary-mobile'>{r['engineers_24h']}</td>"
+            f"<td class='muted secondary-mobile'><time datetime='{_esc(r['last_activity'])}' "
             f"title='{_esc(r['last_activity'])}'>{_esc(_ago(r['last_activity'], now))}</time></td>"
             "</tr>"
             for r in repos
         )
     else:
-        repos_html = (
-            "<tr><td class='empty' colspan='5'>"
-            "no repos using this service yet</td></tr>"
+        repo_empty = (
+            "no activity recorded for this repository yet"
+            if repo_scoped
+            else "no repos using this service yet across all repositories"
         )
+        repos_html = f"<tr><td class='empty' colspan='5'>{repo_empty}</td></tr>"
 
     # ---- top modules (compact list, replaces the second 24h table) ------
     if activity["top_modules"]:
@@ -1198,7 +1449,9 @@ async def render_dashboard(
             for m in activity["top_modules"]
         )
     else:
-        top_modules_html = "<li class='empty'>no activity in the last 24h</li>"
+        top_modules_html = (
+            f"<li class='empty'>no activity in the last 24h {scope_empty_suffix}</li>"
+        )
 
     # ---- active claims ---------------------------------------------------
     # Note: v0.14.1 added a per-row Database.get_claim_symbols call so
@@ -1211,15 +1464,13 @@ async def render_dashboard(
         rows_html = ""
         for r in rows:
             sev = (r.get("severity") or "soft").lower()
-            sev_html = (
-                f'<span class="pill severity-{html.escape(sev)}">{html.escape(sev)}</span>'
-            )
+            sev_html = f'<span class="pill severity-{html.escape(sev)}">{html.escape(sev)}</span>'
             sess = r.get("session_id") or ""
             sess_short = sess[:8] if sess else ""
             sess_cell = (
-                f'<td class="muted" title="{_esc(sess)}">{_esc(sess_short)}</td>'
+                f'<td class="muted secondary-mobile" title="{_esc(sess)}">{_esc(sess_short)}</td>'
                 if sess_short
-                else "<td class='muted'>—</td>"
+                else "<td class='muted secondary-mobile'>—</td>"
             )
             rem = _remaining(r.get("expires_at"))
             rem_class = "muted" if rem == "expired" else ""
@@ -1242,11 +1493,7 @@ async def render_dashboard(
                         start_line = s.get("start_line")
                         end_line = s.get("end_line")
                         if start_line is not None and end_line is not None:
-                            marker = (
-                                ", lsp"
-                                if s.get("resolved_by") == "lsp"
-                                else ""
-                            )
+                            marker = ", lsp" if s.get("resolved_by") == "lsp" else ""
                             name += f" (lines {start_line}-{end_line}{marker})"
                         symbol_names.append(name)
                 # v0.31 wave 2: claims the rename auto-follow sweep
@@ -1256,29 +1503,15 @@ async def render_dashboard(
                 # caveat as the symbol fetch above; same justification.
                 rename_notes: list[str] = []
                 if claim_id:
-                    rename_rows = await svc.db.list_symbol_renames_for_claims(
-                        [str(claim_id)]
-                    )
+                    rename_rows = await svc.db.list_symbol_renames_for_claims([str(claim_id)])
                     for rr in rename_rows:
-                        old_p = str(
-                            rr.get("old_symbol_path")
-                            or rr.get("old_symbol_name")
-                            or ""
-                        )
-                        new_p = str(
-                            rr.get("new_symbol_path")
-                            or rr.get("new_symbol_name")
-                            or ""
-                        )
+                        old_p = str(rr.get("old_symbol_path") or rr.get("old_symbol_name") or "")
+                        new_p = str(rr.get("new_symbol_path") or rr.get("new_symbol_name") or "")
                         if old_p and new_p:
-                            rename_notes.append(
-                                f"renamed: {old_p} -> {new_p}"
-                            )
+                            rename_notes.append(f"renamed: {old_p} -> {new_p}")
                 inner_lines: list[str] = []
                 if symbol_names:
-                    inner_lines.append(
-                        ", ".join(_esc(n) for n in symbol_names)
-                    )
+                    inner_lines.append(", ".join(_esc(n) for n in symbol_names))
                 inner_lines.extend(_esc(n) for n in rename_notes)
                 if inner_lines:
                     symbols_inline = "<br>".join(inner_lines)
@@ -1297,10 +1530,7 @@ async def render_dashboard(
             # same (repo, pattern) at the same time.
             _key = (str(r.get("repo") or ""), str(r.get("pattern") or ""))
             _contended = len(pattern_holders.get(_key, set())) > 1
-            _release_asked = (
-                str(r.get("engineer") or ""),
-                str(r.get("pattern") or ""),
-            ) in release_targets
+            _release_asked = r.get("id") is not None and str(r.get("id")) in release_targets
             flags = ""
             if _release_asked:
                 flags += '<span class="pill release-asked">release asked</span> '
@@ -1314,15 +1544,15 @@ async def render_dashboard(
                 f"<td>{_esc(r.get('repo')) or '<span class=muted>—</span>'}</td>"
                 f"<td><span class='pattern'>{_esc(r.get('pattern'))}</span> {flags}</td>"
                 f"{scope_cell}"
-                f"<td class='muted'>{_esc(r.get('description'))}</td>"
+                f"<td class='muted secondary-mobile'>{_esc(r.get('description'))}</td>"
                 f"<td class='{rem_class}'>{_esc(rem)}</td>"
-                f"<td>{sev_html}</td>"
+                f"<td class='secondary-mobile'>{sev_html}</td>"
                 f"{sess_cell}"
                 "</tr>"
             )
     else:
         rows_html = (
-            "<tr><td class='empty' colspan='8'>no active claims</td></tr>"
+            f"<tr><td class='empty' colspan='8'>no active claims {scope_empty_suffix}</td></tr>"
         )
 
     # ---- module heatmap (full unicode block bar) -------------------------
@@ -1339,7 +1569,7 @@ async def render_dashboard(
         )
     else:
         heat_rows = (
-            "<tr><td class='empty' colspan='3'>no active claims</td></tr>"
+            f"<tr><td class='empty' colspan='3'>no active claims {scope_empty_suffix}</td></tr>"
         )
 
     # ---- conflict log with derived resolution ---------------------------
@@ -1364,15 +1594,15 @@ async def render_dashboard(
                 f"<td>{_esc(c.get('attempted_by'))}</td>"
                 f"<td><span class='pattern'>{_esc(c.get('attempted_pattern'))}</span></td>"
                 f"<td class='muted'>vs {_esc(holder_engineer)}</td>"
-                f"<td><span class='pattern'>{_esc(holder_pattern)}</span></td>"
-                f"<td>{_pill(status, label)}</td>"
-                f"<td class='muted' title='{_esc(attempted_sess)}'>{_esc(sess_short) or '—'}</td>"
+                f"<td class='secondary-mobile'><span class='pattern'>{_esc(holder_pattern)}</span></td>"
+                f"<td>{_pill(status, label, display='retained history · details unavailable' if status == 'missing' else None)}</td>"
+                f"<td class='muted secondary-mobile' title='{_esc(attempted_sess)}'>{_esc(sess_short) or '—'}</td>"
                 "</tr>"
             )
     else:
         conf_html = (
             "<tr><td class='empty' colspan='7'>"
-            "no recent conflict attempts logged</td></tr>"
+            f"no recent conflict attempts logged {scope_empty_suffix}</td></tr>"
         )
 
     # ---- release requests (v0.9.0) --------------------------------------
@@ -1403,9 +1633,9 @@ async def render_dashboard(
                 latency_label = "—"
             scope = r.get("requested_scope") or "—"
             scope_cell = (
-                f"<td><span class='pattern'>{_esc(scope)}</span></td>"
+                f"<td class='secondary-mobile'><span class='pattern'>{_esc(scope)}</span></td>"
                 if scope != "—"
-                else "<td class='muted'>—</td>"
+                else "<td class='muted secondary-mobile'>—</td>"
             )
             req_html += (
                 "<tr>"
@@ -1415,16 +1645,16 @@ async def render_dashboard(
                 f"<td><span class='pattern'>{_esc(r.get('requested_pattern'))}</span></td>"
                 f"{scope_cell}"
                 f"<td class='muted'>vs {_esc(r.get('holder_engineer') or '?')}</td>"
-                f'<td><span class="pill urgency-{html.escape(urgency)}">{html.escape(urgency)}</span></td>'
+                f'<td class="secondary-mobile"><span class="pill urgency-{html.escape(urgency)}">{html.escape(urgency)}</span></td>'
                 f"<td>{_pill(decision, decision)}</td>"
-                f"<td class='muted'>{html.escape(latency_label)}</td>"
+                f"<td class='muted secondary-mobile'>{html.escape(latency_label)}</td>"
                 "</tr>"
             )
         requests_meta = f"{len(requests)} total · {pending_count} pending"
     else:
         req_html = (
             "<tr><td class='empty' colspan='8'>"
-            "no release requests filed yet</td></tr>"
+            f"no release requests filed yet {scope_empty_suffix}</td></tr>"
         )
         requests_meta = "0 total"
 
@@ -1451,25 +1681,29 @@ async def render_dashboard(
                     end_status = ("released", "released")
                 end_html = _pill(*end_status)
             else:
-                end_html = _pill("blocked", "still active") if (
-                    expires
-                    and (exp := _parse_iso(expires))
-                    and exp > now
-                ) else _pill("stale", "TTL passed; cleanup pending")
+                end_html = (
+                    _pill("blocked", "still active")
+                    if (expires and (exp := _parse_iso(expires)) and exp > now)
+                    else _pill("stale", "TTL passed; cleanup pending")
+                )
             timeline_html += (
                 "<tr>"
-                f"<td class='muted'><time datetime='{_esc(r.get('created_at'))}' "
+                f"<td class='muted secondary-mobile'><time datetime='{_esc(r.get('created_at'))}' "
                 f"title='{_esc(r.get('created_at'))}'>{_esc(_ago(r.get('created_at'), now))}</time></td>"
                 f"<td>{_esc(r.get('engineer'))}</td>"
                 f"<td>{_esc(r.get('repo')) or '<span class=muted>—</span>'}</td>"
                 f"<td><span class='pattern'>{_esc(r.get('pattern'))}</span></td>"
                 f"<td>{end_html}</td>"
-                f"<td class='muted'>{_esc(_ago(r.get('released_at') or r.get('expires_at'), now))}</td>"
+                # "updated" for a still-active claim is its last activity
+                # (or creation), never expires_at: a future timestamp hits
+                # _ago's negative-delta branch and renders the literal
+                # "now" for every active claim regardless of real age.
+                f"<td class='muted'>{_esc(_ago(r.get('released_at') or r.get('last_activity') or r.get('created_at'), now))}</td>"
                 "</tr>"
             )
     else:
         timeline_html = (
-            "<tr><td class='empty' colspan='6'>no claim history yet</td></tr>"
+            f"<tr><td class='empty' colspan='6'>no claim history yet {scope_empty_suffix}</td></tr>"
         )
 
     # ---- auto-resolutions panel (v0.14.1) -------------------------------
@@ -1489,10 +1723,7 @@ async def render_dashboard(
     # render each cell as a coloured span keyed on total count.
 
     today = now.date()
-    day_keys = [
-        (today - timedelta(days=29 - i)).strftime("%Y-%m-%d")
-        for i in range(30)
-    ]
+    day_keys = [(today - timedelta(days=29 - i)).strftime("%Y-%m-%d") for i in range(30)]
     series_by_repo: dict[str, dict[str, dict[str, int]]] = {}
     for row in auto_resolution_series:
         repo_key = str(row.get("repo") or "(unattributed)")
@@ -1527,9 +1758,7 @@ async def render_dashboard(
                 f"({d.get('auto_coexist', 0)} coexist, "
                 f"{d.get('auto_narrow', 0)} narrow)"
             )
-            cells.append(
-                f'<span class="hcell {cls}" title="{_esc(title)}"></span>'
-            )
+            cells.append(f'<span class="hcell {cls}" title="{_esc(title)}"></span>')
         cells_html = "".join(cells)
         repo_label = _esc(repo_key)
         heatmap_rows.append(
@@ -1538,23 +1767,21 @@ async def render_dashboard(
             f'<div class="hcells">{cells_html}</div>'
             f'<div class="htotal">{total_coexist + total_narrow} '
             f'<span class="muted">({total_coexist}c·{total_narrow}n)</span></div>'
-            '</div>'
+            "</div>"
         )
     if heatmap_rows:
         heatmap_body = "".join(heatmap_rows)
     else:
         heatmap_body = (
             '<div class="empty" style="padding:calc(var(--grid) * 2)">'
-            'no auto-resolutions in the last 30 days</div>'
+            f"no auto-resolutions {scope_empty_suffix} in the last 30 days</div>"
         )
     heatmap_html = (
         '<section class="panel">'
-        '<header><h2>auto-resolution heatmap (30d)</h2>'
+        "<header><h2>auto-resolution heatmap (30d)</h2>"
         f'<span class="meta">last 30 days · {len(series_by_repo)} repos</span></header>'
-        '<div class="heatmap" style="padding:calc(var(--grid) * 2)">'
-        + heatmap_body +
-        '</div>'
-        '</section>'
+        '<div class="heatmap" style="padding:calc(var(--grid) * 2)">' + heatmap_body + "</div>"
+        "</section>"
     )
 
     # v0.20: hotspot panel. Files agents repeatedly 409 on are
@@ -1576,31 +1803,25 @@ async def render_dashboard(
             tag, label = _hotspot_suggestion(attempts)
             repo_label = _esc(str(row.get("repo") or "(unattributed)"))
             pattern_label = _esc(str(row.get("pattern") or ""))
-            # v0.21: render an "apply" link for actionable suggestions.
-            # The link is documentary (no client-side JS); the operator
-            # actuates via POST /metrics/hotspots/promote with the
-            # data-payload shown in the title attribute.
-            apply_link = ""
-            if tag in ("split", "shared"):
-                action_name = (
-                    "shared_file" if tag == "shared" else "split"
-                )
-                payload_json = json.dumps(
-                    {
-                        "action": action_name,
-                        "pattern": str(row.get("pattern") or ""),
-                        "repo": row.get("repo"),
-                    },
-                    separators=(",", ":"),
-                )
-                title_attr = (
-                    f"POST /metrics/hotspots/promote -d {payload_json}"
-                )
-                apply_link = (
-                    f'<a class="hsapply" title="{_esc(title_attr)}" '
-                    'href="#" data-pattern="'
-                    f'{_esc(str(row.get("pattern") or ""))}" '
-                    f'data-action="{action_name}">apply</a>'
+            # Actionable suggestions are real, CSRF-protected dashboard
+            # forms for unscoped operators. Repo-scoped viewers see the
+            # signal but never an unusable control for the global ownership
+            # write they are not authorized to perform.
+            apply_control = ""
+            if can_promote_hotspots and tag in ("split", "shared"):
+                action_name = "shared_file" if tag == "shared" else "split"
+                apply_control = (
+                    '<form method="POST" action="/dashboard/hotspots/promote" '
+                    'class="hspromote">'
+                    f'<input type="hidden" name="action" value="{action_name}">'
+                    '<input type="hidden" name="pattern" value="'
+                    f'{_esc(str(row.get("pattern") or ""))}">'
+                    '<input type="hidden" name="csrf_token" value="'
+                    f'{_esc(csrf_token)}">'
+                    '<button class="hsapply" type="submit" '
+                    f'aria-label="Apply {action_name} suggestion to '
+                    f'{pattern_label}">apply</button>'
+                    "</form>"
                 )
             hotspot_lines.append(
                 '<div class="hsrow">'
@@ -1608,23 +1829,21 @@ async def render_dashboard(
                 f'<div class="hspattern">{pattern_label}</div>'
                 f'<div class="hscount">{attempts} '
                 f'<span class="muted">({distinct} engineers)</span></div>'
-                f'<div class="hssuggest sg-{tag}">{label}{apply_link}</div>'
-                '</div>'
+                f'<div class="hssuggest sg-{tag}">{label}{apply_control}</div>'
+                "</div>"
             )
         hotspot_body = "".join(hotspot_lines)
     else:
         hotspot_body = (
             '<div class="empty" style="padding:calc(var(--grid) * 2)">'
-            'no hotspot files in the last 30 days (good!)</div>'
+            f"no hotspot files {scope_empty_suffix} in the last 30 days</div>"
         )
     hotspots_html = (
         '<section class="panel">'
-        '<header><h2>hotspot files (30d)</h2>'
+        "<header><h2>hotspot files (30d)</h2>"
         f'<span class="meta">{len(hotspot_rows)} files · min 5 attempts</span></header>'
-        '<div class="hotspots" style="padding:calc(var(--grid) * 2)">'
-        + hotspot_body +
-        '</div>'
-        '</section>'
+        '<div class="hotspots" style="padding:calc(var(--grid) * 2)">' + hotspot_body + "</div>"
+        "</section>"
     )
 
     # v0.22: pending queue panel. Surface per-repo queue depth + the
@@ -1643,6 +1862,7 @@ async def render_dashboard(
         for repo_key in sorted(queue_by_repo):
             entries = queue_by_repo[repo_key]
             depth = len(entries)
+
             # Head-of-queue: smallest position; ties (or NULL positions)
             # fall back to earliest enqueued_at.
             def _head_key(row: dict[str, Any]) -> tuple[int, str]:
@@ -1668,22 +1888,20 @@ async def render_dashboard(
                 f'<div class="qrepo">{_esc(repo_key)}</div>'
                 f'<div class="qdepth">{depth}</div>'
                 f'<div class="qhead">{head_desc}</div>'
-                '</div>'
+                "</div>"
             )
         queue_body = "".join(queue_lines)
     else:
         queue_body = (
             '<div class="empty" style="padding:calc(var(--grid) * 2)">'
-            'no queued claims (good!)</div>'
+            f"no queued claims {scope_empty_suffix}</div>"
         )
     queue_html = (
         '<section class="panel">'
-        '<header><h2>pending queue</h2>'
+        "<header><h2>pending queue</h2>"
         f'<span class="meta">{len(queued_rows)} waiting · {len(queue_by_repo)} repos</span></header>'
-        '<div class="queue" style="padding:calc(var(--grid) * 2)">'
-        + queue_body +
-        '</div>'
-        '</section>'
+        '<div class="queue" style="padding:calc(var(--grid) * 2)">' + queue_body + "</div>"
+        "</section>"
     )
 
     # v0.28: stale engineers panel. Surface engineers whose most
@@ -1694,8 +1912,8 @@ async def render_dashboard(
     if stale_engineer_days <= 0:
         stale_body = (
             '<div class="empty" style="padding:calc(var(--grid) * 2)">'
-            'stale-engineer housekeeping disabled '
-            '(stale_engineer_days = 0)</div>'
+            "stale-engineer housekeeping disabled "
+            "(stale_engineer_days = 0)</div>"
         )
     elif stale_engineers:
         stale_lines: list[str] = []
@@ -1703,35 +1921,32 @@ async def render_dashboard(
             engineer = str(se.get("engineer") or "?")
             age = _ago(se.get("last_activity"), now)
             count = int(se.get("active_claim_count") or 0)
-            # Link the engineer name to ?engineer=NAME so the operator
-            # can drill into the existing activity surface that already
-            # honours the query parameter.
-            link = (
-                f'<a class="seengineer" href="?engineer={_esc(engineer)}">'
-                f'{_esc(engineer)}</a>'
-            )
+            # Plain text, not a link: the dashboard route ignores an
+            # ``engineer`` query parameter (only the v0.28 backpressure
+            # middleware ever read it, and v0.42 restricted even that to
+            # authenticated identities), so an ``?engineer=NAME`` href
+            # just reloaded the identical page.
+            name_html = f'<span class="seengineer">{_esc(engineer)}</span>'
             stale_lines.append(
                 '<div class="serow">'
-                f'<div class="sename">{link}</div>'
+                f'<div class="sename">{name_html}</div>'
                 f'<div class="seage">{_esc(age)}</div>'
                 f'<div class="secount">{count}</div>'
-                '</div>'
+                "</div>"
             )
         stale_body = "".join(stale_lines)
     else:
         stale_body = (
             '<div class="empty" style="padding:calc(var(--grid) * 2)">'
-            'no stale engineers (good!)</div>'
+            f"no stale engineers {scope_empty_suffix}</div>"
         )
     stale_html = (
         '<section class="panel">'
-        '<header><h2>stale engineers</h2>'
+        "<header><h2>stale engineers</h2>"
         f'<span class="meta">threshold {stale_engineer_days}d · '
-        f'{len(stale_engineers)} listed</span></header>'
-        '<div class="stale" style="padding:calc(var(--grid) * 2)">'
-        + stale_body +
-        '</div>'
-        '</section>'
+        f"{len(stale_engineers)} listed</span></header>"
+        '<div class="stale" style="padding:calc(var(--grid) * 2)">' + stale_body + "</div>"
+        "</section>"
     )
 
     # v0.27: webhook delivery panel. Surface per-event-type delivery
@@ -1752,29 +1967,31 @@ async def render_dashboard(
         for event_type in sorted(webhook_stats):
             wc = webhook_stats[event_type]
             wb_d, wb_f, wb_p, wb_x = (
-                int(wc.get(k, 0) or 0)
-                for k in ("delivered", "failed", "pending", "exhausted")
+                int(wc.get(k, 0) or 0) for k in ("delivered", "failed", "pending", "exhausted")
             )
             wb_lines.append(
                 '<div class="wbrow">'
                 f'<div class="wbevent">{_esc(event_type)}</div>'
-                f'{_wbcell(wb_d)}{_wbcell(wb_f, "wbfailed")}'
-                f'{_wbcell(wb_p, "wbpending")}{_wbcell(wb_x, "wbexhausted")}'
-                f'{_wbcell(wb_d + wb_f + wb_p + wb_x)}'
-                '</div>'
+                f"{_wbcell(wb_d)}{_wbcell(wb_f, 'wbfailed')}"
+                f"{_wbcell(wb_p, 'wbpending')}{_wbcell(wb_x, 'wbexhausted')}"
+                f"{_wbcell(wb_d + wb_f + wb_p + wb_x)}"
+                "</div>"
             )
         webhook_body = "".join(wb_lines)
     else:
         webhook_body = (
             '<div class="empty" style="padding:calc(var(--grid) * 2)">'
-            'no webhook events in the last 24h</div>'
+            "no webhook events in the last 24h</div>"
         )
     webhooks_html = (
         '<section class="panel"><header><h2>webhook delivery (24h)</h2>'
         f'<span class="meta">{len(webhook_stats)} event types</span></header>'
         '<div class="webhooks" style="padding:calc(var(--grid) * 2)">'
-        + webhook_body + '</div></section>'
+        + webhook_body
+        + "</div></section>"
     )
+    if repo_scoped:
+        webhooks_html = ""
 
     # v0.29.5: engineer tokens panel. Per-engineer viewers see (and
     # manage) only their own tokens; operators see everyone's,
@@ -1787,9 +2004,7 @@ async def render_dashboard(
     tokens_html = ""
     if is_operator or viewer_engineer:
         if is_operator:
-            token_rows = await svc.db.list_engineer_tokens(
-                include_revoked=True
-            )
+            token_rows = await svc.db.list_engineer_tokens(include_revoked=True)
         else:
             token_rows = await svc.db.list_engineer_tokens(
                 engineer=viewer_engineer, include_revoked=True
@@ -1800,24 +2015,18 @@ async def render_dashboard(
 
         banner_html = ""
         if token_error:
-            banner_html = (
-                f'<div class="tokenbanner err">{_esc(token_error)}</div>'
-            )
+            banner_html = f'<div class="tokenbanner err">{_esc(token_error)}</div>'
         elif token_success:
-            banner_html = (
-                f'<div class="tokenbanner ok">{_esc(token_success)}</div>'
-            )
+            banner_html = f'<div class="tokenbanner ok">{_esc(token_success)}</div>'
 
         engineer_head = "<th>engineer</th>" if is_operator else ""
-        token_colspan = 10 if is_operator else 9
+        token_colspan = 11 if is_operator else 10
         if token_rows:
             token_rows_html = ""
             for t in token_rows:
                 status = derive_token_status(t, now=now)
                 tid = str(t.get("id") or "")
-                engineer_cell = (
-                    f"<td>{_esc(t.get('engineer'))}</td>" if is_operator else ""
-                )
+                engineer_cell = f"<td>{_esc(t.get('engineer'))}</td>" if is_operator else ""
                 if status == "revoked":
                     action_cell = "<td class='muted'>—</td>"
                 else:
@@ -1830,38 +2039,50 @@ async def render_dashboard(
                         '<button type="submit">revoke</button>'
                         "</form></td>"
                     )
+                token_repo = t.get("repo")
+                if token_repo:
+                    token_scope_cell = (
+                        f"<td><span class='pattern'>{_esc(str(token_repo))}</span></td>"
+                    )
+                else:
+                    token_scope_cell = (
+                        "<td><span class='pill tok-unscoped'>unscoped</span>"
+                        "<br><span class='muted token-scope-note'>"
+                        "all repositories</span></td>"
+                    )
                 token_rows_html += (
                     "<tr>"
                     f"<td class='muted' title='{_esc(tid)}'>"
                     f"<code>{_esc(tid[:8])}</code></td>"
                     f"{engineer_cell}"
-                    f"<td class='muted'>{_esc(t.get('description'))}</td>"
+                    f"{token_scope_cell}"
+                    f"<td class='muted secondary-mobile'>{_esc(t.get('description'))}</td>"
                     f"<td><span class='pill tok-{_esc(status)}'>"
                     f"{_esc(status)}</span></td>"
-                    f"<td class='muted'>{_esc(_ago(t.get('created_at'), now))}</td>"
-                    f"<td class='muted'>{_esc(_ago(t.get('last_used_at'), now) if t.get('last_used_at') else '—')}</td>"
-                    f"<td class='num-col'>{int(t.get('request_count') or 0)}</td>"
-                    f"<td class='muted'>{_esc(t.get('last_source_ip') or '—')}</td>"
-                    f"<td class='muted'>{_esc(t.get('expires_at') or 'never')}</td>"
+                    f"<td class='muted secondary-mobile'>{_esc(_ago(t.get('created_at'), now))}</td>"
+                    f"<td class='muted secondary-mobile'>{_esc(_ago(t.get('last_used_at'), now) if t.get('last_used_at') else '—')}</td>"
+                    f"<td class='num-col secondary-mobile'>{int(t.get('request_count') or 0)}</td>"
+                    f"<td class='muted secondary-mobile'>{_esc(t.get('last_source_ip') or '—')}</td>"
+                    f"<td class='muted secondary-mobile'>{_esc(t.get('expires_at') or 'never')}</td>"
                     f"{action_cell}"
                     "</tr>"
                 )
         else:
             token_rows_html = (
                 f"<tr><td class='empty' colspan='{token_colspan}'>"
-                "no tokens issued yet</td></tr>"
+                f"no tokens issued yet {scope_empty_suffix}</td></tr>"
             )
 
         if is_operator:
             engineer_input = (
-                '<label>engineer '
+                "<label>engineer "
                 '<input type="text" name="engineer" placeholder="engineer id">'
                 "</label>"
             )
             scope_meta = f"{len(token_rows)} tokens · all engineers"
         else:
             engineer_input = (
-                '<label>engineer '
+                "<label>engineer "
                 f'<span class="tokself">{_esc(viewer_engineer)}</span>'
                 '<input type="hidden" name="engineer" '
                 f'value="{_esc(viewer_engineer)}">'
@@ -1869,30 +2090,62 @@ async def render_dashboard(
             )
             scope_meta = f"{len(token_rows)} tokens · {_esc(viewer_engineer)}"
 
+        if viewer_repo is not None:
+            repo_input = (
+                "<label>repo "
+                f'<span class="tokself">{_esc(viewer_repo)}</span>'
+                '<input type="hidden" name="repo" '
+                f'value="{_esc(viewer_repo)}">'
+                "</label>"
+            )
+        elif scope_required:
+            repo_input = (
+                "<label>repo "
+                '<input type="text" name="repo" '
+                'placeholder="owner/name (required)"></label>'
+            )
+        else:
+            repo_input = (
+                "<label>repo "
+                '<input type="text" name="repo" '
+                'placeholder="owner/name (recommended)"></label>'
+                '<label class="tokscope-choice">'
+                '<input type="checkbox" name="all_repos" value="1">'
+                " all repositories "
+                '<span class="tokscope-note">high-privilege credential</span>'
+                "</label>"
+            )
+
         tokens_html = (
             '<section class="panel">'
             "<header><h2>engineer tokens</h2>"
             f'<span class="meta">{scope_meta}</span></header>'
             f"{banner_html}"
-            "<table><thead><tr>"
+            '<div class="table-scroll" tabindex="0" role="region" '
+            'aria-label="Engineer token table"><table class="table-tokens">'
+            '<caption class="visually-hidden">Engineer access tokens, '
+            "repository scope, usage, and revocation controls</caption>"
+            "<thead><tr>"
             "<th>id</th>"
             f"{engineer_head}"
-            "<th>description</th>"
+            "<th>repo / scope</th>"
+            '<th class="secondary-mobile">description</th>'
             "<th>status</th>"
-            "<th>created</th>"
-            "<th>last used</th>"
-            '<th class="num-col">reqs</th>'
-            "<th>last ip</th>"
-            "<th>expires</th>"
+            '<th class="secondary-mobile">created</th>'
+            '<th class="secondary-mobile">last used</th>'
+            '<th class="num-col secondary-mobile">reqs</th>'
+            '<th class="secondary-mobile">last ip</th>'
+            '<th class="secondary-mobile">expires</th>'
             "<th>actions</th>"
             "</tr></thead>"
-            f"<tbody>{token_rows_html}</tbody></table>"
+            f"<tbody>{token_rows_html}</tbody></table></div>"
             '<form method="POST" action="/dashboard/tokens/create" '
             'class="tokcreate">'
             f"{engineer_input}"
-            '<label>description '
+            f"{repo_input}"
+            "<label>description "
             '<input type="text" name="description"></label>'
-            '<label>expires_in '
+            "<label>expires_in "
             '<input type="text" name="expires_in" '
             'placeholder="30d (optional)"></label>'
             f'<input type="hidden" name="csrf_token" value="{csrf_attr}">'
@@ -1903,7 +2156,7 @@ async def render_dashboard(
 
     auto_resolutions_html = (
         '<section class="panel">'
-        '<header><h2>auto-resolutions (24h)</h2>'
+        "<header><h2>auto-resolutions (24h)</h2>"
         f'<span class="meta">{auto_total} total</span></header>'
         '<div style="padding:calc(var(--grid) * 2);'
         'display:flex;gap:calc(var(--grid) * 4);align-items:baseline;flex-wrap:wrap">'
@@ -1912,19 +2165,19 @@ async def render_dashboard(
         f'<span class="muted" style="font-size:12px">'
         f'<strong style="color:var(--cyan)">{ac}</strong> coexist · '
         f'<strong style="color:var(--phosphor)">{an}</strong> narrow'
-        '</span>'
+        "</span>"
         '<span class="muted" style="font-size:11px;letter-spacing:0.04em;'
         'margin-left:auto;max-width:60ch;line-height:1.5">'
-        '<strong>auto-coexist</strong>: server granted both symbol claims '
-        'because their symbol sets did not intersect. '
-        '<strong>auto-narrow</strong>: symbol requester was granted alongside '
-        'an existing narrowable file claim. '
+        "<strong>auto-coexist</strong>: server granted both symbol claims "
+        "because their symbol sets did not intersect. "
+        "<strong>auto-narrow</strong>: symbol requester was granted alongside "
+        "an existing narrowable file claim. "
         '<a href="https://github.com/amittell/coord/blob/main/docs/design/'
         'sub-file-claims.md#state-machine-deltas" '
         'style="color:var(--cyan)">design notes</a>.'
-        '</span>'
-        '</div>'
-        '</section>'
+        "</span>"
+        "</div>"
+        "</section>"
     )
 
     # ---- compose page ----------------------------------------------------
@@ -1969,9 +2222,11 @@ async def render_dashboard(
       <span class="seg">{open_conflicts} blocked</span>
       <span class="sep">│</span>
       <span class="seg">idle {idle_timeout_sec // 60}m</span>
-      <span class="seg refresh">auto-refresh <a href="#" id="refresh-toggle" class="rlive">live</a> · <span id="refresh-count">20s</span></span>
+      <span class="seg refresh">auto-refresh <button type="button" id="refresh-toggle" class="rlive" aria-pressed="false" aria-label="Pause automatic refresh" data-state="live">live</button> · <span id="refresh-count" aria-hidden="true">20s</span></span>
       {logout_html}
     </div>
+
+    {scope_banner_html}
 
     <h1 class="title">multi-agent coordination</h1>
     <p class="subtitle">who is touching what, right now and over the last 24 hours</p>
@@ -1984,40 +2239,46 @@ async def render_dashboard(
 
     <section class="panel">
       <header><h2>active claims</h2><span class="meta">{len(rows)} held</span></header>
-      <table>
+      <div class="table-scroll" tabindex="0" role="region" aria-label="Active claims table">
+      <table class="table-wide">
+        <caption class="visually-hidden">Active coordination claims in the selected repository scope</caption>
         <thead>
           <tr>
             <th>engineer</th>
             <th>repo</th>
             <th>pattern</th>
             <th>scope</th>
-            <th>description</th>
+            <th class="secondary-mobile">description</th>
             <th>time left</th>
-            <th>severity</th>
-            <th>session</th>
+            <th class="secondary-mobile">severity</th>
+            <th class="secondary-mobile">session</th>
           </tr>
         </thead>
         <tbody>{rows_html}</tbody>
       </table>
+      </div>
     </section>
 
     <section class="panel">
       <header><h2>release requests</h2><span class="meta">{requests_meta}</span></header>
-      <table>
+      <div class="table-scroll" tabindex="0" role="region" aria-label="Release requests table">
+      <table class="table-wide">
+        <caption class="visually-hidden">Release requests and decisions in the selected repository scope</caption>
         <thead>
           <tr>
             <th>when</th>
             <th>requester</th>
             <th>their pattern</th>
-            <th>scope</th>
+            <th class="secondary-mobile">scope</th>
             <th>holder</th>
-            <th>urgency</th>
+            <th class="secondary-mobile">urgency</th>
             <th>decision</th>
-            <th>latency</th>
+            <th class="secondary-mobile">latency</th>
           </tr>
         </thead>
         <tbody>{req_html}</tbody>
       </table>
+      </div>
     </section>
 
     {queue_html}
@@ -2025,18 +2286,21 @@ async def render_dashboard(
     <div class="row split-7-5">
       <section class="panel">
         <header><h2>repositories</h2><span class="meta">{len(repos)} total</span></header>
-        <table>
+        <div class="table-scroll" tabindex="0" role="region" aria-label="Repositories table">
+        <table class="table-compact">
+          <caption class="visually-hidden">Repository activity summary for the selected dashboard scope</caption>
           <thead>
             <tr>
               <th>repo</th>
               <th class="num-col">active</th>
               <th class="num-col">24h claims</th>
-              <th class="num-col">24h engineers</th>
-              <th>last activity</th>
+              <th class="num-col secondary-mobile">24h engineers</th>
+              <th class="secondary-mobile">last activity</th>
             </tr>
           </thead>
           <tbody>{repos_html}</tbody>
         </table>
+        </div>
       </section>
 
       <section class="panel">
@@ -2048,28 +2312,34 @@ async def render_dashboard(
     <div class="row split-1-1">
       <section class="panel">
         <header><h2>module heatmap</h2><span class="meta">first path segment</span></header>
-        <table>
+        <div class="table-scroll" tabindex="0" role="region" aria-label="Module heatmap table">
+        <table class="table-compact">
+          <caption class="visually-hidden">Active claim counts by first path segment</caption>
           <thead><tr><th>prefix</th><th class="num-col">claims</th><th>density</th></tr></thead>
           <tbody>{heat_rows}</tbody>
         </table>
+        </div>
       </section>
 
       <section class="panel">
-        <header><h2>recent conflicts</h2><span class="meta">last 500 attempts</span></header>
-        <table>
+        <header><h2>recent conflicts · retained history</h2><span class="meta">latest 500 attempts · claim details may age out</span></header>
+        <div class="table-scroll" tabindex="0" role="region" aria-label="Recent conflict history table">
+        <table class="table-wide">
+          <caption class="visually-hidden">Latest 500 retained conflict attempts and current linked-claim status</caption>
           <thead>
             <tr>
               <th>when</th>
               <th>attempted by</th>
               <th>their pattern</th>
               <th>holder</th>
-              <th>holder pattern</th>
+              <th class="secondary-mobile">holder pattern</th>
               <th>status</th>
-              <th>session</th>
+              <th class="secondary-mobile">session</th>
             </tr>
           </thead>
           <tbody>{conf_html}</tbody>
         </table>
+        </div>
       </section>
     </div>
 
@@ -2087,10 +2357,12 @@ async def render_dashboard(
 
     <section class="panel">
       <header><h2>claim timeline</h2><span class="meta">most recent 50</span></header>
-      <table>
+      <div class="table-scroll" tabindex="0" role="region" aria-label="Claim timeline table">
+      <table class="table-wide">
+        <caption class="visually-hidden">Most recent 50 claims and their current lifecycle state</caption>
         <thead>
           <tr>
-            <th>created</th>
+            <th class="secondary-mobile">created</th>
             <th>engineer</th>
             <th>repo</th>
             <th>pattern</th>
@@ -2100,6 +2372,7 @@ async def render_dashboard(
         </thead>
         <tbody>{timeline_html}</tbody>
       </table>
+      </div>
     </section>
 
     <footer class="foot">

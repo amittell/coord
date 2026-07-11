@@ -45,15 +45,21 @@ def sha256_token(raw: str) -> str:
 
 def _elapsed(ts: Any, now: datetime) -> bool:
     """True when a stored ``...Z`` timestamp is at or before ``now``.
-    Empty / NULL means "no deadline", which never elapses. An
+    Empty / NULL means "no deadline", which never elapses. A naive
+    timestamp (no timezone -- a hand-edited or legacy row) is read as
+    UTC instead of raising the naive-vs-aware TypeError, which would
+    crash status derivation rather than failing closed. An
     unparseable value counts as elapsed -- fail closed, because a
     corrupt expiry must not turn into an immortal token."""
     if not ts:
         return False
     try:
-        return datetime.fromisoformat(str(ts).replace("Z", "+00:00")) <= now
-    except ValueError:
+        parsed = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
         return True
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed <= now
 
 
 def derive_token_status(

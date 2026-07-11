@@ -4,35 +4,15 @@
 # still a single write point for v1 (acceptable; restarts are fast and coord
 # clients retry over a blip). Patroni/CloudNativePG is the follow-up.
 #
-# The coord-pg Secret below is a STUB. Do NOT commit real credentials. In prod
-# the value is rendered from sealed-secrets / External Secrets / Vault. Create
-# it imperatively if you are bootstrapping by hand, for example:
-#
-#   kubectl -n coord create secret generic coord-pg \
-#     --from-literal=POSTGRES_USER=coord \
-#     --from-literal=POSTGRES_PASSWORD="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')" \
-#     --from-literal=POSTGRES_DB=coord \
-#     --from-literal=COORD_DATABASE_URL="postgresql://coord:THEPASSWORD@coord-postgres.coord.svc.cluster.local:5432/coord"
-#
-# COORD_DATABASE_URL is consumed by the coord Deployment (deployment.yaml).
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: coord-pg
-  namespace: coord
-  labels:
-    app.kubernetes.io/name: coord-postgres
-    app.kubernetes.io/component: database
-    app.kubernetes.io/part-of: coord
-type: Opaque
-stringData:
-  # Placeholders -- replace via sealed-secret / External Secrets before applying.
-  POSTGRES_USER: "replace-me-coord-user"
-  POSTGRES_PASSWORD: "replace-me-with-a-strong-random-password"
-  POSTGRES_DB: "replace-me-coord-db"
-  # Full DSN coord connects with. Host is the headless Service below.
-  COORD_DATABASE_URL: "postgresql://replace-me-coord-user:replace-me-with-a-strong-random-password@coord-postgres.coord.svc.cluster.local:5432/replace-me-coord-db"
+# The coord-pg Secret is deliberately NOT in this file. This manifest is
+# `kubectl apply`d verbatim by the cutover runbook, and bundling the stub
+# Secret here would clobber the real credentials with placeholders on apply
+# (failing coord's PG auth mid-cutover, or baking placeholder credentials
+# into PGDATA if applied before Postgres's first boot). Create the real
+# Secret from sealed-secrets / External Secrets / Vault, or imperatively --
+# see secret.example.yaml in this directory for the required keys and a
+# bootstrap command. Both the StatefulSet below and the coord Deployment
+# (deployment.yaml) reference it by name (coord-pg).
 ---
 apiVersion: v1
 kind: Service
@@ -87,7 +67,11 @@ spec:
           type: RuntimeDefault
       containers:
         - name: postgres
-          image: postgres:16
+          # Pinned minor + digest, matching the digest-pinning policy the
+          # coord image follows. A floating `postgres:16` tag plus
+          # IfNotPresent would let a rescheduled pod silently jump Postgres
+          # minor versions depending on what each node happened to cache.
+          image: postgres:16.14@sha256:be01cf82fc7dbba824acf0a82e150b4b360f3ff93c6631d7844af431e841a95c
           imagePullPolicy: IfNotPresent
           ports:
             - name: postgres

@@ -2,8 +2,14 @@
 # deploy/k8s/prod/ -- so it can never auto-apply on merge; see the
 # 2026-07-05 incident note in docs/runbooks/coord-ha-cutover.md).
 # NOTE: the release workflow only bumps deploy/k8s/prod/, so the image pin
-# here drifts. REPIN to the current release (copy the image line from
-# deploy/k8s/prod/deployment.yaml) as part of cutover step 0.
+# here drifts. Do NOT copy the standard release image line here: the default
+# production image is intentionally SQLite-only and omits asyncpg. Build and
+# publish an explicit PostgreSQL-enabled variant from the same reviewed
+# release (installing requirements-postgres.txt), then pin its immutable tag
+# and digest here. Any image without asyncpg CrashLoops the moment
+# COORD_DATABASE_URL is set.
+# Verify before the maintenance window (runbook step 0):
+#   docker run --rm <image> python -c "import asyncpg"
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -39,7 +45,12 @@ spec:
         - name: ghcr-pull
       containers:
         - name: coord
-          image: ghcr.io/amittell/coord:v0.45.0@sha256:a55e767f783e2fc1ee3a9bee3c8dc107f077221533f6348030b03d431acc1f33
+          # Fail-closed placeholder: there is intentionally no runnable image
+          # here. Replace it with a verified PostgreSQL-enabled image per the
+          # header note before cutover. `kubectl apply` without that deliberate
+          # edit must produce ImagePullBackOff, never start a SQLite-only image
+          # against COORD_DATABASE_URL and CrashLoop the fleet ambiguously.
+          image: invalid.invalid/coord-postgres:REPLACE_WITH_REVIEWED_IMAGE@sha256:0000000000000000000000000000000000000000000000000000000000000000
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -58,6 +69,11 @@ spec:
                 secretKeyRef:
                   name: coord-pg
                   key: COORD_DATABASE_URL
+            # Stable application namespace inside the target database. Every
+            # replica and pre-cutover migration command must use this exact
+            # value; changing it selects a different, empty coord dataset.
+            - name: COORD_POSTGRES_SCHEMA
+              value: coord
             # v0.29: reject the shared COORD_AUTH_TOKEN once every
             # engineer has been migrated to a per-engineer token
             # (via `coord tokens create` against this same db). The

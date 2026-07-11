@@ -170,12 +170,28 @@ def run_start(args) -> int:
             _wait_for_http_ready(state.api_url, proc)
         except RuntimeError as exc:
             print(str(exc))
-            pid_file = state_paths()["home"] / "coord.pid"
-            if pid_file.exists():
+            # Reap the process this invocation spawned. On a readiness
+            # timeout the child is usually still alive; without this it
+            # would keep running (and could bind the port and the SQLite
+            # DB seconds later) with no PID file recording it, so
+            # 'coord stop' could never find it. Escalate to SIGKILL if
+            # SIGTERM is ignored.
+            if proc.poll() is None:
+                proc.terminate()
                 try:
-                    pid_file.unlink()
-                except OSError:
-                    pass
+                    proc.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=5.0)
+                    except subprocess.TimeoutExpired:
+                        pass
+            # Deliberately do NOT unlink ~/.coord/coord.pid here:
+            # _write_pid_file only runs after readiness succeeds, so this
+            # invocation never wrote it. Any PID file present now belongs
+            # to a different, possibly healthy background service (e.g.
+            # one started on another port); unlinking it would orphan
+            # that service's stop record.
             return 1
         state.pid = proc.pid
         _write_pid_file(proc.pid)

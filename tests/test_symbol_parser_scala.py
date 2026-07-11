@@ -313,20 +313,19 @@ def test_top_level_def_has_no_parent() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Dispatcher path -- only once the integrator registers the extension
+# Dispatcher path
 # ---------------------------------------------------------------------------
 
 
 def test_dispatcher_routes_scala_extension() -> None:
-    """Once ``.scala`` is registered, the dispatcher must route to this backend.
+    """``.scala`` is registered in the dispatcher (v0.33); the extension must
+    stay in ``supported_extensions()`` and route to this backend. Asserted
+    unconditionally so a dropped registration turns the suite red rather
+    than silently skipping."""
 
-    Skips while the registry has not yet been wired (the dispatcher registry is
-    owned by a separate integrator); the backend-direct tests above provide the
-    standalone coverage in the meantime.
-    """
-
-    if ".scala" not in supported_extensions():
-        pytest.skip(".scala not yet registered in the dispatcher")
+    assert ".scala" in supported_extensions(), (
+        ".scala must stay registered in the dispatcher extension map"
+    )
     src = "object Main {\n  def run(): Unit = ()\n}\n"
     result = extract_symbols("foo.scala", src)
     assert result, "expected non-empty result for a simple Scala object"

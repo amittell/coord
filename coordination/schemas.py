@@ -4,7 +4,15 @@ from pydantic import BaseModel, Field
 
 
 class ClaimItem(BaseModel):
-    type: str = Field(..., description="module | file | shared_file")
+    type: str = Field(
+        ...,
+        description=(
+            "file | shared_file. 'module' is a legacy value kept for "
+            "direct HTTP API compatibility; it is not reachable via the "
+            "MCP tools and behaves like a non-narrowable claim outside "
+            "the shared-TTL rules."
+        ),
+    )
     pattern: str
     symbols: list[str] | None = Field(
         default=None,
@@ -23,9 +31,10 @@ class ClaimItem(BaseModel):
         description=(
             "Optional flag (v0.14+) controlling whether an incoming "
             "symbol-scope claim is allowed to auto-narrow this row. "
-            "Defaults: file claims True, shared_file False, module False, "
-            "symbol-scope claims always non-narrowable. Explicit False on "
-            "a normal file claim forces the legacy 409+request flow."
+            "Defaults: file claims True, shared_file False, legacy module "
+            "claims False, symbol-scope claims always non-narrowable. "
+            "Explicit False on a normal file claim forces the legacy "
+            "409+request flow."
         ),
     )
 
@@ -195,6 +204,23 @@ class ConflictCheckResponse(BaseModel):
     suggestion: str | None = None
 
 
+class ConflictBatchRequest(BaseModel):
+    """One-request conflict check used by the managed pre-push hook.
+
+    The legacy ``GET /conflicts`` endpoint accepts repeated ``pattern`` query
+    parameters, but a large push can exceed proxy/request-line limits.  This
+    JSON form keeps the same service semantics while allowing thousands of
+    paths in a bounded request body.
+    """
+
+    patterns: list[str] = Field(min_length=1, max_length=5000)
+    engineer: str = Field(min_length=1)
+    repo: str | None = None
+    all_repos: bool = False
+    session_ids: list[str] = Field(default_factory=list, max_length=1000)
+    branch: str | None = None
+
+
 class ReleaseClaimsRequest(BaseModel):
     claim_ids: list[str]
     engineer: str | None = None
@@ -303,15 +329,11 @@ class PromoteHotspotRequest(BaseModel):
 
     action: str = Field(..., description="'shared_file' or 'split'")
     pattern: str = Field(..., min_length=1)
-    repo: str | None = Field(
-        default=None,
-        description=(
-            "Informational only -- ownership rules are global per coord "
-            "instance today. Recorded in the response so the operator "
-            "can correlate with the dashboard row that triggered the "
-            "promote."
-        ),
-    )
+    # No ``repo`` field: ownership rules are global per coord instance
+    # (the route is operator-only for exactly that reason), so accepting
+    # and echoing a repo would misrepresent the write as repo-scoped.
+    # Clients still sending the retired field are ignored (pydantic's
+    # default extra-field handling).
     note: str | None = Field(
         default=None,
         description=(

@@ -84,8 +84,9 @@ async def test_ping_writes_again_after_interval(clock) -> None:
 async def test_failed_ping_rolls_stamp_back(clock) -> None:
     svc = _svc(interval=30)
     svc.db.fail_next = True
-    with pytest.raises(RuntimeError):
-        await svc._maybe_touch("sess-a", "org/repo")
+    # A ping is liveness-only: the write failure is swallowed (the read
+    # that carried it must not 500), but the coalescing stamp rolls back.
+    await svc._maybe_touch("sess-a", "org/repo")
     # The failed attempt must not suppress the retry.
     await svc._maybe_touch("sess-a", "org/repo")
     assert svc.db.calls == [("sess-a", "org/repo")]

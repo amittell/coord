@@ -77,6 +77,7 @@ otel = [
 dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=1.4.0",
+    "pytest-timeout>=2.3.1",
     "ruff>=0.15.15",
     "mypy>=2.1.0",
     "tree-sitter>=0.25.2",
@@ -165,7 +166,17 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Per-test watchdog (pytest-timeout). The suite contains hang-capable
+# constructs -- server long-polls driven by real tasks, real subprocesses,
+# and the PG backend's known mode where a task blocked on a PG round-trip
+# hangs _cancel_all_tasks forever (see tests/conftest.py). A generous cap
+# turns any single wedged test into a loud failure instead of a deadlocked
+# run that orphans the pytest process. method=thread works with asyncio and
+# subprocess-heavy tests where SIGALRM-based signal handling does not.
+timeout = 120
+timeout_method = "thread"
 markers = [
     "integration: end-to-end tests that spawn real processes (deselect with -m 'not integration')",
+    "platform: targeted cross-platform smoke tests for OS-specific paths, process semantics, permissions, and shell integration",
     "sqlite_only: tests that exercise SQLite-internal mechanics (the migrations chain, flock/subprocess single-writer) that the Postgres backend replaces by design (consolidated v1 schema, advisory locks); skipped when COORD_DATABASE_URL selects Postgres",
 ]

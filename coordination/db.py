@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import json
+import logging
 import os
 import sqlite3
 import sys
@@ -18,6 +19,8 @@ import aiosqlite
 from coordination import metrics
 
 from coordination.repo_id import normalize_repo_id
+
+logger = logging.getLogger(__name__)
 
 
 # Transaction seam (HA re-architecture, design Sections 5/7). When a
@@ -181,7 +184,10 @@ CURRENT_SCHEMA_VERSION = 19
 # waiters eventually win. Keyed on blocking_claim_id so unrelated
 # queues don't interfere with each other's fairness rotations.
 # Per-process state: a restart resets the counters, which is fine
-# because the fairness guarantee is statistical, not absolute.
+# because the fairness guarantee is statistical, not absolute. Pruned by
+# pop_next_waiting_queue_entry when a claim's queue is observed empty,
+# so the map's size tracks currently-contested claims rather than
+# growing one permanent UUID entry per claim ever released.
 _FAIRNESS_COUNTERS: dict[str, int] = {}
 
 
@@ -646,14 +652,21 @@ def _utcnow() -> str:
 
 def _ts_elapsed(ts: Any, ref: datetime) -> bool:
     """True when ``ts`` is a non-empty timestamp at or before ``ref``.
-    Unparseable values count as elapsed -- fail closed, because a
-    corrupt expiry must not turn into an immortal token."""
+    Naive timestamps (no timezone -- hand-edited or legacy rows) are
+    read as UTC instead of raising the naive-vs-aware TypeError, which
+    on the request auth path would turn a corrupt expires_at into a
+    500 rather than a 401. Unparseable values count as elapsed -- fail
+    closed, because a corrupt expiry must not turn into an immortal
+    token."""
     if not ts:
         return False
     try:
-        return datetime.fromisoformat(str(ts).replace("Z", "+00:00")) <= ref
-    except ValueError:
+        parsed = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
         return True
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed <= ref
 
 
 # SQLite waits this long (ms) for a contended write lock before raising
@@ -870,8 +883,20 @@ class Database:
             return object.__new__(PostgresStore)
         return object.__new__(cls)
 
-    def __init__(self, path: Path, *, writer_queue: bool = False) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        writer_queue: bool = False,
+        postgres_schema: str | None = None,
+        postgres_schema_explicit: bool | None = None,
+    ) -> None:
         self.path = path
+        # Accepted so construction can be backend-neutral: service/CLI callers
+        # pass the configured PostgreSQL schema unconditionally. SQLite has no
+        # schema namespace, so the value is intentionally ignored here.
+        _ = postgres_schema
+        _ = postgres_schema_explicit
         # v0.44 scale: when True, all single-statement writes funnel through
         # one persistent connection under ``_writer_lock`` (see _write) instead
         # of a fresh connection per op, removing SQLite write-lock contention
@@ -888,6 +913,22 @@ class Database:
         # disjoint engineers never serialize against each other. Created
         # lazily in :meth:`engineer_lock`.
         self._engineer_locks: dict[str, asyncio.Lock] = {}
+        # init() memoization (mirrors PostgresStore): the schema check runs
+        # a BEGIN IMMEDIATE migration transaction, i.e. it momentarily takes
+        # SQLite's single write lock. Without a flag, every operation
+        # (reads included) re-ran that check per call, so read traffic
+        # contended with the persistent writer for the write lock. The
+        # asyncio.Lock keeps two concurrent first calls from racing the
+        # migration; _migrate_to_current itself stays cross-process safe.
+        self._inited = False
+        self._init_lock = asyncio.Lock()
+        # touch_engineer_token coalescing (per token_sha256): last flushed
+        # write (monotonic seconds) and the accumulated state of skipped
+        # touches. Skipped request_count increments are carried in
+        # ``_token_touch_pending`` and flushed with the next write for that
+        # token, so coalescing never under-counts -- it only defers.
+        self._token_touch_last: dict[str, float] = {}
+        self._token_touch_pending: dict[str, dict[str, Any]] = {}
 
     def _connect(self):
         """Open a fresh per-operation connection.
@@ -961,20 +1002,41 @@ class Database:
         error. This ownership is what makes it reentrancy-safe.
 
         Three modes:
+        - INSIDE a ``transaction()`` (``_BOUND_CONN`` set, checked FIRST so it
+          applies whether the writer queue is on or off): reuse the bound
+          connection and DEFER -- the outer transaction owns the commit, so we
+          neither re-lock nor open a second connection that would write and
+          commit outside the unit-of-work (and, with the queue off, block
+          against the outer transaction's write lock).
         - queue off: fresh connection per op (legacy), commit + close here.
-        - queue on, outside a transaction: acquire ``_writer_lock`` and use the
-          one shared persistent writer connection, commit + release on exit.
-          Concurrent writers queue in-process instead of fighting SQLite's
-          write lock, so the funnelled paths cannot hit ``SQLITE_BUSY``. (A
-          few legacy write paths -- e.g. ``release_for_session``'s
-          ``BEGIN IMMEDIATE`` block -- still open their own connections and
-          can BUSY under extreme contention; migrate them here as the
-          ``sqlite_writer_wait_seconds_total`` metric warrants.)
-        - queue on, INSIDE a ``transaction()`` (``_BOUND_CONN`` set): reuse the
-          bound connection and DEFER -- the outer transaction already holds the
-          lock and owns the commit, so we neither re-lock (no deadlock) nor
-          commit early (no torn unit-of-work).
+        - queue on: acquire ``_writer_lock`` and use the one shared persistent
+          writer connection, commit + release on exit. Concurrent writers
+          queue in-process instead of fighting SQLite's write lock, so the
+          funnelled paths cannot hit ``SQLITE_BUSY``.
+
+        Off-funnel writers: most multi-statement write paths still open their
+        own private connections (``BEGIN IMMEDIATE`` or autocommit) instead of
+        funnelling through here -- create_request, respond_to_request,
+        enqueue_claim_request, pop_next_waiting_queue_entry,
+        mark_queue_granted/expired, cascade_resolve_requests_for_claim,
+        _detach_coexist_partners, rotate_engineer_token, expire_stale_claims,
+        release_active_claims_for_engineers, extend_claim,
+        insert_claim_callsites, update_claim_symbol_rename, and
+        release_for_session's BEGIN IMMEDIATE block. Each of those can BUSY
+        against the persistent writer under extreme contention (bounded by
+        ``PRAGMA busy_timeout``); migrate the hottest onto this funnel or the
+        ``transaction()`` seam as the ``sqlite_writer_wait_seconds_total``
+        metric warrants.
         """
+        bound = _BOUND_CONN.get()
+        if bound is not None:
+            # Inside a write transaction that owns the commit -- reuse its
+            # connection, defer commit/unlock to it. Checked before the
+            # writer-queue branch so the bound reuse applies in BOTH modes;
+            # with the queue off, a fresh connection here would escape the
+            # outer unit-of-work and stall on its write lock.
+            yield bound
+            return
         if not self._writer_queue:
             # Go through self._connect() -- the overridable backend seam -- so
             # the Postgres store's adapter connection is used there, exactly
@@ -993,12 +1055,6 @@ class Database:
                     except Exception:
                         pass
                     raise
-            return
-        bound = _BOUND_CONN.get()
-        if bound is not None:
-            # Inside a write transaction that already holds the lock and owns
-            # commit -- reuse its connection, defer commit/unlock to it.
-            yield bound
             return
         _wait_start = time.perf_counter()
         await self._writer_lock.acquire()
@@ -1024,22 +1080,35 @@ class Database:
             self._writer_lock.release()
 
     async def init(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        async with self._connect() as conn:
-            conn.row_factory = aiosqlite.Row
-            await _configure_sqlite(conn)
+        # Memoized (same pattern as PostgresStore.init): the migration check
+        # below runs BEGIN IMMEDIATE, i.e. it takes SQLite's single write
+        # lock even when the schema is already current. Re-running it on
+        # every operation made all read traffic contend with the persistent
+        # writer connection for the write lock. The double-check under the
+        # lock keeps concurrent first calls from racing each other in this
+        # process; _migrate_to_current stays cross-process safe on its own.
+        if self._inited:
+            return
+        async with self._init_lock:
+            if self._inited:
+                return
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            async with self._connect() as conn:
+                conn.row_factory = aiosqlite.Row
+                await _configure_sqlite(conn)
 
-            # Create the version table outside the migration transaction.
-            # CREATE TABLE IF NOT EXISTS is idempotent so concurrent calls
-            # from multiple processes are safe here.
-            await _ensure_schema_version_table(conn)
+                # Create the version table outside the migration transaction.
+                # CREATE TABLE IF NOT EXISTS is idempotent so concurrent calls
+                # from multiple processes are safe here.
+                await _ensure_schema_version_table(conn)
 
-            # Everything version-sensitive (version read, legacy detection,
-            # pending migrations) runs under a single BEGIN IMMEDIATE
-            # transaction so only one process can drive the upgrade at a
-            # time. Others wait for the write lock, then observe that the
-            # version is already current and do nothing.
-            await _migrate_to_current(conn)
+                # Everything version-sensitive (version read, legacy
+                # detection, pending migrations) runs under a single BEGIN
+                # IMMEDIATE transaction so only one process can drive the
+                # upgrade at a time. Others wait for the write lock, then
+                # observe that the version is already current and do nothing.
+                await _migrate_to_current(conn)
+            self._inited = True
 
     @asynccontextmanager
     async def transaction(self):
@@ -1059,9 +1128,16 @@ class Database:
         and defers commit to the outermost block, so the grant never
         deadlocks against its own open write transaction.
 
-        On SQLite the connection runs in the default deferred-isolation
-        mode: writes accumulate in one implicit transaction and commit
-        once here; an exception rolls the whole unit back.
+        On SQLite with the writer queue off, the unit-of-work opens with
+        an explicit ``BEGIN IMMEDIATE`` so the write lock is taken up
+        front: the overlap re-check and the insert are atomic against any
+        concurrent writer, matching both the writer-queue serialization
+        and the Postgres advisory-lock guarantee. (Deferred isolation
+        here would let two concurrent grants each read a pre-insert
+        snapshot and both pass the overlap re-check -- a double-grant
+        TOCTOU reopened exactly when COORD_SQLITE_WRITER_QUEUE=false.)
+        Writes accumulate in that one transaction and commit once here;
+        an exception rolls the whole unit back.
         """
         existing = _BOUND_CONN.get()
         if existing is not None:
@@ -1115,6 +1191,13 @@ class Database:
         async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
+            # Take the write lock up front (see docstring): without the
+            # writer queue nothing else serializes concurrent grant
+            # units-of-work in this process, and a deferred begin would
+            # let two of them interleave read-check-insert. The PG store
+            # overrides transaction() entirely, so this branch is
+            # SQLite-only and the literal BEGIN IMMEDIATE is safe.
+            await conn.execute("BEGIN IMMEDIATE")
             token = _BOUND_CONN.set(conn)
             held_eng_token = _TXN_ENG_LOCKS.set([])
             try:
@@ -1236,6 +1319,23 @@ class Database:
         """
         return True
 
+    async def release_leader_lease(
+        self, *, lease_name: str, holder_id: str
+    ) -> bool:
+        """Voluntarily give up the background-loop leader lease on
+        graceful shutdown.
+
+        On SQLite the single writer process is unconditionally the
+        leader and no lease row exists (see
+        :meth:`acquire_leader_lease`), so this is a no-op returning
+        True. The Postgres backend overrides it with a holder-guarded
+        DELETE so a draining pod hands leadership off immediately on a
+        rolling deploy instead of leaving its lease row to block every
+        other replica until the TTL expires. ``lease_name`` and
+        ``holder_id`` are ignored on SQLite.
+        """
+        return True
+
     @asynccontextmanager
     async def _acquire(self):
         """Yield ``(conn, owns)`` for a single Database operation.
@@ -1278,7 +1378,13 @@ class Database:
         out: list[dict[str, Any]] = []
         for r in rows:
             exp_raw = str(r["expires_at"])
-            exp = datetime.fromisoformat(exp_raw.replace("Z", "+00:00"))
+            try:
+                exp = datetime.fromisoformat(exp_raw.replace("Z", "+00:00"))
+            except ValueError:
+                # Fail closed: a malformed expires_at is treated as already
+                # expired (excluded here, force-released by the TTL sweep)
+                # instead of raising and 500ing every list/claim call.
+                continue
             if exp <= now:
                 continue
             out.append(dict(r))
@@ -1625,26 +1731,39 @@ class Database:
         new_end_col: int | None,
         resolved_by: str,
         new_pattern: str | None,
+        guard_new_path_collision: bool = False,
+        repo: str | None = None,
     ) -> bool:
         """v0.31 wave 2: apply a detected rename atomically.
 
-        In ONE BEGIN IMMEDIATE transaction:
+        In one transaction (``BEGIN IMMEDIATE`` on SQLite):
 
         1. read the matching ``claim_symbols`` row (old span + parent,
            needed for the audit trail);
-        2. update its ``symbol_name``, span columns, and
+        2. when ``guard_new_path_collision`` is set, re-check that no
+           OTHER active symbol-scope claim in the same ``repo`` bucket
+           already holds a path overlapping the new symbol path on this
+           file, and abort (False, nothing written) when one does. The
+           PostgreSQL path holds the same repo advisory lock as grants.
+           The rename sweep's
+           Python-side collision check reads a snapshot on a separate
+           connection, so without this in-transaction recheck a
+           concurrent grant landing between the sweep's read and this
+           write would let the rename manufacture exactly the
+           double-grant the guard exists to prevent;
+        3. update its ``symbol_name``, span columns, and
            ``resolved_by``;
-        3. update ``claims.pattern`` when ``new_pattern`` is not None
+        4. update ``claims.pattern`` when ``new_pattern`` is not None
            (today the pattern is the file path and never embeds the
            symbol, so the sweep always passes None -- the column update
            exists for any future pattern scheme that does embed it);
-        4. insert the ``claim_symbol_renames`` audit row.
+        5. insert the ``claim_symbol_renames`` audit row.
 
         Partial application is impossible: any failure rolls the whole
         transaction back. Returns False (with nothing written) when no
         ``claim_symbols`` row matches ``(claim_id, file_path,
         old_symbol_name)`` -- e.g. a concurrent release or a second
-        sweep racing this one.
+        sweep racing this one -- or when the collision guard fires.
         """
         await self.init()
         async with self._connect() as conn:
@@ -1652,6 +1771,12 @@ class Database:
             await _configure_sqlite(conn)
             await conn.execute("BEGIN IMMEDIATE")
             try:
+                if guard_new_path_collision:
+                    # Grants take this same lock before their overlap
+                    # re-check. SQLite's repo_lock is a no-op because BEGIN
+                    # IMMEDIATE already serializes writers; PostgreSQL holds
+                    # its advisory lock until the commit below.
+                    await self.repo_lock(conn, repo)
                 cur = await conn.execute(
                     """
                     SELECT id, parent_symbol, start_line, end_line
@@ -1676,6 +1801,41 @@ class Database:
                     if parent
                     else new_symbol_name
                 )
+                if guard_new_path_collision:
+                    # Same active-row semantics as get_symbol_rows_on_file
+                    # (released_at IS NULL, scope_type='symbol', null-safe
+                    # repo bucket), but evaluated on THIS connection inside
+                    # the repo-locked write transaction so no grant can
+                    # commit between the check and the UPDATE below. Use the
+                    # same recursive ancestor/descendant predicate as normal
+                    # claim admission: renaming ``Old`` onto ``New`` must also
+                    # be blocked when another claim holds ``New::method``.
+                    cur = await conn.execute(
+                        """
+                        SELECT cs.parent_symbol, cs.symbol_name
+                        FROM claim_symbols cs
+                        JOIN claims c ON c.id = cs.claim_id
+                        WHERE cs.file_path = ?
+                          AND cs.claim_id != ?
+                          AND c.released_at IS NULL
+                          AND c.scope_type = 'symbol'
+                          AND c.repo IS ?
+                        """,
+                        (file_path, claim_id, repo),
+                    )
+                    other_symbols = await cur.fetchall()
+                    from coordination.overlap_symbols import symbol_paths_overlap
+
+                    target_symbol = (parent, new_symbol_name)
+                    if any(
+                        symbol_paths_overlap(
+                            target_symbol,
+                            (row["parent_symbol"], row["symbol_name"]),
+                        )
+                        for row in other_symbols
+                    ):
+                        await conn.rollback()
+                        return False
                 await conn.execute(
                     """
                     UPDATE claim_symbols
@@ -1765,53 +1925,6 @@ class Database:
             "AND c.scope_type = 'symbol'"
         )
         params: list[Any] = [file_path]
-        if exclude_engineer:
-            sql += " AND c.engineer != ?"
-            params.append(exclude_engineer)
-        if exclude_session_ids:
-            ph = ",".join("?" for _ in exclude_session_ids)
-            sql += f" AND (c.session_id IS NULL OR c.session_id NOT IN ({ph}))"
-            params.extend(exclude_session_ids)
-        if repo is not None:
-            sql += " AND c.repo IS ?"
-            params.append(repo)
-        async with self._connect() as conn:
-            conn.row_factory = aiosqlite.Row
-            await _configure_sqlite(conn)
-            cur = await conn.execute(sql, params)
-            rows = await cur.fetchall()
-            return [dict(r) for r in rows]
-
-    async def find_symbol_overlaps(
-        self,
-        *,
-        file_path: str,
-        symbol_names: list[str],
-        exclude_engineer: str | None = None,
-        exclude_session_ids: list[str] | None = None,
-        repo: str | None = None,
-    ) -> list[dict[str, Any]]:
-        """Return active symbol-scope claim rows whose symbol set intersects
-        the supplied ``symbol_names`` on the supplied ``file_path``.
-
-        Excludes the caller's own engineer / session_ids the same way the
-        path-overlap check does. Used by the conflict engine when both
-        holder and requester are symbol-scoped; an empty intersection
-        means the conflict engine returns AUTO_COEXIST instead of 409.
-        """
-        if not symbol_names:
-            return []
-        await self.init()
-        placeholders = ",".join("?" for _ in symbol_names)
-        params: list[Any] = [file_path, *symbol_names]
-        sql = (
-            "SELECT c.*, cs.symbol_name AS overlapping_symbol, "
-            "cs.symbol_kind AS overlapping_symbol_kind "
-            "FROM claim_symbols cs JOIN claims c ON c.id = cs.claim_id "
-            "WHERE cs.file_path = ? AND cs.symbol_name IN (" + placeholders + ") "
-            "AND c.released_at IS NULL "
-            "AND c.scope_type = 'symbol'"
-        )
         if exclude_engineer:
             sql += " AND c.engineer != ?"
             params.append(exclude_engineer)
@@ -1959,13 +2072,24 @@ class Database:
             row = await cur.fetchone()
             next_position = int((row["p"] if row else 0) or 0) + 1
             # v0.25: priority is one of low|normal|high|blocking. Unknown
-            # values silently coerce to 'normal' so a typo never breaks
-            # the enqueue path.
-            normalised_priority = (
-                priority
-                if priority in ("low", "normal", "high", "blocking")
-                else "normal"
-            )
+            # values coerce to 'normal' so a typo never breaks the enqueue
+            # path (older wrappers pass free-form urgency strings), but the
+            # coercion is logged: an agent that typed 'urgent' meaning
+            # 'blocking' waits at normal priority otherwise invisibly --
+            # the only other signal is the ``priority`` field echoed back
+            # in the returned row.
+            if priority in ("low", "normal", "high", "blocking"):
+                normalised_priority = priority
+            else:
+                if priority:
+                    logger.warning(
+                        "enqueue_claim_request: unrecognized urgency %r from "
+                        "engineer %r coerced to 'normal' (valid: low, normal, "
+                        "high, blocking)",
+                        priority,
+                        requester_engineer,
+                    )
+                normalised_priority = "normal"
             await conn.execute(
                 "INSERT INTO claim_queue ("
                 "id, blocking_claim_id, requester_engineer, "
@@ -2083,12 +2207,20 @@ class Database:
                 # for an integer epoch comparison; if enqueued_at is
                 # malformed the inner strftime returns NULL and the
                 # COALESCE keeps the age at 0 (no boost), so the v0.25
-                # behaviour is preserved on bad data.
+                # behaviour is preserved on bad data. That NULL-on-
+                # malformed degradation is SQLite-only: on the Postgres
+                # backend the translated text::timestamptz cast raises
+                # (SQLSTATE 22007) on a malformed non-NULL enqueued_at
+                # instead of degrading. Rows written by this codebase
+                # are always well-formed, so the divergence only matters
+                # for hand-edited data.
                 #
                 # v0.28: when ``priority_decay_sec`` > 0, subtract one
                 # rank level per ``decay_sec`` seconds in the queue. The
                 # MAX(0, ...) inside the inner CAST clamps the integer
-                # division to be non-negative on malformed timestamps;
+                # division to be non-negative on malformed timestamps
+                # (again SQLite-only -- see the v0.26 note above for the
+                # Postgres divergence);
                 # the outer MAX(_prio_rank, 1) at ORDER BY time floors
                 # the effective rank at 'low'=1 so a very old entry
                 # still pops in declared FIFO order against equally
@@ -2134,6 +2266,16 @@ class Database:
             row = await cur.fetchone()
             if row is None:
                 await conn.commit()
+                # No waiting entries: drop this claim's fairness counter so
+                # the module-level map does not grow one permanent entry per
+                # claim id ever drained (every release drives at least one
+                # pop here, contested or not). An empty queue is a natural
+                # phase reset -- the fairness guarantee is statistical, so
+                # restarting the rotation when the queue re-forms is fine.
+                # Only touched when fairness is enabled, preserving the
+                # v0.27 byte-identical invariant for fairness_interval == 0.
+                if fairness_n > 0:
+                    _FAIRNESS_COUNTERS.pop(blocking_claim_id, None)
                 return None
             await conn.execute(
                 "UPDATE claim_queue SET state = 'in_progress' WHERE id = ?",
@@ -2144,32 +2286,53 @@ class Database:
 
     async def mark_queue_granted(
         self, queue_id: str, granted_claim_id: str
-    ) -> None:
+    ) -> bool:
         """Finalise a queue entry whose drain attempt produced a real
         claim. The in-memory long-poll signal is fired by the service
-        layer; this method just persists the state transition."""
+        layer; this method just persists the state transition.
+
+        Guarded on the non-terminal states: a cancel, a waiter timeout,
+        or the queue reaper can move the row to 'cancelled'/'expired'
+        while the drain's grant re-issue is still in flight (LSP calls
+        and writer-lock waits make that window real), and overwriting
+        that terminal state would hand a live claim to a requester who
+        was already told there is no grant. Returns True when this call
+        performed the transition; False means the grant lost the race
+        and the caller must release the claim it just created."""
         await self.init()
         async with self._connect() as conn:
             await _configure_sqlite(conn)
-            await conn.execute(
+            cur = await conn.execute(
                 "UPDATE claim_queue SET state = 'granted', "
-                "granted_claim_id = ? WHERE id = ?",
+                "granted_claim_id = ? WHERE id = ? "
+                "AND state IN ('waiting', 'in_progress')",
                 (granted_claim_id, queue_id),
             )
             await conn.commit()
+            return (cur.rowcount or 0) > 0
 
-    async def mark_queue_expired(self, queue_id: str) -> None:
+    async def mark_queue_expired(self, queue_id: str) -> bool:
         """Mark a queue entry as expired (wait_seconds elapsed without
         a grant, or the drain attempt re-conflicted). The long-poll on
-        the requester side surfaces the original 409 to the caller."""
+        the requester side surfaces the original 409 to the caller.
+
+        Guarded on the non-terminal states so a waiter timeout racing
+        an in-flight drain cannot clobber a 'granted' row (or a
+        requester's 'cancelled' one). Returns True when this call
+        performed the transition; False means the row was already
+        terminal -- the waiter side re-reads the row and adopts a
+        granted claim instead of surfacing a 409 for scope it now
+        holds."""
         await self.init()
         async with self._connect() as conn:
             await _configure_sqlite(conn)
-            await conn.execute(
-                "UPDATE claim_queue SET state = 'expired' WHERE id = ?",
+            cur = await conn.execute(
+                "UPDATE claim_queue SET state = 'expired' WHERE id = ? "
+                "AND state IN ('waiting', 'in_progress')",
                 (queue_id,),
             )
             await conn.commit()
+            return (cur.rowcount or 0) > 0
 
     async def cancel_queue_entry(
         self,
@@ -2307,7 +2470,12 @@ class Database:
         soonest_dt: datetime | None = None
         for r in rows:
             exp_raw = str(r["expires_at"])
-            exp = datetime.fromisoformat(exp_raw.replace("Z", "+00:00"))
+            try:
+                exp = datetime.fromisoformat(exp_raw.replace("Z", "+00:00"))
+            except ValueError:
+                # Fail closed: malformed expires_at counts as expired (the
+                # TTL sweep releases it) rather than crashing the cap check.
+                continue
             if exp <= ref:
                 continue
             count += 1
@@ -2706,6 +2874,12 @@ class Database:
             return None
         return resolved
 
+    # Minimum seconds between flushed touch_engineer_token writes for one
+    # token. Matches the default of the v0.44 activity-ping coalescing
+    # (``activity_ping_min_interval_sec``): the auth path touches on EVERY
+    # authenticated request, so uncoalesced it is one write per request.
+    TOKEN_TOUCH_MIN_INTERVAL_SEC: float = 30.0
+
     async def touch_engineer_token(
         self,
         token_sha256: str,
@@ -2713,6 +2887,7 @@ class Database:
         source_ip: str | None = None,
         user_agent: str | None = None,
         now: datetime | None = None,
+        min_interval_sec: float | None = None,
     ) -> None:
         """v0.29: bump ``last_used_at`` after a successful auth. Best
         effort: a failure here must NOT cause the request itself to
@@ -2723,22 +2898,78 @@ class Database:
         last-seen source IP / user agent. Both are untrusted proxy
         metadata, so they are truncated before storage; request_count
         is approximate by design (touch failures are swallowed). A
-        request with no IP/UA keeps the previous last-seen values."""
+        request with no IP/UA keeps the previous last-seen values.
+
+        v0.45.x: coalesced and funnelled. The write goes through
+        :meth:`_write` (the writer queue when enabled) instead of a
+        private connection, so per-request auth traffic no longer
+        contends with the persistent writer for the WAL write lock.
+        And, like the session activity pings, at most one write per
+        ``min_interval_sec`` per token is flushed: intervening touches
+        accumulate in-process (request_count increments, latest
+        timestamp/IP/UA) and land with the next flushed write, so the
+        count is deferred rather than dropped. ``min_interval_sec=0``
+        restores write-every-touch; ``None`` uses
+        ``TOKEN_TOUCH_MIN_INTERVAL_SEC``. Coalescing state is
+        per-process, mirroring the v0.44 ping coalescing."""
         await self.init()
         ts = (now or datetime.now(UTC)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         ip = (source_ip or "")[:128] or None
         ua = (user_agent or "")[:512] or None
-        async with self._connect() as conn:
-            await _configure_sqlite(conn)
-            await conn.execute(
-                "UPDATE engineer_tokens SET last_used_at = ?, "
-                "request_count = COALESCE(request_count, 0) + 1, "
-                "last_source_ip = COALESCE(?, last_source_ip), "
-                "last_user_agent = COALESCE(?, last_user_agent) "
-                "WHERE token_sha256 = ? AND revoked_at IS NULL",
-                (ts, ip, ua, token_sha256),
-            )
-            await conn.commit()
+        interval = (
+            self.TOKEN_TOUCH_MIN_INTERVAL_SEC
+            if min_interval_sec is None
+            else max(0.0, float(min_interval_sec))
+        )
+        pending = self._token_touch_pending.get(token_sha256)
+        count = 1
+        if pending:
+            count += int(pending.get("count", 0))
+            # Latest non-None metadata wins; fall back to what an earlier
+            # skipped touch carried so coalescing never loses a last-seen
+            # value a write-every-touch scheme would have recorded.
+            ip = ip or pending.get("ip")
+            ua = ua or pending.get("ua")
+        nowm = time.monotonic()
+        last = self._token_touch_last.get(token_sha256)
+        if interval > 0 and last is not None and (nowm - last) < interval:
+            self._token_touch_pending[token_sha256] = {
+                "count": count,
+                "ip": ip,
+                "ua": ua,
+            }
+            return
+        try:
+            async with self._write() as conn:
+                await conn.execute(
+                    "UPDATE engineer_tokens SET last_used_at = ?, "
+                    "request_count = COALESCE(request_count, 0) + ?, "
+                    "last_source_ip = COALESCE(?, last_source_ip), "
+                    "last_user_agent = COALESCE(?, last_user_agent) "
+                    "WHERE token_sha256 = ? AND revoked_at IS NULL",
+                    (ts, count, ip, ua, token_sha256),
+                )
+        except BaseException:
+            # The caller swallows the exception (best-effort contract), so
+            # park the accumulated count for the next flush attempt rather
+            # than losing it.
+            self._token_touch_pending[token_sha256] = {
+                "count": count,
+                "ip": ip,
+                "ua": ua,
+            }
+            raise
+        self._token_touch_pending.pop(token_sha256, None)
+        self._token_touch_last[token_sha256] = nowm
+        # Bound the per-token maps the same way the service bounds its ping
+        # map: evict the stalest entries once the map grows past any sane
+        # live-token population, so token churn cannot leak memory.
+        if len(self._token_touch_last) > 8192:
+            for key, _seen in sorted(
+                self._token_touch_last.items(), key=lambda kv: kv[1]
+            )[: len(self._token_touch_last) - 4096]:
+                self._token_touch_last.pop(key, None)
+                self._token_touch_pending.pop(key, None)
 
     async def list_engineer_tokens(
         self,
@@ -2942,6 +3173,7 @@ class Database:
         self,
         *,
         engineer: str | None = None,
+        session_id: str | None = None,
         state: str | None = "waiting",
         repo: str | None = None,
         limit: int = 100,
@@ -2953,6 +3185,13 @@ class Database:
         queue state when ``state`` is set (default 'waiting' so the
         operator-facing endpoint only sees live entries; pass None to
         include granted/expired for forensic queries).
+
+        ``session_id`` widens (ORs) the requester filter: a row matches
+        when its ``requester_engineer`` equals ``engineer`` OR its
+        ``requester_session_id`` equals ``session_id``, so an MCP client
+        whose engineer name has drifted since enqueue time (renamed
+        worker, regenerated identity) still sees its own queue entries.
+        With only ``session_id`` set the filter is session-only.
 
         The join is LEFT so a queue row whose holder has been
         cascade-deleted still surfaces with NULL holder fields rather
@@ -2968,9 +3207,17 @@ class Database:
         )
         clauses: list[str] = []
         params: list[Any] = []
-        if engineer:
+        if engineer and session_id:
+            clauses.append(
+                "(cq.requester_engineer = ? OR cq.requester_session_id = ?)"
+            )
+            params.extend([engineer, session_id])
+        elif engineer:
             clauses.append("cq.requester_engineer = ?")
             params.append(engineer)
+        elif session_id:
+            clauses.append("cq.requester_session_id = ?")
+            params.append(session_id)
         if state:
             clauses.append("cq.state = ?")
             params.append(state)
@@ -3065,11 +3312,12 @@ class Database:
 
     async def release_for_session(
         self, session_id: str, *, repo: str | None = None
-    ) -> int:
+    ) -> list[str]:
         """Release every active claim that was created with the given
-        session_id, regardless of engineer name. Returns the count of
-        rows actually closed. Intended for end-of-work cleanup so an
-        agent process can reliably tear down everything it produced
+        session_id, regardless of engineer name. Returns the ids of the
+        rows actually closed so the service layer can drain the FIFO
+        queue behind each of them. Intended for end-of-work cleanup so
+        an agent process can reliably tear down everything it produced
         even when it spawned subagents under multiple engineer names.
 
         ``repo`` (#30 slice 2/3) scopes the release: when set, only claims
@@ -3078,7 +3326,7 @@ class Database:
         (operator) releases the whole session as before.
         """
         if not session_id:
-            return 0
+            return []
         now = _utcnow()
         await self.init()
         # SELECT and UPDATE in a single BEGIN IMMEDIATE transaction so
@@ -3104,15 +3352,12 @@ class Database:
                     upd_params: list[Any] = [now, session_id]
                     if repo is not None:
                         upd_params.append(repo)
-                    cur = await conn.execute(
+                    await conn.execute(
                         "UPDATE claims SET released_at = ? "
                         "WHERE session_id = ? AND released_at IS NULL"
                         + repo_clause,
                         upd_params,
                     )
-                    n = cur.rowcount or 0
-                else:
-                    n = 0
                 await conn.commit()
             except Exception:
                 await conn.rollback()
@@ -3128,7 +3373,7 @@ class Database:
             await self.cascade_resolve_requests_for_claim(
                 cid, release_kind="session-bulk", actor_engineer=None
             )
-        return n
+        return to_close
 
     async def claim_repo(self, claim_id: str) -> tuple[bool, str | None]:
         """Scope-guard lookup: ``(exists, repo)`` for a claim id (#30 s2/3).
@@ -3136,9 +3381,16 @@ class Database:
         ``exists`` is False when the id is unknown so a guard can fall
         through to the handler's own 404 / no-op instead of turning a
         typo into a 403.
+
+        Routed through :meth:`_connect` -- the overridable backend seam --
+        like every other read. A raw ``aiosqlite.connect(self.path)`` here
+        silently broke the repo-scope guards on the Postgres backend (which
+        inherits these methods): the guard consulted a stray SQLite file
+        instead of the real store, 500ing on fresh deployments and reading
+        stale rows (i.e. skipping the 403) where an old file existed.
         """
         await self.init()
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(
@@ -3148,9 +3400,10 @@ class Database:
         return (False, None) if row is None else (True, row["repo"])
 
     async def request_repo(self, request_id: str) -> tuple[bool, str | None]:
-        """``(exists, repo)`` for a request id, via its target claim."""
+        """``(exists, repo)`` for a request id, via its target claim.
+        Uses the :meth:`_connect` seam; see :meth:`claim_repo`."""
         await self.init()
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(
@@ -3161,10 +3414,30 @@ class Database:
             row = await cur.fetchone()
         return (False, None) if row is None else (True, row["repo"])
 
-    async def queue_entry_repo(self, queue_id: str) -> tuple[bool, str | None]:
-        """``(exists, repo)`` for a claim_queue entry id."""
+    async def request_claim_holder(
+        self, request_id: str
+    ) -> tuple[bool, str | None]:
+        """``(exists, holder_engineer)`` for a request id, via its target
+        claim. Powers the API-layer holder-authorization check on
+        POST /requests/{id}/respond: only the claim's holder (or an
+        operator token) may decide a request against it."""
         await self.init()
-        async with aiosqlite.connect(self.path) as conn:
+        async with self._connect() as conn:
+            conn.row_factory = aiosqlite.Row
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                "SELECT c.engineer AS engineer FROM requests r "
+                "JOIN claims c ON c.id = r.claim_id WHERE r.id = ?",
+                (request_id,),
+            )
+            row = await cur.fetchone()
+        return (False, None) if row is None else (True, row["engineer"])
+
+    async def queue_entry_repo(self, queue_id: str) -> tuple[bool, str | None]:
+        """``(exists, repo)`` for a claim_queue entry id.
+        Uses the :meth:`_connect` seam; see :meth:`claim_repo`."""
+        await self.init()
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
             cur = await conn.execute(
@@ -3173,12 +3446,19 @@ class Database:
             row = await cur.fetchone()
         return (False, None) if row is None else (True, row["repo"])
 
-    async def release_claims(self, claim_ids: list[str], engineer: str | None = None) -> int:
+    async def release_claims(
+        self, claim_ids: list[str], engineer: str | None = None
+    ) -> list[str]:
+        """Stamp ``released_at`` on each claim the caller may release.
+        Returns the ids actually released -- engineer-mismatched,
+        unknown, and already-released ids are absent -- so the service
+        layer can drain the FIFO queue for exactly the claims that
+        really closed. Draining for a no-op release would expel every
+        queued waiter behind a still-active claim."""
         now = _utcnow()
         await self.init()
         released_ids: list[str] = []
         async with self._write() as conn:
-            n = 0
             for cid in claim_ids:
                 if engineer:
                     cur = await conn.execute(
@@ -3192,7 +3472,6 @@ class Database:
                     )
                 if cur.rowcount and cur.rowcount > 0:
                     released_ids.append(cid)
-                    n += cur.rowcount
             # _write owns the commit
         # Detach the released claims from any coexisting partners
         # BEFORE cascade-resolve, so a partner that's about to receive
@@ -3207,7 +3486,7 @@ class Database:
             await self.cascade_resolve_requests_for_claim(
                 cid, release_kind="voluntary", actor_engineer=engineer
             )
-        return n
+        return released_ids
 
     async def release_active_claims_for_engineers(
         self, engineers: list[str], *, now_iso: str | None = None
@@ -3250,12 +3529,18 @@ class Database:
             await conn.commit()
             return (cur.rowcount or 0) > 0
 
-    async def expire_stale_claims(self, idle_timeout_sec: int = 0) -> int:
+    async def expire_stale_claims(self, idle_timeout_sec: int = 0) -> list[str]:
         """Close claims whose hard TTL has passed, plus any
         session-tagged claim whose ``last_activity`` is older than
         ``idle_timeout_sec``. Idle expiration only fires when both the
         timeout is positive AND the row has a non-NULL last_activity,
         so legacy NULL-session claims keep their TTL-only behaviour.
+
+        Returns the ids of the claims actually closed so the service
+        layer can drain the FIFO queue behind each of them -- a
+        request_release call exists precisely to shorten the holder's
+        TTL, and when that shortened TTL fires the waiters queued
+        behind the claim must be granted, not stranded.
         """
         now = _utcnow()
         cutoff = datetime.now(UTC)
@@ -3273,7 +3558,12 @@ class Database:
             rows = await cur.fetchall()
             await conn.commit()
 
-        to_close: list[str] = []
+        # Each entry carries the column that justified expiry plus its
+        # snapshot value, so the release UPDATE below is self-guarding: a
+        # holder that extends (new expires_at) or pings (new last_activity)
+        # between this snapshot and the UPDATE keeps its claim instead of
+        # being force-released on stale data.
+        to_close: list[tuple[str, str, Any]] = []
         # ttl_shortened_ids: claims whose TTL was explicitly shortened by a
         # request_release call. Read directly from the claims.ttl_shortened
         # column (set in create_request, reset in denied respond_to_request)
@@ -3283,9 +3573,21 @@ class Database:
         # requester withdrew so no pending request remains).
         ttl_shortened_ids: set[str] = set()
         for r in rows:
-            exp = datetime.fromisoformat(str(r["expires_at"]).replace("Z", "+00:00"))
+            try:
+                exp = datetime.fromisoformat(
+                    str(r["expires_at"]).replace("Z", "+00:00")
+                )
+            except ValueError:
+                # Fail closed: an unparseable expires_at counts as expired.
+                # Skipping it instead would make the claim immortal, and
+                # raising would crash the sweep on every tick (so NOTHING
+                # would ever expire again). Matches _ts_elapsed's rationale.
+                to_close.append((str(r["id"]), "expires_at", r["expires_at"]))
+                if r["ttl_shortened"]:
+                    ttl_shortened_ids.add(str(r["id"]))
+                continue
             if exp <= cutoff:
-                to_close.append(str(r["id"]))
+                to_close.append((str(r["id"]), "expires_at", r["expires_at"]))
                 if r["ttl_shortened"]:
                     ttl_shortened_ids.add(str(r["id"]))
                 continue
@@ -3296,25 +3598,29 @@ class Database:
                 except ValueError:
                     continue
                 if la <= idle_cutoff:
-                    to_close.append(str(r["id"]))
+                    to_close.append((str(r["id"]), "last_activity", la_raw))
                     if r["ttl_shortened"]:
                         ttl_shortened_ids.add(str(r["id"]))
         if not to_close:
-            return 0
+            return []
 
         async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
-            n = 0
             actually_closed: list[str] = []
-            for cid in to_close:
+            for cid, guard_col, guard_val in to_close:
+                # guard_col is one of two literals set above, never caller
+                # input. ``IS ?`` (null-safe equality; the PG adapter maps
+                # it to IS NOT DISTINCT FROM) re-checks the snapshot value:
+                # rowcount 0 means an extend_claim / activity ping landed
+                # after the snapshot and the claim survives this sweep.
                 cur = await conn.execute(
-                    "UPDATE claims SET released_at = ? WHERE id = ? AND released_at IS NULL",
-                    (now, cid),
+                    "UPDATE claims SET released_at = ? "
+                    f"WHERE id = ? AND released_at IS NULL AND {guard_col} IS ?",
+                    (now, cid, guard_val),
                 )
                 if cur.rowcount and cur.rowcount > 0:
                     actually_closed.append(cid)
-                    n += cur.rowcount
             await conn.commit()
 
         # Detach before cascade-resolve so a partner that's about to
@@ -3326,7 +3632,58 @@ class Database:
             await self.cascade_resolve_requests_for_claim(
                 cid, release_kind=kind, actor_engineer=None
             )
-        return n
+        return actually_closed
+
+    async def purge_released_symbol_rows(
+        self,
+        *,
+        older_than_sec: int = 86400,
+        now: datetime | None = None,
+    ) -> dict[str, int]:
+        """Garbage-collect the symbol child tables of long-released claims.
+
+        Claims are soft-released (``released_at`` stamped, the row kept for
+        audit), and ``claim_symbols`` / ``claim_symbol_callsites`` /
+        ``claim_symbol_renames`` declare their claim FK without ON DELETE
+        CASCADE -- so without a reaper every symbol claim ever made leaves
+        its child rows behind permanently, growing the store unbounded and
+        bloating the per-file index scans that symbol-overlap checks walk.
+
+        Deletes child rows for claims released at least ``older_than_sec``
+        seconds ago (default 24h -- comfortably past any audit/dashboard
+        view that joins symbols of recently released claims). The claims
+        rows themselves are kept: they are the audit trail. Correctness is
+        unaffected either way because every live-path query filters on
+        ``released_at IS NULL``.
+
+        Runs on the ``_write`` funnel (one short transaction) and uses only
+        translatable SQL, so the Postgres backend inherits it unchanged.
+        Returns ``{table: rows_deleted}`` for the cleanup loop's logging.
+        """
+        await self.init()
+        cutoff = (now or datetime.now(UTC)) - timedelta(
+            seconds=max(0, int(older_than_sec))
+        )
+        cutoff_iso = (
+            cutoff.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        )
+        counts: dict[str, int] = {}
+        async with self._write() as conn:
+            for table in (
+                "claim_symbols",
+                "claim_symbol_callsites",
+                "claim_symbol_renames",
+            ):
+                # Table names come from this literal tuple, never callers.
+                cur = await conn.execute(
+                    f"DELETE FROM {table} WHERE claim_id IN ("
+                    "SELECT id FROM claims WHERE released_at IS NOT NULL "
+                    "AND datetime(released_at) <= datetime(?))",
+                    (cutoff_iso,),
+                )
+                counts[table] = int(cur.rowcount or 0)
+            # _write owns the commit
+        return counts
 
     async def log_conflict(
         self,
@@ -3972,6 +4329,12 @@ class Database:
         # populate (new claim id, original pattern, etc.) so the
         # responded audit event records the full transition.
         extra_detail: dict[str, Any] = {}
+        # Claim ids this decision actually closed ('approved' releases
+        # the holder's claim; 'narrowed' releases the original before
+        # opening the tighter one). Returned to the service layer under
+        # the private ``_released_claim_ids`` key so it can drain the
+        # FIFO queue for exactly the claims that really closed.
+        released_claim_ids: list[str] = []
         async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
@@ -4021,11 +4384,13 @@ class Database:
                 )
 
                 if decision == "approved":
-                    await conn.execute(
+                    rel_cur = await conn.execute(
                         "UPDATE claims SET released_at = ? "
                         "WHERE id = ? AND released_at IS NULL",
                         (now, req["claim_id"]),
                     )
+                    if rel_cur.rowcount and rel_cur.rowcount > 0:
+                        released_claim_ids.append(str(req["claim_id"]))
                 elif decision == "denied":
                     # Restore the original TTL so the holder isn't
                     # punished for the request having shortened it.
@@ -4045,6 +4410,11 @@ class Database:
                         now=now,
                         min_expires_at=min_expires_at,
                     )
+                    # Private marker from _apply_narrowed -- popped
+                    # before extra_detail lands in the responded audit
+                    # event so the event shape stays unchanged.
+                    if extra_detail.pop("_released_original", False):
+                        released_claim_ids.append(str(req["claim_id"]))
                 elif decision == "coexist":
                     extra_detail = await self._apply_coexist(
                         conn,
@@ -4084,7 +4454,13 @@ class Database:
                 "SELECT * FROM requests WHERE id = ?", (request_id,)
             )
             row = await cur.fetchone()
-            return dict(row) if row else None
+            if row is None:
+                return None
+            result = dict(row)
+            # Private transport for the service layer's queue drain --
+            # popped there, never serialized into an API response.
+            result["_released_claim_ids"] = released_claim_ids
+            return result
 
     @staticmethod
     async def _apply_narrowed(
@@ -4114,7 +4490,7 @@ class Database:
         # proceed to insert the new claim so the responder isn't left
         # in a half-finished state, but the transaction-level outcome
         # is the same either way.
-        await conn.execute(
+        rel_cur = await conn.execute(
             "UPDATE claims SET released_at = ? "
             "WHERE id = ? AND released_at IS NULL",
             (now, original_claim_id),
@@ -4171,6 +4547,13 @@ class Database:
             "original_pattern": str(orig["pattern"]),
             "original_claim_id": original_claim_id,
             "new_claim_id": new_claim_id,
+            # Private marker for the caller's queue drain: True when the
+            # release UPDATE above actually closed the original claim.
+            # respond_to_request pops it before recording extra_detail
+            # in the responded audit event.
+            "_released_original": bool(
+                rel_cur.rowcount and rel_cur.rowcount > 0
+            ),
         }
 
     @staticmethod
@@ -4486,29 +4869,41 @@ class Database:
         same session don't re-fire (a request that's polled every 30s
         for an hour shouldn't write 120 events). Returns True iff a
         new event was written.
+
+        The existence check and the insert run under one BEGIN IMMEDIATE
+        so two concurrent pending_requests polls from the same holder
+        session cannot both pass the check and write duplicate
+        ``notified`` rows -- the write lock serializes them and the
+        second poll's check sees the first poll's committed row.
         """
         await self.init()
         async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
-            cur = await conn.execute(
-                "SELECT 1 FROM request_events "
-                "WHERE request_id = ? AND event_type = 'notified' "
-                "  AND COALESCE(actor_session_id, '') = COALESCE(?, '')",
-                (request_id, holder_session_id),
-            )
-            if await cur.fetchone() is not None:
-                return False
-            await self._record_event_in_txn(
-                conn,
-                request_id=request_id,
-                event_type="notified",
-                actor_engineer=holder_engineer,
-                actor_session_id=holder_session_id,
-                detail=None,
-            )
-            await conn.commit()
-            return True
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = await conn.execute(
+                    "SELECT 1 FROM request_events "
+                    "WHERE request_id = ? AND event_type = 'notified' "
+                    "  AND COALESCE(actor_session_id, '') = COALESCE(?, '')",
+                    (request_id, holder_session_id),
+                )
+                if await cur.fetchone() is not None:
+                    await conn.commit()
+                    return False
+                await self._record_event_in_txn(
+                    conn,
+                    request_id=request_id,
+                    event_type="notified",
+                    actor_engineer=holder_engineer,
+                    actor_session_id=holder_session_id,
+                    detail=None,
+                )
+                await conn.commit()
+                return True
+            except Exception:
+                await conn.rollback()
+                raise
 
     async def record_request_event(
         self,
@@ -4556,11 +4951,18 @@ class Database:
         requester_engineer: str | None = None,
         claim_id: str | None = None,
         decision: str | None = None,
+        repo: str | None = None,
         limit: int = 200,
     ) -> list[dict[str, Any]]:
         """Return requests filtered by the given criteria. Joined with
         the holder's claim row so callers can render holder/pattern
-        without an extra round trip."""
+        without an extra round trip.
+
+        When ``repo`` is given, only requests whose holder claim belongs
+        to that repo are returned. The filter must run in SQL (before
+        LIMIT): on a busy shared service other repos' rows would
+        otherwise consume the LIMIT window and a repo-scoped viewer
+        would see a silently truncated (or empty) list."""
         await self.init()
         clauses: list[str] = []
         args: list[Any] = []
@@ -4573,6 +4975,9 @@ class Database:
         if decision:
             clauses.append("r.decision = ?")
             args.append(decision)
+        if repo is not None:
+            clauses.append("c.repo IS ?")
+            args.append(repo)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         sql = f"""
             SELECT r.*, c.engineer AS holder_engineer, c.pattern AS holder_pattern,
@@ -4648,15 +5053,27 @@ class Database:
             rows = await cur.fetchall()
             return [dict(r) for r in rows]
 
-    async def list_recent_claims(self, limit: int = 200) -> list[dict[str, Any]]:
+    async def list_recent_claims(
+        self, limit: int = 200, *, repo: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Most recent claims regardless of state, newest first. ``repo``
+        applies the scope filter in SQL before the LIMIT so the window is
+        per-repo: filtering after the LIMIT would let another repo's rows
+        crowd a scoped viewer's history out of the global window entirely
+        on a shared service. ``repo=None`` keeps the legacy all-repos
+        window."""
         await self.init()
+        sql = "SELECT * FROM claims"
+        params: list[Any] = []
+        if repo is not None:
+            sql += " WHERE repo IS ?"
+            params.append(repo)
+        sql += " ORDER BY datetime(created_at) DESC LIMIT ?"
+        params.append(limit)
         async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await _configure_sqlite(conn)
-            cur = await conn.execute(
-                "SELECT * FROM claims ORDER BY datetime(created_at) DESC LIMIT ?",
-                (limit,),
-            )
+            cur = await conn.execute(sql, params)
             rows = await cur.fetchall()
             await conn.commit()
             return [dict(r) for r in rows]

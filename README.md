@@ -6,7 +6,7 @@
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
 [![Container image](https://img.shields.io/badge/ghcr.io-coord-blue)](https://github.com/amittell/coord/pkgs/container/coord)
 
-`coord` is a small coordination layer for teams running multiple agent sessions against the same codebase. It gives Claude Code, Codex CLI, and Cursor a shared source of truth for active file/module claims so agents can check, claim, extend, and release work before they step on each other.
+`coord` is a small coordination layer for teams running multiple agent sessions against the same codebase. It gives Claude Code, Codex CLI, and Cursor a shared source of truth for active file/module claims so agents can check, claim, and release work before they step on each other. Agent sessions keep their claims alive implicitly via activity pings; operators can extend a specific claim over HTTP (`POST /claims/{id}/extend`).
 
 **This repo IS the coordination service.** You run one instance of it (locally during development, or as a container in whatever infra your team already uses) and point your application repos at it with `coord init`. The application repos you coordinate live elsewhere.
 
@@ -30,7 +30,7 @@ The stack is intentionally simple:
 - `docs/integrations/claude-code.md`: Claude Code-first integration
 - `docs/integrations/codex-cli.md`: Codex CLI integration
 - Cursor users: see `templates/.cursor/mcp.json.example` and the Cursor rule under `templates/.cursor/rules/`
-- [`docs/design/roadmap.md`](./docs/design/roadmap.md): v0.28-v0.30 candidates and future bucket
+- [`docs/design/roadmap.md`](./docs/design/roadmap.md): the living post-v0.33 forward plan and future bucket
 - `CHANGELOG.md`: notable changes between versions
 
 ## Install
@@ -72,7 +72,7 @@ pip install 'coord-mcp-server[symbols]'   # drop [symbols] if you do not need tr
 Pin to a specific release for reproducible installs:
 
 ```bash
-pip install 'coord-mcp-server==0.28.2'
+pip install 'coord-mcp-server==0.45.0'
 ```
 
 ### Option 3: Docker (self-hosted server)
@@ -86,19 +86,45 @@ docker run -d \
   -e COORD_AUTH_TOKEN="$(openssl rand -hex 32)" \
   -p 8080:8080 \
   -v coord-data:/data \
-  ghcr.io/amittell/coord:v0.28.2
+  ghcr.io/amittell/coord:v0.45.0
 ```
 
 The image is multi-arch (linux/amd64 + linux/arm64), keyless-signed with cosign, and ships SBOM + SLSA provenance attestations. Kubernetes manifests live under `deploy/k8s/` and `docs/deployment.md` has the full operator notes.
+
+### Optional PostgreSQL backend (beta)
+
+SQLite remains the recommended default. For a **fresh** install that needs
+multiple stateless coord replicas, install the optional driver and select a
+stable PostgreSQL schema:
+
+```bash
+python3 -m venv ~/.venvs/coord-postgres
+source ~/.venvs/coord-postgres/bin/activate
+pip install 'coord-mcp-server[postgres]'
+
+export COORD_AUTH_TOKEN="$(openssl rand -hex 32)"
+export COORD_DATABASE_URL='postgresql://coord:password@db.example.com:5432/coord'
+export COORD_POSTGRES_SCHEMA=coord
+coord-api
+```
+
+The database and role must already exist; the role needs permission to create
+the configured schema and its tables. Coord initializes an empty schema on
+first boot. The standard container intentionally excludes asyncpg, so Docker
+operators must build a distinct PostgreSQL-enabled image rather than setting
+the DSN on the normal image. Migrating an existing SQLite deployment is also
+not a config-only flip. See the [PostgreSQL deployment
+guide](docs/deployment.md#optional-postgresql-backend-beta) and the separate
+[hard-drain cutover runbook](docs/runbooks/coord-ha-cutover.md).
 
 ### Verify the install
 
 ```bash
 coord --version
-# coord 0.28.2
+# coord 0.45.0
 
 curl -fsS http://127.0.0.1:8080/readyz
-# {"status":"ready","version":"0.28.2",...}
+# {"status":"ready","version":"0.45.0",...}
 ```
 
 The CLI surface is intentionally small:
@@ -138,7 +164,7 @@ After installing, get the service running and wire your first application repo.
    coord doctor                                  # all-green expected
    ```
 
-   `coord init` writes the tracked MCP template plus a gitignored `.coordination/` directory carrying the real bearer token. The relevant CLAUDE.md / AGENTS.md / .cursor/rules block is added inside managed `coord:begin .. coord:end` markers so future `coord upgrade` runs can refresh it cleanly without touching your own content.
+   `coord init` writes the MCP machine config with placeholder values (gitignored since v0.32) plus a gitignored `.coordination/` directory carrying the real bearer token. The relevant CLAUDE.md / AGENTS.md / .cursor/rules block is added inside managed `coord:begin .. coord:end` markers so future `coord upgrade` runs can refresh it cleanly without touching your own content.
 
 4. **Start coordinating.** Your agents now have `claim_files`, `list_claims`, `release_claims`, and the rest of the MCP tool surface available. See `docs/usage-guide.md` for the day-to-day workflow.
 
@@ -159,13 +185,13 @@ pipx inject coord-mcp-server 'coord-mcp-server[symbols]'
 pip install --upgrade 'coord-mcp-server[symbols]'
 
 # docker (self-hosted server)
-docker pull ghcr.io/amittell/coord:v0.28.2
+docker pull ghcr.io/amittell/coord:v0.45.0
 docker rm -f coord
 docker run -d --name coord \
   -e COORD_AUTH_TOKEN="$EXISTING_TOKEN" \
   -p 8080:8080 \
   -v coord-data:/data \
-  ghcr.io/amittell/coord:v0.28.2
+  ghcr.io/amittell/coord:v0.45.0
 ```
 
 When you point at a shared team server, the server operator owns the container upgrade. End users only need to upgrade their local CLI plus MCP wrapper to match.
@@ -186,10 +212,10 @@ coord doctor         # confirms the new wiring is healthy
 
 ```bash
 coord --version
-# coord 0.28.2
+# coord 0.45.0
 
 curl -fsS http://127.0.0.1:8080/readyz | python3 -m json.tool
-#   "version": "0.28.2"
+#   "version": "0.45.0"
 ```
 
 If your CLI and the running server disagree on version, the dashboard footer and the once-per-24h CLI update notice will both flag it. Set `COORD_NO_UPDATE_CHECK=1` if you are intentionally pinned to an older release.
@@ -199,11 +225,11 @@ If your CLI and the running server disagree on version, the dashboard footer and
 For reproducible installs across a team:
 
 ```bash
-pipx install 'coord-mcp-server==0.28.2'
+pipx install 'coord-mcp-server==0.45.0'
 # or
-pip install 'coord-mcp-server==0.28.2'
+pip install 'coord-mcp-server==0.45.0'
 # or, in a Dockerfile / Kubernetes manifest:
-#   image: ghcr.io/amittell/coord:v0.28.2
+#   image: ghcr.io/amittell/coord:v0.45.0
 ```
 
 The full release history lives on PyPI (<https://pypi.org/project/coord-mcp-server/#history>) and as GitHub releases (<https://github.com/amittell/coord/releases>). `CHANGELOG.md` has the per-version notes.
@@ -243,31 +269,31 @@ curl -X POST http://127.0.0.1:8080/claims \
 
 `coord init` lays down two kinds of files in the application repo:
 
-1. **Tracked templates** committed to VCS with placeholder values. These tell every MCP client (Claude Code, Codex CLI, Cursor) how to spawn `coord-mcp` and tell agents the coordination protocol. They are safe to share publicly.
-2. **Gitignored runtime config** under `.coordination/` carrying the real bearer token and repo identifier. Never committed.
+1. **Tracked protocol snippets** (CLAUDE.md / AGENTS.md / `.cursor/rules`) committed to VCS. These tell agents the coordination protocol and are safe to share publicly.
+2. **Gitignored machine and runtime config**: the per-tool MCP registration files (placeholder values only) and the `.coordination/` directory carrying the real bearer token and repo identifier. Never committed -- since v0.32 `coord init` gitignores the machine configs and untracks previously committed copies, so per-machine wiring stops polluting PRs.
 
 | Path | Tracked? | What it carries |
 |------|----------|-----------------|
-| `.mcp.json` (Claude Code) | yes (template) | `command = "coord-mcp"` + an `env` block with placeholder `COORD_*` values |
-| `.codex/config.toml` (Codex CLI) | yes (template) | Codex equivalent of the above |
-| `.cursor/mcp.json` (Cursor) | yes (template) | Cursor equivalent of the above |
+| `.mcp.json` (Claude Code) | **no** (gitignored since v0.32) | `command = "coord-mcp"` + an `env` block with placeholder `COORD_*` values |
+| `.codex/config.toml` (Codex CLI) | **no** (gitignored since v0.32) | Codex equivalent of the above |
+| `.cursor/mcp.json` (Cursor) | **no** (gitignored since v0.32) | Cursor equivalent of the above |
 | `CLAUDE.md` / `AGENTS.md` | yes | Protocol snippet inside a `coord:begin … coord:end` managed block |
-| `.gitignore` | yes | Managed block adds `/.coordination/` so step 2 stays untracked |
+| `.gitignore` | yes | Managed block adds `/.coordination/` and the three machine configs above so everything in row 2 stays untracked |
 | `.coordination/config.toml` | **no** (gitignored) | Per-repo coord settings: mode, service URL, ownership file path |
 | `.coordination/local.env` | **no** (gitignored) | Real `COORD_AUTH_TOKEN`, `COORD_API_URL`, `COORD_REPO_ID` |
 | `.coordination/owners.yaml` | **no** (gitignored) | Per-repo ownership rules; upload to the service via `POST /config/ownership` |
-| `.git/hooks/pre-push` | not in repo | Installed by `coord init`; sources `.coordination/local.env` before calling the API |
+| `.git/hooks/pre-push` | not in repo | Installed by `coord init`; parses the required keys from `.coordination/local.env` as inert data before calling the API |
 
 `coord init` patches `.gitignore` with `/.coordination/` automatically, so the whole `.coordination/` directory is excluded from the moment it is created. No additional setup is required to keep secrets out of git history.
 
-### How the template + secret split works at runtime
+### How the placeholder + secret split works at runtime
 
-`coord-mcp` is spawned by the editor/CLI with whatever env the tracked MCP registration provides -- usually the placeholder values `set-me`, `example-org/example-repo`, and `http://127.0.0.1:8080`. At startup the wrapper walks up from its working directory (like git looking for `.git/`) until it finds `.coordination/local.env`, then for each `COORD_*` allowlisted key:
+`coord-mcp` is spawned by the editor/CLI with whatever env the MCP registration provides -- usually the placeholder values `set-me`, `example-org/example-repo`, and `http://127.0.0.1:8080`. At startup the wrapper walks up from its working directory (like git looking for `.git/`) until it finds `.coordination/local.env`, then for each `COORD_*` allowlisted key:
 
 - if the variable is currently unset, **or** holds one of the documented placeholders, the wrapper overrides it from `local.env`;
 - if the variable already holds a real value (a shell export, or an inline env block in `.mcp.json` with a real token), the explicit value wins.
 
-`_headers()` also drops the `Authorization` header when the token is a documented placeholder, so a misconfigured client fails loud with a clean `401` instead of silently leaking a `Bearer set-me` request. The net effect: a tracked `.mcp.json` template can ship placeholder values to a public repo without breaking any working setup, and rotating credentials means editing one file (`.coordination/local.env`) rather than every per-tool MCP registration. See `docs/integrations/claude-code.md` and `docs/integrations/codex-cli.md` for the resolution order in tool-specific terms.
+`_headers()` also drops the `Authorization` header when the token is a documented placeholder, so a misconfigured client fails loud with a clean `401` instead of silently leaking a `Bearer set-me` request. The net effect: the machine configs carry only placeholder values (harmless even if a repo still tracks a pre-v0.32 copy), and rotating credentials means editing one file (`.coordination/local.env`) rather than every per-tool MCP registration. See `docs/integrations/claude-code.md` and `docs/integrations/codex-cli.md` for the resolution order in tool-specific terms.
 
 ## Sub-file (symbol-level) claims
 
@@ -299,7 +325,7 @@ Two automatic decisions kick in when symbols are involved:
 - **AUTO_COEXIST**: a second symbol claim on the same file with a disjoint symbol set is granted immediately. Both claims live as cooperative partners (`coexists_with` cross-referenced). No `409`, no request filed, audit row `event_type='auto-coexist'`.
 - **AUTO_NARROW**: a symbol claim arriving against an existing narrowable file claim is granted alongside the file claim. The holder's effective scope becomes "the file minus the new partner's symbols"; they get a `pending_requests` notice on their next poll but don't have to act. File claims are `narrowable=true` by default; `shared_file` and `module` claims are not.
 
-Symbols only cover the named declarations. Imports and module-level statements still need a file claim. TypeScript is supported in v0.14; Python and Go follow in v0.15. See [./docs/design/sub-file-claims.md](./docs/design/sub-file-claims.md) for the full spec.
+Symbols only cover the named declarations. Imports and module-level statements still need a file claim. Language coverage: TypeScript (v0.14), Python and Go (v0.15), plus JavaScript, Rust, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift, and Scala (v0.33) -- 14 languages total, each with a tree-sitter backend (via the optional `[symbols]` extra) and a regex fallback when the grammar wheel is absent. See [./docs/design/sub-file-claims.md](./docs/design/sub-file-claims.md) for the full spec.
 
 ### Method-level scope (v0.16)
 
@@ -420,8 +446,9 @@ backoff capped at COORD_WEBHOOK_MAX_RETRIES (default 5). The
 dashboard's "webhook delivery (24h)" panel surfaces per-event-type
 delivery counts so the operator can see whether the receiver is
 healthy. Filter the event stream with COORD_WEBHOOK_EVENTS
-(comma-separated allowlist; empty = all). Slack and GitHub PR
-adapters are queued for v0.27.x follow-ups.
+(comma-separated allowlist; empty = all). The GitHub PR-comment
+adapter shipped in v0.34 (off unless COORD_GITHUB_TOKEN is set);
+a Slack adapter remains parked.
 
 ### Backpressure header (v0.28)
 
@@ -500,7 +527,8 @@ Start with `docs/integrations/claude-code.md` if your team is primarily on Claud
 | `COORD_IDLE_TIMEOUT_SEC` | Session-tagged claims auto-release if the holder has been silent for this many seconds (added in v0.6.0). Set to `0` to disable idle expiration cluster-wide. Default: `1800` |
 | `COORD_ACTIVITY_PING_MIN_INTERVAL_SEC` | Activity-ping coalescing (v0.45): a session's liveness ping is written at most once per this many seconds instead of on every read, removing the dominant SQLite write load at high agent concurrency. Effective interval is clamped to `COORD_IDLE_TIMEOUT_SEC / 2` so misconfiguration can never cause false idle expiry. Set `0` to restore write-every-read. Default: `30` |
 | `COORD_SQLITE_WRITER_QUEUE` | In-process writer queue (v0.45): funnel hot-path writes through one persistent SQLite connection under an async lock, so concurrent writers queue in-process instead of fighting the write lock (no more dropped writes from `SQLITE_BUSY` on those paths). No-op on the Postgres backend. Set `false` to restore connection-per-op. Default: `true` |
-| `COORD_DATABASE_URL` | Storage backend selector (v0.44, dormant by default): unset/`sqlite://` keeps the standard SQLite file; a `postgresql://` DSN selects the Postgres HA backend. The live prod cutover is operator-gated -- see `docs/runbooks/coord-ha-cutover.md`. Default: unset |
+| `COORD_DATABASE_URL` | Optional beta backend selector: unset/`sqlite://` keeps SQLite; an exact `postgresql://` or `postgres://` DSN selects PostgreSQL and requires the `[postgres]` extra (the standard image does not include it). Fresh installs are supported; existing SQLite migration uses the operator-gated runbook. Default: unset |
+| `COORD_POSTGRES_SCHEMA` | Stable PostgreSQL schema shared by every service replica and operator CLI. Default: `coord`. Must match `[a-z_][a-z0-9_]{0,62}` and may not be `public`, `information_schema`, or start with `pg_`. PostgreSQL only. |
 | `COORD_REQUEST_TTL_SHORT_SEC` | When a release request is filed, the holder's claim TTL is clamped to `min(remaining, this)` (added in v0.9.0). Forces a near-term decision so a non-responsive holder can't sit on the scope. Default: `300` |
 | `COORD_AUTO_PROMOTE_THRESHOLD` | Hard auto-promote (v0.22): when a file's blocked-claim attempts cross this threshold within `COORD_AUTO_PROMOTE_WINDOW_DAYS`, the conflict pipeline writes a `shared_files` rule into `owners.yaml`. Default: `0` (disabled). |
 | `COORD_AUTO_PROMOTE_WINDOW_DAYS` | Rolling window (days) used by hard auto-promote when counting blocked-claim attempts (v0.22). Default: `7` |
@@ -514,6 +542,8 @@ Start with `docs/integrations/claude-code.md` if your team is primarily on Claud
 | `COORD_WEBHOOK_MAX_RETRIES` | Webhook retry cap (v0.27): the delivery loop retries failed POSTs with exponential backoff and marks the outbox row exhausted after this many attempts. Default: `5` |
 | `COORD_WEBHOOK_RETRY_BACKOFF_SEC` | Webhook retry base delay (v0.27): exponential backoff base in seconds; next retry runs at `backoff * 2**retry_count`. Default: `60` |
 | `COORD_WEBHOOK_DELIVERY_INTERVAL_SEC` | Webhook delivery loop interval (v0.27): how often the background loop scans `webhook_outbox` for due rows. Default: `5` |
+| `COORD_GITHUB_TOKEN` | GitHub PR-comment integration (v0.34): when set, `push_bounced` events are routed through the outbox to the GitHub adapter, which posts/updates a de-duplicated comment on the open PR for the bounced branch. Default: unset (feature disabled). |
+| `COORD_GITHUB_API_BASE` | GitHub API base URL for the v0.34 adapter; point at your GitHub Enterprise host if needed. Default: `https://api.github.com` |
 | `COORD_BACKPRESSURE_HEADER` | Backpressure response header (v0.28): when truthy, every authenticated response includes `X-Coord-Queue-Depth: N` if the request carries an engineer signal (`X-Coord-Engineer` header or `engineer` query param). N is that engineer's currently-queued waiting claim count. Set to `false` to disable. Default: `true` |
 | `COORD_QUEUE_FAIRNESS_INTERVAL` | Queue fairness pass (v0.28): every Nth call to `db.pop_next_waiting_queue_entry` bypasses the priority CASE and pops by raw FIFO position, guaranteeing low/normal-priority waiters eventually win against a steady stream of high/blocking entries. Set to `0` to disable (strict priority ordering preserved). Default: `10` |
 | `COORD_QUEUE_PRIORITY_DECAY_SEC` | Queue priority decay (v0.28): counterpart to the v0.26 age boost. A waiting entry's effective priority drops one level per this many seconds in the queue (`blocking` -> `high` -> `normal` -> `low`, floor at `low`). Prevents a misclassified urgent request from monopolising the queue head. Set to `0` to disable. Default: `300` |
@@ -573,6 +603,10 @@ Bypass a specific push with `git push --no-verify` (docs-only changes, etc.).
 ## Docker (build from source)
 
 Distinct from the published image used in [Install Option 3](#option-3-docker-self-hosted-server) above. This builds the image locally from the current checkout, which is what you want when iterating on the container itself.
+
+The default source build is SQLite-only. To run PostgreSQL, extend the image
+and install the pinned `requirements-postgres.txt` layer as shown in the
+[deployment guide](docs/deployment.md#postgresql-enabled-container).
 
 ```bash
 docker build -t coord:dev .

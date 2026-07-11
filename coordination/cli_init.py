@@ -19,6 +19,7 @@ from coordination.cli_shared import (
     state_paths,
     write_executable,
 )
+from coordination.envfile import read_env_file, update_env_file
 from coordination.repo_config import RepoConfig
 
 
@@ -283,27 +284,51 @@ def _write_repo_config(
 
 
 def _write_local_env(
-    repo_root: Path, mode: str, service_url: str, repo_id: str | None = None
-) -> None:
-    if mode == "local":
+    repo_root: Path,
+    mode: str,
+    service_url: str,
+    repo_id: str | None = None,
+    force: bool = False,
+) -> bool:
+    """Write or refresh ``.coordination/local.env``.
+
+    Returns True when an existing non-placeholder ``COORD_AUTH_TOKEN`` was
+    preserved. Re-running init is a supported, additive flow (e.g. a second
+    ``--tool``), and the documented v0.42 workflow has operators paste
+    repo-scoped tokens into this file -- so a re-init must not clobber a
+    working token with the ``set-me`` placeholder (remote mode without
+    COORD_AUTH_TOKEN exported) or the shared ``~/.coord/token`` (local
+    mode). Only ``--force`` re-mints/backfills over an existing real token.
+    Unmanaged keys and comments are preserved verbatim via the shared
+    envfile updater.
+    """
+    path = repo_root / ".coordination" / "local.env"
+    existing_token = read_env_file(path).get("COORD_AUTH_TOKEN", "")
+    preserved = bool(
+        existing_token
+        and existing_token != PLACEHOLDER_AUTH_TOKEN
+        and not force
+    )
+    if preserved:
+        token = existing_token
+    elif mode == "local":
         token = ensure_token_file(state_paths()["token_file"])
     else:
-        token = os.environ.get("COORD_AUTH_TOKEN", "set-me")
-    path = repo_root / ".coordination" / "local.env"
-    path.parent.mkdir(parents=True, exist_ok=True)
+        token = os.environ.get("COORD_AUTH_TOKEN", PLACEHOLDER_AUTH_TOKEN)
     # COORD_API_URL powers coord-mcp and user shells; COORD_SERVICE_URL is
-    # what the pre-push hook reads. Emit both so whichever tool sources
-    # this file picks up the right endpoint -- this is what stops a remote
-    # deployment from silently falling back to http://127.0.0.1:8080.
-    body = (
-        f"COORD_API_URL={service_url}\n"
-        f"COORD_SERVICE_URL={service_url}\n"
-        f"COORD_AUTH_TOKEN={token}\n"
-    )
+    # the legacy name the pre-push hook accepts. Emit both so each inert-data
+    # reader picks up the right endpoint -- this is what stops a
+    # remote installs from silently falling back to http://127.0.0.1:8080.
+    updates = {
+        "COORD_API_URL": service_url,
+        "COORD_SERVICE_URL": service_url,
+        "COORD_AUTH_TOKEN": token,
+    }
     rid = repo_id or _detect_repo_id(repo_root)
     if rid:
-        body += f"COORD_REPO_ID={rid}\n"
-    path.write_text(body, encoding="utf-8")
+        updates["COORD_REPO_ID"] = rid
+    update_env_file(path, updates)
+    return preserved
 
 
 # Placeholder values written into every tracked MCP template
@@ -320,22 +345,57 @@ PLACEHOLDER_AUTH_TOKEN = "set-me"
 PLACEHOLDER_REPO_ID = "example-org/example-repo"
 
 
-def _update_mcp_json(path: Path) -> None:
+def _update_mcp_json(path: Path) -> bool:
     """Write or refresh the tracked .mcp.json template (also used for
     .cursor/mcp.json). Always emits the documented placeholder values;
     the real service URL, bearer token, and repo identifier flow
     exclusively through .coordination/local.env, which the MCP
     wrapper resolves at startup. See PLACEHOLDER_* constants above
-    for the reasoning."""
+    for the reasoning.
+
+    Returns True on success. Mirrors cli_mcp._write_json_config's refusal
+    contract: an existing file that is not valid JSON, not a JSON object,
+    or has a non-object ``mcpServers`` is left untouched (False) with a
+    clear message -- silently replacing it would destroy the user's other
+    MCP servers over a trailing-comma typo."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    data: dict = {}
     if path.exists():
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            data = {}
-    else:
-        data = {}
+            raw = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            print(
+                f"Warning: cannot read {path}: {exc}; leaving it untouched.",
+                file=sys.stderr,
+            )
+            return False
+        if raw.strip():
+            try:
+                loaded = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                print(
+                    f"Warning: {path} is not valid JSON ({exc}); refusing to "
+                    "overwrite it. Fix or remove the file and re-run.",
+                    file=sys.stderr,
+                )
+                return False
+            if not isinstance(loaded, dict):
+                print(
+                    f"Warning: {path} does not contain a JSON object; "
+                    "refusing to overwrite it. Fix or remove the file and "
+                    "re-run.",
+                    file=sys.stderr,
+                )
+                return False
+            data = loaded
     servers = data.setdefault("mcpServers", {})
+    if not isinstance(servers, dict):
+        print(
+            f'Warning: {path} has a non-object "mcpServers"; refusing to '
+            "overwrite it. Fix or remove the file and re-run.",
+            file=sys.stderr,
+        )
+        return False
     servers["coord"] = {
         "command": "coord-mcp",
         "args": [],
@@ -346,6 +406,7 @@ def _update_mcp_json(path: Path) -> None:
         },
     }
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    return True
 
 
 def _update_codex_config(path: Path) -> None:
@@ -557,8 +618,12 @@ def run_init(args) -> int:
     _write_repo_config(repo_root, tool, mode, service_url, repo_id=repo_id)
     written.append(".coordination/config.toml")
 
-    _write_local_env(repo_root, mode, service_url, repo_id=repo_id)
-    written.append(".coordination/local.env")
+    if _write_local_env(
+        repo_root, mode, service_url, repo_id=repo_id, force=args.force
+    ):
+        written.append(".coordination/local.env (existing token preserved)")
+    else:
+        written.append(".coordination/local.env")
 
     # NOTE: we deliberately do NOT pass service_url / token / repo_id to the
     # tracked-template writers below. Those files (.mcp.json,
@@ -578,20 +643,27 @@ def run_init(args) -> int:
     # repo would otherwise format-check and fail on. Collected per tool
     # and exempted via .prettierignore once below.
     prettier_targets: list[str] = []
+    wiring_failed = False
     if tool == "claude":
-        _update_mcp_json(repo_root / ".mcp.json")
+        if _update_mcp_json(repo_root / ".mcp.json"):
+            written.append(".mcp.json")
+            prettier_targets.append(".mcp.json")
+        else:
+            wiring_failed = True
         ensure_managed_block(repo_root / "CLAUDE.md", CLAUDE_SNIPPET)
-        written.extend([".mcp.json", "CLAUDE.md (managed block)"])
-        prettier_targets.append(".mcp.json")
+        written.append("CLAUDE.md (managed block)")
     elif tool == "codex":
         _update_codex_config(repo_root / ".codex" / "config.toml")
         ensure_managed_block(repo_root / "AGENTS.md", AGENTS_SNIPPET)
         written.extend([".codex/config.toml", "AGENTS.md (managed block)"])
     else:
-        _update_mcp_json(repo_root / ".cursor" / "mcp.json")
+        if _update_mcp_json(repo_root / ".cursor" / "mcp.json"):
+            written.append(".cursor/mcp.json")
+            prettier_targets.append(".cursor/mcp.json")
+        else:
+            wiring_failed = True
         ensure_managed_block(repo_root / ".cursor" / "rules" / "coordination.mdc", CURSOR_RULE)
-        written.extend([".cursor/mcp.json", ".cursor/rules/coordination.mdc"])
-        prettier_targets.append(".cursor/mcp.json")
+        written.append(".cursor/rules/coordination.mdc")
 
     if ensure_prettierignore_entries(repo_root, prettier_targets):
         written.append(".prettierignore (managed block)")
@@ -629,5 +701,12 @@ def run_init(args) -> int:
     print("")
     print("Next step: coord doctor")
     _warn_tracked_wiring_commit_risk(repo_root, written)
+    if wiring_failed:
+        print(
+            "One or more MCP configs could not be written (see warnings "
+            "above). Fix or remove the file(s) and re-run 'coord init'.",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 

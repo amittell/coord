@@ -1,0 +1,17 @@
+# Pinned dependency for the OPTIONAL PostgreSQL backend
+# (coordination/pg_backend.py, selected via COORD_DATABASE_URL).
+#
+# Kept out of the base requirements.txt so a SQLite-only install/build
+# carries no Postgres driver. The default production Docker image deliberately
+# does not install this file either. Use it when building an explicit
+# PostgreSQL-enabled image, or install the project's equivalent [postgres]
+# extra for a Python/venv deployment (pip install coord-mcp-server[postgres]).
+# Setting COORD_DATABASE_URL without asyncpg installed fails fast at startup.
+#
+# asyncpg carries no runtime dependencies on coord's supported Pythons, so
+# this file is a single pin. Regenerate by diffing a clean
+# `pip install .[postgres]` freeze against requirements.txt:
+#   python3.12 -m venv /tmp/coord-pg
+#   /tmp/coord-pg/bin/pip install '.[postgres]'
+#   /tmp/coord-pg/bin/pip freeze | grep -vxF -f requirements.txt
+asyncpg==0.31.0

@@ -34,6 +34,10 @@ x-coord-queue-depth: 2
 
 A value of ``0`` means the engineer has no queued waiters; the header is still emitted to make the "no backpressure" signal explicit.
 
+### `X-Coord-Identity-Warning` (v0.46+)
+
+When the service runs with `COORD_ENFORCE_ENGINEER_IDENTITY=warn` (the default), a mutating request whose `engineer` field does not match the authenticated per-engineer token's identity is still honored, but the response carries an ``X-Coord-Identity-Warning`` header naming both identities so the misconfigured client is discoverable before enforcement. With `COORD_ENFORCE_ENGINEER_IDENTITY=enforce` the same mismatch is rejected with `403` instead. An omitted `engineer` defaults to the token's own identity in both modes; shared-token and no-auth deployments never see the header. Rollout guide: [docs/deployment.md](deployment.md).
+
 ## Rate limiting (v0.30.0+)
 
 Three env knobs, all default ``0`` (disabled); limits key on the request-body engineer:
@@ -78,10 +82,13 @@ Example response:
 {
   "status": "ready",
   "version": "0.1.0",
-  "auth_mode": "bearer",
-  "database_path": "data/coordination.db"
+  "auth_mode": "bearer"
 }
 ```
+
+The payload deliberately omits server-internal details such as the database
+filesystem path: the endpoint is unauthenticated, so it exposes only what
+probes and doctor checks consume (`status`, `version`, `auth_mode`).
 
 ## `GET /meta`
 
@@ -123,7 +130,7 @@ Request body:
 
 The top-level body accepts an optional `wait_seconds` field added in v0.21:
 
-- `wait_seconds` (int, default `0`, range `0..600`): when the request would `409`, FIFO-queue the caller behind the blocking holder and long-poll for up to this many seconds for the holder to release. On release (manual `release_claims`, TTL expiry, request approval, or a `narrowed` / `coexist` decision) the service drains the queue and auto-grants the next entry in arrival order. `0` (or omitted) preserves the v0.13-v0.20 immediate-409 behaviour. The server caps the value at 600.
+- `wait_seconds` (int, default `0`, range `0..600`): when the request would `409`, FIFO-queue the caller behind the blocking holder and long-poll for up to this many seconds for the holder to release. On release (manual `release_claims`, TTL expiry, request approval, or a `narrowed` / `coexist` decision) the service drains the queue and auto-grants the next entry in arrival order. `0` (or omitted) preserves the v0.13-v0.20 immediate-409 behaviour. Values outside `0..600` are rejected with a `422` validation error, not clamped.
 
 The top-level body also accepts an optional `urgency` field added in v0.25:
 
@@ -131,7 +138,7 @@ The top-level body also accepts an optional `urgency` field added in v0.25:
 
 Each `ClaimItem` accepts two optional fields added in v0.14:
 
-- `symbols` (`list[str]`): top-level symbol names within `pattern`. When present and non-empty, the claim becomes `scope_type='symbol'` and covers only the listed declarations; imports and module-level statements are explicitly not covered. When `pattern` is a glob, the symbol list applies to every matched file -- pass separate claim items if you want per-file granularity. Empty or absent: `scope_type='file'` (legacy behaviour). Entries containing `::` are interpreted as method-scope (v0.16+): `"Router::handleAuth"` claims the `handleAuth` method on the `Router` class. The server splits at insert time and stores `Router` as the parent and `handleAuth` as the leaf. Two-level only -- nested classes / nested namespaces are not yet supported.
+- `symbols` (`list[str]`): top-level symbol names within `pattern`. When present and non-empty, the claim becomes `scope_type='symbol'` and covers only the listed declarations; imports and module-level statements are explicitly not covered. When `pattern` is a glob, the symbol list applies to every matched file -- pass separate claim items if you want per-file granularity. Empty or absent: `scope_type='file'` (legacy behaviour). Entries containing `::` are interpreted as method-scope (v0.16+): `"Router::handleAuth"` claims the `handleAuth` method on the `Router` class. The server splits at insert time and stores `Router` as the parent and `handleAuth` as the leaf. The notation is recursive (v0.17+): `"Outer::Inner::method"` works to any depth, the full ancestor chain is stored joined by `::`, and a claim on an ancestor covers every descendant.
 - `narrowable` (`bool`): whether a later symbol-scope requester can auto-narrow this claim. Defaults: `file` -> `true`, `shared_file` / `module` / `symbol` -> `false`.
 
 Symbol-scope example (mixing top-level and method-scope symbols):
@@ -248,6 +255,29 @@ Example:
 curl "http://127.0.0.1:8080/conflicts?engineer=alex/claude/main&pattern=src/auth/login.ts" \
   -H "Authorization: Bearer $COORD_AUTH_TOKEN"
 ```
+
+## `POST /conflicts/batch`
+
+Body-based equivalent of `GET /conflicts`, intended for pre-push checks with
+many paths. It applies the same authentication, repo scoping, session
+self-exclusion, and push-bounce reporting without one HTTP request per file or
+an oversized query string.
+
+```bash
+curl -X POST "http://127.0.0.1:8080/conflicts/batch" \
+  -H "Authorization: Bearer $COORD_AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "patterns": ["src/auth/login.ts", "src/auth/session.ts"],
+    "engineer": "alex/claude/main",
+    "repo": "amittell/coord",
+    "session_ids": ["current-mcp-session"],
+    "branch": "feature/auth"
+  }'
+```
+
+The managed hook tries this endpoint first and falls back to per-file
+`GET /conflicts` only when an older server returns 404 or 405.
 
 ## `GET /repos` (v0.3.0+)
 
@@ -386,6 +416,48 @@ Response shape:
 
 The operator stays in the loop -- v0.21 never auto-promotes on its own; the endpoint only writes when actively poked.
 
+## `GET /metrics/auto-resolutions` (v0.18.0+)
+
+Daily `auto-coexist` / `auto-narrow` counts per repo. The same series powers the dashboard's 30-day auto-resolution heatmap and is exposed standalone so external monitoring can track whether sub-file claims are actually saving conflicts.
+
+Query params:
+
+- `days` (int, default `30`, range `1..90`) -- look-back window for `request_events` rows.
+- `repo` (str, optional) -- restrict the result to a single repo identifier. When omitted every repo with at least one event in the window appears.
+- `all_repos` (bool, default `false`) -- operator-wide read on a shared service; a repo-scoped token gets a `403` (v0.42 semantics).
+
+Example:
+
+```bash
+curl "http://127.0.0.1:8080/metrics/auto-resolutions?days=30" \
+  -H "Authorization: Bearer $COORD_AUTH_TOKEN"
+```
+
+Example response:
+
+```json
+{
+  "series": [
+    {
+      "repo": "amittell/coord",
+      "date": "2026-06-01",
+      "auto_coexist": 4,
+      "auto_narrow": 1
+    },
+    {
+      "repo": "amittell/coord",
+      "date": "2026-06-02",
+      "auto_coexist": 2,
+      "auto_narrow": 0
+    }
+  ],
+  "days": 30,
+  "count": 2
+}
+```
+
+One row per (repo, date) bucket, ordered by repo then date ascending. Empty days are omitted -- callers that want a dense grid fill the gaps themselves, exactly as the dashboard heatmap does.
+
 ## `GET /sessions/{session_id}/pending_requests` (v0.6.0+, extended in v0.9.0)
 
 The merged inbox a holder polls. Returns two kinds of rows distinguished by `kind`:
@@ -460,7 +532,7 @@ The holder responds to an open request. Four decisions:
 - `approved` (v0.9): release the claim immediately.
 - `denied` (v0.9): keep the claim, restore the original TTL (so the holder isn't punished for the request having shortened it).
 - `narrowed` (v0.11): close the original claim and atomically open a tighter one. Pass `narrowed_pattern`. The new claim inherits the original's engineer / branch / repo / session / TTL. The server validates `narrowed_pattern` is a subset of the holder's current pattern via the `compute_overlap` synthesizer; disjoint or broader patterns return `400`.
-- `coexist` (v0.11): grant the requester a sibling claim on the same scope. Pass `coexist_pattern`. Both claims live, mutually self-excluded via `claims.coexists_with`, but still adversarial to anyone outside the pair. Cooperative not enforced -- imports and shared module-level state remain on the agents to handle.
+- `coexist` (v0.11): grant the requester a sibling claim on the same scope. Pass `coexist_pattern`, or `coexist_symbols` (v0.35, see below). Both claims live, mutually self-excluded via `claims.coexists_with`, but still adversarial to anyone outside the pair. Cooperative not enforced -- imports and shared module-level state remain on the agents to handle.
 
 ```json
 {
@@ -469,11 +541,16 @@ The holder responds to an open request. Four decisions:
   "session_id": "<holder MCP session id>",
   "note": "ok, releasing",
   "narrowed_pattern": "<required when decision='narrowed'>",
-  "coexist_pattern": "<required when decision='coexist'>"
+  "coexist_pattern": "<decision='coexist' requires this or coexist_symbols>",
+  "coexist_symbols": {"src/auth.py": ["Login::handle"]}
 }
 ```
 
+`coexist_symbols` (v0.35) is the symbol-scoped alternative to `coexist_pattern`: a dict mapping file path to the list of symbol paths the requester is granted a sibling claim on. The requester's new claim is created `scope_type='symbol'` with exactly those symbols, so a later third claim collides only on the granted symbols and auto-coexists elsewhere. Valid only when BOTH the holder's claim and the requester's original claim are symbol-scoped; the granted symbols must be a subset of the requester's claimed symbols and disjoint from the holder's (else `400`).
+
 A late respond (after the request has already terminalised) is recorded as a `responded-late` audit event but does not change state.
+
+Holder authorization (v0.46+): when the caller authenticates with a per-engineer token, only the target claim's holder may decide a request filed against it -- a requester cannot file a release request and self-approve it. A non-holder per-engineer token gets `403` regardless of `COORD_ENFORCE_ENGINEER_IDENTITY` mode. Shared operator tokens (and no-auth deployments) are exempt so dashboard and operator flows keep working. Fleets whose per-engineer token identity deliberately differs from the claim-holder engineer name should pass the optional `engineer` argument on the MCP `respond_to_request` tool.
 
 ## `GET /requests` (v0.9.0+, extended in v0.22.0)
 
@@ -579,6 +656,8 @@ Every event that lands in the `request_events` audit table also goes through `Se
 - `auto-demote` (v0.23) -- a coord-managed `shared_file` entry was removed because the rolling hotspot count dropped.
 - `queue_grant` (v0.21) -- a queued `claim_files(wait_seconds=...)` waiter was auto-granted when the blocking holder released.
 - `queue_cancel` (v0.26) -- a `DELETE /requests/{queue_id}` cancelled a waiting queue entry.
+- `symbol_renamed` (v0.31) -- the rename sweep followed a symbol rename and updated a live claim's symbol path; `detail` carries `claim_id`, `file`, `old`, `new`, and `engineer`.
+- `push_bounced` (v0.34) -- a pre-push conflict check bounced a push. This event travels on a separate transport: it is gated on `COORD_GITHUB_TOKEN` (not `COORD_WEBHOOK_URL`), ignores the `COORD_WEBHOOK_EVENTS` allowlist, and is delivered to the GitHub PR-comment adapter (a de-duplicated comment on the open PR for the bounced branch) instead of the HTTP receiver. `COORD_GITHUB_API_BASE` points the adapter at a GitHub Enterprise host.
 
 `COORD_WEBHOOK_EVENTS` is a comma-separated allowlist; empty or unset means "deliver every event". A receiver that subscribes to a subset never sees enqueue or retry pressure for the unwanted events.
 

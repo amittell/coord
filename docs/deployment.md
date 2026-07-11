@@ -1,6 +1,10 @@
 # Deployment
 
-The coordination service ships as a single OCI container image. It is a small FastAPI process backed by SQLite, designed to be hosted on whatever container infrastructure you already run (Kubernetes, ECS, Nomad, Docker on a VM, Docker Compose, etc.). This document describes the container contract so you can wire it into your platform of choice.
+The coordination service is a small FastAPI process designed to run on
+Kubernetes, ECS, Nomad, Docker, or a VM. SQLite is the default and recommended
+backend. An optional PostgreSQL backend is available for fresh installs that
+need multiple stateless API replicas; it is still beta and requires an explicit
+driver install or PostgreSQL-enabled image.
 
 ## Container contract
 
@@ -8,22 +12,28 @@ The coordination service ships as a single OCI container image. It is a small Fa
 |---------|-------|
 | Image entrypoint | `coord-api` (runs `uvicorn coordination.main:app`) |
 | Listen port | `8080` (bound to `0.0.0.0` inside the container) |
-| Persistent state | SQLite at `COORD_DATABASE_PATH` (default `/data/coordination.db`) |
-| Volume to mount | `/data` (for the SQLite file and its WAL/SHM sidecars) |
+| Persistent state | Default: SQLite at `COORD_DATABASE_PATH` (`/data/coordination.db`); optional beta: external PostgreSQL |
+| Volume to mount | SQLite: `/data` for the DB/WAL/SHM files; PostgreSQL: none for coord itself |
 | Liveness probe | `GET /health` returns `ok` (HTTP 200) with no auth |
 | Readiness probe | `GET /readyz` returns JSON (HTTP 200) with no auth |
 | Graceful shutdown | Responds to `SIGTERM` by letting uvicorn drain in-flight requests |
 | Built-in healthcheck | `HEALTHCHECK` in the Dockerfile probes `/readyz` every 30s |
 | Container user | Non-root `coord` (uid/gid 1000); `/data` is owned by that user |
 
-The runtime image is a multi-stage build on `python:3.12-slim` with pinned production dependencies from `requirements.txt`. It runs as a non-root user (`coord`, uid 1000), so the mounted `/data` volume must be writable by uid 1000 (Kubernetes users can set `spec.securityContext.fsGroup: 1000`; Docker volume drivers and bind mounts may need adjustment).
+The runtime image is a multi-stage build on `python:3.14-slim` with pinned
+production dependencies from `requirements.txt`. The standard image remains
+SQLite-only and does not include asyncpg. It runs as a non-root user (`coord`,
+uid 1000), so a SQLite `/data` mount must be writable by uid 1000 (Kubernetes
+users can set `spec.securityContext.fsGroup: 1000`; Docker volume drivers and
+bind mounts may need adjustment).
 
 ## Minimum production stance
 
 At minimum:
 
 - Set `COORD_AUTH_TOKEN` to a strong random value (e.g. `python -c "import secrets; print(secrets.token_urlsafe(32))"`).
-- Mount persistent storage at `/data`.
+- For SQLite, mount persistent storage at `/data`; for PostgreSQL, use a
+  production database with backups and TLS appropriate to your environment.
 - Expose the HTTP API on a stable hostname, terminated by your own TLS-capable reverse proxy (nginx, Caddy, ALB, Cloudflare, etc.). The service itself speaks plain HTTP.
 - Distribute the bearer token to engineers through your normal secret channel.
 - Keep `coord-mcp` local to each engineer's machine as an editor/CLI command. Do not expose it over the network.
@@ -33,7 +43,9 @@ At minimum:
 | Variable | Purpose |
 |----------|---------|
 | `COORD_AUTH_TOKEN` | Shared bearer token for the HTTP API. May be omitted when `COORD_REQUIRE_PER_ENGINEER_TOKEN=true` (per-engineer-only mode, v0.29.4+) or when `COORD_ALLOW_INSECURE_NO_AUTH=true`; otherwise requests fail with a misconfiguration error. |
-| `COORD_DATABASE_PATH` | SQLite path. Default `/data/coordination.db` in the shipped image. |
+| `COORD_DATABASE_PATH` | SQLite path. Default `/data/coordination.db` in the shipped image; ignored for storage selection when PostgreSQL is active. |
+| `COORD_DATABASE_URL` | Optional PostgreSQL DSN. An exact `postgresql://` or `postgres://` prefix selects the beta PostgreSQL backend; unset keeps SQLite. |
+| `COORD_POSTGRES_SCHEMA` | PostgreSQL only: stable schema shared by every service replica and operator CLI. Default `coord`. |
 
 All other `COORD_*` variables (scope limits, TTLs, cleanup cadence) are optional and documented in the top-level README.
 
@@ -70,6 +82,112 @@ docker compose up --build -d
 curl http://127.0.0.1:8080/readyz
 ```
 
+## Optional PostgreSQL backend (beta)
+
+PostgreSQL is a real, tested backend, but it is opt-in and still beta. Use it
+for a fresh deployment when multiple stateless coord API replicas materially
+help. SQLite remains the simpler, recommended path for a single process. The
+PostgreSQL option does not make the database tier itself highly available.
+
+The backend boundary is intentionally narrow: after asyncpg is installed, an
+exact `postgresql://` or `postgres://` `COORD_DATABASE_URL` selects
+PostgreSQL. Coord creates the configured schema and current tables on first
+boot, then applies later coord migrations at startup. The database and login
+role must already exist, be reachable, and allow schema/table creation.
+
+### Fresh Python/venv quickstart
+
+```bash
+python3 -m venv "$HOME/.venvs/coord-postgres"
+source "$HOME/.venvs/coord-postgres/bin/activate"
+pip install 'coord-mcp-server[postgres]'
+
+export COORD_AUTH_TOKEN="$(openssl rand -hex 32)"
+export COORD_DATABASE_URL='postgresql://coord:password@db.example.com:5432/coord'
+export COORD_POSTGRES_SCHEMA=coord
+# Leave the API running in this terminal.
+coord-api
+```
+
+From a second terminal, verify readiness:
+
+```bash
+curl -fsS http://127.0.0.1:8080/readyz
+```
+
+`COORD_POSTGRES_SCHEMA` defaults to `coord`. It is the durable namespace that
+all API replicas and server-side operator commands must share; changing it
+selects a different logical coord database inside the same PostgreSQL
+database. Accepted names are lowercase ASCII PostgreSQL identifiers matching
+`[a-z_][a-z0-9_]{0,62}`. `public`, `information_schema`, and every `pg_*`
+name are rejected. Set it explicitly in production even when using the
+default, so the namespace is visible in deployment configuration.
+
+**Upgrading an experimental v0.44/v0.45 PostgreSQL install:** those releases
+derived a schema named `coord_<24 hex characters>` from the local
+`COORD_DATABASE_PATH`. A current release with no explicit
+`COORD_POSTGRES_SCHEMA` detects such a schema and refuses to start instead of
+silently selecting an apparently empty `coord` dataset. List candidates with:
+
+```sql
+SELECT schema_name
+FROM information_schema.schemata
+WHERE schema_name ~ '^coord_[0-9a-f]{24}$';
+```
+
+Set `COORD_POSTGRES_SCHEMA` to the existing schema name to continue using that
+data immediately, or deliberately rename/migrate it to `coord` and then set
+`COORD_POSTGRES_SCHEMA=coord`. Do not delete the legacy schema until the chosen
+path has been verified and backed up. If the query returns more than one
+candidate, do not select the first arbitrarily: verify the expected token and
+ownership rows (and the prior `COORD_DATABASE_PATH`) for the specific install.
+
+### PostgreSQL-enabled container
+
+The standard production image intentionally excludes asyncpg, keeping the
+default SQLite artifact smaller and its dependency surface narrower. Build a
+separately tagged derivative from the same pinned coord release:
+
+```dockerfile
+ARG COORD_BASE=ghcr.io/amittell/coord:<release>@sha256:<digest>
+FROM ${COORD_BASE}
+USER root
+COPY requirements-postgres.txt /tmp/requirements-postgres.txt
+RUN /opt/venv/bin/pip install --no-cache-dir \
+      -r /tmp/requirements-postgres.txt \
+    && rm /tmp/requirements-postgres.txt
+USER coord
+```
+
+Build from a checkout containing `requirements-postgres.txt`, publish the
+variant under a distinct tag such as `coord:<release>-postgres`, and verify the
+artifact before deploying it:
+
+```bash
+docker build -f Dockerfile.postgres -t coord:postgres .
+docker run --rm --entrypoint python coord:postgres \
+  -c 'import asyncpg, coordination; print(asyncpg.__version__)'
+
+docker run -d --name coord-postgres \
+  -e COORD_AUTH_TOKEN=replace-me \
+  -e COORD_DATABASE_URL='postgresql://coord:password@db.example.com:5432/coord' \
+  -e COORD_POSTGRES_SCHEMA=coord \
+  -p 8080:8080 \
+  coord:postgres
+```
+
+Do not mount `/data` for PostgreSQL state; persistence, backups, TLS, and HA
+belong to the PostgreSQL deployment. Do not set `COORD_DATABASE_URL` on the
+standard image: startup deliberately fails with an installation hint when the
+driver is absent.
+
+This quickstart is for an empty PostgreSQL schema. Switching an existing
+SQLite service requires a hard drain and explicit durable-state migration;
+follow the [SQLite-to-PostgreSQL cutover
+runbook](runbooks/coord-ha-cutover.md). The project's own live cutover remains
+operator-gated even though third parties may choose PostgreSQL for a fresh
+install.
+
 ## Run with uvicorn directly (no container)
 
 If you want to run the ASGI app on bare metal or inside a different process supervisor, the app object is `coordination.main:app`:
@@ -89,7 +207,10 @@ This service is meant for a small to medium team coordinating one repo or a smal
 - SQLite + WAL behaves well for one API process. Running multiple replicas against the same SQLite file is not supported.
 - Memory footprint stays under 200 MB in normal use; CPU is negligible.
 
-If you need to run multiple replicas for HA, the storage layer needs to be replaced first. The HTTP and MCP contracts are stable enough that this is a local-only change.
+The optional PostgreSQL backend supports multiple stateless coord replicas, but
+it is beta and does not make PostgreSQL itself highly available. Keep SQLite
+for the common single-process deployment unless multi-replica topology is a
+real requirement.
 
 ## `COORD_REPO_ROOT` guidance
 
@@ -129,6 +250,10 @@ The SQLite file at `COORD_DATABASE_PATH` plus its `*-wal` and `*-shm` siblings t
 
 Because claims are short-lived (TTL in hours), most teams do not need historical backups. The conflict log is the most lossy piece on restore.
 
+PostgreSQL deployments use normal PostgreSQL backup/restore tooling (managed
+snapshots, `pg_dump`, WAL archiving, and tested restores). The SQLite commands
+above do not apply to that backend.
+
 ## Token lifecycle
 
 ### Per-engineer tokens (v0.29+)
@@ -148,6 +273,8 @@ coord tokens list
 # Kill switch: token stops authenticating immediately
 coord tokens revoke <token-id>
 ```
+
+`coord tokens rotate` and `coord tokens revoke` accept either the full token id or any unambiguous prefix of at least 8 characters -- exactly the width of the TOKEN ID column that `coord tokens list` prints, so the visible column value always resolves. An ambiguous prefix lists the candidates and exits non-zero without touching anything. All the `coord tokens` subcommands take `--database-path` to target a non-default SQLite file; `rotate`/`revoke` against a missing database file are a distinct exit-code-2 error (nothing to mutate), while `list` reports "No tokens issued" without creating an empty file.
 
 The raw token is printed exactly once at creation; only its sha256 lands in the database. Tokens created without `--expires-in` never expire (matching pre-v0.29.4 behavior). In a remote-mode repo, `coord tokens create` refuses the default local SQLite write unless you pass `--local-db`, `--database-path`, or `COORD_DATABASE_PATH`; that opt-in is for operators intentionally writing a server-side/local database, not for normal remote token creation.
 
@@ -193,11 +320,12 @@ The shared token has no grace-window mechanism; if you need zero-downtime rotati
 ## Observability
 
 - stdout/stderr: standard uvicorn logs at the level set by `COORD_LOG_LEVEL`.
-- `/readyz`: includes version, auth mode, and database path for quick probing.
+- `/readyz`: includes status, version, and auth mode for quick probing. The database filesystem path is deliberately NOT exposed: the endpoint is unauthenticated, so it reports only what probes and doctor checks consume.
 - `/meta`: name, version, auth mode, and whether `COORD_REPO_ROOT` is configured.
 - `/metrics`: Prometheus-style text exposition (`text/plain; version=0.0.4`). Exposed unauthenticated by convention so standard Prometheus scrapers work without custom headers. If you need to restrict it, front the service with a reverse proxy that gates `/metrics` separately from the rest of the API.
 - Per-request IDs: every response carries an `X-Request-ID` header. If the client sends one on the request the service echoes it; otherwise the service mints a 16-character hex id. Use it to correlate a client error with a specific server-side log line.
 - Structured logs (default): the whole server process emits one-line JSON by default (`ts`, `level`, `logger`, `msg`, and `request_id` when set), which a log aggregator such as Loki ingests directly from the container stream. This covers both coord's own `coordination.*` loggers and uvicorn's loggers (startup banner, errors) -- when launched via `coord-api`, `run()` hands uvicorn `log_config=None` so it does not reinstall plain-text formatters. uvicorn's per-request access log is disabled because the access-log middleware already emits a richer structured line (method, path, status, `duration_ms`, `request_id`). Set `COORD_LOG_JSON=false` to opt back out to a plain human-readable formatter for local development.
+- `coord status` (client-side wiring check, v0.46+): resolves `COORD_AUTH_TOKEN` with the same precedence as the MCP wrapper (a real exported env var wins over `.coordination/local.env`; the `set-me` placeholder counts as unset in both) and prints a `Token: from environment` / `Token: from .coordination/local.env` / `Token: not set` provenance line, so the human running it and coord-mcp can never silently authenticate with different tokens. It also probes `GET /claims` with that token and exits 1 when the probe fails (401/403/non-200/unreachable) even if `/readyz` returned 200 -- a dead token is a broken deployment for agents, so scripts gating on `coord status` fail on it too.
 
 ### Metrics surfaced
 
@@ -306,6 +434,30 @@ Typical rollout: ship with the warning on, let agents rotate to scoped tokens as
 they notice the notice, then flip `COORD_REQUIRE_SCOPED_TOKEN=true` once the fleet
 is clean.
 
+### Engineer identity: bind mutations to the token (v0.46+)
+
+Per-engineer tokens authenticate a caller, but mutating requests also carry an
+`engineer` field naming who is acting -- and historically nothing tied the two
+together, so any authenticated agent could act under another engineer's name.
+`COORD_ENFORCE_ENGINEER_IDENTITY` controls the binding:
+
+- `warn` (default): a mismatch between the request's named engineer and the
+  authenticated per-engineer token identity is honored, but logged server-side
+  and echoed back in an `X-Coord-Identity-Warning` response header so the
+  misconfigured client is discoverable before enforcement.
+- `enforce`: a mismatch is rejected with 403. An omitted engineer defaults to
+  the token's own identity in both modes, so well-behaved clients need no
+  change.
+
+Independently of the mode, `POST /requests/{id}/respond` applies an immediate
+holder-authorization rule for per-engineer tokens: only the target claim's
+holder may decide a request filed against it, so a requester cannot file a
+release request and self-approve it. Shared operator tokens (and no-auth
+deployments) are exempt so dashboard and operator flows keep working. Fleets
+whose token identity deliberately differs from the claim-holder engineer name
+should pass the optional `engineer` argument on the MCP `respond_to_request`
+tool (or stay on `warn` until names converge).
+
 ### Rollout safety: drain legacy NULL-repo claims first
 
 Conflict detection isolates the `NULL`-repo bucket from repo-tagged claims
@@ -324,11 +476,19 @@ The coordination service assumes single-writer semantics for its in-process cach
 Storage backends: the default is a single SQLite file, tuned for high agent
 concurrency since v0.45 (activity-ping coalescing + an in-process writer
 queue; see the `COORD_ACTIVITY_PING_MIN_INTERVAL_SEC` /
-`COORD_SQLITE_WRITER_QUEUE` settings). A Postgres backend for stateless
-multi-replica HA exists but ships dormant: it activates only when
-`COORD_DATABASE_URL` is a `postgresql://` DSN, and the live prod cutover is
+`COORD_SQLITE_WRITER_QUEUE` settings). The optional beta PostgreSQL backend
+supports stateless replicas when the driver, `COORD_DATABASE_URL`, and one
+shared `COORD_POSTGRES_SCHEMA` are configured. Fresh third-party installs may
+choose it directly; migrating this project's live SQLite service remains
 operator-gated per `docs/runbooks/coord-ha-cutover.md` (its manifests live in
-`deploy/k8s/ha-cutover/`, deliberately outside ArgoCD's watched path). To catch that at startup, the service takes an advisory `fcntl.flock(LOCK_EX | LOCK_NB)` on `<COORD_DATABASE_PATH>.lock` during lifespan initialisation. If the lock is already held, the process refuses to start with a message identifying the current holder's PID.
+`deploy/k8s/ha-cutover/`, deliberately outside ArgoCD's watched path).
+
+On SQLite, the service takes an advisory `fcntl.flock(LOCK_EX | LOCK_NB)` on
+`<COORD_DATABASE_PATH>.lock` during lifespan initialization. If the lock is
+already held, the process refuses to start with a message identifying the
+current holder's PID. PostgreSQL mode skips that local-file lock; concurrency
+is coordinated through database transactions, advisory locks, and the leader
+lease instead.
 
 - The lock file lives next to the database file (same directory, `.lock` suffix). Your volume mount must allow creating it.
 - The file descriptor is held for the process lifetime; `fcntl` auto-releases on fd close or process exit, so crashed instances do not leave a stale lease behind.

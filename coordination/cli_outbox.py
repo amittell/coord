@@ -84,6 +84,16 @@ def _db_path() -> Path:
     return Path(get_settings().database_path)
 
 
+def _database(path: Path) -> Database:
+    """Open the configured backend, including its explicit PG schema."""
+    settings = get_settings()
+    return Database(
+        path,
+        postgres_schema=settings.postgres_schema,
+        postgres_schema_explicit=settings.postgres_schema_is_explicit,
+    )
+
+
 def _postgres_selected() -> bool:
     """True when ``COORD_DATABASE_URL`` selects the Postgres backend.
 
@@ -133,7 +143,7 @@ def _run_stats(args: argparse.Namespace) -> int:
         return 1
     try:
         stats = asyncio.run(
-            Database(path).webhook_delivery_stats(window_hours=hours)
+            _database(path).webhook_delivery_stats(window_hours=hours)
         )
     except Exception as exc:
         print(f"Database error: {exc}", file=sys.stderr)
@@ -186,7 +196,7 @@ def _run_tail(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        rows = asyncio.run(Database(path).recent_webhook_outbox(limit=n))
+        rows = asyncio.run(_database(path).recent_webhook_outbox(limit=n))
     except Exception as exc:
         print(f"Database error: {exc}", file=sys.stderr)
         return 2
@@ -285,7 +295,7 @@ def _run_retry(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        db = Database(path)
+        db = _database(path)
         if args.dry_run:
             count = asyncio.run(db.count_webhook_outbox(statuses))
             print(
@@ -342,7 +352,7 @@ def _run_purge(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        db = Database(path)
+        db = _database(path)
         if args.dry_run:
             count = asyncio.run(db.count_webhook_outbox(statuses))
             print(

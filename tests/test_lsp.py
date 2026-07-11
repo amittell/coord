@@ -21,6 +21,7 @@ from typing import Any
 import pytest
 
 import coordination.lsp as lsp_module
+from conftest import seam_connection
 from coordination.config import Settings
 from coordination.db import Database
 from coordination.lsp import (
@@ -935,8 +936,6 @@ async def _make_enriched_holder(
 async def test_callsite_advisory_warns_cross_engineer_file_claim(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import aiosqlite
-
     svc, holder_cid = await _make_enriched_holder(tmp_path, monkeypatch)
 
     result = await svc.create_claims(
@@ -960,7 +959,7 @@ async def test_callsite_advisory_warns_cross_engineer_file_claim(
     assert "lines 2, 3" in advisory
 
     # Each finding also lands as a callsite-advisory audit event.
-    async with aiosqlite.connect(svc.db.path) as conn:
+    async with seam_connection(svc.db) as conn:
         cur = await conn.execute(
             "SELECT detail FROM request_events "
             "WHERE event_type = 'callsite-advisory'"

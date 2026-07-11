@@ -4,7 +4,11 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - "**/*.md"
   pull_request:
+    paths-ignore:
+      - "**/*.md"
 
 permissions:
   contents: read
@@ -15,25 +19,51 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  quality:
+    name: quality (ruff, mypy, otel)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: "3.14"
+
+      # Keep lint/type checks single-shot. Installing the pinned optional
+      # tracing stack here also exercises OTel's enabled path without a
+      # separate runner.
+      - name: Install quality dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]" -r requirements-otel.txt
+
+      - name: Lint with ruff
+        run: ruff check .
+
+      - name: Run mypy
+        run: mypy coordination
+
+      - name: Run OpenTelemetry enabled-path tests
+        run: pytest tests/test_otel.py -q
+
   test:
-    name: test (${{ matrix.os }} py${{ matrix.python-version }})
-    runs-on: ${{ matrix.os }}
+    name: sqlite (ubuntu py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            python-version: "3.11"
-          - os: ubuntu-latest
-            python-version: "3.12"
-          - os: ubuntu-latest
-            python-version: "3.14"
-          - os: macos-latest
-            python-version: "3.12"
-          - os: windows-latest
-            python-version: "3.12"
-    # Force bash on all runners so quoting and pipelines behave consistently.
-    # Windows GHA runners ship Git for Windows' bash at /usr/bin/bash.
+        # 3.11 is the advertised floor; 3.14 is the release-image runtime.
+        # Intermediate-version and full platform coverage run weekly.
+        python-version:
+          - "3.11"
+          - "3.14"
     defaults:
       run:
         shell: bash
@@ -45,45 +75,27 @@ jobs:
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
         with:
           python-version: ${{ matrix.python-version }}
-          cache: pip
-          cache-dependency-path: |
-            pyproject.toml
-            requirements.txt
 
       - name: Install project with dev extras
         run: |
           python -m pip install --upgrade pip
           python -m pip install ".[dev]"
 
-      - name: Lint with ruff
-        run: ruff check .
-
-      - name: Run tests
+      - name: Run full SQLite suite
         run: pytest -q
 
-  test-postgres:
-    name: test (postgres backend)
-    runs-on: ubuntu-latest
-    # The default `test` matrix exercises the SQLite backend only. The HA
-    # re-architecture adds a PostgresStore selected by COORD_DATABASE_URL;
-    # this job runs the same suite against a real Postgres so the PG path
-    # (dialect adapter, advisory-lock grant unit-of-work, leader lease) is
-    # actually gated on every PR rather than validated by local runs alone.
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: coord
-          POSTGRES_PASSWORD: coord
-          POSTGRES_DB: coord
-        ports:
-          - 5432:5432
-        # Wait for the server to accept connections before the job starts.
-        options: >-
-          --health-cmd "pg_isready -U coord"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
+  platform:
+    name: platform smoke (${{ matrix.os }} py3.14)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+          - windows-latest
+    # Git for Windows supplies bash; using one shell keeps hook and quoting
+    # behavior consistent between the two platform runners.
     defaults:
       run:
         shell: bash
@@ -91,30 +103,29 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
-      - name: Set up Python 3.12
+      - name: Set up Python 3.14
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
         with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: |
-            pyproject.toml
-            requirements.txt
+          python-version: "3.14"
 
-      # The asyncpg driver lives in the optional `postgres` extra, so install
-      # it alongside `dev`; the SQLite matrix deliberately does not pull it in.
-      - name: Install project with dev + postgres extras
+      # These tests exercise OS-facing process, path, permissions, and shell
+      # behavior. They do not need lint/type/OTel or the tree-sitter grammar
+      # stack carried by the full dev extra.
+      - name: Install project and focused test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install ".[dev,postgres]"
+          python -m pip install . \
+            "pytest>=9.0.3" \
+            "pytest-asyncio>=1.4.0" \
+            "pytest-timeout>=2.3.1"
 
-      - name: Run tests against Postgres
-        env:
-          COORD_DATABASE_URL: postgresql://coord:coord@localhost:5432/coord
-        run: pytest -q
+      - name: Run platform-specific smoke suite
+        run: pytest -q -m platform
 
   lint-workflows:
     name: lint workflows (actionlint)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
@@ -126,62 +137,17 @@ jobs:
           level: error
           fail_level: error
 
-  type-check:
-    name: type check (mypy)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-
-      - name: Set up Python 3.12
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: |
-            pyproject.toml
-            requirements.txt
-
-      - name: Install project with dev extras
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install ".[dev]"
-
-      - name: Run mypy
-        run: mypy coordination
-
-  otel:
-    name: otel tracing tests
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-
-      - name: Set up Python 3.12
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: |
-            pyproject.toml
-            requirements.txt
-            requirements-otel.txt
-
-      # The OpenTelemetry SDK is an optional extra, so the main test matrix
-      # (installed with just [dev]) skips the enabled-path tracing tests.
-      # Install the pinned tracing stack here so those tests actually run.
-      - name: Install project with dev extras + pinned OpenTelemetry stack
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install ".[dev]" -r requirements-otel.txt
-
-      - name: Run OpenTelemetry tracing tests (enabled path)
-        run: pytest tests/test_otel.py -q
-
   docker-build:
-    name: docker build smoke
-    needs: test
+    name: docker SQLite readiness smoke
+    # The SQLite legs are the long pole, so these cheap gates normally finish
+    # first. If they fail, avoid paying for a Docker build of invalid code.
+    needs: [quality, test, lint-workflows]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # build-push-action otherwise uploads a build-record artifact for every
+      # ephemeral PR build even though this job neither pushes nor publishes.
+      DOCKER_BUILD_RECORD_UPLOAD: "false"
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
@@ -189,8 +155,6 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
 
-      # Build the image once (amd64 only, no push) to catch Dockerfile
-      # regressions on every PR without spending time on multi-arch.
       - name: Build image (no push)
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
         with:
@@ -199,5 +163,34 @@ jobs:
           push: false
           load: true
           tags: coord:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=docker-ci
+          # PR merge refs are ephemeral and their caches cannot help later
+          # branches. Only main refreshes the shared, minimal build cache.
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,scope=docker-ci,mode=min' || '' }}
+
+      - name: Start image and verify real SQLite readiness
+        shell: bash
+        run: |
+          container_id="$(docker run --detach --env COORD_AUTH_TOKEN=ci-smoke --publish 127.0.0.1:18080:8080 coord:ci)"
+          cleanup() {
+            docker logs "$container_id" || true
+            docker rm --force "$container_id" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          ready=0
+          for _ in {1..30}; do
+            if body="$(curl --fail --silent http://127.0.0.1:18080/readyz)" \
+              && READY_BODY="$body" python -c 'import json, os; assert json.loads(os.environ["READY_BODY"])["status"] == "ready"'; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "::error::container did not become ready with SQLite" >&2
+            exit 1
+          fi
+
+          docker exec "$container_id" python -c \
+            'import importlib.util, sqlite3; assert importlib.util.find_spec("asyncpg") is None; c = sqlite3.connect("/data/coordination.db"); assert c.execute("SELECT count(*) FROM sqlite_master WHERE type = ?", ("table",)).fetchone()[0] > 0'

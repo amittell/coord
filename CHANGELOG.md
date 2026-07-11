@@ -7,7 +7,180 @@ Semantic Versioning.
 
 ## [Unreleased]
 
-(none recorded yet)
+Repo-wide audit-fix campaign (2026-07-08). Behavior changes below; pure
+bug fixes and test hardening are listed after them.
+
+### Added
+
+- `POST /conflicts/batch`, the JSON body equivalent of `GET /conflicts`, lets
+  the managed pre-push hook check the complete pushed file set in one network
+  round-trip. The hook falls back to the legacy per-file GET only for older
+  servers returning 404/405, eliminating the multi-minute per-file curl loop
+  reported in #67 without breaking mixed-version fleets.
+- New-branch push checks accept `COORD_PUSH_BASE_REF` (or branch-local Git
+  config `branch.<name>.coordPushBase`) and prefer a resolvable configured
+  tracking base before `origin/HEAD`. Integration-branch topics now diff only
+  their own changes instead of the full integration-vs-main delta (#68).
+
+- Engineer identity binding (`COORD_ENFORCE_ENGINEER_IDENTITY`,
+  `warn` | `enforce`, default `warn`). Per-engineer tokens authenticate a
+  caller, but mutating requests also name an acting `engineer`; nothing
+  previously tied the two together. In `warn` mode a mismatch between the
+  request's engineer and the token identity is honored but logged
+  server-side and echoed back in an `X-Coord-Identity-Warning` response
+  header; in `enforce` mode it is rejected with 403. An omitted engineer
+  defaults to the token's own identity in both modes.
+- Holder authorization on `POST /requests/{id}/respond`: with a
+  per-engineer token, only the target claim's holder may decide a release
+  request filed against it (403 otherwise, in both identity modes), so a
+  requester can no longer file a request and self-approve it. Shared
+  operator tokens and no-auth deployments are exempt. The MCP
+  `respond_to_request` tool gained an optional `engineer` argument for
+  fleets whose token identity differs from the claim-holder name.
+- `COORD_SYMBOL_PURGE_AFTER_SEC` (default 86400): the background cleanup
+  loop now garbage-collects the `claim_symbols` / callsite / rename child
+  rows of claims released at least this long ago. Claims stay
+  soft-released for audit, but their symbol child rows previously had no
+  reaper at all. Set 0 to disable.
+- `COORD_REPO_ROOT_REPO`: declares which repo id the single
+  `COORD_REPO_ROOT` checkout represents. When set, the rename auto-follow
+  sweep only follows claims tagged with that repo (NULL-repo legacy claims
+  excluded), so on a shared multi-repo service a claim from another repo
+  can never be "renamed" based on this checkout's file content. Unset
+  preserves the single-repo behavior.
+- `GET /requests?queued=true` accepts a `session_id` query param that
+  OR-widens the requester filter, and coord-mcp sends its session id
+  automatically -- an MCP client whose engineer name drifted since
+  enqueue time still sees its own queue entries.
+- `coord tokens rotate` / `revoke` accept any unambiguous token-id prefix
+  of at least 8 characters (the width `coord tokens list` prints).
+  Rotate/revoke against a missing database file is a distinct exit-code-2
+  error; `list` on a fresh install still exits 0 and no longer creates an
+  empty database file as a side effect.
+- Postgres extra hardening: `requirements-postgres.txt` pins asyncpg for
+  explicit PostgreSQL image builds while the standard production image stays
+  SQLite-only; PyPI users opt in with `coord-mcp-server[postgres]`.
+  `PostgresStore` fails fast with a clear error when `COORD_DATABASE_URL` is
+  set but asyncpg is not installed, and the CI Postgres service container is
+  digest-pinned to the same build as the HA-cutover manifest (enforced by a
+  lockstep test).
+- `COORD_POSTGRES_SCHEMA` gives service replicas and operator CLIs one stable
+  PostgreSQL namespace (default `coord`) instead of coupling production data
+  identity to a local SQLite path. Reserved/system names and invalid
+  identifiers fail before connecting. Upgrades also fail closed when an
+  implicit v0.44/v0.45 path-hashed schema is detected, with instructions to
+  select that data explicitly rather than silently opening an empty namespace.
+- Release workflow: manual dispatches refuse to overwrite an
+  already-published version unless `overwrite=true` is passed.
+
+### Changed
+
+- Dashboard views now identify their effective repository/fleet scope, use
+  scope-aware empty states, keep wide tables contained on narrow screens, and
+  provide larger mobile controls and accessible refresh/table semantics.
+  Repo-scoped viewers no longer see fleet-wide webhook aggregates, while the
+  token table calls out unscoped all-repository credentials explicitly.
+  Passive dashboard polling no longer corrupts token usage telemetry;
+  operator token creation requires a repo or an explicit all-repositories
+  choice (and mandatory-scope deployments cannot mint unusable unscoped
+  tokens); keyboard focus resets the refresh timer while editing a form
+  auto-pauses it; and hotspot suggestions use real, CSRF-protected unscoped
+  operator forms instead of dead links.
+- CLI token precedence flip: `coord status` / `claims` / `release` now
+  resolve `COORD_AUTH_TOKEN` the same way the MCP wrapper does -- a real
+  exported environment variable wins over `.coordination/local.env`, and
+  the `set-me` placeholder counts as unset in both sources. Previously
+  local.env silently beat the exported variable, so `coord status` could
+  pass with one token while coord-mcp 401'd with another. `coord status`
+  prints a new `Token: from environment` / `Token: from
+  .coordination/local.env` / `Token: not set` provenance line.
+- `coord status` now exits 1 when its `GET /claims` probe fails
+  (401/403/non-200/unreachable) even though `/readyz` returned 200: a dead
+  token is a broken deployment for agents, so scripts gating on
+  `coord status` fail on it too.
+- Leader lease (multi-replica Postgres deployments): renewal moved to a
+  dedicated heartbeat task with a heartbeat-derived TTL (~65s, previously
+  derived from the slowest work-loop interval at ~3 hours), and the lease
+  is voluntarily released during graceful shutdown -- leadership hands off
+  immediately on a rolling deploy and within about a minute after a crash.
+  SQLite deployments are unaffected (acquire/release are no-ops).
+- Queue drain on all release paths: `release_claims`, `release_session`,
+  request-release approvals/narrowing, and stale-claim expiry all drain
+  the FIFO queue behind each claim that actually closed, and the expiry
+  sweep now also runs (with draining) on `check_conflicts` /
+  `create_claims` / `list_claims` traffic -- so a waiter queued behind a
+  claim that expires converges to a grant instead of burning its whole
+  `wait_seconds`. The db-layer release/expiry methods now return the list
+  of closed claim ids instead of int counts (service-layer HTTP response
+  shapes are unchanged).
+- Multi-item wait warning: a multi-item claim batch that resolves via a
+  queued grant now carries an explicit warning that the grant is PARTIAL,
+  naming the patterns that were NOT reserved -- only the conflicting item
+  is enqueued and granted; the rest must be claimed separately.
+- Webhook delivery: unsigned rows (no `COORD_WEBHOOK_SECRET`) omit the
+  `X-Coord-Signature` header entirely instead of sending an empty value,
+  and the service logs a one-shot per-process operator warning when it
+  delivers unsigned. `kind='webhook'` outbox rows deliver to the current
+  `COORD_WEBHOOK_URL` when non-empty, falling back to the URL frozen in
+  the row (purge the outbox if you unset the URL with rows pending).
+- `/readyz` no longer exposes the database filesystem path; the
+  unauthenticated payload reports only `status`, `version`, `auth_mode`.
+- `coord init` / `coord upgrade`: refuse (exit 1, file untouched) when an
+  existing `.mcp.json` / `.cursor/mcp.json` is invalid JSON, a non-object
+  document, or has a non-object `mcpServers` key, instead of silently
+  clobbering the user's other MCP servers. Re-running `coord init` no
+  longer overwrites a real `COORD_AUTH_TOKEN` in
+  `.coordination/local.env` (pass `--force` for the old re-mint
+  behavior), and local.env rewrites preserve comments, blank lines, and
+  unmanaged keys via the new `coordination/envfile.py` `update_env_file`
+  helper.
+- Claim pattern intake canonicalization: every incoming claim pattern is
+  normalized to the overlap engine's canonical spelling before
+  validation/storage, and the symbol-overlap classifier normalizes stored
+  file paths defensively on read -- two spellings of the same file
+  ("./src/a.py" vs "src/a.py") can no longer make two claims on the same
+  symbol silently auto-coexist.
+- Repo-scoped listing windows: `db.list_recent_claims` and queued request
+  listings apply the token's repo filter in SQL before the LIMIT, so
+  another repo's rows can no longer crowd a scoped viewer's window out on
+  a shared service.
+- Metrics: the `http_requests_total` `path` label collapses unmatched
+  routes to a sentinel so unauthenticated path probing cannot grow the
+  label cardinality unbounded.
+- LSP symbol routing: `language_for_path` now recognizes the full v0.33
+  14-language set (.rs, .java, .rb, ...) so claims on those files attempt
+  the configured language server instead of silently skipping LSP; hosts
+  without the binaries fall back to parser spans via the existing circuit
+  breaker. `.js`/`.jsx` deliberately continue to share the typescript
+  server pool.
+- OIDC: the ID-token `iss` claim is now verified manually against the
+  configured issuer (with trailing-slash tolerance, `iss` required),
+  matching the discovery-document check.
+- GitHub bounce comments sanitize engineer names and descriptions into
+  backtick code spans, preventing markdown/mention injection via claim
+  metadata.
+- Manual-copy MCP templates ship the recognized placeholders (`set-me`,
+  `http://127.0.0.1:8080`, `example-org/example-repo`) instead of
+  `REPLACE_ME` / `YOUR_COORD_SERVICE.example`, so copied templates no
+  longer shadow `.coordination/local.env`; the template pre-push hook is
+  regenerated from `assets.PRE_PUSH_SCRIPT` (drift-tested).
+
+### Documentation
+
+- Deployment, API-reference, README, getting-started, and integration
+  docs refreshed for the changes above (identity enforcement rollout,
+  token provenance line, token-id prefixes, `/readyz` payload, template
+  placeholder model) and for previously shipped but undocumented
+  surfaces (v0.17 recursive symbol nesting, v0.34 GitHub adapter env
+  vars, v0.35 `coexist_symbols`, `GET /metrics/auto-resolutions`).
+
+### Fixed
+
+- The SQLite-to-PostgreSQL durable-state importer now targets an explicit
+  `--postgres-schema` (defaulting from `COORD_POSTGRES_SCHEMA`), schema-qualifies
+  its upserts, and validates the name before invoking psql. The cutover runbook
+  first initializes that exact schema with the selected coord release, so it
+  no longer imports unqualified tables into a nonexistent/default namespace.
 
 ## [0.45.0] - 2026-07-07
 

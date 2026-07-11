@@ -6,9 +6,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
-import aiosqlite
 import pytest
 
+from conftest import seam_connection
 from coordination.db import Database
 
 
@@ -28,7 +28,7 @@ async def _insert(
     branch: str | None = None,
 ) -> str:
     cid = str(uuid4())
-    async with aiosqlite.connect(db.path) as conn:
+    async with seam_connection(db) as conn:
         await conn.execute(
             """
             INSERT INTO claims (
@@ -50,7 +50,6 @@ async def _insert(
                 repo,
             ),
         )
-        await conn.commit()
     return cid
 
 
@@ -302,8 +301,6 @@ async def test_daily_auto_resolutions_buckets_correctly(tmp_path: Path) -> None:
     """v0.18: daily_auto_resolutions groups events by (repo, date) and
     separates auto-coexist from auto-narrow counts."""
     import json
-    import aiosqlite
-    from coordination.db import _configure_sqlite
 
     db = Database(tmp_path / "db.sqlite")
     await db.init()
@@ -322,10 +319,8 @@ async def test_daily_auto_resolutions_buckets_correctly(tmp_path: Path) -> None:
         repo="repo-a",
     )
     # Override repo for c-b1 to repo-b (insert_claims_batch sets one repo per call).
-    async with aiosqlite.connect(db.path) as conn:
-        await _configure_sqlite(conn)
+    async with seam_connection(db) as conn:
         await conn.execute("UPDATE claims SET repo = 'repo-b' WHERE id = 'c-b1'")
-        await conn.commit()
 
     # Seed events across three dates for repo-a, one for repo-b.
     events = [
@@ -335,8 +330,7 @@ async def test_daily_auto_resolutions_buckets_correctly(tmp_path: Path) -> None:
         ("e4", "auto-coexist", "c-a2", "2026-06-01T10:00:00Z"),
         ("e5", "auto-narrow",  "c-b1", "2026-06-01T11:00:00Z"),
     ]
-    async with aiosqlite.connect(db.path) as conn:
-        await _configure_sqlite(conn)
+    async with seam_connection(db) as conn:
         for eid, etype, holder_id, ts in events:
             detail = json.dumps({"holder_claim_id": holder_id})
             await conn.execute(
@@ -346,7 +340,6 @@ async def test_daily_auto_resolutions_buckets_correctly(tmp_path: Path) -> None:
                 "VALUES (?, NULL, ?, NULL, NULL, ?, ?)",
                 (eid, etype, detail, ts),
             )
-        await conn.commit()
 
     from datetime import datetime, UTC
     fake_now = datetime(2026, 6, 2, 12, 0, 0, tzinfo=UTC)
@@ -370,9 +363,6 @@ async def test_hotspot_files_groups_and_threshold(tmp_path: Path) -> None:
     """v0.20: hotspot_files groups by (repo, pattern), enforces
     min_attempts threshold, orders by attempts DESC, and caps at limit.
     """
-    import aiosqlite
-    from coordination.db import _configure_sqlite
-
     db = Database(tmp_path / "db.sqlite")
     await db.init()
 
@@ -393,8 +383,7 @@ async def test_hotspot_files_groups_and_threshold(tmp_path: Path) -> None:
     # Seed conflict_log: 12 attempts on hot.ts (8 distinct), 7 on warm.ts, 3 on cold.ts.
     from uuid import uuid4
 
-    async with aiosqlite.connect(db.path) as conn:
-        await _configure_sqlite(conn)
+    async with seam_connection(db) as conn:
         for i in range(12):
             await conn.execute(
                 "INSERT INTO conflict_log (id, claim_id, attempted_by, "
@@ -419,7 +408,6 @@ async def test_hotspot_files_groups_and_threshold(tmp_path: Path) -> None:
                 (str(uuid4()), "cC", f"eng-{i}", "src/cold.ts",
                  "2026-06-01T12:00:00Z"),
             )
-        await conn.commit()
 
     from datetime import datetime, UTC
     fake_now = datetime(2026, 6, 2, 12, 0, 0, tzinfo=UTC)

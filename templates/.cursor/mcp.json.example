@@ -4,8 +4,9 @@
       "command": "coord-mcp",
       "args": [],
       "env": {
-        "COORD_API_URL": "https://YOUR_COORD_SERVICE.example",
-        "COORD_AUTH_TOKEN": "REPLACE_ME"
+        "COORD_API_URL": "http://127.0.0.1:8080",
+        "COORD_AUTH_TOKEN": "set-me",
+        "COORD_REPO_ID": "example-org/example-repo"
       }
     }
   }

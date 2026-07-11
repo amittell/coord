@@ -36,7 +36,7 @@ pip install -e .
 
 ## 3. Add project MCP config manually
 
-Copy `templates/.mcp.json.example` into the application repo as `.mcp.json`, then fill in the service URL and token.
+Copy `templates/.mcp.json.example` into the application repo as `.mcp.json` and leave the placeholder values (`set-me`, `http://127.0.0.1:8080`, `example-org/example-repo`) exactly as they are: the MCP wrapper recognizes them as unset and falls back to the real values in the gitignored `.coordination/local.env`. Putting real tokens or URLs into `.mcp.json` both commits a secret and shadows every engineer's per-machine `local.env` configuration.
 
 Example:
 
@@ -123,7 +123,7 @@ To jump ahead of normal-priority waiters when the work genuinely cannot wait (v0
 
 To abandon a queued wait early without writing a manual HTTP call (v0.26+), call `cancel_queue_request(queue_id="q-abc123", engineer="alex/claude/main")` -- the MCP wrapper forwards a `DELETE /requests/{queue_id}` and the in-process long-poll wakes immediately.
 
-For backpressure feedback (v0.28+), the MCP wrapper should set the `X-Coord-Engineer` request header to the current engineer id on every outbound call so coord can attach an `X-Coord-Queue-Depth` response header indicating how many queued waiters this engineer already has. A subsequent `coord-mcp` release wires this in automatically; until then, an operator can set the header manually when calling the HTTP API directly from a script.
+For backpressure feedback (v0.28+), `coord-mcp` sets the `X-Coord-Engineer` request header to the current engineer id on every outbound call automatically (the `coord` CLI does the same), so coord attaches an `X-Coord-Queue-Depth` response header indicating how many queued waiters this engineer already has. No extra setup is needed; scripts calling the HTTP API directly can set the header themselves to get the same signal.
 
 ## Auth resolution order
 

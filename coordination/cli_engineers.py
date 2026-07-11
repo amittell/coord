@@ -80,6 +80,16 @@ def _db_path() -> Path:
     return Path(get_settings().database_path)
 
 
+def _database(path: Path) -> Database:
+    """Open the configured backend, including its explicit PG schema."""
+    settings = get_settings()
+    return Database(
+        path,
+        postgres_schema=settings.postgres_schema,
+        postgres_schema_explicit=settings.postgres_schema_is_explicit,
+    )
+
+
 def _postgres_selected() -> bool:
     """True when ``COORD_DATABASE_URL`` selects the Postgres backend.
 
@@ -176,7 +186,7 @@ def _run_stale(args: argparse.Namespace) -> int:
     now = datetime.now(UTC)
     try:
         engineers = asyncio.run(
-            Database(path).list_stale_engineers(days=days, now=now)
+            _database(path).list_stale_engineers(days=days, now=now)
         )
     except Exception as exc:
         print(f"Database error: {exc}", file=sys.stderr)
@@ -212,7 +222,7 @@ def _run_stale(args: argparse.Namespace) -> int:
             now_iso = _utcnow()
             try:
                 released_per_engineer = asyncio.run(
-                    Database(path).release_active_claims_for_engineers(
+                    _database(path).release_active_claims_for_engineers(
                         [str(e["engineer"]) for e in engineers], now_iso=now_iso
                     )
                 )
@@ -288,7 +298,7 @@ def _release_engineers(
     now_iso = _utcnow()
     try:
         released_per_engineer = asyncio.run(
-            Database(path).release_active_claims_for_engineers(
+            _database(path).release_active_claims_for_engineers(
                 [str(e["engineer"]) for e in engineers], now_iso=now_iso
             )
         )

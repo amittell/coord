@@ -107,11 +107,92 @@ Use `symbols={"path.ts": ["handleLogin"]}` on `claim_files` for sub-file scope (
 PRE_PUSH_SCRIPT = """#!/usr/bin/env bash
 set -euo pipefail
 
-# Source .coordination/local.env so the hook picks up the service URL and
-# token written by `coord init`, not whichever stale values happen to be
-# in the pushing shell's environment. Without this, a remote-mode repo
-# would silently fall back to http://127.0.0.1:8080 and quietly soft-pass
-# every push.
+# Read .coordination/local.env as inert data so the hook picks up the service
+# URL and token written by `coord init` without executing operator-provided
+# shell syntax. The parser intentionally mirrors coordination.envfile:
+# whitespace/export prefixes are tolerated, one layer of matching outer
+# quotes is removed, and the last assignment wins. Only keys this hook uses
+# are imported; every other line remains inert.
+load_coord_local_env() {
+  local env_file="$1"
+  local coord_env_records=""
+  local coord_env_record=""
+  local coord_env_key=""
+  local coord_env_value=""
+
+  if ! coord_env_records="$(python3 - "${env_file}" <<'PY'
+import sys
+from pathlib import Path
+
+wanted = (
+    "COORD_API_URL",
+    "COORD_SERVICE_URL",
+    "COORD_URL",
+    "COORD_TOKEN",
+    "COORD_AUTH_TOKEN",
+    "COORD_REPO_ID",
+    "COORD_PUSH_BASE_REF",
+)
+
+try:
+    text = Path(sys.argv[1]).read_text(encoding="utf-8")
+except (OSError, UnicodeError) as exc:
+    print(f"unable to read local.env: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+values = {}
+for raw in text.splitlines():
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    if line.startswith("export "):
+        line = line[len("export ") :].lstrip()
+    key, sep, value = line.partition("=")
+    if sep != "=":
+        continue
+    key = key.strip()
+    if key not in wanted:
+        continue
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+        value = value[1:-1]
+    if "\\x00" in value:
+        print(f"NUL byte in {key}", file=sys.stderr)
+        raise SystemExit(1)
+    values[key] = value
+
+records = "".join(
+    f"{key}={values[key]}\\n" for key in wanted if key in values
+)
+# Binary stdout prevents Windows Python from translating LF to CRLF. The Git
+# Bash read builtin deliberately preserves a trailing CR, which would otherwise
+# become part of each imported URL/token/repo value.
+sys.stdout.buffer.write(records.encode("utf-8"))
+PY
+)"; then
+    echo "coordination pre-push: could not parse ${env_file}; refusing to push" >&2
+    return 1
+  fi
+
+  # Do not eval or source these records. Quoted assignment keeps spaces,
+  # semicolons, dollar signs, and command-substitution text literal on bash
+  # 3.2 and newer.
+  while IFS= read -r coord_env_record || [[ -n "${coord_env_record}" ]]; do
+    [[ -z "${coord_env_record}" ]] && continue
+    coord_env_key="${coord_env_record%%=*}"
+    coord_env_value="${coord_env_record#*=}"
+    case "${coord_env_key}" in
+      COORD_API_URL) COORD_API_URL="${coord_env_value}" ;;
+      COORD_SERVICE_URL) COORD_SERVICE_URL="${coord_env_value}" ;;
+      COORD_URL) COORD_URL="${coord_env_value}" ;;
+      COORD_TOKEN) COORD_TOKEN="${coord_env_value}" ;;
+      COORD_AUTH_TOKEN) COORD_AUTH_TOKEN="${coord_env_value}" ;;
+      COORD_REPO_ID) COORD_REPO_ID="${coord_env_value}" ;;
+      COORD_PUSH_BASE_REF) COORD_PUSH_BASE_REF="${coord_env_value}" ;;
+    esac
+  done <<< "${coord_env_records}"
+}
+
 # Resolve the MAIN worktree root via the common git dir's parent so the
 # hook still finds .coordination/local.env when invoked from a linked git
 # worktree (where --show-toplevel points at the linked root, which has no
@@ -124,10 +205,9 @@ if [[ -n "${COORD_COMMON_DIR}" ]]; then
   REPO_ROOT="$(cd "${COORD_COMMON_DIR}/.." 2>/dev/null && pwd || true)"
 fi
 if [[ -n "${REPO_ROOT}" && -f "${REPO_ROOT}/.coordination/local.env" ]]; then
-  set -a
-  # shellcheck disable=SC1090,SC1091
-  source "${REPO_ROOT}/.coordination/local.env"
-  set +a
+  if ! load_coord_local_env "${REPO_ROOT}/.coordination/local.env"; then
+    exit 1
+  fi
 fi
 
 COORD_URL="${COORD_API_URL:-${COORD_SERVICE_URL:-${COORD_URL:-http://127.0.0.1:8080}}}"
@@ -146,9 +226,29 @@ REPO_ID="${COORD_REPO_ID:-}"
 # Empty-array expansion under `set -u` is unbound on bash 3.2 (the macOS
 # system bash), so guard with the ${var+...} fallback whenever we expand
 # CURL_AUTH below.
+# The Authorization header travels via a private curl config file (mktemp
+# creates it 0600), never on the curl command line: argv is world-readable
+# through `ps` for the duration of each request -- and the hook runs one
+# curl per pushed file -- so a bearer token passed as
+# `-H "Authorization: Bearer ..."` could be harvested by any local user on
+# a shared host. The token reaches python3 via the environment (also not
+# visible to other users), not argv, for the same reason.
 CURL_AUTH=()
+CURL_AUTH_CFG=""
 if [[ -n "${TOKEN}" ]]; then
-  CURL_AUTH=(-H "Authorization: Bearer ${TOKEN}")
+  CURL_AUTH_CFG="$(mktemp "${TMPDIR:-/tmp}/coord-pre-push.XXXXXX")"
+  chmod 600 "${CURL_AUTH_CFG}"
+  trap 'rm -f "${CURL_AUTH_CFG}"' EXIT
+  COORD_HOOK_TOKEN="${TOKEN}" python3 - > "${CURL_AUTH_CFG}" <<'PY'
+import os
+
+token = os.environ["COORD_HOOK_TOKEN"]
+# curl config quoting: escape backslash and double quote so a pathological
+# token cannot break out of the quoted parameter value.
+token = token.replace("\\\\", "\\\\\\\\").replace('"', '\\\\"')
+print('header = "Authorization: Bearer %s"' % token)
+PY
+  CURL_AUTH=(--config "${CURL_AUTH_CFG}")
 fi
 
 if ! command -v jq >/dev/null 2>&1; then
@@ -179,12 +279,59 @@ diff_names() {
   fi
 }
 
+new_branch_base_ref() {
+  local local_ref="$1"
+  local short_ref="${local_ref#refs/heads/}"
+  local configured="${COORD_PUSH_BASE_REF:-}"
+  local merge_ref=""
+  local merge_remote=""
+  local inferred=""
+
+  # Explicit override wins. It may be supplied by .coordination/local.env
+  # for integration-branch repos, or per branch in git config:
+  #   git config branch.<name>.coordPushBase origin/pre-prod
+  if [[ -z "${configured}" && "${short_ref}" != "${local_ref}" ]]; then
+    configured="$(git config --get "branch.${short_ref}.coordPushBase" 2>/dev/null || true)"
+  fi
+  if [[ -n "${configured}" ]]; then
+    if ! git rev-parse "${configured}" >/dev/null 2>&1; then
+      echo "coordination pre-push: configured push base does not resolve: ${configured}" >&2
+      return 1
+    fi
+    printf '%s\\n' "${configured}"
+    return 0
+  fi
+
+  # A preconfigured tracking base is the next-best signal. This is useful
+  # when a new topic branch intentionally tracks a long-lived integration
+  # branch. Ignore an inferred ref that is not present locally and continue
+  # to the backwards-compatible remote-HEAD fallback.
+  if [[ "${short_ref}" != "${local_ref}" ]]; then
+    merge_ref="$(git config --get "branch.${short_ref}.merge" 2>/dev/null || true)"
+    merge_remote="$(git config --get "branch.${short_ref}.remote" 2>/dev/null || true)"
+    if [[ -n "${merge_ref}" ]]; then
+      if [[ -z "${merge_remote}" || "${merge_remote}" == "." ]]; then
+        inferred="${merge_ref#refs/heads/}"
+      else
+        inferred="${merge_remote}/${merge_ref#refs/heads/}"
+      fi
+      if git rev-parse "${inferred}" >/dev/null 2>&1; then
+        printf '%s\\n' "${inferred}"
+        return 0
+      fi
+    fi
+  fi
+
+  printf '%s\\n' "${UPSTREAM}/HEAD"
+}
+
 diff_for_ref() {
   local local_ref="$1"
   local local_sha="$2"
   local remote_ref="$3"
   local remote_sha="$4"
   local base=""
+  local base_ref=""
 
   # Deleted refs have no local tree to inspect; nothing to claim against.
   if [[ -z "${local_sha}" || "${local_sha}" == "${ZERO_SHA}" ]]; then
@@ -197,13 +344,19 @@ diff_for_ref() {
     return
   fi
 
-  # First push of this branch: fall back to merge-base against the
-  # default branch, or against the empty tree if no remote HEAD yet.
+  # First push of this branch: prefer an explicit/configured integration
+  # base, then a resolvable tracking base, and only then remote HEAD. This
+  # prevents a one-file branch cut from pre-prod from checking the entire
+  # pre-prod-vs-main delta (#68). Fall back to the empty tree if no remote
+  # reference exists yet.
   # The empty tree is required for the very first push; triple-dot
   # diffs fail there because triple-dot needs a commit on each side.
-  if git rev-parse "${UPSTREAM}/HEAD" >/dev/null 2>&1; then
-    if ! base="$(git merge-base "${local_sha}" "${UPSTREAM}/HEAD")"; then
-      echo "coordination pre-push: could not find merge base for ${local_ref} and ${UPSTREAM}/HEAD" >&2
+  if ! base_ref="$(new_branch_base_ref "${local_ref}")"; then
+    return 1
+  fi
+  if git rev-parse "${base_ref}" >/dev/null 2>&1; then
+    if ! base="$(git merge-base "${local_sha}" "${base_ref}")"; then
+      echo "coordination pre-push: could not find merge base for ${local_ref} and ${base_ref}" >&2
       return 1
     fi
   else
@@ -299,6 +452,7 @@ fi
 # no live MCP sessions for this repo, in which case we fall through to
 # the existing engineer-name self-exclusion.
 SESSION_QS=""
+SESSION_IDS=""
 if [[ -f "${REPO_ROOT}/.coordination/sessions.live" ]]; then
   coord_pid_is_live() {
     local pid="$1"
@@ -310,8 +464,27 @@ import os
 import sys
 
 pid = int(sys.argv[1])
-if pid <= 0 or os.name != "nt":
+if pid <= 0:
     sys.exit(1)
+
+if os.name != "nt":
+    # The shell's `kill -0` already returned success for any process this
+    # user may signal; landing here means it failed, which conflates ESRCH
+    # (no such process) with EPERM (alive but owned by another user).
+    # Re-probe and treat EPERM as live so a coord-mcp session started
+    # under a different UID (service account, containerized agent sharing
+    # the worktree) keeps its /conflicts self-exclusion instead of being
+    # pruned as dead -- pruning it would false-positive the push against
+    # the agent's own claims.
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        sys.exit(1)
+    except PermissionError:
+        sys.exit(0)
+    except OSError:
+        sys.exit(1)
+    sys.exit(0)
 
 try:
     import ctypes
@@ -356,44 +529,100 @@ PY
     if ! [[ "${pid_field}" =~ ^[0-9]+$ ]]; then
       continue
     fi
-    # Liveness probe. POSIX shells can use kill -0 directly; Git Bash on
-    # Windows cannot reliably resolve native Python PIDs, so fall back to
-    # a tiny Win32 process-exit-code check there.
+    # Liveness probe. `kill -0` answers directly for processes this user
+    # may signal; the python3 fallback distinguishes EPERM (alive, owned
+    # by another user -> live) from ESRCH (gone -> dead) on POSIX, and on
+    # Git Bash for Windows -- which cannot reliably resolve native Python
+    # PIDs -- uses a tiny Win32 process-exit-code check instead.
     if ! coord_pid_is_live "${pid_field}"; then
       continue
     fi
+    SESSION_IDS+="${session_field}"$'\\n'
     enc_sid="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${session_field}")"
     SESSION_QS+="&session_id=${enc_sid}"
   done < "${REPO_ROOT}/.coordination/sessions.live"
 fi
 
-while IFS= read -r file; do
-  [[ -z "${file}" ]] && continue
-  enc="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${file}")"
-  # Fail-closed on transport errors. Pre-v0.7 used '|| true' here, which
-  # made network glitches silently bypass the conflict check.
-  if ! resp="$(curl -fsS \\
-    ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} \\
-    "${COORD_URL}/conflicts?pattern=${enc}&engineer=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${ENGINEER}")${REPO_QS}${SESSION_QS}${BRANCH_QS}")"; then
-    echo "coordination pre-push: conflict check failed for ${file}; refusing to push" >&2
-    exit 1
-  fi
-  if ! has="$(printf '%s' "${resp}" | jq -r '.has_conflicts // false' 2>/dev/null)"; then
-    echo "coordination pre-push: invalid conflict-check response for ${file}; refusing to push" >&2
+validate_conflict_response() {
+  local resp="$1"
+  local context="$2"
+  local has=""
+  if ! has="$(printf '%s' "${resp}" | jq -r \\
+    'if (.has_conflicts | type) == "boolean" then .has_conflicts else error("missing boolean has_conflicts") end' \\
+    2>/dev/null)"; then
+    echo "coordination pre-push: invalid conflict-check response for ${context}; refusing to push" >&2
     printf '%s\\n' "${resp}" >&2
-    exit 1
+    return 1
   fi
   if [[ "${has}" == "true" ]]; then
-    echo "coordination pre-push: conflict reported for ${file}" >&2
+    echo "coordination pre-push: conflict reported for ${context}" >&2
     printf '%s\\n' "${resp}" | jq . >&2 || printf '%s\\n' "${resp}" >&2
-    exit 1
+    return 2
   fi
   if [[ "${has}" != "false" ]]; then
-    echo "coordination pre-push: unexpected conflict-check value for ${file}: ${has}" >&2
+    echo "coordination pre-push: unexpected conflict-check value for ${context}: ${has}" >&2
     printf '%s\\n' "${resp}" | jq . >&2 || printf '%s\\n' "${resp}" >&2
-    exit 1
+    return 1
   fi
-done <<< "${MODIFIED}"
+  return 0
+}
+
+legacy_conflict_check() {
+  local file=""
+  local enc=""
+  local resp=""
+  while IFS= read -r file; do
+    [[ -z "${file}" ]] && continue
+    enc="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${file}")"
+    # Fail-closed on transport errors. Pre-v0.7 used '|| true' here, which
+    # made network glitches silently bypass the conflict check.
+    if ! resp="$(curl -fsS \\
+      ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} \\
+      "${COORD_URL}/conflicts?pattern=${enc}&engineer=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${ENGINEER}")${REPO_QS}${SESSION_QS}${BRANCH_QS}")"; then
+      echo "coordination pre-push: conflict check failed for ${file}; refusing to push" >&2
+      return 1
+    fi
+    validate_conflict_response "${resp}" "${file}" || return $?
+  done <<< "${MODIFIED}"
+}
+
+# Modern servers accept the complete push as JSON, cutting a 300-file push
+# from 300 HTTP round-trips (plus per-file interpreter spawns) to one (#67).
+# A 404/405 means an older coord server; only that case falls back to the
+# legacy per-file GET contract. Every other error remains fail-closed.
+PATTERNS_JSON="$(printf '%s\\n' "${MODIFIED}" | jq -Rsc 'split("\\n") | map(select(length > 0))')"
+SESSION_IDS_JSON="$(printf '%s' "${SESSION_IDS}" | jq -Rsc 'split("\\n") | map(select(length > 0))')"
+BATCH_PAYLOAD="$(jq -cn \\
+  --argjson patterns "${PATTERNS_JSON}" \\
+  --arg engineer "${ENGINEER}" \\
+  --arg repo "${REPO_ID}" \\
+  --arg branch "${BRANCH}" \\
+  --argjson session_ids "${SESSION_IDS_JSON}" \\
+  '{patterns: $patterns, engineer: $engineer, session_ids: $session_ids}
+   + (if $repo == "" then {} else {repo: $repo} end)
+   + (if $branch == "" or $branch == "HEAD" then {} else {branch: $branch} end)')"
+
+if ! batch_raw="$(printf '%s' "${BATCH_PAYLOAD}" | curl -sS \\
+  ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} \\
+  -H "Content-Type: application/json" \\
+  --data-binary @- \\
+  -w $'\\n%{http_code}' \\
+  "${COORD_URL}/conflicts/batch")"; then
+  echo "coordination pre-push: batch conflict check failed; refusing to push" >&2
+  exit 1
+fi
+
+batch_status="${batch_raw##*$'\\n'}"
+batch_resp="${batch_raw%$'\\n'*}"
+if [[ "${batch_status}" == "404" || "${batch_status}" == "405" ]]; then
+  legacy_conflict_check || exit $?
+elif [[ "${batch_status}" == 2* ]]; then
+  validate_conflict_response "${batch_resp}" "pushed file batch" || exit $?
+else
+  echo "coordination pre-push: batch conflict check returned HTTP ${batch_status}; refusing to push" >&2
+  printf '%s\\n' "${batch_resp}" >&2
+  exit 1
+fi
 
 exit 0
 """

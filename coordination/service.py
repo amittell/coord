@@ -13,7 +13,12 @@ from uuid import uuid4
 from coordination import metrics
 from coordination.config import Settings, get_settings
 from coordination.db import Database
-from coordination.engine import compute_overlap, files_matching_pattern, git_ls_files
+from coordination.engine import (
+    _normalize_pattern,
+    compute_overlap,
+    files_matching_pattern,
+    git_ls_files,
+)
 from coordination.lsp import get_lsp_pool, language_for_path, relpath_under_root
 from coordination.overlap_symbols import (
     OverlapKind,
@@ -360,6 +365,25 @@ def _drop_waiter(queue_id: str) -> None:
     _QUEUE_WAITERS.pop(queue_id, None)
 
 
+def _consume_finalise_result(task: asyncio.Task) -> None:
+    """Consume the outcome of an orphaned queue-wait finalise task.
+
+    Attached only when the awaiting handler was cancelled mid-finalise
+    (a second disconnect signal): the shielded task keeps running so
+    the queue row still reaches a terminal state, and this callback
+    retrieves its result so a failure is logged instead of surfacing
+    as 'Task exception was never retrieved' at GC time."""
+
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error(
+            "queue-wait finalise failed after handler cancellation: %s",
+            exc,
+        )
+
+
 @dataclass
 class CoordinationService:
     db: Database
@@ -392,6 +416,10 @@ class CoordinationService:
     # v0.44 scale: per-(session, repo) monotonic timestamp of the last
     # activity ping actually written, for coalescing (see _maybe_touch).
     _last_ping: dict[tuple[str, str | None], float] = field(default_factory=dict)
+    # One-shot latch so the unsigned-webhook operator warning (webhook_url
+    # configured without webhook_secret; see fire_webhook) logs once per
+    # process instead of once per emitted event.
+    _warned_unsigned_webhook: bool = False
 
     async def _maybe_touch(self, session_id: str | None, repo: str | None) -> None:
         """Activity ping with v0.44 coalescing. Most reads write a liveness
@@ -406,7 +434,18 @@ class CoordinationService:
             return
         interval = self.settings.activity_ping_min_interval_sec
         if interval <= 0:
-            await self.db.touch_session_activity(session_id, repo=repo)
+            try:
+                await self.db.touch_session_activity(session_id, repo=repo)
+            except Exception:
+                # Best-effort by contract: a ping is liveness only, so a
+                # write failure (SQLITE_BUSY under contention, IO error)
+                # degrades to a slightly delayed idle-expiry instead of
+                # turning the read that carried it into a 500.
+                logger.debug(
+                    "activity ping for session %s failed; dropped",
+                    session_id,
+                    exc_info=True,
+                )
             return
         # Defensive clamp: coalescing must never out-pace idle expiry, or a
         # read-only session could be expired as idle between pings. Half the
@@ -444,10 +483,25 @@ class CoordinationService:
                     del self._last_ping[k]
         try:
             await self.db.touch_session_activity(session_id, repo=repo)
-        except BaseException:
+        except Exception:
             # The write did not land -- roll the stamp back so the next call
             # retries immediately instead of being suppressed for a full
-            # interval on the strength of a failed ping.
+            # interval on the strength of a failed ping. Then SWALLOW the
+            # error: the docstring's contract is that dropping a ping is
+            # safe, and the read paths that carry these pings
+            # (check_conflicts, list_claims) do not guard the call -- a
+            # re-raise here turned an otherwise-successful read into an
+            # unhandled 500 under exactly the write contention this
+            # coalescing exists to absorb.
+            self._last_ping.pop(key, None)
+            logger.debug(
+                "activity ping for session %s failed; dropped",
+                session_id,
+                exc_info=True,
+            )
+        except BaseException:
+            # Cancellation / interpreter shutdown must still propagate,
+            # but the stamp rollback applies the same way.
             self._last_ping.pop(key, None)
             raise
 
@@ -727,7 +781,7 @@ class CoordinationService:
             err = _validate_pattern_syntax(pat)
             if err:
                 raise ValueError(err)
-        await self.db.expire_stale_claims(self.settings.idle_timeout_sec)
+        await self.expire_stale_claims()
         # Activity ping: a session that's actively checking conflicts is
         # still alive even if it isn't creating new claims, so refresh
         # last_activity for everything it currently holds before we
@@ -774,11 +828,18 @@ class CoordinationService:
         if session_ids:
             own_session_set = set(session_ids)
             own_claims = await self.db.list_active_claims_rows(exclude_engineer=None)
+            # The own-claims harvest mirrors the adversarial set's repo
+            # handling: ``all_repos=True`` resolves to ``repo=None``, so
+            # keeping the bucket filter here would confine the harvest to
+            # the legacy NULL-repo bucket -- on a fully repo-tagged
+            # deployment that harvests nothing and the operator's global
+            # view reports conflicts against claims that are explicitly
+            # granted coexist partners of the caller's sessions.
             own_claims = [
                 c
                 for c in own_claims
                 if c.get("session_id") in own_session_set
-                and c.get("repo") == repo
+                and (all_repos or c.get("repo") == repo)
             ]
             partner_ids = _coexist_partner_ids_from_rows(own_claims)
             if partner_ids:
@@ -939,13 +1000,25 @@ class CoordinationService:
         *,
         auto_promote_allowed: bool = True,
     ) -> CreateClaimsResponse:
-        await self.db.expire_stale_claims(self.settings.idle_timeout_sec)
+        await self.expire_stale_claims()
         # Activity ping: making a claim is the strongest possible
         # liveness signal -- bump last_activity for every claim this
         # session already holds before we decide what's stale.
         if body.session_id:
             await self._maybe_touch(body.session_id, body.repo)
         rules = await self._rules()
+        # Intake canonicalization: collapse every claim pattern to the same
+        # canonical form the overlap engine matches with (backslashes ->
+        # forward slashes, leading "./" and "/" stripped, trailing "/"
+        # expanded to "/**") BEFORE validation, storage, and symbol
+        # bookkeeping. The pattern is the join key everywhere downstream --
+        # ``claims.pattern``, ``claim_symbols.file_path``, and the requester
+        # side of the symbol-overlap classifier -- so two spellings of the
+        # same file ("./src/a.py" vs "src/a.py") must collapse here or the
+        # symbol/symbol classifier compares different dict keys and lets two
+        # claims on the same symbol silently auto-coexist.
+        for item in body.claims:
+            item.pattern = _normalize_pattern(item.pattern)
         patterns = [c.pattern for c in body.claims]
         for pat in patterns:
             syntax_err = _validate_pattern_syntax(pat)
@@ -991,13 +1064,33 @@ class CoordinationService:
 
         zero_match_warnings = await self._zero_match_warnings(patterns)
 
+        # v0.45.x audit: resolve v0.31 span sources HERE, in Phase A,
+        # before the grant transaction opens. _finalise_v14_scope used to
+        # run its own LSP documentSymbol roundtrips while the claim-grant
+        # transaction held the v0.44 shared writer lock (SQLite) / the
+        # per-repo advisory lock (Postgres), so a slow or timing-out
+        # language server stalled every write in the process. Pre-resolving
+        # per unique pattern keeps the transaction pure DB work; a batch
+        # that ends up 409ing wastes at most one cached LSP call per file.
+        parser_span_by_pattern, lsp_span_by_pattern = (
+            await self._resolve_symbol_spans(
+                body.claims,
+                parser_symbols_by_file=parser_symbols_by_file,
+                lsp_symbols_by_file=lsp_symbols_by_file,
+            )
+        )
+
         conflicts: list[ConflictEntry] = []
-        # Queued auto-resolutions (v0.14): pairs of (item, holder_row, result)
-        # discovered during the overlap pass that should bypass 409 and be
-        # recorded as auto-coexist / auto-narrow events after the
-        # requester's claim row is inserted. We hold the requester's
-        # claim id back until insert_claims_batch returns.
-        auto_resolutions: list[tuple[ClaimItem, dict[str, Any], Any]] = []
+        # Queued auto-resolutions (v0.14): tuples of (item_index,
+        # holder_row, result) discovered during the overlap pass that
+        # should bypass 409 and be recorded as auto-coexist / auto-narrow
+        # events after the requester's claim row is inserted. We key by
+        # the ClaimItem's index in ``body.claims`` (NOT its pattern):
+        # nothing rejects duplicate patterns within one batch, and a
+        # pattern-keyed lookup would collapse duplicates onto the last
+        # inserted claim id, doubling one item's coexist partner links
+        # while dropping the other's.
+        auto_resolutions: list[tuple[int, dict[str, Any], Any]] = []
 
         # Phase B (design 5.1/5.2): the claims-table overlap RE-CHECK,
         # the claim insert, the v0.14 scope/symbol finalization and the
@@ -1045,7 +1138,7 @@ class CoordinationService:
                     skip = _blanket_skip_partner_ids(partner_ids, active)
                     if skip:
                         active = [r for r in active if str(r.get("id")) not in skip]
-            for item in body.claims:
+            for item_idx, item in enumerate(body.claims):
                 requester_scope = "symbol" if item.symbols else "file"
                 requester_symbols_by_file: dict[str, list[str]] = (
                     {item.pattern: list(item.symbols)} if item.symbols else {}
@@ -1064,7 +1157,7 @@ class CoordinationService:
                         OverlapKind.AUTO_COEXIST,
                         OverlapKind.AUTO_NARROW,
                     ):
-                        auto_resolutions.append((item, row, result))
+                        auto_resolutions.append((item_idx, row, result))
                         continue
                     # FILE_OVERLAP, SYMBOL_OVERLAP, PARTIAL_GRANT all 409.
                     holder_symbols: list[str] | None = None
@@ -1164,21 +1257,24 @@ class CoordinationService:
                 await self._finalise_v14_scope(
                     created=created,
                     item_for_cid=item_for_cid,
-                    parser_symbols_by_file=parser_symbols_by_file,
-                    lsp_symbols_by_file=lsp_symbols_by_file,
+                    parser_span_by_pattern=parser_span_by_pattern,
+                    lsp_span_by_pattern=lsp_span_by_pattern,
                 )
 
                 # v0.14: persist any auto-resolutions queued during overlap pass.
-                # We look up the requester's claim id by (item.pattern) match
-                # against the just-inserted batch. Each ClaimItem produces exactly
-                # one row in ``ids`` so the pattern is unique within this batch.
+                # ``ids`` was built by iterating ``body.claims`` in order, so
+                # ``ids[item_idx]`` is exactly the row inserted for
+                # ``body.claims[item_idx]``. Keying by index (not pattern)
+                # keeps the wiring correct when a batch carries duplicate
+                # patterns -- e.g. two symbol claims on different symbol sets
+                # of the same file.
                 if auto_resolutions:
-                    cid_by_pattern: dict[str, str] = {
-                        pat: cid for cid, _ctype, pat, _sev, _exp in ids if cid in created
-                    }
-                    for item, holder_row, result in auto_resolutions:
-                        requester_cid = cid_by_pattern.get(item.pattern)
-                        if not requester_cid:
+                    created_set = set(created)
+                    for item_idx, holder_row, result in auto_resolutions:
+                        requester_cid = (
+                            ids[item_idx][0] if item_idx < len(ids) else None
+                        )
+                        if not requester_cid or requester_cid not in created_set:
                             continue
                         await record_auto_resolution(
                             db=self.db,
@@ -1461,52 +1557,41 @@ class CoordinationService:
             )
             await self.fire_webhook("auto-promote", leaf_detail)
 
-    async def _finalise_v14_scope(
+    async def _resolve_symbol_spans(
         self,
+        items: list[ClaimItem],
         *,
-        created: list[str],
-        item_for_cid: dict[str, ClaimItem],
-        parser_symbols_by_file: dict[str, list[Symbol]] | None = None,
-        lsp_symbols_by_file: dict[str, list[dict[str, Any]] | None] | None = None,
-    ) -> None:
-        """Apply v0.14 ``scope_type`` / ``narrowable`` / ``claim_symbols``
-        to each just-inserted claim row.
+        parser_symbols_by_file: dict[str, list[Symbol]] | None,
+        lsp_symbols_by_file: dict[str, list[dict[str, Any]] | None] | None,
+    ) -> tuple[
+        dict[str, dict[str, tuple[int, int]]],
+        dict[str, dict[str, tuple[int, int, int, int]]],
+    ]:
+        """Resolve v0.31 span sources for every symbol-scope item in a
+        claim batch. One entry per unique pattern; duplicate patterns in
+        a batch share the work.
 
-        v0.14 fields default to ``scope_type='file'`` and ``narrowable=1``
-        at the schema level. The conflict pipeline then promotes rows
-        per ClaimItem: symbol claims get ``scope_type='symbol'`` plus
-        ``claim_symbols`` rows; ``shared_file`` / ``module`` / explicit
-        opt-out claims get ``narrowable=0``. Splitting this out of
-        ``insert_claims_batch`` keeps the legacy contract intact and
-        makes the v0.14 surface self-contained.
+        This runs in Phase A of ``create_claims`` -- BEFORE
+        ``db.transaction()`` opens -- because the LSP documentSymbol
+        roundtrip can take up to the request timeout and must never
+        execute under the v0.44 shared writer lock (or the Postgres
+        per-repo advisory lock). ``_finalise_v14_scope`` then consumes
+        the returned maps as pure data, so the grant unit-of-work stays
+        DB-only.
 
-        v0.31 span persistence: each ``claim_symbols`` row now carries
-        the symbol's location at claim time. ``parser_symbols_by_file``
-        is the extraction the validation pass already produced (parser
-        spans: 1-based lines, NULL columns, resolved_by='parser').
-        When LSP is enabled, one documentSymbol call per claimed file
-        (reusing ``lsp_symbols_by_file`` entries the validation
-        fallback may have cached) upgrades matching symbols to exact
-        ranges with resolved_by='lsp'; unmatched symbols keep their
-        parser spans, and a pool failure silently keeps the parser
-        spans for the whole file. No repo root / no extraction means
-        the spans simply stay NULL -- overlap detection remains purely
-        lexical either way.
+        ``parser_symbols_by_file`` is the extraction the validation pass
+        already produced (parser spans: 1-based lines, NULL columns,
+        resolved_by='parser'). When LSP is enabled, one documentSymbol
+        call per claimed file (reusing ``lsp_symbols_by_file`` entries
+        the validation fallback may have cached) yields exact ranges
+        for resolved_by='lsp'; a pool failure leaves that pattern with
+        an empty LSP map so the parser spans win downstream.
         """
-        if not created:
-            return
-
-        # Resolve span sources up front, before the DB connection
-        # opens: the LSP roundtrip can take up to the request timeout
-        # and there is no reason to hold a SQLite handle across it.
-        # One entry per unique pattern; duplicate patterns in a batch
-        # share the work.
         parser_span_by_pattern: dict[str, dict[str, tuple[int, int]]] = {}
         lsp_span_by_pattern: dict[str, dict[str, tuple[int, int, int, int]]] = {}
         root = self.settings.repo_root
-        for cid in created:
-            item = item_for_cid.get(cid)
-            if item is None or not item.symbols:
+        for item in items:
+            if not item.symbols:
                 continue
             if item.pattern not in parser_span_by_pattern:
                 spans: dict[str, tuple[int, int]] = {}
@@ -1527,6 +1612,45 @@ class CoordinationService:
                 lsp_span_by_pattern[item.pattern] = (
                     _lsp_span_map(flattened) if flattened is not None else {}
                 )
+        return parser_span_by_pattern, lsp_span_by_pattern
+
+    async def _finalise_v14_scope(
+        self,
+        *,
+        created: list[str],
+        item_for_cid: dict[str, ClaimItem],
+        parser_span_by_pattern: dict[str, dict[str, tuple[int, int]]] | None = None,
+        lsp_span_by_pattern: (
+            dict[str, dict[str, tuple[int, int, int, int]]] | None
+        ) = None,
+    ) -> None:
+        """Apply v0.14 ``scope_type`` / ``narrowable`` / ``claim_symbols``
+        to each just-inserted claim row.
+
+        v0.14 fields default to ``scope_type='file'`` and ``narrowable=1``
+        at the schema level. The conflict pipeline then promotes rows
+        per ClaimItem: symbol claims get ``scope_type='symbol'`` plus
+        ``claim_symbols`` rows; ``shared_file`` / ``module`` / explicit
+        opt-out claims get ``narrowable=0``. Splitting this out of
+        ``insert_claims_batch`` keeps the legacy contract intact and
+        makes the v0.14 surface self-contained.
+
+        v0.31 span persistence: each ``claim_symbols`` row carries the
+        symbol's location at claim time. ``parser_span_by_pattern`` and
+        ``lsp_span_by_pattern`` arrive pre-resolved from
+        :meth:`_resolve_symbol_spans`, which ``create_claims`` runs in
+        Phase A so no LSP (or any other slow) work ever executes here --
+        this method is called inside the claim-grant transaction and
+        must stay pure DB writes (see the Phase B design note in
+        ``create_claims``). LSP spans win when present; otherwise the
+        parser's line span; otherwise the span columns stay NULL and
+        overlap detection remains purely lexical.
+        """
+        if not created:
+            return
+
+        parser_span_by_pattern = parser_span_by_pattern or {}
+        lsp_span_by_pattern = lsp_span_by_pattern or {}
 
         symbol_rows: list[tuple[Any, ...]] = []
         # Routed through the Database transaction seam: when this runs
@@ -1714,6 +1838,16 @@ class CoordinationService:
         engineer, different session, same repo bucket) inside
         :func:`group_callsite_overlaps`.
 
+        Known limitation: the whole-file probe queries
+        ``callsites_intersecting`` with the claim pattern verbatim, and
+        stored callsite rows carry concrete file paths -- so a
+        file-scope claim whose pattern is a glob (``src/auth/*.ts``,
+        ``docs/**``) never matches a stored row and gets no CALLSITE
+        advisory. Expanding globs would cost a ``git ls-files`` walk per
+        claim on the grant hot path for a purely advisory feature, so
+        the gap is accepted by design: callsite advisories apply to
+        literal-path claims only.
+
         Each finding also lands as a ``callsite-advisory``
         ``request_events`` audit row -- the same mechanism the
         auto-coexist / auto-narrow resolutions use -- so the dashboard's
@@ -1834,6 +1968,19 @@ class CoordinationService:
         if not root or not root.is_dir():
             return 0
         active = await self.db.list_active_claims_rows(exclude_engineer=None)
+        # Multi-repo guard: the sweep resolves claim file paths against the
+        # ONE checkout at ``repo_root``, but on a shared service the active
+        # claims span every repo. When ``repo_root_repo`` declares which
+        # repo id that checkout represents, only claims tagged with that
+        # repo are swept -- a claim from another repo whose relative path
+        # happens to exist under this root must never be "renamed" based on
+        # this repo's file content. NULL-repo legacy claims are excluded
+        # too: their provenance is unknown, and a wrong follow rewrites
+        # claim rows. Unset preserves the single-repo behaviour (sweep
+        # everything).
+        root_repo = self.settings.repo_root_repo
+        if root_repo:
+            active = [r for r in active if r.get("repo") == root_repo]
         symbol_claims = [
             r for r in active if r.get("scope_type") == "symbol"
         ][:max_claims]
@@ -1931,6 +2078,14 @@ class CoordinationService:
                     # the overlap that claim-time enforcement would
                     # have 409'd. Ambiguity rule applies: doubt means
                     # no action.
+                    #
+                    # This read is a cheap early skip only -- it runs on
+                    # its own connection and every await between here
+                    # and the write is a yield point a concurrent grant
+                    # can land in. The AUTHORITATIVE collision check is
+                    # re-run inside update_claim_symbol_rename's own
+                    # BEGIN IMMEDIATE transaction (guard flag below), so
+                    # the check and the rewrite are one atomic unit.
                     existing_rows = await self.db.get_symbol_rows_on_file(
                         file_path=file_path,
                         repo=claim.get("repo"),
@@ -1981,6 +2136,8 @@ class CoordinationService:
                         new_end_col=new_span[3],
                         resolved_by=resolved_by,
                         new_pattern=None,
+                        guard_new_path_collision=True,
+                        repo=claim.get("repo"),
                     )
                     if not updated:
                         continue
@@ -2229,7 +2386,7 @@ class CoordinationService:
         session_id: str | None = None,
         repo: str | None = None,
     ) -> list[dict[str, Any]]:
-        await self.db.expire_stale_claims(self.settings.idle_timeout_sec)
+        await self.expire_stale_claims()
         # Activity ping: an agent reading the claim list is still alive,
         # so keep its claims warm. No-op when session_id is unset
         # (legacy / non-MCP callers). ``repo`` scopes the warm-up so a
@@ -2240,7 +2397,12 @@ class CoordinationService:
         if active_only:
             rows = await self.db.list_active_claims_rows(exclude_engineer=None)
         else:
-            rows = await self.db.list_recent_claims(200)
+            # Push the repo scope into the SQL query so the 200-row window
+            # is per-repo: filtering after the LIMIT would let another
+            # repo's rows crowd a scoped viewer's history out of the
+            # global window entirely on a shared multi-repo service. The
+            # route-level post-filter stays as belt-and-braces.
+            rows = await self.db.list_recent_claims(200, repo=repo)
         if engineer:
             rows = [r for r in rows if r["engineer"] == engineer]
         if module_substring:
@@ -2460,7 +2622,7 @@ class CoordinationService:
         # inherit the shortened deadline that request_release imposed on the
         # holder's original claim.
         min_expires_at = _expires_at(self.settings.default_ttl_hours)
-        return await self.db.respond_to_request(
+        row = await self.db.respond_to_request(
             request_id=request_id,
             decision=decision,
             actor_engineer=actor_engineer,
@@ -2471,6 +2633,19 @@ class CoordinationService:
             coexist_symbols=coexist_symbols,
             min_expires_at=min_expires_at,
         )
+        if row is None:
+            return None
+        # Drain the FIFO queue for every claim this decision actually
+        # closed ('approved' releases the holder's claim; 'narrowed'
+        # releases the original before opening the tighter one).
+        # Without this, waiters queued behind that claim would burn
+        # their whole wait_seconds against scope that is already free.
+        # The key is private DB->service transport: popped here (with a
+        # default, since the responded-late path never releases) so it
+        # never reaches the API response.
+        for cid in row.pop("_released_claim_ids", []):
+            await self._drain_queue_for(cid)
+        return row
 
     async def _validate_symbol_coexist(
         self,
@@ -2604,12 +2779,14 @@ class CoordinationService:
         requester_engineer: str | None = None,
         claim_id: str | None = None,
         decision: str | None = None,
+        repo: str | None = None,
         limit: int = 200,
     ) -> list[dict[str, Any]]:
         return await self.db.list_requests(
             requester_engineer=requester_engineer,
             claim_id=claim_id,
             decision=decision,
+            repo=repo,
             limit=limit,
         )
 
@@ -2653,16 +2830,48 @@ class CoordinationService:
             await asyncio.sleep(poll_interval_seconds)
 
     async def release_claims(self, claim_ids: list[str], engineer: str | None) -> int:
-        n = await self.db.release_claims(claim_ids, engineer)
-        for _ in range(n):
+        released_ids = await self.db.release_claims(claim_ids, engineer)
+        for _ in released_ids:
             metrics.claims_released_total.inc()
-        # v0.21: drain the FIFO queue against every input id.
-        # _drain_queue_for is idempotent -- if the id wasn't really
-        # released (wrong engineer, already gone), pop_next_waiting
-        # returns None and the call is a no-op.
-        for cid in claim_ids:
+        # v0.21: drain the FIFO queue -- but only for the ids that were
+        # actually released. Draining an id that did not close (wrong
+        # engineer, already released, unknown) would pop every waiter
+        # behind the still-active claim, re-conflict each of them
+        # against the unchanged holder, and expel the whole queue with
+        # immediate 409s despite the wait_seconds they asked for.
+        for cid in released_ids:
             await self._drain_queue_for(cid)
-        return n
+        return len(released_ids)
+
+    async def release_session(
+        self, session_id: str, *, repo: str | None = None
+    ) -> int:
+        """End-of-session bulk release, routed through the service
+        layer so every claim the session held drains its FIFO queue.
+        ``POST /sessions/{id}/release`` is the protocol-recommended
+        cleanup call, so waiters queued behind any of the session's
+        claims must be granted here exactly like an explicit
+        release_claims would. Returns the number of claims closed."""
+        released_ids = await self.db.release_for_session(
+            session_id, repo=repo
+        )
+        for cid in released_ids:
+            await self._drain_queue_for(cid)
+        return len(released_ids)
+
+    async def expire_stale_claims(self) -> list[str]:
+        """TTL/idle sweep plus FIFO-queue drain for every claim the
+        sweep actually closed. request_release exists to shorten the
+        holder's TTL; when that shortened TTL fires, the waiters queued
+        behind the claim must be granted rather than burning their full
+        wait_seconds against scope that is already free. Returns the
+        expired claim ids."""
+        expired_ids = await self.db.expire_stale_claims(
+            self.settings.idle_timeout_sec
+        )
+        for cid in expired_ids:
+            await self._drain_queue_for(cid)
+        return expired_ids
 
     async def cancel_queue_request(
         self,
@@ -2743,14 +2952,31 @@ class CoordinationService:
         # the lock is released before the wait loop below.
         first_conflict = conflicts[0]
         blocking_claim_id = first_conflict.conflicting_claim.id
-        # Find the requester ClaimItem that produced this conflict by
-        # matching the your_pattern field; falling back to the first
-        # claim item if matching fails. Either way one item is enqueued.
+        # Find the requester ClaimItem that produced this conflict.
+        # Prefer a match on BOTH the pattern and the symbol set: a batch
+        # may legitimately carry two items with the same pattern but
+        # different symbols (e.g. two symbol scopes on one file), and a
+        # pattern-only first-match would enqueue the wrong item's
+        # symbols/narrowable. Fall back to pattern-only, then to the
+        # first claim item. Either way one item is enqueued.
+        conflict_symbols = (
+            list(first_conflict.your_symbols)
+            if first_conflict.your_symbols
+            else None
+        )
         target_item = body.claims[0]
-        for item in body.claims:
-            if item.pattern == first_conflict.your_pattern:
-                target_item = item
-                break
+        pattern_matches = [
+            item
+            for item in body.claims
+            if item.pattern == first_conflict.your_pattern
+        ]
+        if pattern_matches:
+            target_item = pattern_matches[0]
+            for item in pattern_matches:
+                item_symbols = list(item.symbols) if item.symbols else None
+                if item_symbols == conflict_symbols:
+                    target_item = item
+                    break
 
         async with self._quota_lock:
             engineer_queue_limit = self.settings.max_queued_per_engineer
@@ -2860,21 +3086,90 @@ class CoordinationService:
                     break
         finally:
             _drop_waiter(entry["id"])
+            # Terminal DB transition, INSIDE the finally so it runs on
+            # every exit path -- most importantly CancelledError, which
+            # the ASGI server raises into this handler when the
+            # long-polling client disconnects. The old placement (after
+            # the try block) was skipped on cancellation, leaking the
+            # row in state='waiting' forever: it counted against the
+            # per-engineer and per-repo queue caps and stayed poppable
+            # by a future drain, minting a real claim for a requester
+            # who was long gone. v0.26: skip when the requester
+            # cancelled -- the row is already 'cancelled' and must not
+            # be re-labelled 'expired'.
+            if granted_cid is None and not was_cancelled:
+                finalise = asyncio.ensure_future(
+                    self._finalise_queue_wait(entry["id"])
+                )
+                try:
+                    adopted = await asyncio.shield(finalise)
+                except asyncio.CancelledError:
+                    # A(nother) cancellation landed while finalising.
+                    # The shielded task keeps running to completion in
+                    # the background so the row still reaches a
+                    # terminal state; consume its outcome so a failure
+                    # doesn't warn unretrieved at GC time.
+                    finalise.add_done_callback(_consume_finalise_result)
+                    raise
+                if adopted is not None:
+                    granted_cid = adopted
 
         if granted_cid:
+            grant_warnings: list[str] = []
+            if len(body.claims) > 1:
+                # The v0.21 queue enqueues only the single conflicted
+                # item, so a wait_seconds grant covers ONE pattern of
+                # this batch; every other item -- including ones that
+                # never conflicted, since a batch with any conflict
+                # inserts nothing -- was NOT claimed. Name them so the
+                # caller does not edit files it never reserved.
+                # Deliberately a warning rather than a re-attempt of
+                # the remaining items: a response carrying claim_ids
+                # plus non-empty conflicts reads as failure to every
+                # existing client.
+                uncovered = sorted(
+                    {
+                        item.pattern
+                        for item in body.claims
+                        if item is not target_item
+                    }
+                )
+                grant_warnings.append(
+                    f"queued grant is PARTIAL: it covers only "
+                    f"{target_item.pattern!r}. Not reserved: "
+                    f"{uncovered}. Claim these separately before "
+                    "editing them."
+                )
             return CreateClaimsResponse(
                 claim_ids=[granted_cid],
                 conflicts=[],
-                warnings=[],
+                warnings=grant_warnings,
                 options=[],
             )
-        # Mark expired in case the loop ran out of time without a state
-        # change (DB still 'waiting' or 'in_progress'). Idempotent: a
-        # row that is already terminal stays terminal. v0.26: skip when
-        # the requester cancelled -- otherwise we'd clobber the
-        # 'cancelled' state with 'expired'.
-        if not was_cancelled:
-            await self.db.mark_queue_expired(entry["id"])
+        return None
+
+    async def _finalise_queue_wait(self, queue_id: str) -> str | None:
+        """Drive a finished long-poll wait (timeout, client disconnect,
+        or a verdictless wake) to a terminal DB state.
+
+        Attempts the waiting/in_progress -> expired transition first.
+        When that loses -- rowcount 0 because the row is already
+        terminal -- the row is re-read: if an in-flight drain won the
+        race and marked it granted, the granted claim id is returned so
+        the caller adopts the grant instead of surfacing a 409 for a
+        claim that now exists in the requester's name. Returns None
+        when the row was expired here or was already terminal without
+        a grant."""
+        expired = await self.db.mark_queue_expired(queue_id)
+        if expired:
+            return None
+        row = await self.db.get_queue_entry(queue_id)
+        if (
+            row is not None
+            and row.get("state") == "granted"
+            and row.get("granted_claim_id")
+        ):
+            return str(row["granted_claim_id"])
         return None
 
     async def _drain_queue_for(self, released_claim_id: str) -> None:
@@ -2947,7 +3242,31 @@ class CoordinationService:
                 continue
             if resp.claim_ids:
                 granted_cid = resp.claim_ids[0]
-                await self.db.mark_queue_granted(entry["id"], granted_cid)
+                granted = await self.db.mark_queue_granted(
+                    entry["id"], granted_cid
+                )
+                if not granted:
+                    # The waiter is gone: its timeout, a cancel, or the
+                    # queue reaper moved the row to a terminal state
+                    # while the grant re-issue was in flight. Finalising
+                    # anyway would mint a live claim for a requester who
+                    # was told there is no grant, blocking everyone else
+                    # until TTL/idle expiry. Release the claim(s) just
+                    # created -- through the service path, so any waiter
+                    # already queued behind the short-lived claim drains
+                    # too -- and keep draining: the freed scope may
+                    # satisfy the next waiter.
+                    logger.info(
+                        "FIFO drain: queue %s lost the grant race (row "
+                        "already terminal); releasing orphan claim %s",
+                        entry["id"],
+                        granted_cid,
+                    )
+                    await self.release_claims(
+                        list(resp.claim_ids),
+                        entry.get("requester_engineer"),
+                    )
+                    continue
                 _notify_waiter(
                     entry["id"], {"granted_claim_id": granted_cid}
                 )
@@ -3093,6 +3412,20 @@ class CoordinationService:
             if secret
             else ""
         )
+        if not secret and kind != "github" and not self._warned_unsigned_webhook:
+            # Fail-open but loudly: the outbox column is NOT NULL so an
+            # empty signature satisfies the schema and nothing else tells
+            # the operator that COORD_WEBHOOK_URL was configured without
+            # COORD_WEBHOOK_SECRET. The delivery loop omits the
+            # X-Coord-Signature header for unsigned rows so a receiver
+            # cannot mistake an empty signature for an authenticated one.
+            self._warned_unsigned_webhook = True
+            logger.warning(
+                "COORD_WEBHOOK_URL is set but COORD_WEBHOOK_SECRET is empty; "
+                "outgoing webhooks are UNSIGNED and will be delivered "
+                "without an X-Coord-Signature header. Configure a secret if "
+                "receivers must authenticate events."
+            )
         try:
             return await self.db.enqueue_webhook(
                 url=url,
@@ -3157,15 +3490,37 @@ class CoordinationService:
                         counts=counts,
                     )
                     continue
+                # Resolve the target from CURRENT settings at delivery time
+                # (mirroring the github path, which ignores the stored url):
+                # rows enqueued before an operator rotated COORD_WEBHOOK_URL
+                # -- including away from a decommissioned or compromised
+                # receiver -- must follow the rotation, not the endpoint
+                # frozen at emit time. The stored row url stays as the
+                # fallback so pending rows still deliver if the setting is
+                # cleared between emit and delivery.
+                target_url = (
+                    self.settings.webhook_url or ""
+                ).strip() or str(row["url"])
+                # X-Coord-Delivery-Id carries the stable outbox row id so
+                # receivers can dedup: delivery is at-least-once (a lost 2xx
+                # or a failed mark_webhook_delivered re-POSTs the same row),
+                # and without a stable key the receiver cannot suppress the
+                # duplicate side effects. The signature header is omitted
+                # entirely for unsigned rows -- an empty X-Coord-Signature
+                # looks authentic to a receiver that only checks presence.
+                headers = {
+                    "Content-Type": "application/json",
+                    "X-Coord-Event-Type": row["event_type"],
+                    "X-Coord-Delivery-Id": outbox_id,
+                }
+                signature = str(row.get("hmac_signature") or "")
+                if signature:
+                    headers["X-Coord-Signature"] = signature
                 try:
                     response = await client.post(
-                        row["url"],
+                        target_url,
                         content=row["payload_json"],
-                        headers={
-                            "Content-Type": "application/json",
-                            "X-Coord-Signature": row["hmac_signature"],
-                            "X-Coord-Event-Type": row["event_type"],
-                        },
+                        headers=headers,
                     )
                 except Exception as exc:  # noqa: BLE001 - per-row isolation
                     error = f"{type(exc).__name__}: {exc}"
@@ -3500,6 +3855,11 @@ class CoordinationService:
 def build_service() -> CoordinationService:
     s = get_settings()
     return CoordinationService(
-        db=Database(s.database_path, writer_queue=s.sqlite_writer_queue),
+        db=Database(
+            s.database_path,
+            writer_queue=s.sqlite_writer_queue,
+            postgres_schema=s.postgres_schema,
+            postgres_schema_explicit=s.postgres_schema_is_explicit,
+        ),
         settings=s,
     )

@@ -1,0 +1,516 @@
+"""Audit follow-up tests: JSON log validity, PR-comment markdown
+sanitization, migration-script schema lockstep, and release/CI workflow
+hygiene.
+
+Covers:
+
+* :class:`coordination.logging.JsonFormatter` must emit strictly valid
+  JSON even when an extra carries a non-finite float (NaN/Infinity),
+  which Python's default ``json.dumps`` renders as invalid-JSON tokens.
+* :func:`coordination.github_adapter._render_body` must neutralize
+  engineer-controlled claim fields (descriptions, paths, names) so a
+  bounce comment cannot inject @mentions, links, or markdown structure
+  into a PR thread.
+* ``scripts/migrate_tokens_ownership.py`` must stay in lockstep with
+  ``coordination.db``: its known schema version equals
+  CURRENT_SCHEMA_VERSION and its expected token column list matches the
+  real SQLite schema, so the cutover runbook sees no false warnings.
+* ``.github/workflows/release.yml`` must guard manual dispatches against
+  silently republishing an existing image version tag.
+* Lean PR CI and weekly compatibility coverage together must exercise every
+  Python version advertised in the pyproject classifiers without duplicating
+  expensive full suites on every change.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import logging as pylogging
+import math
+import os
+import sqlite3
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+import pytest
+import yaml
+
+from coordination.github_adapter import MARKER, _render_body, _sanitize_inline
+from coordination.logging import JsonFormatter
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+_POSTGRES_SELECTED = os.environ.get("COORD_DATABASE_URL", "").startswith(
+    ("postgres://", "postgresql://", "postgresql+asyncpg://")
+)
+
+
+def _load_migrate_script():
+    """Import scripts/migrate_tokens_ownership.py as a module (scripts/ is
+    not a package, so load it straight from its file path)."""
+    path = REPO_ROOT / "scripts" / "migrate_tokens_ownership.py"
+    spec = importlib.util.spec_from_file_location(
+        "migrate_tokens_ownership", path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _format_record(**extra: object) -> str:
+    record = pylogging.LogRecord(
+        name="coordination.test",
+        level=pylogging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="hello",
+        args=(),
+        exc_info=None,
+    )
+    for key, value in extra.items():
+        setattr(record, key, value)
+    return JsonFormatter().format(record)
+
+
+def _strict_json_loads(line: str) -> dict:
+    """Parse with a strict-JSON stance: reject the NaN/Infinity tokens the
+    way Loki's JSON stage or jq would."""
+
+    def reject(token: str) -> None:
+        raise AssertionError(f"non-strict JSON constant emitted: {token}")
+
+    return json.loads(line, parse_constant=reject)
+
+
+class TestJsonFormatterNonFiniteExtras:
+    def test_nan_extra_emits_valid_json(self) -> None:
+        line = _format_record(duration_ms=float("nan"))
+        payload = _strict_json_loads(line)
+        assert payload["msg"] == "hello"
+        assert payload["duration_ms"] == "nan"
+
+    def test_infinity_extras_emit_valid_json(self) -> None:
+        line = _format_record(pos=float("inf"), neg=float("-inf"))
+        payload = _strict_json_loads(line)
+        assert payload["pos"] == "inf"
+        assert payload["neg"] == "-inf"
+
+    def test_nested_nan_extra_emits_valid_json(self) -> None:
+        line = _format_record(timings={"p99": float("nan")})
+        payload = _strict_json_loads(line)
+        # The whole nested structure falls back to repr, keeping the
+        # line strictly parseable.
+        assert "nan" in payload["timings"]
+
+    def test_finite_float_extra_survives_as_number(self) -> None:
+        line = _format_record(duration_ms=12.5)
+        payload = _strict_json_loads(line)
+        assert payload["duration_ms"] == 12.5
+        assert math.isclose(payload["duration_ms"], 12.5)
+
+
+class TestRenderBodySanitization:
+    def _detail(self, **entry_overrides: object) -> dict:
+        entry: dict[str, object] = {
+            "files": ["src/auth/login.ts"],
+            "holder_engineer": "bob",
+            "holder_branch": "feature/y",
+            "holder_pattern": "src/auth/**",
+            "holder_description": "auth refactor",
+        }
+        entry.update(entry_overrides)
+        return {
+            "repo": "octo/widgets",
+            "pushing_engineer": "alice",
+            "pushing_branch": "feature/x",
+            "bounced": [entry],
+        }
+
+    def test_description_is_rendered_as_code_span(self) -> None:
+        body = _render_body(
+            self._detail(holder_description="ping @org/everyone now")
+        )
+        # Inside backticks GitHub does not resolve mentions.
+        assert "- description: `ping @org/everyone now`" in body
+
+    def test_description_backticks_and_newlines_are_stripped(self) -> None:
+        body = _render_body(
+            self._detail(
+                holder_description="x` ![img](https://evil/a.png)\n# heading"
+            )
+        )
+        # The backtick cannot terminate the code span and the newline
+        # cannot open a fresh markdown block.
+        assert "![img]" in body  # still present but inside the code span
+        assert "- description: `x ![img](https://evil/a.png) # heading`" in body
+        assert "\n# heading" not in body
+
+    def test_path_backticks_are_stripped(self) -> None:
+        body = _render_body(
+            self._detail(files=["src/a`@org/everyone`.ts"])
+        )
+        assert "  - `src/a@org/everyone.ts`" in body
+        # No stray double-backtick breakout sequence.
+        assert "``" not in body
+
+    def test_path_that_sanitizes_to_empty_is_skipped(self) -> None:
+        body = _render_body(self._detail(files=["```"]))
+        assert "- files:" in body
+        assert "  - ``" not in body
+
+    def test_holder_engineer_is_neutralized_in_header(self) -> None:
+        body = _render_body(self._detail(holder_engineer="@org/everyone"))
+        assert "### `@org/everyone`" in body
+
+    def test_marker_still_first_line(self) -> None:
+        body = _render_body(self._detail())
+        assert body.splitlines()[0] == MARKER
+
+    def test_clean_detail_renders_all_fields(self) -> None:
+        body = _render_body(self._detail())
+        assert "`alice` pushed to `feature/x` in `octo/widgets`" in body
+        assert "### `bob` (`feature/y`)" in body
+        assert "- claim: `src/auth/**`" in body
+        assert "- description: `auth refactor`" in body
+        assert "  - `src/auth/login.ts`" in body
+
+    def test_sanitize_inline_collapses_whitespace(self) -> None:
+        assert _sanitize_inline("a\r\n b\t\tc") == "a b c"
+        assert _sanitize_inline("`` `") == ""
+
+
+class TestMigrationScriptSchemaLockstep:
+    def test_known_schema_version_matches_db(self) -> None:
+        from coordination.db import CURRENT_SCHEMA_VERSION
+
+        module = _load_migrate_script()
+        assert module.KNOWN_SCHEMA_VERSION == CURRENT_SCHEMA_VERSION, (
+            "scripts/migrate_tokens_ownership.py KNOWN_SCHEMA_VERSION has "
+            "drifted behind coordination.db.CURRENT_SCHEMA_VERSION; bump the "
+            "constant and extend EXPECTED_TOKEN_COLUMNS/the self-test fixture "
+            "for any new engineer_tokens columns"
+        )
+
+    def test_self_test_passes(self, capsys: pytest.CaptureFixture) -> None:
+        module = _load_migrate_script()
+        assert module.self_test() == 0
+        out = capsys.readouterr().out
+        assert "SELF-TEST PASSED" in out
+
+    @pytest.mark.skipif(
+        _POSTGRES_SELECTED,
+        reason="live-schema check builds a SQLite database directly",
+    )
+    async def test_expected_token_columns_match_live_schema(
+        self, tmp_path: Path
+    ) -> None:
+        from coordination.db import Database
+
+        db_path = tmp_path / "coordination.db"
+        db = Database(db_path)
+        await db.init()
+
+        conn = sqlite3.connect(db_path)
+        try:
+            cur = conn.execute("PRAGMA table_info(engineer_tokens)")
+            live_columns = {row[1] for row in cur.fetchall()}
+        finally:
+            conn.close()
+
+        module = _load_migrate_script()
+        assert set(module.EXPECTED_TOKEN_COLUMNS) == live_columns, (
+            "EXPECTED_TOKEN_COLUMNS in scripts/migrate_tokens_ownership.py "
+            "does not match the live engineer_tokens schema; the cutover "
+            "script would emit spurious warnings (or miss real drift)"
+        )
+
+
+class TestReleaseWorkflowDispatchGuard:
+    def _workflow(self) -> dict:
+        raw = (REPO_ROOT / ".github" / "workflows" / "release.yml").read_text(
+            encoding="utf-8"
+        )
+        return yaml.safe_load(raw)
+
+    def test_overwrite_input_defined(self) -> None:
+        workflow = self._workflow()
+        # PyYAML parses the bare `on` key as boolean True.
+        triggers = workflow.get("on") or workflow.get(True)
+        inputs = triggers["workflow_dispatch"]["inputs"]
+        assert "overwrite" in inputs
+        assert inputs["overwrite"]["type"] == "boolean"
+        assert inputs["overwrite"].get("default") is False
+
+    def test_guard_step_refuses_existing_tag_on_dispatch(self) -> None:
+        workflow = self._workflow()
+        steps = workflow["jobs"]["publish-image"]["steps"]
+        guards = [
+            step
+            for step in steps
+            if "imagetools inspect" in str(step.get("run") or "")
+        ]
+        assert len(guards) == 1, (
+            "release.yml must carry exactly one registry-tag republish guard"
+        )
+        guard = guards[0]
+        condition = str(guard.get("if") or "")
+        assert "workflow_dispatch" in condition
+        assert "inputs.overwrite != true" in condition
+        assert "exit 1" in guard["run"]
+
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="release workflow guard runs under the POSIX GitHub runner",
+    )
+    @pytest.mark.parametrize(
+        ("mode", "expected_returncode", "expected_output"),
+        [
+            ("existing", 1, "already exists in the registry"),
+            ("missing", 0, "not present in the registry"),
+            ("missing-manifest", 0, "not present in the registry"),
+            ("missing-code", 0, "not present in the registry"),
+            ("ambiguous-missing", 1, "refusing to publish"),
+            ("transient", 1, "refusing to publish"),
+            ("auth", 1, "refusing to publish"),
+            ("server", 1, "refusing to publish"),
+        ],
+    )
+    def test_guard_fails_closed_except_for_specific_missing_manifest(
+        self,
+        tmp_path: Path,
+        mode: str,
+        expected_returncode: int,
+        expected_output: str,
+    ) -> None:
+        workflow = self._workflow()
+        steps = workflow["jobs"]["publish-image"]["steps"]
+        guard = next(
+            step
+            for step in steps
+            if "imagetools inspect" in str(step.get("run") or "")
+        )
+
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        fake_docker = fake_bin / "docker"
+        fake_docker.write_text(
+            """#!/bin/sh
+case "$FAKE_DOCKER_MODE" in
+  existing)
+    exit 0
+    ;;
+  missing)
+    echo 'ERROR: ghcr.io/octo/coord:v1: not found' >&2
+    exit 1
+    ;;
+  missing-manifest)
+    echo 'ERROR: manifest unknown: manifest unknown' >&2
+    exit 1
+    ;;
+  missing-code)
+    echo '{"errors":[{"code":"MANIFEST_UNKNOWN"}]}' >&2
+    exit 1
+    ;;
+  ambiguous-missing)
+    echo 'ERROR: registry endpoint: not found' >&2
+    exit 1
+    ;;
+  transient)
+    echo 'ERROR: failed to do request: lookup ghcr.io: temporary failure in name resolution' >&2
+    exit 1
+    ;;
+  auth)
+    echo 'ERROR: unexpected status from HEAD request: 401 Unauthorized' >&2
+    exit 1
+    ;;
+  server)
+    echo 'ERROR: unexpected status from HEAD request: 503 Service Unavailable' >&2
+    exit 1
+    ;;
+esac
+exit 2
+""",
+            encoding="utf-8",
+        )
+        fake_docker.chmod(0o755)
+
+        env = os.environ.copy()
+        env.update(
+            {
+                "FAKE_DOCKER_MODE": mode,
+                "IMAGE": "ghcr.io/octo/coord",
+                "VERSION": "v1",
+                "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
+            }
+        )
+        result = subprocess.run(
+            [
+                "bash",
+                "--noprofile",
+                "--norc",
+                "-e",
+                "-o",
+                "pipefail",
+                "-c",
+                guard["run"],
+            ],
+            check=False,
+            capture_output=True,
+            env=env,
+            text=True,
+        )
+
+        output = result.stdout + result.stderr
+        assert result.returncode == expected_returncode, output
+        assert expected_output in output
+
+
+class TestCiMatrixCoversClassifiers:
+    @staticmethod
+    def _workflow(name: str) -> dict:
+        return yaml.safe_load(
+            (REPO_ROOT / ".github" / "workflows" / name).read_text(
+                encoding="utf-8"
+            )
+        )
+
+    def test_every_python_classifier_version_is_tested(self) -> None:
+        pyproject = tomllib.loads(
+            (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        )
+        classifier_versions = {
+            classifier.rsplit(":: ", 1)[1]
+            for classifier in pyproject["project"]["classifiers"]
+            if classifier.startswith("Programming Language :: Python :: 3.")
+        }
+
+        ci = self._workflow("ci.yml")
+        pr_versions = {
+            str(version)
+            for version in ci["jobs"]["test"]["strategy"]["matrix"][
+                "python-version"
+            ]
+        }
+        compatibility = self._workflow("compatibility.yml")
+        weekly_versions = {
+            str(leg["python-version"])
+            for leg in compatibility["jobs"]["test"]["strategy"][
+                "matrix"
+            ]["include"]
+        }
+        tested_versions = pr_versions | weekly_versions
+
+        missing = classifier_versions - tested_versions
+        assert not missing, (
+            f"pyproject.toml advertises Python {sorted(missing)} but neither "
+            "PR nor weekly compatibility CI tests them"
+        )
+
+    def test_pr_full_suite_only_covers_floor_and_production(self) -> None:
+        ci = self._workflow("ci.yml")
+        versions = {
+            str(version)
+            for version in ci["jobs"]["test"]["strategy"]["matrix"][
+                "python-version"
+            ]
+        }
+        assert versions == {"3.11", "3.14"}
+        assert ci["jobs"]["test"]["runs-on"] == "ubuntu-latest"
+
+    def test_pr_platform_jobs_run_only_marked_smoke_tests(self) -> None:
+        ci = self._workflow("ci.yml")
+        platform = ci["jobs"]["platform"]
+        assert set(platform["strategy"]["matrix"]["os"]) == {
+            "macos-latest",
+            "windows-latest",
+        }
+        commands = "\n".join(
+            str(step.get("run") or "") for step in platform["steps"]
+        )
+        assert "pytest -q -m platform" in commands
+        assert ".[dev]" not in commands
+        assert "pytest-timeout" in commands
+
+    def test_quality_is_single_job_and_includes_otel(self) -> None:
+        ci = self._workflow("ci.yml")
+        commands = "\n".join(
+            str(step.get("run") or "")
+            for step in ci["jobs"]["quality"]["steps"]
+        )
+        assert "ruff check ." in commands
+        assert "mypy coordination" in commands
+        assert "pytest tests/test_otel.py -q" in commands
+        assert "otel" not in ci["jobs"]
+        assert "type-check" not in ci["jobs"]
+
+    def test_pr_ci_ignores_markdown_and_does_not_write_pip_caches(self) -> None:
+        ci = self._workflow("ci.yml")
+        triggers = ci.get("on") or ci.get(True)
+        assert triggers["pull_request"]["paths-ignore"] == ["**/*.md"]
+        setup_steps = [
+            step
+            for job in ci["jobs"].values()
+            for step in job.get("steps", [])
+            if str(step.get("uses") or "").startswith("actions/setup-python@")
+        ]
+        assert setup_steps
+        assert all("cache" not in step.get("with", {}) for step in setup_steps)
+
+    def test_docker_smoke_starts_authenticated_sqlite_service(self) -> None:
+        ci = self._workflow("ci.yml")
+        docker = ci["jobs"]["docker-build"]
+        commands = "\n".join(
+            str(step.get("run") or "")
+            for step in docker["steps"]
+        )
+        assert "--env COORD_AUTH_TOKEN=ci-smoke" in commands
+        assert "/readyz" in commands
+        assert "sqlite3.connect" in commands
+        assert "import asyncpg" not in commands
+        assert 'find_spec("asyncpg") is None' in commands
+        assert docker["env"]["DOCKER_BUILD_RECORD_UPLOAD"] == "false"
+
+    def test_every_ci_job_has_a_bounded_timeout(self) -> None:
+        for workflow_name in ("ci.yml", "compatibility.yml", "postgres.yml"):
+            workflow = self._workflow(workflow_name)
+            missing = [
+                name
+                for name, job in workflow["jobs"].items()
+                if "timeout-minutes" not in job
+            ]
+            assert not missing, f"{workflow_name} has unbounded jobs: {missing}"
+            assert all(
+                1 <= int(job["timeout-minutes"]) <= 30
+                for job in workflow["jobs"].values()
+            )
+
+    def test_postgres_path_gate_has_no_stale_explicit_paths(self) -> None:
+        postgres = self._workflow("postgres.yml")
+        triggers = postgres.get("on") or postgres.get(True)
+        paths = triggers["pull_request"]["paths"]
+        explicit_paths = [path for path in paths if not set(path) & set("*?[")]
+        missing = [path for path in explicit_paths if not (REPO_ROOT / path).exists()]
+        assert not missing, f"postgres workflow has stale paths: {missing}"
+        assert "schedule" in triggers
+        assert "workflow_dispatch" in triggers
+        assert "workflow_call" in triggers
+
+    def test_postgres_path_gate_covers_backend_overlap_translation(self) -> None:
+        postgres = self._workflow("postgres.yml")
+        triggers = postgres.get("on") or postgres.get(True)
+        for event in ("pull_request", "push"):
+            assert "coordination/overlap_symbols.py" in triggers[event]["paths"]
+
+    def test_release_publish_jobs_require_real_postgres_gate(self) -> None:
+        release = self._workflow("release.yml")
+        jobs = release["jobs"]
+        assert jobs["postgres-gate"]["uses"] == (
+            "./.github/workflows/postgres.yml"
+        )
+        assert jobs["publish-image"]["needs"] == "postgres-gate"
+        assert jobs["publish-pypi"]["needs"] == "postgres-gate"

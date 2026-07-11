@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from conftest import seam_connection
 from coordination.db import Database
 from coordination.main import app
 
@@ -61,6 +62,12 @@ async def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncClient
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
 
+    # v0.45's writer queue owns a persistent aiosqlite worker thread.
+    # Close it while pytest-asyncio's loop is still alive; clearing the
+    # lru_cache alone drops the object but lets the worker report back to an
+    # already-closed loop during interpreter/fixture teardown.
+    if deps.get_service.cache_info().currsize:
+        await deps.get_service().db.aclose()
     deps.get_service.cache_clear()
 
 
@@ -78,7 +85,9 @@ async def test_readyz_reports_metadata(client: AsyncClient) -> None:
     body = r.json()
     assert body["status"] == "ready"
     assert body["auth_mode"] == "bearer"
-    assert body["database_path"].endswith("db.sqlite")
+    # The unauthenticated probe must not leak server-internal filesystem
+    # layout (audit: info-disclosure).
+    assert "database_path" not in body
 
 
 @pytest.mark.asyncio
@@ -459,6 +468,49 @@ async def test_conflicts_endpoint_filters_by_repo(client: AsyncClient) -> None:
     )
     assert r.status_code == 200, r.text
     assert r.json()["has_conflicts"] is True
+
+
+@pytest.mark.asyncio
+async def test_conflicts_batch_matches_get_semantics(client: AsyncClient) -> None:
+    """The body-based hook endpoint checks every path in one request."""
+    h = {"Authorization": "Bearer test-token"}
+    r = await client.post(
+        "/claims",
+        headers=h,
+        json={
+            "engineer": "holder",
+            "repo": "amittell/coord",
+            "session_id": "holder-session",
+            "claims": [{"type": "module", "pattern": "src/claimed/**"}],
+        },
+    )
+    assert r.status_code == 200, r.text
+
+    r = await client.post(
+        "/conflicts/batch",
+        headers=h,
+        json={
+            "patterns": ["src/free.py", "src/claimed/file.py"],
+            "engineer": "pusher",
+            "repo": "amittell/coord",
+            "session_ids": ["pusher-session"],
+            "branch": "feature/batched-hook",
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["has_conflicts"] is True
+    assert {c["pattern"] for c in body["conflicts"]} == {"src/claimed/**"}
+
+
+@pytest.mark.asyncio
+async def test_conflicts_batch_requires_patterns(client: AsyncClient) -> None:
+    r = await client.post(
+        "/conflicts/batch",
+        headers={"Authorization": "Bearer test-token"},
+        json={"patterns": [], "engineer": "pusher"},
+    )
+    assert r.status_code == 422
 
 
 @pytest.mark.asyncio
@@ -1555,6 +1607,22 @@ async def test_queue_disabled_when_wait_seconds_omitted(
     # Legacy 409 (or 200 with conflicts depending on the path); claim
     # ids must be empty either way.
     assert rr.json().get("claim_ids", None) == [] or rr.status_code == 409
+    # The docstring's second half: the plain-409 path must not enqueue.
+    # A silently inserted zero-wait claim_queue row would later be
+    # auto-granted on release even though bob never asked to wait.
+    rq = await client.get(
+        "/requests?queued=true&requester=bob", headers=_AUTH
+    )
+    assert rq.status_code == 200, rq.text
+    queued_rows = [
+        row
+        for row in rq.json().get("requests", [])
+        if row.get("requester_engineer") == "bob"
+    ]
+    assert queued_rows == [], (
+        f"wait_seconds omitted must not insert a claim_queue row; got "
+        f"{queued_rows}"
+    )
 
 
 @pytest.mark.asyncio
@@ -1636,14 +1704,19 @@ async def test_queue_grants_in_fifo_order_on_release(
     assert bob_result.get("claim_ids"), (
         f"bob should be auto-granted; got {bob_result}"
     )
-    # Carol either got auto-granted in turn (after bob releases, but he
-    # didn't here) or her wait timed out into a conflict payload. In
-    # this test we don't release bob, so carol times out with the
-    # conflict shape (and her wait_seconds is large enough that she
-    # may still be waiting -- the test asserts her result is well-formed
-    # either way).
-    assert carol_result.get("claim_ids", []) == [] or carol_result.get(
-        "claim_ids"
+    # Carol must NOT be granted: _drain_queue_for pops every waiter on
+    # the released claim, grants bob (head of FIFO), then re-runs the
+    # conflict check for carol against the post-release world -- she now
+    # conflicts with bob's fresh claim, so her queue entry is marked
+    # expired and her long-poll returns the conflict payload with no
+    # claim ids. Pin both halves so a double-grant regression fails.
+    assert carol_result.get("claim_ids") == [], (
+        f"carol must not be granted while bob holds the file; got "
+        f"{carol_result}"
+    )
+    assert carol_result.get("conflicts"), (
+        f"carol's expired wait must surface the conflict payload; got "
+        f"{carol_result}"
     )
 
 
@@ -2107,10 +2180,7 @@ async def test_auto_demote_removes_dormant_entry(
     assert list_coord_managed_shared_files(after) == []
 
     # Audit row was recorded with the expected detail shape.
-    import aiosqlite
-
-    async with aiosqlite.connect(svc.db.path) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with seam_connection(svc.db) as conn:
         cur = await conn.execute(
             "SELECT event_type, detail FROM request_events "
             "WHERE event_type = 'auto-demote'"
@@ -2833,20 +2903,19 @@ async def _backdate_queue_entry(
 ) -> None:
     """Rewrite a claim_queue row's ``enqueued_at`` to N seconds in the past
     so the age boost can be exercised deterministically (no real sleeps).
-    Uses raw aiosqlite because no public Database helper backdates queue
-    rows -- this is a v0.26 test fixture, not a production code path.
+    Routes through the backend-agnostic ``seam_connection`` helper because no
+    public Database helper backdates queue rows -- this is a v0.26 test
+    fixture, not a production code path.
     """
-    import aiosqlite
     from datetime import UTC, datetime, timedelta
 
     past = datetime.now(UTC) - timedelta(seconds=seconds_ago)
     past_iso = past.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    async with aiosqlite.connect(db.path) as conn:
+    async with seam_connection(db) as conn:
         await conn.execute(
             "UPDATE claim_queue SET enqueued_at = ? WHERE id = ?",
             (past_iso, queue_id),
         )
-        await conn.commit()
 
 
 @pytest.mark.asyncio
@@ -3716,16 +3785,13 @@ async def test_long_poll_wakes_on_cancellation(
 
 
 async def _outbox_rows(db_path: str, event_type: str | None = None) -> list[dict[str, Any]]:
-    """Return outbox rows directly via aiosqlite.
+    """Return outbox rows directly via the backend-agnostic test DB seam.
 
     The delivery loop is not running in these tests; we are exercising
     the emission path only (fire_webhook -> enqueue_webhook), so reading
     the table directly is the most precise observation point.
     """
-    import aiosqlite
-
-    async with aiosqlite.connect(db_path) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with seam_connection(Database(Path(db_path))) as conn:
         if event_type is None:
             cur = await conn.execute(
                 "SELECT * FROM webhook_outbox ORDER BY created_at ASC"

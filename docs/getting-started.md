@@ -76,24 +76,24 @@ That command sequence will:
 1. create `.coordination/config.toml` (gitignored)
 2. create `.coordination/local.env` (gitignored, holds the bearer token)
 3. create `.coordination/owners.yaml` (gitignored)
-4. patch `.mcp.json` or the selected tool config (tracked template, ships with placeholder env values)
+4. patch `.mcp.json` or the selected tool config (placeholder env values only; gitignored since v0.32, and previously committed copies are untracked)
 5. patch `CLAUDE.md` or `AGENTS.md` (tracked, protocol snippet inside a managed block)
 6. install a pre-push hook at `.git/hooks/pre-push`
-7. patch `.gitignore` with `/.coordination/` (tracked)
+7. patch `.gitignore` with `/.coordination/` plus the machine configs (`.mcp.json`, `.cursor/mcp.json`, `.codex/config.toml`) (tracked)
 
 If you prefer manual rollout, the template inventory still lives in `../templates/README.md`.
 
 ### Configuration & secrets
 
-The split between tracked templates and the gitignored `.coordination/` directory is deliberate: the MCP registration files (`.mcp.json`, `.codex/config.toml`, `.cursor/mcp.json`) are committed with placeholder env values (`COORD_AUTH_TOKEN=set-me`, `COORD_REPO_ID=example-org/example-repo`, `COORD_API_URL=http://127.0.0.1:8080`) so the shape is visible to every contributor and so a public-facing repo can ship the template without leaking credentials. The real values live only in `.coordination/local.env`.
+The MCP registration files (`.mcp.json`, `.codex/config.toml`, `.cursor/mcp.json`) carry only the placeholder env values (`COORD_AUTH_TOKEN=set-me`, `COORD_REPO_ID=example-org/example-repo`, `COORD_API_URL=http://127.0.0.1:8080`) and are gitignored since v0.32 -- machine config is per-checkout state, and committing it polluted PRs. `coord init` regenerates them locally and untracks previously committed copies. The real values live only in `.coordination/local.env`, which is also gitignored.
 
 `coord-mcp` reconciles the two at startup: it walks up from its working directory looking for `.coordination/local.env`, and for each `COORD_*` allowlisted variable overrides any unset or placeholder value with what the file carries. Real values supplied via shell exports or via a non-placeholder env block in `.mcp.json` are preserved (explicit > file > built-in defaults). The `Authorization` header is also dropped when the token is a documented placeholder, so a misconfigured setup yields a clean `401` rather than `Bearer set-me`.
 
 Operational implications:
 
-- rotating the bearer token = edit `.coordination/local.env` in every coordinated repo; the committed MCP configs do not need to change.
-- a stale tracked `.mcp.json` (e.g. one regenerated against a sanitised template) does not require a `coord init --force` to recover; `coord-mcp` will fall through to `local.env`.
-- the pre-push hook sources `.coordination/local.env` directly via shell, independent of the MCP wrapper, so it is unaffected by editor/CLI restarts.
+- rotating the bearer token = edit `.coordination/local.env` in every coordinated repo; the MCP registration files do not need to change.
+- a stale `.mcp.json` (e.g. one regenerated against a sanitised template, or a pre-v0.32 committed copy) does not require a `coord init --force` to recover; `coord-mcp` will fall through to `local.env`.
+- the pre-push hook loads only the keys it needs from `.coordination/local.env` as inert data, independent of the MCP wrapper, so it is unaffected by editor/CLI restarts without executing shell syntax from the file.
 
 See `docs/integrations/claude-code.md` and `docs/integrations/codex-cli.md` for the resolution order in tool-specific terms.
 
@@ -115,8 +115,9 @@ Your agent rules should follow this order:
 
 1. check conflicts before editing
 2. claim files or modules before editing
-3. extend claims if work runs long
-4. release claims when done
+3. release claims when done
+
+There is deliberately no agent-facing "extend" tool: every MCP call carrying the session id acts as an activity ping, so an active session's claims are not idle-expired out from under it, and a claim that hits its hard TTL is simply re-claimed by the next `claim_files`. If a claim genuinely needs more wall-clock time up front, an operator can extend it directly over HTTP with `POST /claims/{claim_id}/extend` (see `usage-guide.md`).
 
 The shipped snippets in `templates/` already encode this workflow.
 

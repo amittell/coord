@@ -178,6 +178,151 @@ async def test_concurrent_overlapping_symbol_claims_single_winner(
     assert len(active) == 1, f"double-active symbol row: {active!r}"
 
 
+async def test_guarded_rename_serializes_with_concurrent_symbol_grant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rename and a grant for its new symbol share the repo lock.
+
+    Pause the rename immediately before its symbol-row UPDATE, after its
+    collision check has seen the target path as free. While it is paused, a
+    second service instance attempts to grant that target symbol. PostgreSQL
+    must show the rename holding the advisory lock and the grant waiting for
+    it; after the rename commits, the grant re-check sees the renamed claim
+    and is rejected.
+    """
+    from coordination.pg_backend import _PGConnAdapter
+
+    svc_a = _make_service(tmp_path)
+    svc_b = _second_instance(tmp_path)
+    await svc_a.db.init()
+    await svc_b.db.init()
+    pattern = "src/rename_race.py"
+    repo = "example-org/app"
+
+    seeded = await _claim(
+        svc_a,
+        engineer="renamer",
+        pattern=pattern,
+        repo=repo,
+        symbols=["old_name"],
+    )
+    assert seeded.claim_ids
+    claim_id = seeded.claim_ids[0]
+
+    rename_at_update = asyncio.Event()
+    allow_rename_update = asyncio.Event()
+    grant_at_repo_lock = asyncio.Event()
+    rename_pid: int | None = None
+    grant_pid: int | None = None
+    rename_task: asyncio.Task[bool] | None = None
+
+    original_execute = _PGConnAdapter.execute
+
+    async def _pause_rename_update(self, sql: str, params=()):
+        nonlocal rename_pid
+        normalized = " ".join(sql.lower().split())
+        if (
+            asyncio.current_task() is rename_task
+            and normalized.startswith("update claim_symbols")
+            and "set symbol_name" in normalized
+        ):
+            rename_pid = self._raw.get_server_pid()
+            rename_at_update.set()
+            await allow_rename_update.wait()
+        return await original_execute(self, sql, params)
+
+    monkeypatch.setattr(_PGConnAdapter, "execute", _pause_rename_update)
+
+    original_grant_repo_lock = svc_b.db.repo_lock
+
+    async def _observe_grant_repo_lock(conn, lock_repo: str | None) -> None:
+        nonlocal grant_pid
+        grant_pid = conn._raw.get_server_pid()
+        grant_at_repo_lock.set()
+        await original_grant_repo_lock(conn, lock_repo)
+
+    monkeypatch.setattr(svc_b.db, "repo_lock", _observe_grant_repo_lock)
+
+    rename_task = asyncio.create_task(
+        svc_a.db.update_claim_symbol_rename(
+            claim_id,
+            file_path=pattern,
+            old_symbol_name="old_name",
+            new_symbol_name="new_name",
+            new_start_line=1,
+            new_start_col=None,
+            new_end_line=2,
+            new_end_col=None,
+            resolved_by="parser",
+            new_pattern=None,
+            guard_new_path_collision=True,
+            repo=repo,
+        )
+    )
+    await asyncio.wait_for(rename_at_update.wait(), timeout=5)
+    assert rename_pid is not None
+
+    grant_task = asyncio.create_task(
+        _claim(
+            svc_b,
+            engineer="concurrent-granter",
+            pattern=pattern,
+            repo=repo,
+            symbols=["new_name"],
+        )
+    )
+    await asyncio.wait_for(grant_at_repo_lock.wait(), timeout=5)
+    assert grant_pid is not None
+
+    rename_holds_lock = False
+    grant_waits_for_lock = False
+    try:
+        async with svc_a.db._connect() as observer:
+            for _ in range(100):
+                cur = await observer.execute(
+                    """
+                    SELECT pid, granted
+                    FROM pg_locks
+                    WHERE locktype = 'advisory' AND pid IN (?, ?)
+                    """,
+                    (rename_pid, grant_pid),
+                )
+                lock_rows = await cur.fetchall()
+                rename_holds_lock = any(
+                    row["pid"] == rename_pid and row["granted"]
+                    for row in lock_rows
+                )
+                grant_waits_for_lock = any(
+                    row["pid"] == grant_pid and not row["granted"]
+                    for row in lock_rows
+                )
+                if rename_holds_lock and grant_waits_for_lock:
+                    break
+                await asyncio.sleep(0.01)
+    finally:
+        # Never strand either transaction if an assertion or observer query
+        # fails: releasing the gate lets the rename commit and the grant drain.
+        allow_rename_update.set()
+
+    rename_applied = await asyncio.wait_for(rename_task, timeout=5)
+    grant_result = await asyncio.wait_for(grant_task, timeout=5)
+
+    symbol_rows = await svc_a.db.get_symbol_rows_on_file(
+        file_path=pattern,
+        repo=repo,
+    )
+    matching = [
+        row
+        for row in symbol_rows
+        if row.get("overlapping_symbol") == "new_name"
+    ]
+    assert len(matching) == 1, f"rename/grant race double-granted: {matching!r}"
+    assert rename_holds_lock, "guarded rename did not hold the repo advisory lock"
+    assert grant_waits_for_lock, "concurrent grant did not wait for the rename lock"
+    assert rename_applied is True
+    assert grant_result.claim_ids == []
+
+
 # ---------------------------------------------------------------------------
 # Two-instance variants (design Section 5 / 9): the single-winner invariant
 # must hold across SEPARATE service instances that do NOT share an in-process

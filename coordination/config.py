@@ -1,6 +1,37 @@
+import re
 from pathlib import Path
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+POSTGRES_SCHEMA_DEFAULT = "coord"
+_POSTGRES_SCHEMA_RE = re.compile(r"[a-z_][a-z0-9_]{0,62}\Z")
+
+
+def validate_postgres_schema(value: str) -> str:
+    """Validate a schema name before it is interpolated into PostgreSQL SQL.
+
+    PostgreSQL identifiers are limited to 63 bytes by default. Restricting the
+    operator setting to lowercase ASCII identifiers keeps quoting predictable,
+    rules out SQL injection, and avoids case-sensitive quoted-schema surprises.
+    System schemas are never valid application targets.
+    """
+    if not _POSTGRES_SCHEMA_RE.fullmatch(value):
+        raise ValueError(
+            "postgres_schema must be a lowercase PostgreSQL identifier: "
+            "1-63 characters matching [a-z_][a-z0-9_]*"
+        )
+    if (
+        value == "public"
+        or value == "information_schema"
+        or value.startswith("pg_")
+    ):
+        raise ValueError(
+            "postgres_schema must not target a PostgreSQL system schema "
+            "(public, information_schema, or pg_*)"
+        )
+    return value
 
 
 class Settings(BaseSettings):
@@ -13,9 +44,43 @@ class Settings(BaseSettings):
     # single-writer SQLite path at ``database_path``. ``COORD_DATABASE_PATH``
     # stays the deprecated alias for the SQLite file location.
     database_url: str | None = None
+    # Stable application schema used whenever ``database_url`` selects
+    # PostgreSQL. It is deliberately independent of ``database_path`` so every
+    # replica and every operator CLI reaches the same durable state. Tests that
+    # construct PostgresStore directly without this value retain path-derived
+    # private schemas for isolation.
+    postgres_schema: str = POSTGRES_SCHEMA_DEFAULT
+
+    @field_validator("postgres_schema")
+    @classmethod
+    def _validate_postgres_schema(cls, value: str) -> str:
+        return validate_postgres_schema(value)
+
+    @property
+    def postgres_schema_is_explicit(self) -> bool:
+        """Whether an operator supplied the schema instead of using default.
+
+        This distinction lets the PostgreSQL backend fail closed when it sees
+        data in the path-hashed schema used by the v0.44/v0.45 beta backend.
+        Explicitly choosing either that legacy schema or the new stable
+        default resolves the ambiguity.
+        """
+        return "postgres_schema" in self.model_fields_set
+
     auth_token: str | None = None
     allow_insecure_no_auth: bool = False
     repo_root: Path | None = None
+    # ``repo_root_repo``: declares which repo id (``owner/name``) the
+    # single ``repo_root`` checkout represents. On a shared multi-repo
+    # service the rename auto-follow sweep walks ACTIVE claims from
+    # every repo but resolves their file paths against this one
+    # checkout; when set, the sweep only follows claims whose ``repo``
+    # matches (NULL-repo legacy claims are excluded too), so a claim
+    # from another repo whose relative path happens to exist under
+    # this root can never be "renamed" based on the wrong repo's file
+    # content. Unset (default) preserves the single-repo behaviour:
+    # every claim is swept against ``repo_root``.
+    repo_root_repo: str | None = None
     repo_scope: str | None = None
     api_url: str = "http://127.0.0.1:8080"
     host: str = "0.0.0.0"
@@ -24,6 +89,17 @@ class Settings(BaseSettings):
     max_claim_files: int = 100
     max_claim_ratio: float = 0.2
     cleanup_interval_sec: int = 900
+    # Retention window for the symbol child tables (claim_symbols /
+    # claim_symbol_callsites / claim_symbol_renames) of RELEASED claims.
+    # Claims are soft-released (the row is kept for audit) and the child
+    # tables have no ON DELETE CASCADE, so without a reaper every symbol
+    # claim ever made leaves its child rows behind permanently. The
+    # background cleanup loop purges child rows of claims released at
+    # least this many seconds ago (leader-only, same cadence as
+    # cleanup_interval_sec). Default 24h -- comfortably past any audit or
+    # dashboard view that joins symbols of recently released claims. Set
+    # to 0 to disable the purge and keep child rows forever.
+    symbol_purge_after_sec: int = 86400
     default_ttl_hours: int = 4
     shared_ttl_hours: int = 2
     # Session-tagged claims auto-release when their holder has been
@@ -169,6 +245,17 @@ class Settings(BaseSettings):
     # cross-repo escape hatch (keep one, or an operator loses all-repo access).
     # Default False so existing deployments are unaffected on upgrade.
     require_scoped_token: bool = False
+    # ``enforce_engineer_identity``: bind the ``engineer`` named on mutating
+    # requests (claim release, queue cancel, request respond) to the
+    # authenticated per-engineer token identity. ``warn`` (default) honors
+    # the request but logs the mismatch and stamps an
+    # ``X-Coord-Identity-Warning`` response header -- live fleets share one
+    # token across several agent identities, so hard enforcement is opt-in.
+    # ``enforce`` rejects a mismatching engineer with 403 and defaults an
+    # omitted engineer to the token's own identity so destructive updates
+    # always carry an ownership predicate. Shared operator tokens (and
+    # no-auth deployments) are exempt in both modes.
+    enforce_engineer_identity: str = "warn"
     # ``warn_unscoped_token`` (v0.43): the middle-ground nudge before
     # ``require_scoped_token`` is turned on. When True, a request made with
     # an UNSCOPED per-engineer token (repo IS NULL) is still honored, but the
@@ -349,10 +436,10 @@ class Settings(BaseSettings):
     @property
     def oidc_allowed_principal_set(self) -> frozenset[str]:
         """Parsed allowlist: split on commas, strip whitespace, drop
-        empties, lowercase. Lowercasing here means operators can paste
-        mixed-case emails and they still match the lowercased email
-        claim; non-email principals should be configured in the exact
-        (lowercase) form the IdP emits."""
+        empties, lowercase. Membership checks case-fold the claim value
+        the same way (oidc.map_claim_to_engineer), so operators can
+        paste principals in whatever case they like and an IdP that
+        emits mixed case still matches."""
         return frozenset(
             p.strip().lower()
             for p in self.oidc_allowed_principals.split(",")

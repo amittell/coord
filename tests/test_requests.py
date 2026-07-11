@@ -30,6 +30,7 @@ from uuid import uuid4
 
 import pytest
 
+from conftest import seam_connection
 from coordination.config import Settings
 from coordination.db import Database
 from coordination.service import CoordinationService
@@ -118,13 +119,10 @@ async def test_file_request_never_extends_an_already_short_ttl(
     cid = await _seed_active_claim(svc, ttl_hours=0)  # near-immediate
     # Force expires_at to ~60s out.
     soon = _iso(datetime.now(UTC) + timedelta(seconds=60))
-    import aiosqlite
-
-    async with aiosqlite.connect(svc.db.path) as conn:
+    async with seam_connection(svc.db) as conn:
         await conn.execute(
             "UPDATE claims SET expires_at = ? WHERE id = ?", (soon, cid)
         )
-        await conn.commit()
 
     await svc.file_request(
         claim_id=cid,
@@ -315,16 +313,13 @@ async def test_shortened_ttl_expiry_cascades_to_request(
     # Force the claim's expires_at into the past so expire_stale_claims
     # picks it up.
     past = _iso(datetime.now(UTC) - timedelta(seconds=1))
-    import aiosqlite
-
-    async with aiosqlite.connect(svc.db.path) as conn:
+    async with seam_connection(svc.db) as conn:
         await conn.execute(
             "UPDATE claims SET expires_at = ? WHERE id = ?", (past, cid)
         )
-        await conn.commit()
 
-    n = await svc.db.expire_stale_claims()
-    assert n == 1
+    expired = await svc.db.expire_stale_claims()
+    assert expired == [cid]
 
     final = await svc.get_request(req["id"])
     assert final is not None
@@ -353,8 +348,8 @@ async def test_release_session_resolves_open_requests(
         reason="block",
         urgency="high",
     )
-    n = await svc.db.release_for_session("bulk-sess")
-    assert n == 1
+    released = await svc.db.release_for_session("bulk-sess")
+    assert released == [cid]
 
     final = await svc.get_request(req["id"])
     assert final is not None
@@ -382,8 +377,8 @@ async def test_release_claims_cascades_open_requests_to_resolved(
         urgency="normal",
     )
     # Holder voluntarily releases (e.g. via release_claims).
-    n = await svc.db.release_claims([cid], engineer="alice")
-    assert n == 1
+    released = await svc.db.release_claims([cid], engineer="alice")
+    assert released == [cid]
 
     final = await svc.get_request(req["id"])
     assert final is not None

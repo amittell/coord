@@ -13,12 +13,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
-import aiosqlite
 import httpx
 import pytest
 
+from conftest import seam_connection
 from coordination.config import Settings
-from coordination.db import Database, _configure_sqlite
+from coordination.db import Database
 from coordination.service import CoordinationService
 
 
@@ -81,19 +81,15 @@ async def _backdate_next_attempt(db: Database, outbox_id: str) -> None:
     past = (
         datetime.now(UTC) - timedelta(hours=1)
     ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    async with aiosqlite.connect(db.path) as conn:
-        await _configure_sqlite(conn)
+    async with seam_connection(db) as conn:
         await conn.execute(
             "UPDATE webhook_outbox SET next_attempt_at = ? WHERE id = ?",
             (past, outbox_id),
         )
-        await conn.commit()
 
 
 async def _get_outbox_row(db: Database, outbox_id: str) -> dict[str, Any]:
-    async with aiosqlite.connect(db.path) as conn:
-        conn.row_factory = aiosqlite.Row
-        await _configure_sqlite(conn)
+    async with seam_connection(db) as conn:
         cur = await conn.execute(
             "SELECT * FROM webhook_outbox WHERE id = ?", (outbox_id,)
         )
@@ -280,8 +276,7 @@ async def test_webhook_disabled_when_url_empty(
     result = await svc.fire_webhook("auto-coexist", {"foo": "bar"})
     assert result is None
 
-    async with aiosqlite.connect(db.path) as conn:
-        await _configure_sqlite(conn)
+    async with seam_connection(db) as conn:
         cur = await conn.execute("SELECT COUNT(*) FROM webhook_outbox")
         (n,) = await cur.fetchone()
     assert n == 0

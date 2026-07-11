@@ -30,7 +30,11 @@ from coordination.repo_id import InvalidRepoId, normalize_repo_id
 from coordination.cli_shared import parse_duration
 from coordination.config import get_settings
 from coordination.dashboard import render_dashboard
-from coordination.db import _LOCK_SKIPPED, acquire_instance_lock
+from coordination.db import (
+    _LOCK_SKIPPED,
+    _postgres_url_selected,
+    acquire_instance_lock,
+)
 from coordination.deps import get_service
 from coordination.tokens import generate_raw_token, sha256_token
 from coordination.logging import (
@@ -44,6 +48,7 @@ from coordination.ownership import parse_ownership_yaml
 from coordination.service import LspUnavailable, RateLimitExceeded
 from coordination.schemas import (
     ClaimRefactorRequest,
+    ConflictBatchRequest,
     CreateClaimsRequest,
     ExtendClaimRequest,
     FileRequestRequest,
@@ -54,6 +59,18 @@ from coordination.schemas import (
 
 logger = logging.getLogger(__name__)
 access_logger = logging.getLogger(ACCESS_LOGGER_NAME)
+
+# Leader-lease cadence for the background loops. Leadership is renewed by a
+# dedicated heartbeat task (see ``lifespan``) on this fixed short interval,
+# decoupled from the work loops' own cadence: the loops tick as slowly as an
+# hour (auto-demote), so a TTL sized off work cadence either risks expiring
+# between renewals or stretches to hours and stalls failover for that long
+# after a leader crash. The TTL is three heartbeats plus slack so one missed
+# renewal (GC pause, brief DB blip) does not drop leadership, while a crashed
+# or SIGKILLed leader is replaced in about a minute.
+LEADER_HEARTBEAT_INTERVAL_SEC = 20.0
+LEADER_LEASE_TTL_SEC = LEADER_HEARTBEAT_INTERVAL_SEC * 3 + 5
+LEADER_LEASE_NAME = "coord-background-loops"
 
 
 @asynccontextmanager
@@ -83,10 +100,9 @@ async def lifespan(app: FastAPI):
     # The flock instance lock detects a second SQLite writer on one file; it
     # is meaningless across pods sharing a Postgres (design Section 7). In PG
     # mode bypass it (return the sentinel) -- multiple replicas are expected.
-    if settings.database_url and (
-        settings.database_url.startswith("postgresql://")
-        or settings.database_url.startswith("postgres://")
-    ):
+    # Backend selection uses the same predicate ``Database.__new__`` dispatches
+    # on, so the lock decision can never drift from which store actually opens.
+    if _postgres_url_selected() is not None:
         app.state.instance_lock_fd = _LOCK_SKIPPED
     else:
         app.state.instance_lock_fd = acquire_instance_lock(settings.database_path)
@@ -108,40 +124,61 @@ async def lifespan(app: FastAPI):
         try:
             yield
         finally:
+            # Disabling the background loops must not disable resource
+            # cleanup. The SQLite writer queue owns a persistent aiosqlite
+            # thread/connection that still needs an orderly shutdown.
+            try:
+                await get_service().db.aclose()
+            except Exception:  # pragma: no cover - best-effort shutdown
+                logger.debug("db.aclose on shutdown failed", exc_info=True)
             await _shutdown_lsp_pool()
         return
 
     # Single-leader election for the multi-replica background loops
-    # (design Section 6). All three loops below mutate shared DB state
+    # (design Section 6). All the loops below mutate shared DB state
     # (and webhook delivery POSTs externally), so on Postgres three
     # replicas running them unguarded would expire/auto-demote in
     # triplicate and -- worst -- deliver every webhook 3x. The lease lets
     # exactly one replica (the leader) run the per-DB work. On SQLite
     # there is a single writer process, so the lease is unconditionally
     # True and every loop runs exactly as it always has. ``leader_id`` is
-    # minted once per process so the lease is stable across renew ticks;
-    # the TTL bounds how long a dead leader blocks failover.
+    # minted once per process so the lease is stable across renew ticks.
+    #
+    # Renewal runs in a dedicated heartbeat task (LEADER_HEARTBEAT_
+    # INTERVAL_SEC cadence, TTL ~3 heartbeats -- see the module-level
+    # constants) rather than inside the work loops, so failover after a
+    # crashed leader is bounded by roughly a minute regardless of how
+    # slowly the work loops tick. The work loops read the cached
+    # leadership flag, which the heartbeat keeps fresh.
     leader_id = uuid4().hex
-    leader_lease_ttl = (
-        max(
-            settings.cleanup_interval_sec,
-            settings.auto_demote_interval_sec,
-            settings.webhook_delivery_interval_sec,
-        )
-        * 3
-        + 5
-    )
+    leader_state = {"is_leader": False}
 
-    async def _is_background_leader() -> bool:
+    async def _renew_leader_lease() -> bool:
         try:
             return await get_service().db.acquire_leader_lease(
-                lease_name="coord-background-loops",
+                lease_name=LEADER_LEASE_NAME,
                 holder_id=leader_id,
-                ttl_sec=leader_lease_ttl,
+                ttl_sec=LEADER_LEASE_TTL_SEC,
             )
         except Exception:  # pragma: no cover - lease failures must not kill the loop
-            logger.exception("leader lease check failed; skipping this tick")
+            logger.exception(
+                "leader lease renewal failed; treating this replica as non-leader"
+            )
             return False
+
+    async def _is_background_leader() -> bool:
+        return leader_state["is_leader"]
+
+    async def lease_heartbeat_loop() -> None:
+        """Renew (or contest) the background-loop leader lease on a fixed
+        short cadence. The initial acquire below runs before the work
+        loops start, so their first tick sees real leadership state
+        instead of a cold False; this loop therefore sleeps first."""
+        while True:
+            await asyncio.sleep(LEADER_HEARTBEAT_INTERVAL_SEC)
+            leader_state["is_leader"] = await _renew_leader_lease()
+
+    leader_state["is_leader"] = await _renew_leader_lease()
 
     async def cleanup_loop() -> None:
         while True:
@@ -149,11 +186,44 @@ async def lifespan(app: FastAPI):
             leader = await _is_background_leader()
             if leader:
                 try:
-                    await get_service().db.expire_stale_claims(
-                        idle_timeout_sec=settings.idle_timeout_sec
-                    )
+                    # Service-layer sweep: closes TTL/idle-expired claims
+                    # AND drains the FIFO queue behind each of them, so a
+                    # waiter queued behind a claim whose (possibly
+                    # request_release-shortened) TTL fires here is granted
+                    # instead of burning its whole wait_seconds.
+                    await get_service().expire_stale_claims()
                 except Exception:  # pragma: no cover - background cleanup failures are logged
                     logger.exception("Failed to expire stale claims")
+                # Reap queue rows by their own expires_at so a waiter
+                # stranded by a process restart / crash (its in-memory
+                # event lost) converges to 'expired' instead of holding a
+                # 'waiting' slot against COORD_MAX_QUEUED_PER_ENGINEER and
+                # the per-repo depth cap forever.
+                try:
+                    await get_service().db.expire_stale_queue_entries()
+                except Exception:  # pragma: no cover - background cleanup failures are logged
+                    logger.exception("Failed to expire stale queue entries")
+                # Garbage-collect the claim_symbols / callsites / renames
+                # child rows of long-released claims. Claims themselves are
+                # soft-released and kept as the audit trail, but their
+                # symbol child rows have no other reaper and would grow the
+                # store unbounded (and bloat the per-file index scans the
+                # symbol-overlap checks walk). Leader-only like the other
+                # DB-mutating sweeps; 0 disables.
+                if settings.symbol_purge_after_sec > 0:
+                    try:
+                        purged = await get_service().db.purge_released_symbol_rows(
+                            older_than_sec=settings.symbol_purge_after_sec
+                        )
+                        if any(purged.values()):
+                            logger.info(
+                                "Purged symbol rows of released claims: %s",
+                                purged,
+                            )
+                    except Exception:  # pragma: no cover - background cleanup failures are logged
+                        logger.exception(
+                            "Failed to purge released-claim symbol rows"
+                        )
             # v0.31 wave 2: rename auto-follow sweep piggybacks on the
             # cleanup cadence rather than running its own task -- one
             # background heartbeat, two cheap jobs. Gated on
@@ -203,8 +273,10 @@ async def lifespan(app: FastAPI):
         ``settings.webhook_delivery_interval_sec`` seconds, drain the
         webhook outbox. Exceptions are logged and swallowed so a single
         bad tick never tears the loop down. The loop is only started
-        when ``COORD_WEBHOOK_URL`` is configured so deployments that
-        don't use webhooks pay no scheduler overhead."""
+        when ``COORD_WEBHOOK_URL`` or ``COORD_GITHUB_TOKEN`` is
+        configured -- either transport writes outbox rows and this loop
+        is the only drain -- so deployments that use neither pay no
+        scheduler overhead."""
         while True:
             # Webhook delivery POSTs externally and marks rows delivered;
             # leader only so the outbox is drained once, not once per
@@ -216,11 +288,18 @@ async def lifespan(app: FastAPI):
                     logger.exception("webhook_delivery_loop: tick failed")
             await asyncio.sleep(settings.webhook_delivery_interval_sec)
 
-    task = asyncio.create_task(cleanup_loop())
-    tasks: list[asyncio.Task] = [task]
+    tasks: list[asyncio.Task] = [
+        asyncio.create_task(lease_heartbeat_loop()),
+        asyncio.create_task(cleanup_loop()),
+    ]
     if settings.auto_demote_interval_sec > 0:
         tasks.append(asyncio.create_task(auto_demote_loop()))
-    if settings.webhook_url:
+    # fire_webhook enqueues kind='github' rows gated solely on
+    # COORD_GITHUB_TOKEN (a documented-valid config with no webhook_url),
+    # and this loop is the only drain of the outbox -- so start it when
+    # EITHER transport is configured, or github PR-comment rows would sit
+    # 'pending' forever without ever being attempted.
+    if settings.webhook_url or settings.github_token.strip():
         tasks.append(asyncio.create_task(webhook_delivery_loop()))
     try:
         yield
@@ -232,6 +311,18 @@ async def lifespan(app: FastAPI):
                 await t
             except asyncio.CancelledError:
                 pass
+        # Hand leadership back on graceful shutdown so the next replica
+        # takes over immediately (rolling deploys) instead of waiting out
+        # the lease TTL. Best-effort: a crash skips this, and the short
+        # heartbeat-derived TTL bounds the stall in that case.
+        try:
+            await get_service().db.release_leader_lease(
+                lease_name=LEADER_LEASE_NAME, holder_id=leader_id
+            )
+        except Exception:  # pragma: no cover - best-effort shutdown
+            logger.debug(
+                "leader lease release on shutdown failed", exc_info=True
+            )
         # v0.44: close the shared SQLite writer connection (no-op when the
         # writer queue is off / on the Postgres backend).
         try:
@@ -326,9 +417,28 @@ def _unscoped_token_warning(engineer: str | None) -> str:
 async def _count_http_requests(request: Request, call_next):
     """Increment ``http_requests_total`` after each response. Uses the
     matched route template (e.g. ``/claims/{claim_id}``) for the ``path``
-    label so cardinality stays bounded; falls back to the raw URL path
-    if routing did not attach a matched route (404s, /metrics itself)."""
-    response = await call_next(request)
+    label so cardinality stays bounded; requests that did not match a
+    route (404s) collapse to the constant ``<unmatched>`` label. Using
+    the raw URL path there would let an unauthenticated scanner mint one
+    permanent series per probed path (series live for the process
+    lifetime), growing memory and the /metrics scrape body without
+    bound."""
+    try:
+        response = await call_next(request)
+    except Exception:
+        # An unhandled route exception unwinds through this middleware
+        # before Starlette's outermost ServerErrorMiddleware renders the
+        # 500, so count it here -- otherwise crash 500s (exactly the
+        # requests error-rate dashboards care about) vanish from the
+        # metric and an exception storm reads as a 0% error rate.
+        route = request.scope.get("route")
+        path_label = getattr(route, "path", None) or "<unmatched>"
+        metrics.http_requests_total.inc(
+            method=request.method,
+            path=path_label,
+            status="500",
+        )
+        raise
     # #30 slice 2/3: advertise the repo a scoped token was pinned to, so an
     # operator who dropped a token into the wrong repo's local.env can see
     # why results are empty instead of a silent void. Unscoped tokens (the
@@ -348,8 +458,16 @@ async def _count_http_requests(request: Request, call_next):
         response.headers["X-Coord-Token-Warning"] = _unscoped_token_warning(
             getattr(request.state, "engineer", None)
         )
+    # Identity-binding warn mode (_bind_mutation_engineer): surface the
+    # mismatch the handler recorded so the offending client sees it on
+    # the very response it caused, not just in server logs.
+    _identity_warning = getattr(
+        request.state, "engineer_identity_warning", None
+    )
+    if _identity_warning:
+        response.headers["X-Coord-Identity-Warning"] = _identity_warning
     route = request.scope.get("route")
-    path_label = getattr(route, "path", None) or request.url.path
+    path_label = getattr(route, "path", None) or "<unmatched>"
     metrics.http_requests_total.inc(
         method=request.method,
         path=path_label,
@@ -461,7 +579,30 @@ async def _access_log_middleware(request: Request, call_next):
     cardinality; falls back to the raw URL path when routing did not
     attach a matched route (404s, static endpoints like ``/metrics``)."""
     start = time.monotonic()
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    except Exception:
+        # An unhandled route exception propagates through here before
+        # Starlette's ServerErrorMiddleware renders the 500, so emit the
+        # access-log line now or crash 500s never get one. The minted
+        # X-Request-ID response header never materialized on this path
+        # (and the contextvar was already reset by the inner middleware),
+        # so fall back to the inbound header when the client sent one.
+        duration_ms = (time.monotonic() - start) * 1000.0
+        route = request.scope.get("route")
+        path_label = getattr(route, "path", None) or request.url.path
+        access_logger.info(
+            "http_request",
+            extra={
+                "event": "http_request",
+                "method": request.method,
+                "path": path_label,
+                "status": 500,
+                "duration_ms": round(duration_ms, 2),
+                "request_id": request.headers.get("x-request-id", ""),
+            },
+        )
+        raise
     duration_ms = (time.monotonic() - start) * 1000.0
     route = request.scope.get("route")
     path_label = getattr(route, "path", None) or request.url.path
@@ -533,7 +674,10 @@ def _source_ip_from_request(request: Request) -> str | None:
 
 
 async def _authenticate_bearer(
-    request: Request, token: str | None
+    request: Request,
+    token: str | None,
+    *,
+    record_activity: bool = True,
 ) -> AuthOutcome:
     """Single source of truth for bearer authentication (v0.29.4).
 
@@ -552,6 +696,11 @@ async def _authenticate_bearer(
 
     Counts ``auth_failures_total`` on every 401 it produces; the
     misconfiguration 500 is not an auth failure and is not counted.
+
+    ``record_activity=False`` is reserved for passive dashboard renders.
+    The login POST records the browser session once; subsequent polling must
+    not overwrite the token audit fields every 20 seconds and make an idle
+    credential look active.
     """
     settings = get_settings()
 
@@ -615,14 +764,15 @@ async def _authenticate_bearer(
             # Best-effort activity capture. The auth path must never
             # 401 because the update failed (e.g. transient lock
             # contention), so a broad except is correct here.
-            try:
-                await service.db.touch_engineer_token(
-                    token_hash,
-                    source_ip=_source_ip_from_request(request),
-                    user_agent=request.headers.get("user-agent"),
-                )
-            except Exception:  # noqa: BLE001 - intentional swallow
-                pass
+            if record_activity:
+                try:
+                    await service.db.touch_engineer_token(
+                        token_hash,
+                        source_ip=_source_ip_from_request(request),
+                        user_agent=request.headers.get("user-agent"),
+                    )
+                except Exception:  # noqa: BLE001 - intentional swallow
+                    pass
             return AuthOutcome(
                 ok=True,
                 auth_kind="per_engineer",
@@ -852,6 +1002,72 @@ async def _require_queue_in_scope(request: Request, queue_id: str) -> None:
         raise _scope_403(token_repo, "queue entry")
 
 
+def _ascii_header_value(value: str, cap: int = 256) -> str:
+    """Restrict to visible ASCII (0x20-0x7E) and cap the length so a
+    client-supplied engineer id cannot inject header control bytes
+    (CR/LF), break Starlette's latin-1 header encoding, or bloat the
+    header past receiver size limits. Same rule as the unscoped-token
+    warning header."""
+    return "".join(ch for ch in value if 0x20 <= ord(ch) <= 0x7E)[:cap]
+
+
+def _bind_mutation_engineer(
+    request: Request, engineer: str | None, *, operation: str
+) -> str | None:
+    """Bind the ``engineer`` named on a mutating request to the
+    authenticated identity.
+
+    Shared/operator tokens and no-auth deployments are exempt: acting on
+    other engineers' claims is what the operator escape hatch is for.
+    For per-engineer tokens the behaviour follows
+    ``COORD_ENFORCE_ENGINEER_IDENTITY``:
+
+    - ``warn`` (default): a mismatching or omitted engineer is honored
+      unchanged -- live fleets share one token across several agent
+      identities, so hard enforcement must be opt-in -- but the mismatch
+      is logged and echoed back in an ``X-Coord-Identity-Warning``
+      response header so operators can find offending clients before
+      flipping to enforce.
+    - ``enforce``: an omitted engineer is defaulted to the token's own
+      identity, so destructive DB updates always carry an ownership
+      predicate, and a mismatching value is rejected with 403.
+
+    Returns the effective engineer the handler should pass downstream.
+    """
+    if getattr(request.state, "auth_kind", None) != "per_engineer":
+        return engineer
+    token_engineer = getattr(request.state, "engineer", None)
+    if not token_engineer or engineer == token_engineer:
+        return engineer
+    mode = (get_settings().enforce_engineer_identity or "").strip().lower()
+    if mode == "enforce":
+        if engineer is None:
+            return token_engineer
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"This token authenticates engineer '{token_engineer}'; "
+                f"it cannot {operation} as engineer '{engineer}' "
+                "(COORD_ENFORCE_ENGINEER_IDENTITY=enforce)."
+            ),
+        )
+    named = engineer if engineer is not None else "<omitted>"
+    logger.warning(
+        "engineer identity mismatch on %s: token engineer %r, "
+        "request engineer %r (COORD_ENFORCE_ENGINEER_IDENTITY=warn)",
+        operation,
+        token_engineer,
+        engineer,
+    )
+    request.state.engineer_identity_warning = _ascii_header_value(
+        f"Request named engineer '{named}' but the token authenticates "
+        f"'{token_engineer}'. Honored for now "
+        "(COORD_ENFORCE_ENGINEER_IDENTITY=warn); with enforce a mismatch "
+        "is rejected and an omitted engineer is scoped to the token's own."
+    )
+    return engineer
+
+
 # Cookie set by ``/dashboard/login``. HTTP-only so JS in any
 # extension/widget can't read it; SameSite=Lax so a cross-site GET
 # doesn't accidentally carry it; Secure because the login page
@@ -958,13 +1174,17 @@ async def metrics_endpoint() -> Response:
 
 @app.get("/readyz")
 async def readyz() -> dict[str, str]:
+    # Deliberately unauthenticated (readiness probes rarely carry bearer
+    # tokens), so the payload must not leak server internals: auth_mode
+    # and version are documented probe fields (docs/deployment.md), but
+    # the absolute database filesystem path is reconnaissance material on
+    # an internet-fronted service and has no unauthenticated consumer.
     settings = get_settings()
     await get_service().db.init()
     return {
         "status": "ready",
         "version": __version__,
         "auth_mode": settings.auth_mode,
-        "database_path": str(settings.database_path),
     }
 
 
@@ -1019,6 +1239,10 @@ async def _render_dashboard_for(
     return await render_dashboard(
         viewer_engineer=outcome.engineer,
         is_operator=outcome.auth_kind == "shared",
+        can_promote_hotspots=(
+            outcome.auth_kind in {"per_engineer", "shared"}
+            and outcome.token_repo is None
+        ),
         viewer_repo=outcome.token_repo,
         csrf_token=csrf,
         token_error=token_error,
@@ -1043,7 +1267,9 @@ async def dashboard(
     can scope itself (own tokens vs operator view).
     """
     token = _extract_bearer(authorization, request)
-    outcome = await _authenticate_bearer(request, token)
+    outcome = await _authenticate_bearer(
+        request, token, record_activity=False
+    )
     if outcome.ok:
         csrf, minted = _csrf_for_request(request)
         response = HTMLResponse(await _render_dashboard_for(outcome, csrf))
@@ -1820,8 +2046,8 @@ async def dashboard_tokens_create(
 ) -> Response:
     """Mint a per-engineer token from the dashboard's create form.
 
-    Form fields: ``engineer``, ``description``, ``expires_in``,
-    ``csrf_token``. Per-engineer sessions can only mint for
+    Form fields: ``engineer``, ``repo``, ``all_repos``, ``description``,
+    ``expires_in``, ``csrf_token``. Per-engineer sessions can only mint for
     themselves (the submitted engineer field is ignored) and, when
     their own session token expires, only tokens that expire no later
     -- self-service must never escalate lifetime. Shared-token
@@ -1855,6 +2081,49 @@ async def dashboard_tokens_create(
         if not engineer:
             return await _dashboard_with_token_error(
                 request, outcome, "Engineer is required to mint a token."
+            )
+
+    # Scoped sessions always pass their own scope through to child tokens;
+    # submitted repo/all_repos fields cannot widen it. Unscoped sessions
+    # must now choose a repository or explicitly opt into a fleet-wide
+    # credential. This keeps the dangerous legacy capability available for
+    # intentional operators without making it the dashboard's silent
+    # default.
+    new_token_repo: str | None
+    if outcome.token_repo is not None:
+        new_token_repo = outcome.token_repo
+    else:
+        requested_repo = _form_str(form, "repo")
+        all_repos_value = _form_str(form, "all_repos").lower()
+        explicit_all_repos = all_repos_value in {"1", "on", "true", "yes"}
+        if get_settings().require_scoped_token and explicit_all_repos:
+            return await _dashboard_with_token_error(
+                request,
+                outcome,
+                "This deployment requires repo-scoped tokens; choose one "
+                "repository instead of all repositories.",
+            )
+        if requested_repo and explicit_all_repos:
+            return await _dashboard_with_token_error(
+                request,
+                outcome,
+                "Choose either one repository or all repositories, not both.",
+            )
+        if requested_repo:
+            try:
+                new_token_repo = normalize_repo_id(requested_repo)
+            except InvalidRepoId as exc:
+                return await _dashboard_with_token_error(
+                    request, outcome, str(exc)
+                )
+        elif explicit_all_repos:
+            new_token_repo = None
+        else:
+            return await _dashboard_with_token_error(
+                request,
+                outcome,
+                "Repository is required. To mint a fleet-wide credential, "
+                "explicitly select all repositories.",
             )
 
     expires_at: datetime | None = None
@@ -1906,11 +2175,8 @@ async def dashboard_tokens_create(
             )
 
     # #30 slice 2/3: a repo-scoped session may only mint tokens bound to its
-    # own repo -- it must never be able to mint an unscoped (operator) token
-    # or one for another repo, which would be a privilege escalation. An
-    # operator (unscoped / shared) session has token_repo=None and keeps
-    # minting unscoped tokens as before.
-    new_token_repo = outcome.token_repo
+    # own repo -- it must never be able to mint an unscoped credential or one
+    # for another repo, which would be a privilege escalation.
     raw = generate_raw_token()
     token_id = await get_service().db.create_engineer_token(
         engineer,
@@ -2016,6 +2282,71 @@ async def dashboard_tokens_revoke(
                     )
     else:
         await db.revoke_engineer_token(token_id)
+
+    response = Response(status_code=303)
+    response.headers["Location"] = "/dashboard"
+    return response
+
+
+@app.post("/dashboard/hotspots/promote", response_class=HTMLResponse)
+async def dashboard_hotspot_promote(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """Apply one dashboard hotspot suggestion as an operator.
+
+    This form bridge gives the server-rendered dashboard a real action without
+    weakening the JSON API: it requires an authenticated shared/operator
+    session plus the dashboard's double-submit CSRF token. Repo-scoped
+    sessions are rejected because the ownership YAML mutation is
+    deployment-global; an unscoped per-engineer credential retains the same
+    global capability as the JSON endpoint in per-engineer-only deployments.
+    """
+    gate = await _authenticate_token_management(request, authorization)
+    if isinstance(gate, Response):
+        return gate
+    if gate.token_repo is not None:
+        return HTMLResponse(
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+            "<title>coord -- forbidden</title></head><body>"
+            "<p>Hotspot promotion requires an unscoped operator session.</p>"
+            "<p><a href=\"/dashboard\">back to dashboard</a></p>"
+            "</body></html>",
+            status_code=403,
+        )
+
+    form = await request.form()
+    csrf_value = form.get("csrf_token")
+    if not isinstance(csrf_value, str) or not _validate_dashboard_csrf(
+        request, csrf_value
+    ):
+        return _csrf_failure_response()
+
+    action = _form_str(form, "action")
+    pattern = _form_str(form, "pattern")
+    if action not in {"shared_file", "split"} or not pattern:
+        return HTMLResponse(
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+            "<title>coord -- invalid hotspot action</title></head><body>"
+            "<p>A hotspot action must name a pattern and use shared_file or "
+            "split.</p><p><a href=\"/dashboard\">back to dashboard</a></p>"
+            "</body></html>",
+            status_code=400,
+        )
+
+    try:
+        await get_service().promote_hotspot(
+            action=action, pattern=pattern, note=None
+        )
+    except ValueError as exc:
+        return HTMLResponse(
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+            "<title>coord -- hotspot action failed</title></head><body>"
+            f"<p>{html_mod.escape(str(exc))}</p>"
+            "<p><a href=\"/dashboard\">back to dashboard</a></p>"
+            "</body></html>",
+            status_code=400,
+        )
 
     response = Response(status_code=303)
     response.headers["Location"] = "/dashboard"
@@ -2192,11 +2523,14 @@ async def promote_hotspot(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # No ``repo`` in the response: the ownership YAML write is
+    # deployment-global (which is why the route is operator-only), so
+    # echoing a client-supplied repo would misrepresent the promotion as
+    # repo-scoped. Clients still sending the retired field are ignored.
     return {
         "ok": True,
         "action": body.action,
         "pattern": body.pattern,
-        "repo": body.repo,
         "patched_yaml": patched,
     }
 
@@ -2259,6 +2593,39 @@ async def conflicts(
     return result.model_dump()
 
 
+@app.post("/conflicts/batch")
+async def conflicts_batch(
+    body: ConflictBatchRequest,
+    request: Request,
+    _: None = Depends(require_auth),
+) -> dict:
+    """Check every pushed path in one HTTP request.
+
+    This is the body-based twin of ``GET /conflicts``.  It exists for the
+    managed pre-push hook, where hundreds of per-file network round-trips are
+    both slow and prone to request-line limits when encoded into one GET.
+    Authentication, repo-scope enforcement, session self-exclusion and GitHub
+    push-bounce reporting are intentionally identical to the legacy route.
+    """
+    repo = _effective_read_repo(
+        request,
+        body.repo,
+        all_repos=body.all_repos,
+    )
+    try:
+        result = await get_service().check_conflicts(
+            patterns=body.patterns,
+            engineer=body.engineer,
+            repo=repo,
+            all_repos=body.all_repos,
+            session_ids=body.session_ids,
+            pushing_branch=body.branch,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return result.model_dump()
+
+
 @app.post("/sessions/{session_id}/release")
 async def release_session(
     session_id: str,
@@ -2272,8 +2639,13 @@ async def release_session(
 
     A repo-scoped token releases only that repo's claims within the
     session (#30 slice 2/3), so it cannot tear down another repo's work
-    that happens to share a session id."""
-    n = await get_service().db.release_for_session(
+    that happens to share a session id.
+
+    Routed through the service layer (not db.release_for_session
+    directly) so every released claim drains its FIFO queue -- waiters
+    queued behind this session's claims are granted here exactly like
+    an explicit release would grant them."""
+    n = await get_service().release_session(
         session_id, repo=_token_repo(request)
     )
     return {"released": n}
@@ -2360,6 +2732,48 @@ async def respond_to_request(
 
     All transitions are audit-logged."""
     await _require_request_in_scope(request, request_id)
+    named_engineer = body.engineer
+    if (
+        named_engineer is None
+        and getattr(request.state, "auth_kind", None) == "per_engineer"
+    ):
+        # An omitted actor is not an impersonation attempt: the
+        # authenticated identity is acting. Defaulting it here (in both
+        # warn and enforce modes) keeps the standard MCP holder flow --
+        # which sends no ``engineer`` on respond -- working under the
+        # holder-authorization check below, and records a real identity
+        # in ``decided_by_engineer`` instead of NULL.
+        named_engineer = getattr(request.state, "engineer", None)
+    actor_engineer = _bind_mutation_engineer(
+        request, named_engineer, operation="respond to a release request"
+    )
+    # Holder authorization: only the target claim's holder may decide a
+    # request against it -- otherwise a requester could file a request
+    # and immediately self-approve it, releasing the holder's claim.
+    # Enforced at the API layer for per-engineer tokens; the shared
+    # operator token (and no-auth deployments) stays exempt so dashboard
+    # and operator flows keep working. The check compares the NAMED
+    # actor: with COORD_ENFORCE_ENGINEER_IDENTITY=enforce the actor is
+    # already bound to the token identity above, which closes the loop
+    # against a requester lying about who they are.
+    if getattr(request.state, "auth_kind", None) == "per_engineer":
+        exists, holder = await get_service().db.request_claim_holder(
+            request_id
+        )
+        if exists and holder is not None and actor_engineer != holder:
+            named_actor = (
+                f"engineer '{actor_engineer}'"
+                if actor_engineer is not None
+                else "no engineer"
+            )
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"Only the claim holder '{holder}' may respond to "
+                    f"this request; the response named {named_actor}. "
+                    "Operator (shared) tokens are exempt."
+                ),
+            )
     if body.decision not in ("approved", "denied", "narrowed", "coexist"):
         raise HTTPException(
             status_code=400,
@@ -2389,7 +2803,7 @@ async def respond_to_request(
         result = await get_service().respond_to_request(
             request_id=request_id,
             decision=body.decision,
-            actor_engineer=body.engineer,
+            actor_engineer=actor_engineer,
             actor_session_id=body.session_id,
             note=body.note,
             narrowed_pattern=body.narrowed_pattern,
@@ -2410,6 +2824,7 @@ async def list_requests(
     decision: str | None = Query(default=None),
     queued: bool = Query(default=False),
     state: str | None = Query(default=None),
+    session_id: str | None = Query(default=None),
     request: Request = None,  # type: ignore[assignment]
     _: None = Depends(require_auth),
 ) -> dict:
@@ -2424,16 +2839,29 @@ async def list_requests(
     (defaults to ``waiting``; pass an empty string is not supported --
     omit the param to keep the default). ``requester`` continues to
     apply, filtering queue rows by ``requester_engineer``.
+
+    ``session_id`` widens the ``queued=true`` requester filter: rows
+    whose ``requester_session_id`` matches are included even when their
+    ``requester_engineer`` differs from ``requester``, so an MCP client
+    whose engineer name changed since enqueue time still sees its own
+    queue entries. Ignored on the legacy (non-queued) branch, which
+    already scopes by requester name only.
     """
     token_repo = _token_repo(request)
     if queued:
+        # The repo filter is pushed into the query (claim_queue.repo is
+        # the requester's repo at enqueue time) so the LIMIT window is
+        # per-repo: on a shared multi-repo service with more live queue
+        # rows than the limit, filtering after the LIMIT would let other
+        # repos' rows crowd a scoped token's own entries out entirely.
         rows = await get_service().db.list_queued_with_holder(
             engineer=requester,
+            session_id=session_id,
             state=state or "waiting",
+            repo=token_repo,
         )
         if token_repo is not None:
-            # A scoped token only sees queue entries for its own repo
-            # (claim_queue.repo is the requester's repo at enqueue time).
+            # Belt-and-braces re-check of the SQL-side scope filter.
             rows = [r for r in rows if r.get("repo") == token_repo]
         out: list[dict] = []
         for r in rows:
@@ -2520,6 +2948,9 @@ async def cancel_request(
     False when the row was already terminal or unknown.
     """
     await _require_queue_in_scope(request, queue_id)
+    engineer = _bind_mutation_engineer(
+        request, engineer, operation="cancel a queued request"
+    )
     cancelled = await get_service().cancel_queue_request(
         queue_id, engineer=engineer
     )
@@ -2534,6 +2965,9 @@ async def delete_claim(
     _: None = Depends(require_auth),
 ) -> dict:
     await _require_claim_in_scope(request, claim_id)
+    engineer = _bind_mutation_engineer(
+        request, engineer, operation="release a claim"
+    )
     released = await get_service().release_claims([claim_id], engineer)
     return {"released": released}
 
@@ -2542,7 +2976,10 @@ async def delete_claim(
 async def release_claims(body: ReleaseClaimsRequest, request: Request, _: None = Depends(require_auth)) -> dict:
     for _cid in body.claim_ids:
         await _require_claim_in_scope(request, _cid)
-    released = await get_service().release_claims(body.claim_ids, body.engineer)
+    engineer = _bind_mutation_engineer(
+        request, body.engineer, operation="release claims"
+    )
+    released = await get_service().release_claims(body.claim_ids, engineer)
     return {"released": released}
 
 
@@ -2560,11 +2997,55 @@ async def extend_claim(
     return {"ok": True}
 
 
+# Ownership YAML files are a few KB; anything past this is a mistake or
+# abuse, and reading it fully into memory before parsing would let one
+# oversized upload balloon the process.
+OWNERSHIP_MAX_BODY_BYTES = 1 << 20  # 1 MiB
+
+
 @app.post("/config/ownership")
 async def set_ownership(request: Request, _: None = Depends(require_auth)) -> dict:
     _require_operator(request)
-    raw = await request.body()
-    text = raw.decode("utf-8")
+    # Bound the body read: check the declared Content-Length first for a
+    # fast 413 without consuming the stream, then enforce the same cap
+    # while streaming so a chunked body with no declared length cannot
+    # buffer unbounded either.
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            declared_len = int(declared)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail="Invalid Content-Length header"
+            ) from exc
+        if declared_len > OWNERSHIP_MAX_BODY_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    "Ownership YAML body exceeds the "
+                    f"{OWNERSHIP_MAX_BODY_BYTES}-byte limit"
+                ),
+            )
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > OWNERSHIP_MAX_BODY_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    "Ownership YAML body exceeds the "
+                    f"{OWNERSHIP_MAX_BODY_BYTES}-byte limit"
+                ),
+            )
+        chunks.append(chunk)
+    raw = b"".join(chunks)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(
+            status_code=400, detail="Ownership YAML must be valid UTF-8"
+        ) from exc
     try:
         rules = parse_ownership_yaml(text)
     except ValueError as exc:

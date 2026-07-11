@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
-from coordination.engine import compute_overlap
+from coordination.engine import _normalize_pattern, compute_overlap
 
 if TYPE_CHECKING:
     from coordination.db import Database
@@ -303,9 +303,16 @@ async def _classify_symbol_symbol(
     """
     holder_id = str(holder.get("id") or "")
     holder_symbols_rows = await db.get_claim_symbols(holder_id) if holder_id else []
+    # File paths on both sides are normalized to the engine's canonical
+    # spelling before they become dict keys. Intake canonicalizes new
+    # claims, but claim_symbols rows stored before that fix can still
+    # carry raw spellings ("./src/a.py"); without this defensive
+    # normalization two spellings of the same file compare as different
+    # keys and two claims on the same symbol silently auto-coexist.
+    # Normalization is idempotent, so canonical rows pass through as-is.
     holder_by_file: dict[str, list[SymbolPath]] = {}
     for row in holder_symbols_rows:
-        f = str(row["file_path"])
+        f = _normalize_pattern(str(row["file_path"]))
         parent = row.get("parent_symbol")
         parent_str: str | None = str(parent) if parent else None
         name = str(row["symbol_name"])
@@ -313,7 +320,9 @@ async def _classify_symbol_symbol(
 
     requester_by_file: dict[str, list[SymbolPath]] = {}
     for f, syms in requester_symbols_by_file.items():
-        requester_by_file[str(f)] = [parse_symbol_path(str(s)) for s in syms]
+        requester_by_file[_normalize_pattern(str(f))] = [
+            parse_symbol_path(str(s)) for s in syms
+        ]
 
     candidate_files: set[str]
     if overlapping_paths == ("<unknown>",) or not overlapping_paths:

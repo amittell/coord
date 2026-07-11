@@ -50,13 +50,15 @@ Dry run (prints the SQL it would apply and the psql command, writes nothing)::
     python3 scripts/migrate_tokens_ownership.py \\
         --sqlite /data/coordination.db \\
         --postgres-url "$COORD_DATABASE_URL" \\
+        --postgres-schema "$COORD_POSTGRES_SCHEMA" \\
         --dry-run
 
 Live import (pipes the generated SQL into psql, atomically)::
 
     python3 scripts/migrate_tokens_ownership.py \\
         --sqlite /data/coordination.db \\
-        --postgres-url "$COORD_DATABASE_URL"
+        --postgres-url "$COORD_DATABASE_URL" \\
+        --postgres-schema "$COORD_POSTGRES_SCHEMA"
 
 Self-test (builds a temporary SQLite, generates SQL, asserts invariants;
 no Postgres or psql required)::
@@ -67,6 +69,8 @@ no Postgres or psql required)::
 from __future__ import annotations
 
 import argparse
+import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -82,6 +86,8 @@ from pathlib import Path
 # else is refreshed from the source via ``EXCLUDED``.
 TOKEN_TABLE = "engineer_tokens"
 OWNERSHIP_TABLE = "ownership_config"
+DEFAULT_POSTGRES_SCHEMA = "coord"
+_POSTGRES_SCHEMA_RE = re.compile(r"[a-z_][a-z0-9_]{0,62}\Z")
 
 # The full Postgres column set, used purely for a sanity warning if the source
 # carries a column the target schema is not expected to have. The migration
@@ -100,13 +106,17 @@ EXPECTED_TOKEN_COLUMNS = (
     "request_count",
     "last_source_ip",
     "last_user_agent",
+    "repo",
 )
 EXPECTED_OWNERSHIP_COLUMNS = ("id", "yaml_text", "updated_at")
 
 # coord schema version this script was written against (matches
 # CURRENT_SCHEMA_VERSION in coordination/db.py at authoring time). Used only to
-# emit a warning if the source DB is newer than we know about.
-KNOWN_SCHEMA_VERSION = 18
+# emit a warning if the source DB is newer than we know about. Kept in lockstep
+# by tests/test_audit_coordination_hardening.py, which asserts equality against
+# coordination.db.CURRENT_SCHEMA_VERSION so this constant cannot silently
+# drift when a new migration lands.
+KNOWN_SCHEMA_VERSION = 19
 
 # Ephemeral tables that MUST never appear in the generated SQL. Asserted by the
 # self-test; documented here as the contract.
@@ -121,6 +131,39 @@ EPHEMERAL_TABLES = (
     "conflict_log",
     "webhook_outbox",
 )
+
+
+def validate_postgres_schema(value: str) -> str:
+    """Return a safe application schema name or raise ``ValueError``.
+
+    Keep this validator dependency-free and in lockstep with
+    ``coordination.config.validate_postgres_schema``: this migration is meant
+    to run with stock Python plus ``psql``, before the coord package is
+    necessarily installed.
+    """
+    if not _POSTGRES_SCHEMA_RE.fullmatch(value):
+        raise ValueError(
+            "Postgres schema must be a lowercase identifier: 1-63 "
+            "characters matching [a-z_][a-z0-9_]*"
+        )
+    if (
+        value == "public"
+        or value == "information_schema"
+        or value.startswith("pg_")
+    ):
+        raise ValueError(
+            "Postgres schema must not target a system schema "
+            "(public, information_schema, or pg_*)"
+        )
+    return value
+
+
+def _target_table(postgres_schema: str, table: str) -> str:
+    """Render a fully-qualified target table from validated identifiers."""
+    schema = validate_postgres_schema(postgres_schema)
+    # ``table`` is always one of the two module constants above, not source
+    # data. Quote both components so the import never depends on search_path.
+    return f'"{schema}"."{table}"'
 
 
 def _sql_literal(value: object) -> str:
@@ -182,6 +225,7 @@ def _render_upsert(
     columns: list[str],
     rows: list[tuple],
     *,
+    postgres_schema: str,
     conflict: tuple[str, ...],
     preserve: tuple[str, ...],
 ) -> str:
@@ -215,18 +259,23 @@ def _render_upsert(
         # conflict key, so a re-run is a no-op.
         on_conflict = f"ON CONFLICT ({conflict_cols}) DO NOTHING"
 
+    target = _target_table(postgres_schema, table)
     return (
         f"-- {table}: {len(rows)} row(s)\n"
-        f"INSERT INTO {table} ({col_list}) VALUES\n"
+        f"INSERT INTO {target} ({col_list}) VALUES\n"
         f"{values_sql}\n"
         f"{on_conflict};\n"
     )
 
 
-def build_sql(sqlite_path: Path) -> str:
+def build_sql(
+    sqlite_path: Path,
+    postgres_schema: str = DEFAULT_POSTGRES_SCHEMA,
+) -> str:
     """Open the source SQLite database read-only and build the full idempotent
     SQL script that imports engineer_tokens + ownership_config. Never writes to
     or creates the source file."""
+    postgres_schema = validate_postgres_schema(postgres_schema)
     if not sqlite_path.exists():
         raise FileNotFoundError(f"source SQLite database not found: {sqlite_path}")
 
@@ -274,6 +323,7 @@ def build_sql(sqlite_path: Path) -> str:
                     TOKEN_TABLE,
                     token_cols,
                     token_rows,
+                    postgres_schema=postgres_schema,
                     conflict=("token_sha256",),
                     # Preserve the existing target id on conflict so rotation
                     # chain pointers (rotated_from -> id) are never re-pointed.
@@ -300,6 +350,7 @@ def build_sql(sqlite_path: Path) -> str:
                     OWNERSHIP_TABLE,
                     own_cols,
                     own_rows,
+                    postgres_schema=postgres_schema,
                     conflict=("id",),
                     preserve=(),
                 )
@@ -315,6 +366,7 @@ def build_sql(sqlite_path: Path) -> str:
     header = [
         "-- coord HA durable-state migration",
         f"-- source SQLite: {sqlite_path}",
+        f"-- target Postgres schema: {postgres_schema}",
         "-- migrates: engineer_tokens, ownership_config (idempotent upserts)",
         "-- does NOT migrate ephemeral claim/queue/request/outbox state",
         "--",
@@ -384,7 +436,7 @@ def self_test() -> int:
             """
             CREATE TABLE schema_version (id INTEGER PRIMARY KEY CHECK (id = 1),
                 version INTEGER NOT NULL);
-            INSERT INTO schema_version (id, version) VALUES (1, 18);
+            INSERT INTO schema_version (id, version) VALUES (1, 19);
 
             CREATE TABLE engineer_tokens (
                 id TEXT PRIMARY KEY,
@@ -399,7 +451,8 @@ def self_test() -> int:
                 rotation_grace_until TEXT,
                 request_count INTEGER NOT NULL DEFAULT 0,
                 last_source_ip TEXT,
-                last_user_agent TEXT
+                last_user_agent TEXT,
+                repo TEXT
             );
 
             CREATE TABLE ownership_config (
@@ -416,12 +469,12 @@ def self_test() -> int:
             );
             """
         )
-        # Token with a single-quote in the description (escaping check) plus
-        # NULLs in the nullable columns.
+        # Token with a single-quote in the description (escaping check), a
+        # v19 repo scope, plus NULLs in the nullable columns.
         conn.execute(
             "INSERT INTO engineer_tokens (id, engineer, token_sha256, "
-            "description, created_at, request_count) VALUES "
-            "(?, ?, ?, ?, ?, ?)",
+            "description, created_at, request_count, repo) VALUES "
+            "(?, ?, ?, ?, ?, ?, ?)",
             (
                 "tok-1",
                 "alex",
@@ -429,6 +482,7 @@ def self_test() -> int:
                 "alex's laptop",
                 "2026-06-29T12:00:00Z",
                 7,
+                "amittell/coord",
             ),
         )
         conn.execute(
@@ -451,7 +505,9 @@ def self_test() -> int:
         conn.commit()
         conn.close()
 
-        sql = build_sql(db_path)
+        sql = build_sql(db_path, DEFAULT_POSTGRES_SCHEMA)
+        token_target = _target_table(DEFAULT_POSTGRES_SCHEMA, TOKEN_TABLE)
+        ownership_target = _target_table(DEFAULT_POSTGRES_SCHEMA, OWNERSHIP_TABLE)
 
         failures: list[str] = []
 
@@ -461,7 +517,7 @@ def self_test() -> int:
 
         check("BEGIN;" in sql and "COMMIT;" in sql, "missing transaction wrapper")
         check(
-            "INSERT INTO engineer_tokens" in sql,
+            f"INSERT INTO {token_target}" in sql,
             "missing engineer_tokens insert",
         )
         check(
@@ -469,7 +525,7 @@ def self_test() -> int:
             "missing/incorrect token conflict clause",
         )
         check(
-            "INSERT INTO ownership_config" in sql,
+            f"INSERT INTO {ownership_target}" in sql,
             "missing ownership_config insert",
         )
         check(
@@ -477,7 +533,7 @@ def self_test() -> int:
             "missing/incorrect ownership conflict clause",
         )
         # id must be preserved on token conflict (not in the SET list).
-        token_block = sql.split("INSERT INTO engineer_tokens", 1)[1].split(
+        token_block = sql.split(f"INSERT INTO {token_target}", 1)[1].split(
             ";", 1
         )[0]
         check(
@@ -487,6 +543,19 @@ def self_test() -> int:
         check(
             "engineer = EXCLUDED.engineer" in token_block,
             "token mutable columns should be refreshed on conflict",
+        )
+        # The v19 repo scope column migrates like any other source column.
+        check(
+            "repo = EXCLUDED.repo" in token_block,
+            "repo column should be refreshed on conflict",
+        )
+        check("'amittell/coord'" in sql, "repo scope value missing from insert")
+        # A source at the current schema must generate zero warnings: any
+        # WARNING here means EXPECTED_TOKEN_COLUMNS or KNOWN_SCHEMA_VERSION
+        # has drifted behind coordination/db.py.
+        check(
+            "-- WARNING:" not in sql,
+            "current-schema source should generate no header warnings",
         )
         # Single quotes doubled.
         check("'alex''s laptop'" in sql, "single-quote escaping failed")
@@ -499,12 +568,12 @@ def self_test() -> int:
             if line.startswith("INSERT INTO")
         ]
         check(
-            set(insert_targets) == {TOKEN_TABLE, OWNERSHIP_TABLE},
+            set(insert_targets) == {token_target, ownership_target},
             f"unexpected INSERT targets: {insert_targets}",
         )
         for table in EPHEMERAL_TABLES:
             check(
-                f"INTO {table}" not in sql and f"FROM {table}" not in sql,
+                f'INTO "{table}"' not in sql and f'FROM "{table}"' not in sql,
                 f"ephemeral table {table} leaked into migration SQL",
             )
 
@@ -541,6 +610,15 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--postgres-schema",
+        type=validate_postgres_schema,
+        default=os.environ.get("COORD_POSTGRES_SCHEMA", DEFAULT_POSTGRES_SCHEMA),
+        help=(
+            "target application schema (default: COORD_POSTGRES_SCHEMA or "
+            f"{DEFAULT_POSTGRES_SCHEMA!r}); must match the coord service"
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="print the SQL and the psql command that would run; change nothing",
@@ -570,8 +648,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--sqlite is required (or use --self-test)")
 
     try:
-        sql = build_sql(args.sqlite)
-    except (FileNotFoundError, RuntimeError, sqlite3.Error) as exc:
+        sql = build_sql(args.sqlite, args.postgres_schema)
+    except (FileNotFoundError, RuntimeError, ValueError, sqlite3.Error) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
@@ -597,7 +675,11 @@ def main(argv: list[str] | None = None) -> int:
 
     rc = run_psql(args.postgres_url, sql, args.psql_bin)
     if rc == 0:
-        print("durable-state migration applied successfully.", file=sys.stderr)
+        print(
+            "durable-state migration applied successfully to schema "
+            f"{args.postgres_schema!r}.",
+            file=sys.stderr,
+        )
     else:
         print(
             f"psql exited with code {rc}; migration NOT applied "

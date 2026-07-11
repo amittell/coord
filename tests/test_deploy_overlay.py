@@ -6,16 +6,19 @@
    ingress + secret sync in prod. We assert placeholders are ABSENT
    and the known-good concrete values are PRESENT.
 
-2. ``.mcp.json`` is a committed TEMPLATE -- a stale ``coord init`` run
-   that writes a real bearer token into the env block would leak it
-   to a public GitHub repo. We assert placeholders are PRESENT (or
-   the env block is absent) and that no real-looking token slipped in.
+2. ``.mcp.json`` is LOCAL machine config -- gitignored and untracked
+   under the v0.32 untracked-machine-config model, so it never exists
+   in a CI checkout and the guard below always skips there. The check
+   is a local-dev lint: on a machine where ``coord init`` has written
+   an ``.mcp.json``, it flags a real bearer token sitting in the env
+   block, because that file is one careless ``git add -f`` (or a
+   dropped ``.gitignore`` entry) away from a public GitHub repo.
 
 The wrapper's ``_load_local_env`` (see coordination/mcp_server.py)
 overrides placeholders with values from ``.coordination/local.env``
 on startup, so the placeholder-in-.mcp.json pattern is functionally
-correct -- this test just stops a future ``coord init`` against a
-configured local from accidentally committing the real token.
+correct -- this lint just stops a real token from accumulating in the
+local file at all.
 """
 
 from __future__ import annotations
@@ -67,10 +70,16 @@ def test_overlay_has_concrete_values(name: str, needles: tuple[str, ...]) -> Non
 
 
 def test_mcp_json_does_not_leak_real_token() -> None:
-    """``.mcp.json`` is a committed template. The env block (if present)
-    must use the documented ``set-me`` placeholder, never a real token."""
+    """Local-dev lint (see module docstring point 2): ``.mcp.json`` is
+    gitignored machine config, so this always skips in CI where the file
+    does not exist. On dev machines the env block (if present) must use
+    the documented ``set-me`` placeholder, never a real token, so the
+    file stays safe to un-ignore or force-add by mistake."""
     if not MCP_JSON.exists():
-        pytest.skip(".mcp.json not present")
+        pytest.skip(
+            ".mcp.json not present (gitignored machine config; expected "
+            "absent in CI -- this lint only runs on configured dev machines)"
+        )
     data = json.loads(MCP_JSON.read_text(encoding="utf-8"))
     env = data.get("mcpServers", {}).get("coord", {}).get("env", {})
     token = env.get("COORD_AUTH_TOKEN")
