@@ -7,6 +7,10 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+(none recorded yet)
+
+## [0.46.0] - 2026-07-11
+
 Repo-wide audit-fix campaign (2026-07-08). Behavior changes below; pure
 bug fixes and test hardening are listed after them.
 
