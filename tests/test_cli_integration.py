@@ -40,6 +40,7 @@ from coordination.cli_ops import _read_pid_record
 
 pytestmark = [
     pytest.mark.integration,
+    pytest.mark.platform,
     pytest.mark.skipif(
         sys.platform == "win32",
         reason="Integration tests use POSIX signals; Windows path is mock-tested in test_cli_ops.py.",

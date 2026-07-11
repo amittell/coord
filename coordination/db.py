@@ -883,8 +883,20 @@ class Database:
             return object.__new__(PostgresStore)
         return object.__new__(cls)
 
-    def __init__(self, path: Path, *, writer_queue: bool = False) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        writer_queue: bool = False,
+        postgres_schema: str | None = None,
+        postgres_schema_explicit: bool | None = None,
+    ) -> None:
         self.path = path
+        # Accepted so construction can be backend-neutral: service/CLI callers
+        # pass the configured PostgreSQL schema unconditionally. SQLite has no
+        # schema namespace, so the value is intentionally ignored here.
+        _ = postgres_schema
+        _ = postgres_schema_explicit
         # v0.44 scale: when True, all single-statement writes funnel through
         # one persistent connection under ``_writer_lock`` (see _write) instead
         # of a fresh connection per op, removing SQLite write-lock contention

@@ -91,6 +91,32 @@ docker run -d \
 
 The image is multi-arch (linux/amd64 + linux/arm64), keyless-signed with cosign, and ships SBOM + SLSA provenance attestations. Kubernetes manifests live under `deploy/k8s/` and `docs/deployment.md` has the full operator notes.
 
+### Optional PostgreSQL backend (beta)
+
+SQLite remains the recommended default. For a **fresh** install that needs
+multiple stateless coord replicas, install the optional driver and select a
+stable PostgreSQL schema:
+
+```bash
+python3 -m venv ~/.venvs/coord-postgres
+source ~/.venvs/coord-postgres/bin/activate
+pip install 'coord-mcp-server[postgres]'
+
+export COORD_AUTH_TOKEN="$(openssl rand -hex 32)"
+export COORD_DATABASE_URL='postgresql://coord:password@db.example.com:5432/coord'
+export COORD_POSTGRES_SCHEMA=coord
+coord-api
+```
+
+The database and role must already exist; the role needs permission to create
+the configured schema and its tables. Coord initializes an empty schema on
+first boot. The standard container intentionally excludes asyncpg, so Docker
+operators must build a distinct PostgreSQL-enabled image rather than setting
+the DSN on the normal image. Migrating an existing SQLite deployment is also
+not a config-only flip. See the [PostgreSQL deployment
+guide](docs/deployment.md#optional-postgresql-backend-beta) and the separate
+[hard-drain cutover runbook](docs/runbooks/coord-ha-cutover.md).
+
 ### Verify the install
 
 ```bash
@@ -501,7 +527,8 @@ Start with `docs/integrations/claude-code.md` if your team is primarily on Claud
 | `COORD_IDLE_TIMEOUT_SEC` | Session-tagged claims auto-release if the holder has been silent for this many seconds (added in v0.6.0). Set to `0` to disable idle expiration cluster-wide. Default: `1800` |
 | `COORD_ACTIVITY_PING_MIN_INTERVAL_SEC` | Activity-ping coalescing (v0.45): a session's liveness ping is written at most once per this many seconds instead of on every read, removing the dominant SQLite write load at high agent concurrency. Effective interval is clamped to `COORD_IDLE_TIMEOUT_SEC / 2` so misconfiguration can never cause false idle expiry. Set `0` to restore write-every-read. Default: `30` |
 | `COORD_SQLITE_WRITER_QUEUE` | In-process writer queue (v0.45): funnel hot-path writes through one persistent SQLite connection under an async lock, so concurrent writers queue in-process instead of fighting the write lock (no more dropped writes from `SQLITE_BUSY` on those paths). No-op on the Postgres backend. Set `false` to restore connection-per-op. Default: `true` |
-| `COORD_DATABASE_URL` | Storage backend selector (v0.44, dormant by default): unset/`sqlite://` keeps the standard SQLite file; a `postgresql://` DSN selects the Postgres HA backend. The live prod cutover is operator-gated -- see `docs/runbooks/coord-ha-cutover.md`. Default: unset |
+| `COORD_DATABASE_URL` | Optional beta backend selector: unset/`sqlite://` keeps SQLite; an exact `postgresql://` or `postgres://` DSN selects PostgreSQL and requires the `[postgres]` extra (the standard image does not include it). Fresh installs are supported; existing SQLite migration uses the operator-gated runbook. Default: unset |
+| `COORD_POSTGRES_SCHEMA` | Stable PostgreSQL schema shared by every service replica and operator CLI. Default: `coord`. Must match `[a-z_][a-z0-9_]{0,62}` and may not be `public`, `information_schema`, or start with `pg_`. PostgreSQL only. |
 | `COORD_REQUEST_TTL_SHORT_SEC` | When a release request is filed, the holder's claim TTL is clamped to `min(remaining, this)` (added in v0.9.0). Forces a near-term decision so a non-responsive holder can't sit on the scope. Default: `300` |
 | `COORD_AUTO_PROMOTE_THRESHOLD` | Hard auto-promote (v0.22): when a file's blocked-claim attempts cross this threshold within `COORD_AUTO_PROMOTE_WINDOW_DAYS`, the conflict pipeline writes a `shared_files` rule into `owners.yaml`. Default: `0` (disabled). |
 | `COORD_AUTO_PROMOTE_WINDOW_DAYS` | Rolling window (days) used by hard auto-promote when counting blocked-claim attempts (v0.22). Default: `7` |
@@ -576,6 +603,10 @@ Bypass a specific push with `git push --no-verify` (docs-only changes, etc.).
 ## Docker (build from source)
 
 Distinct from the published image used in [Install Option 3](#option-3-docker-self-hosted-server) above. This builds the image locally from the current checkout, which is what you want when iterating on the container itself.
+
+The default source build is SQLite-only. To run PostgreSQL, extend the image
+and install the pinned `requirements-postgres.txt` layer as shown in the
+[deployment guide](docs/deployment.md#postgresql-enabled-container).
 
 ```bash
 docker build -t coord:dev .

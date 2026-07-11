@@ -57,12 +57,19 @@ bug fixes and test hardening are listed after them.
   Rotate/revoke against a missing database file is a distinct exit-code-2
   error; `list` on a fresh install still exits 0 and no longer creates an
   empty database file as a side effect.
-- Postgres extra hardening: `requirements-postgres.txt` pins asyncpg into
-  the container image, `PostgresStore` fails fast with a clear error when
-  `COORD_DATABASE_URL` is set but asyncpg is not installed, CI smoke-tests
-  `import asyncpg` inside the built image, and the CI Postgres service
-  container is digest-pinned to the same build as the HA-cutover manifest
-  (enforced by a lockstep test).
+- Postgres extra hardening: `requirements-postgres.txt` pins asyncpg for
+  explicit PostgreSQL image builds while the standard production image stays
+  SQLite-only; PyPI users opt in with `coord-mcp-server[postgres]`.
+  `PostgresStore` fails fast with a clear error when `COORD_DATABASE_URL` is
+  set but asyncpg is not installed, and the CI Postgres service container is
+  digest-pinned to the same build as the HA-cutover manifest (enforced by a
+  lockstep test).
+- `COORD_POSTGRES_SCHEMA` gives service replicas and operator CLIs one stable
+  PostgreSQL namespace (default `coord`) instead of coupling production data
+  identity to a local SQLite path. Reserved/system names and invalid
+  identifiers fail before connecting. Upgrades also fail closed when an
+  implicit v0.44/v0.45 path-hashed schema is detected, with instructions to
+  select that data explicitly rather than silently opening an empty namespace.
 - Release workflow: manual dispatches refuse to overwrite an
   already-published version unless `overwrite=true` is passed.
 
@@ -166,6 +173,14 @@ bug fixes and test hardening are listed after them.
   placeholder model) and for previously shipped but undocumented
   surfaces (v0.17 recursive symbol nesting, v0.34 GitHub adapter env
   vars, v0.35 `coexist_symbols`, `GET /metrics/auto-resolutions`).
+
+### Fixed
+
+- The SQLite-to-PostgreSQL durable-state importer now targets an explicit
+  `--postgres-schema` (defaulting from `COORD_POSTGRES_SCHEMA`), schema-qualifies
+  its upserts, and validates the name before invoking psql. The cutover runbook
+  first initializes that exact schema with the selected coord release, so it
+  no longer imports unqualified tables into a nonexistent/default namespace.
 
 ## [0.45.0] - 2026-07-07
 

@@ -12,6 +12,11 @@ from coordination.assets import PRE_PUSH_SCRIPT
 from coordination.cli_init import _install_hook
 
 
+# Exercise the generated hook under native macOS bash and Windows Git Bash on
+# every PR; the rest of the suite stays on the cheaper Ubuntu runners.
+pytestmark = pytest.mark.platform
+
+
 def test_script_runs_conflict_check_when_token_is_empty() -> None:
     # The old script exited 0 with "COORD_TOKEN (or COORD_AUTH_TOKEN) not set;
     # skipping" whenever the token was empty, which silently disabled the

@@ -17,8 +17,9 @@ Covers:
   real SQLite schema, so the cutover runbook sees no false warnings.
 * ``.github/workflows/release.yml`` must guard manual dispatches against
   silently republishing an existing image version tag.
-* The CI test matrix must exercise every Python version advertised in
-  the pyproject classifiers.
+* Lean PR CI and weekly compatibility coverage together must exercise every
+  Python version advertised in the pyproject classifiers without duplicating
+  expensive full suites on every change.
 """
 
 from __future__ import annotations
@@ -263,6 +264,14 @@ class TestReleaseWorkflowDispatchGuard:
 
 
 class TestCiMatrixCoversClassifiers:
+    @staticmethod
+    def _workflow(name: str) -> dict:
+        return yaml.safe_load(
+            (REPO_ROOT / ".github" / "workflows" / name).read_text(
+                encoding="utf-8"
+            )
+        )
+
     def test_every_python_classifier_version_is_tested(self) -> None:
         pyproject = tomllib.loads(
             (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
@@ -273,16 +282,122 @@ class TestCiMatrixCoversClassifiers:
             if classifier.startswith("Programming Language :: Python :: 3.")
         }
 
-        ci = yaml.safe_load(
-            (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
-                encoding="utf-8"
-            )
-        )
-        matrix = ci["jobs"]["test"]["strategy"]["matrix"]["include"]
-        tested_versions = {str(leg["python-version"]) for leg in matrix}
+        ci = self._workflow("ci.yml")
+        pr_versions = {
+            str(version)
+            for version in ci["jobs"]["test"]["strategy"]["matrix"][
+                "python-version"
+            ]
+        }
+        compatibility = self._workflow("compatibility.yml")
+        weekly_versions = {
+            str(leg["python-version"])
+            for leg in compatibility["jobs"]["test"]["strategy"][
+                "matrix"
+            ]["include"]
+        }
+        tested_versions = pr_versions | weekly_versions
 
         missing = classifier_versions - tested_versions
         assert not missing, (
-            f"pyproject.toml advertises Python {sorted(missing)} but ci.yml "
-            "never tests them; add matrix legs or drop the classifiers"
+            f"pyproject.toml advertises Python {sorted(missing)} but neither "
+            "PR nor weekly compatibility CI tests them"
         )
+
+    def test_pr_full_suite_only_covers_floor_and_production(self) -> None:
+        ci = self._workflow("ci.yml")
+        versions = {
+            str(version)
+            for version in ci["jobs"]["test"]["strategy"]["matrix"][
+                "python-version"
+            ]
+        }
+        assert versions == {"3.11", "3.14"}
+        assert ci["jobs"]["test"]["runs-on"] == "ubuntu-latest"
+
+    def test_pr_platform_jobs_run_only_marked_smoke_tests(self) -> None:
+        ci = self._workflow("ci.yml")
+        platform = ci["jobs"]["platform"]
+        assert set(platform["strategy"]["matrix"]["os"]) == {
+            "macos-latest",
+            "windows-latest",
+        }
+        commands = "\n".join(
+            str(step.get("run") or "") for step in platform["steps"]
+        )
+        assert "pytest -q -m platform" in commands
+        assert ".[dev]" not in commands
+        assert "pytest-timeout" in commands
+
+    def test_quality_is_single_job_and_includes_otel(self) -> None:
+        ci = self._workflow("ci.yml")
+        commands = "\n".join(
+            str(step.get("run") or "")
+            for step in ci["jobs"]["quality"]["steps"]
+        )
+        assert "ruff check ." in commands
+        assert "mypy coordination" in commands
+        assert "pytest tests/test_otel.py -q" in commands
+        assert "otel" not in ci["jobs"]
+        assert "type-check" not in ci["jobs"]
+
+    def test_pr_ci_ignores_markdown_and_does_not_write_pip_caches(self) -> None:
+        ci = self._workflow("ci.yml")
+        triggers = ci.get("on") or ci.get(True)
+        assert triggers["pull_request"]["paths-ignore"] == ["**/*.md"]
+        setup_steps = [
+            step
+            for job in ci["jobs"].values()
+            for step in job.get("steps", [])
+            if str(step.get("uses") or "").startswith("actions/setup-python@")
+        ]
+        assert setup_steps
+        assert all("cache" not in step.get("with", {}) for step in setup_steps)
+
+    def test_docker_smoke_starts_authenticated_sqlite_service(self) -> None:
+        ci = self._workflow("ci.yml")
+        docker = ci["jobs"]["docker-build"]
+        commands = "\n".join(
+            str(step.get("run") or "")
+            for step in docker["steps"]
+        )
+        assert "--env COORD_AUTH_TOKEN=ci-smoke" in commands
+        assert "/readyz" in commands
+        assert "sqlite3.connect" in commands
+        assert "import asyncpg" not in commands
+        assert 'find_spec("asyncpg") is None' in commands
+        assert docker["env"]["DOCKER_BUILD_RECORD_UPLOAD"] == "false"
+
+    def test_every_ci_job_has_a_bounded_timeout(self) -> None:
+        for workflow_name in ("ci.yml", "compatibility.yml", "postgres.yml"):
+            workflow = self._workflow(workflow_name)
+            missing = [
+                name
+                for name, job in workflow["jobs"].items()
+                if "timeout-minutes" not in job
+            ]
+            assert not missing, f"{workflow_name} has unbounded jobs: {missing}"
+            assert all(
+                1 <= int(job["timeout-minutes"]) <= 30
+                for job in workflow["jobs"].values()
+            )
+
+    def test_postgres_path_gate_has_no_stale_explicit_paths(self) -> None:
+        postgres = self._workflow("postgres.yml")
+        triggers = postgres.get("on") or postgres.get(True)
+        paths = triggers["pull_request"]["paths"]
+        explicit_paths = [path for path in paths if not set(path) & set("*?[")]
+        missing = [path for path in explicit_paths if not (REPO_ROOT / path).exists()]
+        assert not missing, f"postgres workflow has stale paths: {missing}"
+        assert "schedule" in triggers
+        assert "workflow_dispatch" in triggers
+        assert "workflow_call" in triggers
+
+    def test_release_publish_jobs_require_real_postgres_gate(self) -> None:
+        release = self._workflow("release.yml")
+        jobs = release["jobs"]
+        assert jobs["postgres-gate"]["uses"] == (
+            "./.github/workflows/postgres.yml"
+        )
+        assert jobs["publish-image"]["needs"] == "postgres-gate"
+        assert jobs["publish-pypi"]["needs"] == "postgres-gate"

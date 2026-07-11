@@ -1,0 +1,104 @@
+name: postgres
+
+on:
+  pull_request:
+    paths:
+      - "coordination/db.py"
+      - "coordination/pg_backend.py"
+      - "coordination/config.py"
+      - "coordination/deps.py"
+      - "coordination/main.py"
+      - "coordination/service.py"
+      - "coordination/cli_engineers.py"
+      - "coordination/cli_outbox.py"
+      - "coordination/cli_tokens.py"
+      - "scripts/migrate_tokens_ownership.py"
+      - "deploy/k8s/ha-cutover/**"
+      - "requirements-postgres.txt"
+      - "pyproject.toml"
+      - "tests/conftest.py"
+      - "tests/test_pg_*.py"
+      - "tests/test_audit_coordination_db_*.py"
+      - "tests/test_audit_coordination_pg_*.py"
+      - "tests/test_audit_deploy_ha_cutover.py"
+      - "tests/test_audit_deploy_pg_image_lockstep.py"
+      - ".github/workflows/postgres.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "coordination/db.py"
+      - "coordination/pg_backend.py"
+      - "coordination/config.py"
+      - "coordination/deps.py"
+      - "coordination/main.py"
+      - "coordination/service.py"
+      - "coordination/cli_engineers.py"
+      - "coordination/cli_outbox.py"
+      - "coordination/cli_tokens.py"
+      - "scripts/migrate_tokens_ownership.py"
+      - "deploy/k8s/ha-cutover/**"
+      - "requirements-postgres.txt"
+      - "pyproject.toml"
+      - "tests/conftest.py"
+      - "tests/test_pg_*.py"
+      - "tests/test_audit_coordination_db_*.py"
+      - "tests/test_audit_coordination_pg_*.py"
+      - "tests/test_audit_deploy_ha_cutover.py"
+      - "tests/test_audit_deploy_pg_image_lockstep.py"
+      - ".github/workflows/postgres.yml"
+  schedule:
+    - cron: "41 5 * * 2"
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  # The extra suffix keeps a reusable call from sharing the caller's
+  # concurrency group (which would otherwise cancel the release workflow).
+  group: ${{ github.workflow }}-postgres-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-postgres:
+    name: full suite (postgres backend)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        # Keep this digest in lockstep with the HA cutover manifest.
+        image: postgres:16.14@sha256:be01cf82fc7dbba824acf0a82e150b4b360f3ff93c6631d7844af431e841a95c
+        env:
+          POSTGRES_USER: coord
+          POSTGRES_PASSWORD: coord
+          POSTGRES_DB: coord
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U coord"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: "3.14"
+
+      - name: Install project with dev and Postgres extras
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev,postgres]"
+
+      - name: Run full suite against Postgres
+        env:
+          COORD_DATABASE_URL: postgresql://coord:coord@localhost:5432/coord
+        run: pytest -q

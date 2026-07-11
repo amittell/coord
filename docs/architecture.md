@@ -9,7 +9,8 @@ flowchart LR
     A[Claude Code / Codex CLI / Cursor] --> B[coord-mcp stdio bridge]
     B --> C[FastAPI coordination service]
     D[curl / hooks / CI] --> C
-    C --> E[(SQLite)]
+    C --> E[(SQLite default)]
+    C -. optional beta .-> P[(PostgreSQL)]
     C --> F[HTML dashboard]
     C -. optional .-> G[Application repo checkout via COORD_REPO_ROOT]
 ```
@@ -28,7 +29,14 @@ The API handles:
 - readiness/metadata endpoints
 - dashboard rendering
 
-### SQLite database
+### Storage backends
+
+Every service path constructs the same `Database` interface. With no
+`COORD_DATABASE_URL`, that is the SQLite implementation below. A
+`postgresql://` or `postgres://` URL selects the optional PostgreSQL adapter,
+so the HTTP and MCP contracts do not change with the backend.
+
+#### SQLite (default)
 
 SQLite stores:
 
@@ -49,6 +57,26 @@ WAL mode is enabled so reads and writes behave better under normal team concurre
 Write path at scale (v0.45): reads open short-lived per-operation connections (WAL keeps them concurrent), while hot-path writes -- activity pings, claim release, and every `transaction()` unit-of-work including claim grants -- funnel through one persistent writer connection guarded by an in-process async lock (`COORD_SQLITE_WRITER_QUEUE`, default on). Concurrent writers queue in-process instead of fighting SQLite's single write lock, which eliminates `SQLITE_BUSY` failures on those paths under hundreds of concurrent agents. Complementing that, the liveness ping most reads used to write on every call is coalesced to once per `COORD_ACTIVITY_PING_MIN_INTERVAL_SEC` (default 30s, clamped to half the idle timeout) per session. Two counters -- `sqlite_writes_total` and `sqlite_writer_wait_seconds_total` -- expose write throughput and writer-lock contention.
 
 At startup the service takes an advisory `fcntl.flock` on `<database_path>.lock`, a sibling file in the same directory as the SQLite database. The lock is held for the process lifetime and auto-releases on exit, so a second coord process pointed at the same DB refuses to start with a clear error rather than silently racing on in-process caches. Set `COORD_DISABLE_INSTANCE_LOCK=true` to bypass (NFS-backed volumes, debugging). Note: flock is advisory and depends on the underlying filesystem honouring it. Native Linux kernels (production containers) enforce it across processes and containers; Docker Desktop on Mac and Windows does not propagate flock across containers sharing a host bind mount, so dev-time on those hosts should rely on orchestrator-level single-replica constraints instead.
+
+#### PostgreSQL (optional beta)
+
+`PostgresStore` subclasses the shared database implementation and translates
+its SQLite-shaped SQL through an asyncpg adapter. Transaction-scoped advisory
+locks serialize grants per repository and engineer, while a database leader
+lease ensures only one API replica runs cleanup and delivery loops. The
+service creates its tables and applies schema migrations on startup.
+
+The service and operator CLIs use one explicit PostgreSQL namespace,
+`COORD_POSTGRES_SCHEMA` (default `coord`), rather than deriving storage identity
+from a local SQLite path. Every replica must use the same value. A different
+schema gives an intentionally isolated coord dataset within the same database;
+reserved/system schema names are rejected before connecting.
+
+This backend is intended for fresh third-party installs that require stateless
+API replicas. It is opt-in: Python installs need the `[postgres]` extra, and
+the standard production container deliberately excludes asyncpg. Migrating an
+existing SQLite deployment is a separate hard-drain operation, not a config-only
+flip; see the operator-gated cutover runbook.
 
 ### MCP bridge
 
@@ -186,10 +214,8 @@ Less ideal:
 - strict transactional guarantees across many concurrent writers
 - cross-region HA requirements
 
-If you outgrow SQLite even with the v0.45 write-scaling, that replacement
-already exists: a Postgres backend (`coordination/pg_backend.py`, a `Database`
-subclass that translates the SQLite dialect on the fly and serialises grants
-with per-repo `pg_advisory_xact_lock`) supports stateless multi-replica HA. It
-ships dormant -- selected only by a `postgresql://` `COORD_DATABASE_URL`, with
-an operator-gated cutover (`docs/runbooks/coord-ha-cutover.md`) -- and the
-HTTP and MCP contracts are identical on both backends.
+If you outgrow SQLite even with the v0.45 write-scaling, the optional
+PostgreSQL backend supports stateless multi-replica coord. It remains beta and
+does not make the database tier itself highly available. Fresh installs can
+select it explicitly; existing SQLite deployments must use the operator-gated
+hard-drain cutover (`docs/runbooks/coord-ha-cutover.md`).

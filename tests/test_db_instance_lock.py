@@ -12,6 +12,11 @@ import pytest
 from coordination import db as db_mod
 
 
+# The implementation deliberately differs between POSIX flock and the
+# Windows no-op sentinel, so these tests are high-value platform smoke.
+pytestmark = pytest.mark.platform
+
+
 # fcntl.flock is POSIX-only. On Windows, acquire_instance_lock is a
 # documented no-op that returns a sentinel. The tests below actively
 # exercise the flock semantics (real fd, cross-process contention) so

@@ -14,6 +14,11 @@ import pytest
 from coordination import cli, cli_ops
 
 
+# This module owns the CLI's POSIX/Windows process dispatch, signal behavior,
+# and OS-facing status paths. Keep it in the small per-PR platform smoke set.
+pytestmark = pytest.mark.platform
+
+
 def _make_repo(root: Path) -> Path:
     repo = root / "app"
     (repo / ".git" / "hooks").mkdir(parents=True)

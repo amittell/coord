@@ -3855,6 +3855,11 @@ class CoordinationService:
 def build_service() -> CoordinationService:
     s = get_settings()
     return CoordinationService(
-        db=Database(s.database_path, writer_queue=s.sqlite_writer_queue),
+        db=Database(
+            s.database_path,
+            writer_queue=s.sqlite_writer_queue,
+            postgres_schema=s.postgres_schema,
+            postgres_schema_explicit=s.postgres_schema_is_explicit,
+        ),
         settings=s,
     )

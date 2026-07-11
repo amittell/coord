@@ -22,6 +22,11 @@ import pytest
 from coordination.assets import PRE_PUSH_SCRIPT
 
 
+# These regressions specifically cover POSIX permissions/liveness and their
+# Windows-safe fallbacks, so they belong in the targeted platform smoke set.
+pytestmark = pytest.mark.platform
+
+
 def _require_bash() -> str:
     bash = shutil.which("bash")
     if not bash:

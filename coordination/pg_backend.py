@@ -19,12 +19,13 @@ unserialized) and ``'eng:'||engineer`` (design 5.3) respectively. The
 single-leader lease (:meth:`acquire_leader_lease`, design Section 6) keeps
 the background loops on exactly one replica.
 
-Isolation: each :class:`PostgresStore` instance derives a private
-PostgreSQL *schema* from its ``path`` so that tests pointed at distinct
-temp paths never see each other's rows (the SQLite tests rely on a fresh
-file per ``tmp_path``); two stores on the same path share a schema, which
-is exactly the SQLite same-file semantics. The advisory-lock keys fold in
-the schema name so locks never collide across isolated schemas.
+Schema selection: application entry points pass the validated
+``COORD_POSTGRES_SCHEMA`` setting (stable default: ``coord``), so replicas and
+operator commands share one explicit schema independent of the vestigial
+SQLite path. Low-level/test construction that omits ``postgres_schema`` keeps
+the historical path-derived private schema: tests pointed at distinct temp
+paths never see each other's rows. Advisory-lock keys fold in the selected
+schema so locks never collide across isolated schemas.
 
 Backend selection is by ``COORD_DATABASE_URL`` (``postgresql://``); the
 default SQLite path is byte-for-byte unchanged.
@@ -51,6 +52,7 @@ except ModuleNotFoundError:  # the driver is only needed for the Postgres
     # with only [dev] installed can still exercise the translation tests.
     asyncpg = None
 
+from coordination.config import POSTGRES_SCHEMA_DEFAULT, validate_postgres_schema
 from coordination.db import _BOUND_CONN, Database
 
 # Fixed seed for hashtextextended(text, int8). The advisory-lock namespace
@@ -780,7 +782,14 @@ class _PGConnAdapter:
 class PostgresStore(Database):
     """asyncpg-backed :class:`Database` (design Sections 5-7)."""
 
-    def __init__(self, path: Path, *, writer_queue: bool = False) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        writer_queue: bool = False,
+        postgres_schema: str | None = None,
+        postgres_schema_explicit: bool | None = None,
+    ) -> None:
         # Fail fast at construction (i.e. at service startup) with a clear
         # error when the PG backend is selected but the driver is missing;
         # otherwise the first pool build dies later with an opaque
@@ -792,9 +801,9 @@ class PostgresStore(Database):
                 "extra (pip install 'coord-mcp-server[postgres]') or unset "
                 "COORD_DATABASE_URL to run on SQLite."
             )
-        # ``writer_queue`` is accepted for signature compatibility with
-        # ``Database(path, writer_queue=...)`` construction and deliberately
-        # IGNORED: the in-process writer serialization is a SQLite
+        # ``writer_queue`` / ``postgres_schema`` are accepted for signature
+        # compatibility with backend-neutral ``Database(...)`` construction.
+        # The in-process writer serialization is a SQLite
         # single-writer concern; Postgres is MVCC and its writes must not be
         # serialized through one connection (nor touch the SQLite-specific
         # shared-writer plumbing). super() is called without it so the
@@ -803,7 +812,25 @@ class PostgresStore(Database):
         url = os.environ.get("COORD_DATABASE_URL", "")
         # asyncpg understands postgresql:// and postgres:// DSNs directly.
         self._dsn = url
-        self._schema = _schema_for_path(path)
+        # Service and operator CLI paths pass Settings.postgres_schema, whose
+        # stable default is ``coord``. Honour an explicitly exported env value
+        # for low-level callers too. With neither, retain path-derived schemas
+        # solely for the existing test harness and low-level compatibility.
+        configured_schema = postgres_schema
+        if configured_schema is None:
+            configured_schema = os.environ.get("COORD_POSTGRES_SCHEMA")
+        self._schema = (
+            validate_postgres_schema(configured_schema)
+            if configured_schema is not None
+            else _schema_for_path(path)
+        )
+        if postgres_schema_explicit is None:
+            self._postgres_schema_explicit = (
+                postgres_schema is not None
+                or "COORD_POSTGRES_SCHEMA" in os.environ
+            )
+        else:
+            self._postgres_schema_explicit = postgres_schema_explicit
         self._inited = False
         self._init_lock = asyncio.Lock()
 
@@ -832,6 +859,7 @@ class PostgresStore(Database):
                         f"{self._schema}:__init__",
                         _NS_SEED,
                     )
+                    await self._refuse_implicit_legacy_schema(raw)
                     await raw.execute(
                         f'CREATE SCHEMA IF NOT EXISTS "{self._schema}"'
                     )
@@ -851,6 +879,61 @@ class PostgresStore(Database):
                         # and every post-upgrade feature fails at runtime.
                         await self._apply_pending_migrations(raw)
             self._inited = True
+
+    async def _refuse_implicit_legacy_schema(
+        self, raw: asyncpg.Connection
+    ) -> None:
+        """Prevent a beta-backend upgrade from appearing to lose all data.
+
+        v0.44/v0.45 derived a private schema from ``COORD_DATABASE_PATH``.
+        The stable default is now ``coord``. If an operator has not made an
+        explicit choice and any legacy schema still contains coord's version
+        table, creating/using ``coord`` could expose an apparently empty
+        installation. Fail before DDL and tell the operator how to choose.
+        """
+        if (
+            self._postgres_schema_explicit
+            or self._schema != POSTGRES_SCHEMA_DEFAULT
+        ):
+            return
+        exact_legacy = _schema_for_path(self.path)
+        rows = await raw.fetch(
+            "SELECT n.nspname "
+            "FROM pg_namespace AS n "
+            "JOIN pg_class AS c ON c.relnamespace = n.oid "
+            "WHERE n.nspname ~ '^coord_[0-9a-f]{24}$' "
+            "AND c.relname = 'schema_version' "
+            "AND c.relkind IN ('r', 'p') "
+            "ORDER BY (n.nspname = $1) DESC, n.nspname "
+            "LIMIT 21",
+            exact_legacy,
+        )
+        candidates = [str(row["nspname"]) for row in rows[:20]]
+        if not candidates:
+            return
+        rendered_candidates = ", ".join(repr(name) for name in candidates)
+        if len(rows) > 20:
+            rendered_candidates += ", ..."
+        if exact_legacy in candidates:
+            guidance = (
+                "The candidate matching the current COORD_DATABASE_PATH is "
+                f"{exact_legacy!r}; verify it, then set "
+                f"COORD_POSTGRES_SCHEMA={exact_legacy}."
+            )
+        else:
+            guidance = (
+                "None matches the current COORD_DATABASE_PATH, so the source "
+                "installation is ambiguous. Inspect the candidates and set "
+                "COORD_POSTGRES_SCHEMA only to the verified schema."
+            )
+        raise RuntimeError(
+            "existing legacy coord PostgreSQL schema candidate(s) detected "
+            "while COORD_POSTGRES_SCHEMA is unset; refusing to select the "
+            "new default 'coord' because it could expose the wrong dataset. "
+            f"Candidates: {rendered_candidates}. {guidance} Alternatively, "
+            "deliberately migrate/rename the verified schema to 'coord' and "
+            "then set COORD_POSTGRES_SCHEMA=coord."
+        )
 
     async def _apply_pending_migrations(self, raw: asyncpg.Connection) -> None:
         """Apply every ``MIGRATIONS`` entry newer than the stamped

@@ -17,16 +17,13 @@ ENV PATH="/opt/venv/bin:$PATH"
 # Install pinned runtime dependencies first for better layer caching.
 # requirements-otel.txt bundles the OPTIONAL OpenTelemetry tracing stack so
 # COORD_OTEL_ENABLED can be toggled at runtime without rebuilding; drop that
-# -r for a slimmer, tracing-less image. requirements-postgres.txt bundles
-# the asyncpg driver so this same image can serve the Postgres backend when
-# COORD_DATABASE_URL is set (the HA-cutover manifest set in
-# deploy/k8s/ha-cutover/ depends on this -- an image without asyncpg
-# CrashLoops at startup once COORD_DATABASE_URL points at Postgres).
-COPY requirements.txt requirements-otel.txt requirements-postgres.txt /build/
+# -r for a slimmer, tracing-less image. The default production image remains
+# SQLite-only and deliberately does NOT install requirements-postgres.txt;
+# PostgreSQL operators build an explicit variant with that optional driver.
+COPY requirements.txt requirements-otel.txt /build/
 RUN pip install --upgrade pip && \
     pip install -r /build/requirements.txt \
-        -r /build/requirements-otel.txt \
-        -r /build/requirements-postgres.txt
+        -r /build/requirements-otel.txt
 
 # Install the app itself with no deps - they are already pinned above.
 COPY pyproject.toml README.md /build/

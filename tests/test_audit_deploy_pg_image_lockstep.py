@@ -1,9 +1,9 @@
 """Audit: CI and the HA-cutover manifest must run the same Postgres build.
 
-The CI ``test-postgres`` job's service container and the cutover
+The PostgreSQL workflow's service container and the cutover
 StatefulSet (deploy/k8s/ha-cutover/postgres.yaml) are both pinned to a
 minor version + digest. If either side drifts, CI stops exercising the
-exact Postgres build prod runs and the pin comment in ci.yml becomes a
+exact Postgres build prod runs and the pin comment in postgres.yml becomes a
 lie. This lockstep test fails the build until both are bumped together.
 """
 
@@ -15,21 +15,21 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
-CI_YML = ROOT / ".github" / "workflows" / "ci.yml"
+POSTGRES_YML = ROOT / ".github" / "workflows" / "postgres.yml"
 PG_MANIFEST = ROOT / "deploy" / "k8s" / "ha-cutover" / "postgres.yaml"
 
 _PINNED = re.compile(r"^postgres:\d+\.\d+@sha256:[0-9a-f]{64}$")
 
 
 def _ci_postgres_image() -> str:
-    doc = yaml.safe_load(CI_YML.read_text(encoding="utf-8"))
+    doc = yaml.safe_load(POSTGRES_YML.read_text(encoding="utf-8"))
     for job in doc["jobs"].values():
         services = job.get("services") or {}
         pg = services.get("postgres")
         if pg:
             return str(pg["image"])
     raise AssertionError(
-        "no job in .github/workflows/ci.yml declares a postgres service "
+        "no job in .github/workflows/postgres.yml declares a postgres service "
         "container; the test-postgres job is expected to."
     )
 
@@ -76,6 +76,6 @@ def test_ci_and_manifest_postgres_images_match() -> None:
     manifest_image = _manifest_postgres_image()
     assert ci_image == manifest_image, (
         f"CI runs {ci_image!r} but the cutover manifest deploys "
-        f"{manifest_image!r}. Bump both together (the ci.yml pin comment "
+        f"{manifest_image!r}. Bump both together (the postgres.yml pin comment "
         "promises they match)."
     )

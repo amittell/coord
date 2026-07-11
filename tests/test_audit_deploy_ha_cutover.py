@@ -3,10 +3,10 @@
 Locks in the fixes for the 2026-07 audit findings against
 ``deploy/k8s/ha-cutover/`` and ``docs/runbooks/coord-ha-cutover.md``:
 
-1. The container image must bundle asyncpg (requirements-postgres.txt
-   installed by the Dockerfile) so the cutover Deployment's
-   ``COORD_DATABASE_URL`` does not CrashLoop the fleet on an image that
-   cannot speak Postgres.
+1. The default container image must stay SQLite-only, while
+   ``requirements-postgres.txt`` remains pinned for an explicitly built
+   PostgreSQL image. The cutover manifest must warn operators not to point
+   the standard image at ``COORD_DATABASE_URL``.
 2. ``postgres.yaml`` must NOT bundle the stub coord-pg Secret: the runbook
    ``kubectl apply``s that file verbatim, and a bundled stub would clobber
    the real credentials with replace-me placeholders. The stub lives in
@@ -36,7 +36,7 @@ REQ_POSTGRES = REPO_ROOT / "requirements-postgres.txt"
 
 
 # ---------------------------------------------------------------------------
-# 1. The image can speak Postgres: asyncpg is pinned and installed.
+# 1. PostgreSQL is opt-in: the pin exists, but the default image stays lean.
 # ---------------------------------------------------------------------------
 
 
@@ -49,36 +49,59 @@ def test_requirements_postgres_pins_asyncpg() -> None:
     ]
     assert any(re.fullmatch(r"asyncpg==\d+\.\d+(\.\d+)?", p) for p in pins), (
         "requirements-postgres.txt must pin asyncpg exactly (asyncpg==X.Y.Z); "
-        f"got {pins!r}. Without it the container image cannot serve the "
-        "Postgres backend and the HA-cutover Deployment CrashLoops."
+        f"got {pins!r}. Explicit PostgreSQL builds need a reproducible driver "
+        "layer even though the default image does not install it."
     )
 
 
-def test_dockerfile_installs_postgres_requirements() -> None:
+def test_default_dockerfile_excludes_postgres_requirements() -> None:
     text = DOCKERFILE.read_text(encoding="utf-8")
     copy_lines = [
         line for line in text.splitlines() if line.startswith("COPY")
     ]
-    assert any("requirements-postgres.txt" in line for line in copy_lines), (
-        "Dockerfile must COPY requirements-postgres.txt into the builder "
-        "stage so the image bundles asyncpg."
+    assert all("requirements-postgres.txt" not in line for line in copy_lines), (
+        "The default Dockerfile must not COPY requirements-postgres.txt; "
+        "PostgreSQL is an explicit image/package extra."
     )
-    # The pip install command spans continuation lines; match on the raw text.
-    assert re.search(r"pip install[^&]*-r /build/requirements-postgres\.txt", text), (
-        "Dockerfile must `pip install -r /build/requirements-postgres.txt` so "
-        "the release image can speak Postgres when COORD_DATABASE_URL is set "
-        "(deploy/k8s/ha-cutover/deployment.yaml depends on this)."
+    assert not re.search(
+        r"pip install[^&]*-r /build/requirements-postgres\.txt", text
+    ), (
+        "The standard release image must remain SQLite-only; build a separate "
+        "PostgreSQL image when COORD_DATABASE_URL will be set."
     )
 
 
 def test_cutover_deployment_warns_about_asyncpg_repin() -> None:
-    """The pinned v0.45.0 image predates asyncpg in the image; the manifest
-    must carry the repin warning so cutover step 0 cannot repin to another
-    asyncpg-less release."""
+    """The standard release image intentionally excludes asyncpg; the
+    manifest must require an explicit PostgreSQL-enabled image."""
     text = (HA_DIR / "deployment.yaml").read_text(encoding="utf-8")
-    assert "asyncpg" in text, (
-        "ha-cutover deployment.yaml must warn that the image pin needs a "
-        "release whose image bundles asyncpg (v0.45.0 and earlier do not)."
+    assert "asyncpg" in text and "PostgreSQL-enabled" in text, (
+        "ha-cutover deployment.yaml must warn that the standard image omits "
+        "asyncpg and require an explicitly PostgreSQL-enabled image."
+    )
+    docs = yaml.safe_load_all(text)
+    deployment = next(d for d in docs if d and d.get("kind") == "Deployment")
+    image = deployment["spec"]["template"]["spec"]["containers"][0]["image"]
+    assert "REPLACE_WITH_REVIEWED_IMAGE" in image
+    assert not image.startswith("ghcr.io/amittell/coord:"), (
+        "The unapplied HA template must fail closed, not carry a real standard "
+        "SQLite image that will CrashLoop when COORD_DATABASE_URL is set."
+    )
+
+
+def test_cutover_deployment_sets_stable_postgres_schema() -> None:
+    docs = yaml.safe_load_all(
+        (HA_DIR / "deployment.yaml").read_text(encoding="utf-8")
+    )
+    deployment = next(d for d in docs if d and d.get("kind") == "Deployment")
+    env = deployment["spec"]["template"]["spec"]["containers"][0]["env"]
+    schema = next(
+        (item.get("value") for item in env if item.get("name") == "COORD_POSTGRES_SCHEMA"),
+        None,
+    )
+    assert schema == "coord", (
+        "The HA deployment must pin COORD_POSTGRES_SCHEMA=coord so every "
+        "replica and the migration runbook address the same durable namespace."
     )
 
 
@@ -133,6 +156,69 @@ def test_runbook_never_applies_the_example_secret() -> None:
         "The runbook preconditions should point operators at "
         "secret.example.yaml for the required coord-pg keys."
     )
+
+
+def test_runbook_bootstraps_and_migrates_one_explicit_schema() -> None:
+    text = RUNBOOK.read_text(encoding="utf-8")
+    bootstrap = 'asyncio.run(build_service().db.init())'
+    first_import = "python3 scripts/migrate_tokens_ownership.py"
+    assert bootstrap in text
+    assert text.index(bootstrap) < text.index(first_import), (
+        "The target PostgreSQL schema/tables must be initialized before the "
+        "durable-state importer addresses them."
+    )
+    assert "COORD_POSTGRES_SCHEMA=\"$PG_SCHEMA\"" in text
+    assert text.count('--postgres-schema "$PG_SCHEMA"') >= 3
+    assert "${PG_SCHEMA}.engineer_tokens" in text
+    assert '"<PG_SCHEMA>"."engineer_tokens"' in text
+    assert "Unqualified target tables are a failure" in text
+
+
+def test_runbook_uses_a_local_port_forward_for_operator_postgres_commands() -> None:
+    text = RUNBOOK.read_text(encoding="utf-8")
+    bootstrap = text.index('asyncio.run(build_service().db.init())')
+    forward = text.index("port-forward pod/coord-postgres-0")
+    assert "@127.0.0.1:15432/coord" in text
+    assert "PG_FORWARD_PID=$!" in text
+    assert forward < bootstrap
+
+
+def test_runbook_imports_a_fresh_post_drain_snapshot() -> None:
+    text = RUNBOOK.read_text(encoding="utf-8")
+    assert "set -euo pipefail" in text
+    assert "same Bash session" in text
+    hard_cutover = text.index("## 4. Hard cutover")
+    verify = text.index("## 5. Verify")
+    cutover = text[hard_cutover:verify]
+    disable_argocd = cutover.index("patch application coord-prod")
+    scale_down = cutover.index("scale deploy/coord --replicas=0")
+    pods_deleted = cutover.index("wait_for_no_coord_pods", scale_down)
+    final_snapshot = cutover.index("coordination.final-cutover.db")
+    final_import = cutover.index("--sqlite ./coordination.final-cutover.db")
+    assert disable_argocd < scale_down < pods_deleted < final_snapshot < final_import
+    assert "persistentVolumeClaim:" in cutover
+    assert "claimName: coord-data" in cutover
+    assert "--sqlite ./coordination.pre-cutover.db" not in cutover
+
+
+def test_runbook_waits_for_postgres_pods_to_delete_before_rollback() -> None:
+    text = RUNBOOK.read_text(encoding="utf-8")
+    rollback = text[text.index("## 6. Rollback") :]
+    disable_argocd = rollback.index("patch application coord-prod")
+    scale_down = rollback.index("scale deploy/coord --replicas=0")
+    pods_deleted = rollback.index("wait_for_no_coord_pods", scale_down)
+    sqlite_apply = rollback.index('apply -f "$SQLITE_ROLLBACK_MANIFEST"')
+    assert disable_argocd < scale_down < pods_deleted < sqlite_apply
+
+
+def test_runbook_freezes_durable_mutations_for_executable_rollback() -> None:
+    text = RUNBOOK.read_text(encoding="utf-8")
+    assert "Token create/rotate/revoke and ownership-config changes are frozen" in text
+    assert 'test -s "$SQLITE_ROLLBACK_MANIFEST"' in text
+    assert "post-cutover-tokens.txt" not in text
+    rollback = text[text.index("## 6. Rollback") :]
+    assert "partial token dump" in rollback
+    assert "rollback guarantee is no longer valid" in rollback
 
 
 # ---------------------------------------------------------------------------

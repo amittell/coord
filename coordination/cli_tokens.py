@@ -104,6 +104,16 @@ def _db_path(args: argparse.Namespace | None = None) -> Path:
     return Path(override) if override else Path(get_settings().database_path)
 
 
+def _database(path: Path) -> Database:
+    """Open the configured backend, including its explicit PG schema."""
+    settings = get_settings()
+    return Database(
+        path,
+        postgres_schema=settings.postgres_schema,
+        postgres_schema_explicit=settings.postgres_schema_is_explicit,
+    )
+
+
 def _display_db_path(path: Path) -> Path:
     return path if path.is_absolute() else (Path.cwd() / path).resolve()
 
@@ -312,7 +322,7 @@ async def _create(args: argparse.Namespace) -> int:
         return 1
     if _refuse_implicit_remote_mode_local_create(args):
         return 1
-    db = Database(_db_path(args))
+    db = _database(_db_path(args))
     raw = generate_raw_token()
     token_id = await db.create_engineer_token(
         args.engineer,
@@ -370,7 +380,7 @@ async def _rotate(args: argparse.Namespace) -> int:
         return 2
     now = datetime.now(UTC)
     expires_at = now + expires_delta if expires_delta else None
-    db = Database(db_path)
+    db = _database(db_path)
     token_id = await _resolve_token_id(db, args.token_id)
     if token_id is None:
         return 1
@@ -445,7 +455,7 @@ async def _list(args: argparse.Namespace) -> int:
             )
             print(f"No tokens issued{scope}.")
         return 0
-    db = Database(db_path)
+    db = _database(db_path)
     rows = await db.list_engineer_tokens(
         engineer=args.engineer,
         include_revoked=args.include_revoked,
@@ -496,7 +506,7 @@ async def _revoke(args: argparse.Namespace) -> int:
     if _sqlite_db_missing(db_path):
         _missing_db_error(db_path)
         return 2
-    db = Database(db_path)
+    db = _database(db_path)
     token_id = await _resolve_token_id(db, args.token_id)
     if token_id is None:
         return 1

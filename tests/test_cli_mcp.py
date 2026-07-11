@@ -23,6 +23,11 @@ from coordination import cli_mcp
 from coordination.cli import build_parser
 
 
+# MCP client configuration paths and permission handling differ across
+# macOS/Windows; retain this focused installer coverage on both PR runners.
+pytestmark = pytest.mark.platform
+
+
 # ---------------------------------------------------------------------------
 # fixtures + helpers
 # ---------------------------------------------------------------------------

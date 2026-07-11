@@ -22,10 +22,12 @@ Until every raw call site is migrated, a **transitional deprecation shim**
 below keeps the un-migrated ones working on PG by redirecting
 ``aiosqlite.connect`` -- only when the PG backend is selected -- to a
 connection bound to the same PG schema the ``PostgresStore`` for that path
-uses (schema is derived deterministically from the path). The shim is
-deprecated: it structurally masks the raw-SQLite seam-bypass bug class (a
-production module reaching past ``Database`` to SQLite looks fine on PG only
-because this shim silently reroutes it). Set
+uses. An autouse fixture gives every test a unique valid
+``COORD_POSTGRES_SCHEMA`` so application constructors that use the stable
+production schema default remain isolated too. The shim is deprecated: it
+structurally masks the raw-SQLite seam-bypass bug class (a production module
+reaching past ``Database`` to SQLite looks fine on PG only because this shim
+silently reroutes it). Set
 ``COORD_TEST_DISABLE_AIOSQLITE_SHIM=1`` to prove a migrated file no longer
 needs it.
 
@@ -38,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import hashlib
 import os
 import warnings
 from contextlib import asynccontextmanager
@@ -194,6 +197,36 @@ def pytest_collection_modifyitems(
 
 if _PG_SELECTED:
     from coordination.pg_backend import PostgresStore, terminate_pool
+
+    @pytest.fixture(autouse=True)
+    def _pg_schema_per_test(
+        request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Give every PG test a stable application schema of its own.
+
+        Production defaults to the explicit ``coord`` schema. The full test
+        suite, however, assumes each test starts with a fresh database and
+        includes ``build_service()`` paths that now correctly use the
+        configured schema instead of deriving one from ``database_path``.
+        Hash the node id (plus worker/process identity) into a valid schema so
+        those application-level constructors stay isolated under serial and
+        xdist runs. Low-level multiple-store tests can still pass an explicit
+        ``postgres_schema`` when they need two schemas inside one test.
+        """
+        worker = os.environ.get("PYTEST_XDIST_WORKER", "main")
+        seed = f"{worker}:{os.getpid()}:{request.node.nodeid}"
+        digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:24]
+        monkeypatch.setenv("COORD_POSTGRES_SCHEMA", f"coord_test_{digest}")
+
+        from coordination import deps
+
+        clear_cache = getattr(deps.get_service, "cache_clear", None)
+        if clear_cache is not None:
+            clear_cache()
+        yield
+        clear_cache = getattr(deps.get_service, "cache_clear", None)
+        if clear_cache is not None:
+            clear_cache()
 
     @pytest.fixture(autouse=True)
     async def _pg_drain_pool():

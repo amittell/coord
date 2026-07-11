@@ -1,6 +1,37 @@
+import re
 from pathlib import Path
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+POSTGRES_SCHEMA_DEFAULT = "coord"
+_POSTGRES_SCHEMA_RE = re.compile(r"[a-z_][a-z0-9_]{0,62}\Z")
+
+
+def validate_postgres_schema(value: str) -> str:
+    """Validate a schema name before it is interpolated into PostgreSQL SQL.
+
+    PostgreSQL identifiers are limited to 63 bytes by default. Restricting the
+    operator setting to lowercase ASCII identifiers keeps quoting predictable,
+    rules out SQL injection, and avoids case-sensitive quoted-schema surprises.
+    System schemas are never valid application targets.
+    """
+    if not _POSTGRES_SCHEMA_RE.fullmatch(value):
+        raise ValueError(
+            "postgres_schema must be a lowercase PostgreSQL identifier: "
+            "1-63 characters matching [a-z_][a-z0-9_]*"
+        )
+    if (
+        value == "public"
+        or value == "information_schema"
+        or value.startswith("pg_")
+    ):
+        raise ValueError(
+            "postgres_schema must not target a PostgreSQL system schema "
+            "(public, information_schema, or pg_*)"
+        )
+    return value
 
 
 class Settings(BaseSettings):
@@ -13,6 +44,29 @@ class Settings(BaseSettings):
     # single-writer SQLite path at ``database_path``. ``COORD_DATABASE_PATH``
     # stays the deprecated alias for the SQLite file location.
     database_url: str | None = None
+    # Stable application schema used whenever ``database_url`` selects
+    # PostgreSQL. It is deliberately independent of ``database_path`` so every
+    # replica and every operator CLI reaches the same durable state. Tests that
+    # construct PostgresStore directly without this value retain path-derived
+    # private schemas for isolation.
+    postgres_schema: str = POSTGRES_SCHEMA_DEFAULT
+
+    @field_validator("postgres_schema")
+    @classmethod
+    def _validate_postgres_schema(cls, value: str) -> str:
+        return validate_postgres_schema(value)
+
+    @property
+    def postgres_schema_is_explicit(self) -> bool:
+        """Whether an operator supplied the schema instead of using default.
+
+        This distinction lets the PostgreSQL backend fail closed when it sees
+        data in the path-hashed schema used by the v0.44/v0.45 beta backend.
+        Explicitly choosing either that legacy schema or the new stable
+        default resolves the ambiguity.
+        """
+        return "postgres_schema" in self.model_fields_set
+
     auth_token: str | None = None
     allow_insecure_no_auth: bool = False
     repo_root: Path | None = None
