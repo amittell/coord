@@ -130,7 +130,7 @@ def test_templates_carry_no_unrecognized_placeholder_strings() -> None:
 def test_template_pre_push_hook_matches_assets_script() -> None:
     """The manual-rollout hook template must be byte-identical to the
     hook coord init installs, so manual adopters get the same fail-closed
-    jq check, local.env sourcing, and sessions.live forwarding."""
+    jq check, inert local.env loading, and sessions.live forwarding."""
     template = (TEMPLATES / ".coordination" / "hooks" / "pre-push").read_text(
         encoding="utf-8"
     )

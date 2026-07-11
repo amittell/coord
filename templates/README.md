@@ -14,7 +14,7 @@ For step-by-step rollout guidance, see `../docs/getting-started.md` plus the too
 | `CLAUDE.md.snippet.md` | Append coordination section to `CLAUDE.md` |
 | `.codex/config.toml.example` | Codex CLI MCP wiring |
 | `AGENTS.md.snippet.md` | Append coordination section to `AGENTS.md` |
-| `.coordination/hooks/pre-push` | Git pre-push check against `/conflicts` (same script `coord init` installs at `.git/hooks/pre-push`: sources `.coordination/local.env`, refuses when `jq` is missing, forwards `sessions.live` session ids) |
+| `.coordination/hooks/pre-push` | Git pre-push check against `/conflicts` (same script `coord init` installs at `.git/hooks/pre-push`: parses required `.coordination/local.env` keys as inert data, refuses when `jq` is missing, forwards `sessions.live` session ids) |
 | `github-coordination-semantic.yml` | Copy to `.github/workflows/coordination-semantic.yml` (PR + merge-group CI template) |
 | `MERGE_QUEUE.md` | Notes for merge queue + stacked PR workflow |
 | `skills/coordinating-file-claims/` | Agent Skill (SKILL.md, agentskills.io format) teaching any skill-capable agent to install, configure, and use coord. Copy the directory into `.agents/skills/` (Codex), `.claude/skills/` (Claude Code), or `.cursor/skills/` (Cursor) |

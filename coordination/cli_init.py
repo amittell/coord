@@ -316,9 +316,9 @@ def _write_local_env(
     else:
         token = os.environ.get("COORD_AUTH_TOKEN", PLACEHOLDER_AUTH_TOKEN)
     # COORD_API_URL powers coord-mcp and user shells; COORD_SERVICE_URL is
-    # what the pre-push hook reads. Emit both so whichever tool sources
-    # this file picks up the right endpoint -- this is what stops a remote
-    # deployment from silently falling back to http://127.0.0.1:8080.
+    # the legacy name the pre-push hook accepts. Emit both so each inert-data
+    # reader picks up the right endpoint -- this is what stops a
+    # remote installs from silently falling back to http://127.0.0.1:8080.
     updates = {
         "COORD_API_URL": service_url,
         "COORD_SERVICE_URL": service_url,

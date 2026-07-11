@@ -43,8 +43,8 @@ from coordination.repo_config import RepoConfig
 def _read_existing_token(local_env: Path) -> str:
     # Shared parser (coordination.envfile): tolerates a leading `export `,
     # indentation and quotes, and applies last-assignment-wins -- exactly
-    # how the MCP wrapper, coord doctor, and the bash-sourced pre-push
-    # hook read this file. The old first-match ``startswith`` reader
+    # how the MCP wrapper, coord doctor, and the pre-push hook's inert-data
+    # loader read this file. The old first-match ``startswith`` reader
     # blanked `export`-prefixed tokens (rewriting the file with an empty
     # COORD_AUTH_TOKEN) and silently regressed a rotated token appended
     # below a stale one.

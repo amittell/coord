@@ -30,6 +30,7 @@ import logging as pylogging
 import math
 import os
 import sqlite3
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -262,6 +263,112 @@ class TestReleaseWorkflowDispatchGuard:
         assert "inputs.overwrite != true" in condition
         assert "exit 1" in guard["run"]
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="release workflow guard runs under the POSIX GitHub runner",
+    )
+    @pytest.mark.parametrize(
+        ("mode", "expected_returncode", "expected_output"),
+        [
+            ("existing", 1, "already exists in the registry"),
+            ("missing", 0, "not present in the registry"),
+            ("missing-manifest", 0, "not present in the registry"),
+            ("missing-code", 0, "not present in the registry"),
+            ("ambiguous-missing", 1, "refusing to publish"),
+            ("transient", 1, "refusing to publish"),
+            ("auth", 1, "refusing to publish"),
+            ("server", 1, "refusing to publish"),
+        ],
+    )
+    def test_guard_fails_closed_except_for_specific_missing_manifest(
+        self,
+        tmp_path: Path,
+        mode: str,
+        expected_returncode: int,
+        expected_output: str,
+    ) -> None:
+        workflow = self._workflow()
+        steps = workflow["jobs"]["publish-image"]["steps"]
+        guard = next(
+            step
+            for step in steps
+            if "imagetools inspect" in str(step.get("run") or "")
+        )
+
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        fake_docker = fake_bin / "docker"
+        fake_docker.write_text(
+            """#!/bin/sh
+case "$FAKE_DOCKER_MODE" in
+  existing)
+    exit 0
+    ;;
+  missing)
+    echo 'ERROR: ghcr.io/octo/coord:v1: not found' >&2
+    exit 1
+    ;;
+  missing-manifest)
+    echo 'ERROR: manifest unknown: manifest unknown' >&2
+    exit 1
+    ;;
+  missing-code)
+    echo '{"errors":[{"code":"MANIFEST_UNKNOWN"}]}' >&2
+    exit 1
+    ;;
+  ambiguous-missing)
+    echo 'ERROR: registry endpoint: not found' >&2
+    exit 1
+    ;;
+  transient)
+    echo 'ERROR: failed to do request: lookup ghcr.io: temporary failure in name resolution' >&2
+    exit 1
+    ;;
+  auth)
+    echo 'ERROR: unexpected status from HEAD request: 401 Unauthorized' >&2
+    exit 1
+    ;;
+  server)
+    echo 'ERROR: unexpected status from HEAD request: 503 Service Unavailable' >&2
+    exit 1
+    ;;
+esac
+exit 2
+""",
+            encoding="utf-8",
+        )
+        fake_docker.chmod(0o755)
+
+        env = os.environ.copy()
+        env.update(
+            {
+                "FAKE_DOCKER_MODE": mode,
+                "IMAGE": "ghcr.io/octo/coord",
+                "VERSION": "v1",
+                "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
+            }
+        )
+        result = subprocess.run(
+            [
+                "bash",
+                "--noprofile",
+                "--norc",
+                "-e",
+                "-o",
+                "pipefail",
+                "-c",
+                guard["run"],
+            ],
+            check=False,
+            capture_output=True,
+            env=env,
+            text=True,
+        )
+
+        output = result.stdout + result.stderr
+        assert result.returncode == expected_returncode, output
+        assert expected_output in output
+
 
 class TestCiMatrixCoversClassifiers:
     @staticmethod
@@ -392,6 +499,12 @@ class TestCiMatrixCoversClassifiers:
         assert "schedule" in triggers
         assert "workflow_dispatch" in triggers
         assert "workflow_call" in triggers
+
+    def test_postgres_path_gate_covers_backend_overlap_translation(self) -> None:
+        postgres = self._workflow("postgres.yml")
+        triggers = postgres.get("on") or postgres.get(True)
+        for event in ("pull_request", "push"):
+            assert "coordination/overlap_symbols.py" in triggers[event]["paths"]
 
     def test_release_publish_jobs_require_real_postgres_gate(self) -> None:
         release = self._workflow("release.yml")

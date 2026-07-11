@@ -117,19 +117,37 @@ jobs:
       # silently get different code under the same version. Fail fast when
       # the tag already exists unless the operator explicitly opted in via
       # the overwrite input. Runs after the registry login above so private
-      # registries resolve; imagetools inspect exits non-zero for a missing
-      # manifest, which is the "safe to publish" case.
+      # registries resolve. Inspect failures are ambiguous (missing manifest,
+      # auth, DNS, rate limit, or registry outage), so only recognized
+      # manifest-not-found responses are safe to publish; everything else
+      # fails closed.
       - name: Refuse to republish an existing image tag (manual dispatch)
         if: github.event_name == 'workflow_dispatch' && inputs.overwrite != true
         env:
           IMAGE: ${{ steps.image.outputs.name }}
           VERSION: ${{ steps.version.outputs.tag }}
         run: |
-          if docker buildx imagetools inspect "${IMAGE}:${VERSION}" >/dev/null 2>&1; then
+          inspect_error="$(mktemp)"
+          trap 'rm -f "$inspect_error"' EXIT
+
+          if docker buildx imagetools inspect "${IMAGE}:${VERSION}" >/dev/null 2>"$inspect_error"; then
             echo "::error::${IMAGE}:${VERSION} already exists in the registry; re-run with overwrite=true to intentionally replace it" >&2
             exit 1
+          else
+            inspect_status=$?
           fi
-          echo "${IMAGE}:${VERSION} not present in the registry; safe to publish."
+
+          inspect_message="$(cat "$inspect_error")"
+          if printf '%s\n' "$inspect_message" | grep -Eq '"code"[[:space:]]*:[[:space:]]*"(MANIFEST_UNKNOWN|NAME_UNKNOWN)"' || \
+             printf '%s\n' "$inspect_message" | grep -Eiq '(^|[^[:alnum:]])(manifest|name)[[:space:]]+unknown([^[:alnum:]]|$)' || \
+             printf '%s\n' "$inspect_message" | grep -Fq -- "${IMAGE}:${VERSION}: not found"; then
+            echo "${IMAGE}:${VERSION} not present in the registry; safe to publish."
+            exit 0
+          fi
+
+          echo "::error::could not verify whether ${IMAGE}:${VERSION} exists; refusing to publish" >&2
+          printf '%s\n' "$inspect_message" >&2
+          exit "$inspect_status"
 
       # Build the tag list.
       #  - tag push:           push both :<version> and :latest

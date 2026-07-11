@@ -107,11 +107,88 @@ Use `symbols={"path.ts": ["handleLogin"]}` on `claim_files` for sub-file scope (
 PRE_PUSH_SCRIPT = """#!/usr/bin/env bash
 set -euo pipefail
 
-# Source .coordination/local.env so the hook picks up the service URL and
-# token written by `coord init`, not whichever stale values happen to be
-# in the pushing shell's environment. Without this, a remote-mode repo
-# would silently fall back to http://127.0.0.1:8080 and quietly soft-pass
-# every push.
+# Read .coordination/local.env as inert data so the hook picks up the service
+# URL and token written by `coord init` without executing operator-provided
+# shell syntax. The parser intentionally mirrors coordination.envfile:
+# whitespace/export prefixes are tolerated, one layer of matching outer
+# quotes is removed, and the last assignment wins. Only keys this hook uses
+# are imported; every other line remains inert.
+load_coord_local_env() {
+  local env_file="$1"
+  local coord_env_records=""
+  local coord_env_record=""
+  local coord_env_key=""
+  local coord_env_value=""
+
+  if ! coord_env_records="$(python3 - "${env_file}" <<'PY'
+import sys
+from pathlib import Path
+
+wanted = (
+    "COORD_API_URL",
+    "COORD_SERVICE_URL",
+    "COORD_URL",
+    "COORD_TOKEN",
+    "COORD_AUTH_TOKEN",
+    "COORD_REPO_ID",
+    "COORD_PUSH_BASE_REF",
+)
+
+try:
+    text = Path(sys.argv[1]).read_text(encoding="utf-8")
+except (OSError, UnicodeError) as exc:
+    print(f"unable to read local.env: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+values = {}
+for raw in text.splitlines():
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    if line.startswith("export "):
+        line = line[len("export ") :].lstrip()
+    key, sep, value = line.partition("=")
+    if sep != "=":
+        continue
+    key = key.strip()
+    if key not in wanted:
+        continue
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+        value = value[1:-1]
+    if "\\x00" in value:
+        print(f"NUL byte in {key}", file=sys.stderr)
+        raise SystemExit(1)
+    values[key] = value
+
+for key in wanted:
+    if key in values:
+        print(f"{key}={values[key]}")
+PY
+)"; then
+    echo "coordination pre-push: could not parse ${env_file}; refusing to push" >&2
+    return 1
+  fi
+
+  # Do not eval or source these records. Quoted assignment keeps spaces,
+  # semicolons, dollar signs, and command-substitution text literal on bash
+  # 3.2 and newer.
+  while IFS= read -r coord_env_record || [[ -n "${coord_env_record}" ]]; do
+    [[ -z "${coord_env_record}" ]] && continue
+    coord_env_key="${coord_env_record%%=*}"
+    coord_env_value="${coord_env_record#*=}"
+    case "${coord_env_key}" in
+      COORD_API_URL) COORD_API_URL="${coord_env_value}" ;;
+      COORD_SERVICE_URL) COORD_SERVICE_URL="${coord_env_value}" ;;
+      COORD_URL) COORD_URL="${coord_env_value}" ;;
+      COORD_TOKEN) COORD_TOKEN="${coord_env_value}" ;;
+      COORD_AUTH_TOKEN) COORD_AUTH_TOKEN="${coord_env_value}" ;;
+      COORD_REPO_ID) COORD_REPO_ID="${coord_env_value}" ;;
+      COORD_PUSH_BASE_REF) COORD_PUSH_BASE_REF="${coord_env_value}" ;;
+    esac
+  done <<< "${coord_env_records}"
+}
+
 # Resolve the MAIN worktree root via the common git dir's parent so the
 # hook still finds .coordination/local.env when invoked from a linked git
 # worktree (where --show-toplevel points at the linked root, which has no
@@ -124,10 +201,9 @@ if [[ -n "${COORD_COMMON_DIR}" ]]; then
   REPO_ROOT="$(cd "${COORD_COMMON_DIR}/.." 2>/dev/null && pwd || true)"
 fi
 if [[ -n "${REPO_ROOT}" && -f "${REPO_ROOT}/.coordination/local.env" ]]; then
-  set -a
-  # shellcheck disable=SC1090,SC1091
-  source "${REPO_ROOT}/.coordination/local.env"
-  set +a
+  if ! load_coord_local_env "${REPO_ROOT}/.coordination/local.env"; then
+    exit 1
+  fi
 fi
 
 COORD_URL="${COORD_API_URL:-${COORD_SERVICE_URL:-${COORD_URL:-http://127.0.0.1:8080}}}"

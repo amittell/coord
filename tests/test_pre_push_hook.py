@@ -133,19 +133,127 @@ def test_script_prefers_batch_conflict_endpoint_with_legacy_fallback() -> None:
     assert '"${batch_status}" == "405"' in PRE_PUSH_SCRIPT
 
 
-def test_script_sources_local_env_before_reading_config() -> None:
-    # The hook must source .coordination/local.env before falling back
-    # to env vars and defaults. Without this, a remote-mode repo would
-    # silently hit http://127.0.0.1:8080 whenever COORD_API_URL is not
-    # set in the pushing shell.
-    assert 'source "${REPO_ROOT}/.coordination/local.env"' in PRE_PUSH_SCRIPT
+def test_script_parses_local_env_as_inert_data_before_reading_config() -> None:
+    # The hook must read .coordination/local.env before falling back to env
+    # vars and defaults, but must never execute that operator-controlled file.
+    assert 'source "${REPO_ROOT}/.coordination/local.env"' not in PRE_PUSH_SCRIPT
+    assert 'load_coord_local_env "${REPO_ROOT}/.coordination/local.env"' in (
+        PRE_PUSH_SCRIPT
+    )
     # URL precedence must prefer COORD_API_URL (written by `coord init`)
     # over the legacy COORD_SERVICE_URL / COORD_URL names.
     assert '"${COORD_API_URL:-${COORD_SERVICE_URL:-${COORD_URL:-' in PRE_PUSH_SCRIPT
 
 
+def _extract_local_env_loader(script: str) -> str:
+    start = script.index("load_coord_local_env() {")
+    end = script.index('\nCOORD_URL="${COORD_API_URL', start)
+    return script[start:end]
+
+
+def test_local_env_loader_preserves_values_without_shell_expansion(tmp_path) -> None:
+    bash = shutil.which("bash")
+    if not bash or not shutil.which("python3") or not shutil.which("git"):
+        pytest.skip("bash, python3, and git are required")
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    coord_dir = repo / ".coordination"
+    coord_dir.mkdir()
+    command_marker = tmp_path / "command-substitution-ran"
+    unmanaged_marker = tmp_path / "unmanaged-line-ran"
+    bare_marker = tmp_path / "bare-line-ran"
+    (coord_dir / "local.env").write_text(
+        "COORD_API_URL=https://stale.example\n"
+        f'COORD_API_URL="https://coord.test/path with spaces; $HOME; '
+        f'$(touch {command_marker})"\n'
+        "COORD_AUTH_TOKEN='token with spaces; $HOME; $(false)'\n"
+        "COORD_REPO_ID=owner/repo with spaces;still-data\n"
+        "export COORD_PUSH_BASE_REF = 'origin/pre prod; $HOME'\n"
+        f"COORD_UNMANAGED=$(touch {unmanaged_marker})\n"
+        f"$(touch {bare_marker})\n",
+        encoding="utf-8",
+    )
+
+    fragment = tmp_path / "load-local-env.sh"
+    fragment.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        f"{_extract_local_env_loader(PRE_PUSH_SCRIPT)}\n"
+        "printf 'API=<%s>\\n' \"${COORD_API_URL}\"\n"
+        "printf 'TOKEN=<%s>\\n' \"${COORD_AUTH_TOKEN}\"\n"
+        "printf 'REPO=<%s>\\n' \"${COORD_REPO_ID}\"\n"
+        "printf 'BASE=<%s>\\n' \"${COORD_PUSH_BASE_REF}\"\n"
+        "printf 'UNMANAGED=<%s>\\n' \"${COORD_UNMANAGED:-unset}\"\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env["HOME"] = "/expanded/home"
+    env.pop("COORD_UNMANAGED", None)
+    result = subprocess.run(
+        [bash, str(fragment)],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        (
+            "API=<https://coord.test/path with spaces; $HOME; "
+            f"$(touch {command_marker})>"
+        ),
+        "TOKEN=<token with spaces; $HOME; $(false)>",
+        "REPO=<owner/repo with spaces;still-data>",
+        "BASE=<origin/pre prod; $HOME>",
+        "UNMANAGED=<unset>",
+    ]
+    assert not command_marker.exists()
+    assert not unmanaged_marker.exists()
+    assert not bare_marker.exists()
+
+
+def test_local_env_loader_fails_closed_when_present_file_cannot_be_parsed(
+    tmp_path,
+) -> None:
+    bash = shutil.which("bash")
+    if not bash or not shutil.which("python3") or not shutil.which("git"):
+        pytest.skip("bash, python3, and git are required")
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    coord_dir = repo / ".coordination"
+    coord_dir.mkdir()
+    (coord_dir / "local.env").write_bytes(b"COORD_API_URL=https://bad/\xff\n")
+    fragment = tmp_path / "load-invalid-local-env.sh"
+    fragment.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        f"{_extract_local_env_loader(PRE_PUSH_SCRIPT)}\n"
+        "echo should-not-run\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [bash, str(fragment)],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "could not parse" in result.stderr
+    assert "refusing to push" in result.stderr
+    assert "should-not-run" not in result.stdout
+
+
 def test_script_passes_repo_id_to_conflicts_endpoint() -> None:
-    # v0.4.0: when COORD_REPO_ID is set (sourced from local.env), the hook
+    # v0.4.0: when COORD_REPO_ID is set (read from local.env), the hook
     # must forward it as &repo=<id> on the /conflicts query so the server
     # scopes the conflict check to claims from the same repo. Without
     # this, cross-repo path collisions false-positive.

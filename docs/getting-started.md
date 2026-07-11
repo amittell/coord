@@ -93,7 +93,7 @@ Operational implications:
 
 - rotating the bearer token = edit `.coordination/local.env` in every coordinated repo; the MCP registration files do not need to change.
 - a stale `.mcp.json` (e.g. one regenerated against a sanitised template, or a pre-v0.32 committed copy) does not require a `coord init --force` to recover; `coord-mcp` will fall through to `local.env`.
-- the pre-push hook sources `.coordination/local.env` directly via shell, independent of the MCP wrapper, so it is unaffected by editor/CLI restarts.
+- the pre-push hook loads only the keys it needs from `.coordination/local.env` as inert data, independent of the MCP wrapper, so it is unaffected by editor/CLI restarts without executing shell syntax from the file.
 
 See `docs/integrations/claude-code.md` and `docs/integrations/codex-cli.md` for the resolution order in tool-specific terms.
 

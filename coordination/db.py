@@ -1736,14 +1736,16 @@ class Database:
     ) -> bool:
         """v0.31 wave 2: apply a detected rename atomically.
 
-        In ONE BEGIN IMMEDIATE transaction:
+        In one transaction (``BEGIN IMMEDIATE`` on SQLite):
 
         1. read the matching ``claim_symbols`` row (old span + parent,
            needed for the audit trail);
         2. when ``guard_new_path_collision`` is set, re-check that no
            OTHER active symbol-scope claim in the same ``repo`` bucket
-           already holds the new symbol path on this file, and abort
-           (False, nothing written) when one does. The rename sweep's
+           already holds a path overlapping the new symbol path on this
+           file, and abort (False, nothing written) when one does. The
+           PostgreSQL path holds the same repo advisory lock as grants.
+           The rename sweep's
            Python-side collision check reads a snapshot on a separate
            connection, so without this in-transaction recheck a
            concurrent grant landing between the sweep's read and this
@@ -1769,6 +1771,12 @@ class Database:
             await _configure_sqlite(conn)
             await conn.execute("BEGIN IMMEDIATE")
             try:
+                if guard_new_path_collision:
+                    # Grants take this same lock before their overlap
+                    # re-check. SQLite's repo_lock is a no-op because BEGIN
+                    # IMMEDIATE already serializes writers; PostgreSQL holds
+                    # its advisory lock until the commit below.
+                    await self.repo_lock(conn, repo)
                 cur = await conn.execute(
                     """
                     SELECT id, parent_symbol, start_line, end_line
@@ -1797,27 +1805,35 @@ class Database:
                     # Same active-row semantics as get_symbol_rows_on_file
                     # (released_at IS NULL, scope_type='symbol', null-safe
                     # repo bucket), but evaluated on THIS connection inside
-                    # the BEGIN IMMEDIATE write transaction so no grant can
-                    # commit between the check and the UPDATE below. The
-                    # rename keeps the stored parent, so the collision key
-                    # is (file_path, parent, new leaf).
+                    # the repo-locked write transaction so no grant can
+                    # commit between the check and the UPDATE below. Use the
+                    # same recursive ancestor/descendant predicate as normal
+                    # claim admission: renaming ``Old`` onto ``New`` must also
+                    # be blocked when another claim holds ``New::method``.
                     cur = await conn.execute(
                         """
-                        SELECT 1
+                        SELECT cs.parent_symbol, cs.symbol_name
                         FROM claim_symbols cs
                         JOIN claims c ON c.id = cs.claim_id
                         WHERE cs.file_path = ?
                           AND cs.claim_id != ?
                           AND c.released_at IS NULL
                           AND c.scope_type = 'symbol'
-                          AND cs.symbol_name = ?
-                          AND cs.parent_symbol IS ?
                           AND c.repo IS ?
-                        LIMIT 1
                         """,
-                        (file_path, claim_id, new_symbol_name, parent, repo),
+                        (file_path, claim_id, repo),
                     )
-                    if await cur.fetchone() is not None:
+                    other_symbols = await cur.fetchall()
+                    from coordination.overlap_symbols import symbol_paths_overlap
+
+                    target_symbol = (parent, new_symbol_name)
+                    if any(
+                        symbol_paths_overlap(
+                            target_symbol,
+                            (row["parent_symbol"], row["symbol_name"]),
+                        )
+                        for row in other_symbols
+                    ):
                         await conn.rollback()
                         return False
                 await conn.execute(

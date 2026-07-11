@@ -282,7 +282,7 @@ curl -X POST http://127.0.0.1:8080/claims \
 | `.coordination/config.toml` | **no** (gitignored) | Per-repo coord settings: mode, service URL, ownership file path |
 | `.coordination/local.env` | **no** (gitignored) | Real `COORD_AUTH_TOKEN`, `COORD_API_URL`, `COORD_REPO_ID` |
 | `.coordination/owners.yaml` | **no** (gitignored) | Per-repo ownership rules; upload to the service via `POST /config/ownership` |
-| `.git/hooks/pre-push` | not in repo | Installed by `coord init`; sources `.coordination/local.env` before calling the API |
+| `.git/hooks/pre-push` | not in repo | Installed by `coord init`; parses the required keys from `.coordination/local.env` as inert data before calling the API |
 
 `coord init` patches `.gitignore` with `/.coordination/` automatically, so the whole `.coordination/` directory is excluded from the moment it is created. No additional setup is required to keep secrets out of git history.
 
