@@ -161,9 +161,13 @@ for raw in text.splitlines():
         raise SystemExit(1)
     values[key] = value
 
-for key in wanted:
-    if key in values:
-        print(f"{key}={values[key]}")
+records = "".join(
+    f"{key}={values[key]}\\n" for key in wanted if key in values
+)
+# Binary stdout prevents Windows Python from translating LF to CRLF. The Git
+# Bash read builtin deliberately preserves a trailing CR, which would otherwise
+# become part of each imported URL/token/repo value.
+sys.stdout.buffer.write(records.encode("utf-8"))
 PY
 )"; then
     echo "coordination pre-push: could not parse ${env_file}; refusing to push" >&2
