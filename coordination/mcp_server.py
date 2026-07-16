@@ -5,6 +5,7 @@ import atexit
 import os
 import random
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -71,19 +72,116 @@ def _load_local_env(start: Path | None = None) -> Path | None:
             continue
         from coordination.envfile import parse_env
 
-        for key, val in parse_env(text).items():
-            if key not in _LOCAL_ENV_KEYS:
-                continue
-            existing = os.environ.get(key, "")
-            if existing and existing not in _PLACEHOLDER_VALUES:
-                continue
-            if val:
-                os.environ[key] = val
+        _apply_local_env(parse_env(text))
+        _env_reload["path"] = env_file
+        _env_reload["stamp"] = _stat_stamp(env_file)
+        _env_reload["bad_stamp"] = None
         return env_file
     return None
 
 
+# ---- hot reload of local.env (v0.47) ----------------------------------------
+#
+# MCP servers are long-lived: without this, a token rotation or repo-scope
+# change in ``.coordination/local.env`` silently did nothing until every
+# agent session restarted (observed live 2026-07-15: a repo-scope rename left
+# running sessions claiming into the old scope). The file is re-checked --
+# one ``os.stat`` -- whenever the wrapper is about to use its config
+# (``_base_url``/``_repo_id``/``_headers``), and re-applied when the
+# ``(mtime_ns, size)`` stamp changes.
+#
+# A changed file is applied only if every non-blank, non-comment line is a
+# ``KEY=VALUE`` assignment; otherwise (mid-edit save, corrupted write) the
+# last-good config stays and one warning goes to stderr per bad version --
+# stdout is the MCP protocol channel and must stay clean.
+#
+# Ownership rule: explicit env (shell exports, real .mcp.json values) wins
+# forever; values WE previously loaded from the file are ours to update.
+# Keys deleted from the file keep their last-applied value (we never unset).
+_env_reload: dict[str, Any] = {
+    "path": None,  # Path of the watched local.env (set by _load_local_env)
+    "stamp": None,  # (st_mtime_ns, st_size) of the last APPLIED version
+    "applied": {},  # key -> value this wrapper set from the file
+    "bad_stamp": None,  # stamp of a rejected version (warn once, retry on change)
+}
+
+
+def _stat_stamp(path: Path) -> tuple[int, int] | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
+def _apply_local_env(parsed: dict[str, str]) -> None:
+    """Apply parsed local.env pairs to os.environ under the ownership rule."""
+    applied = _env_reload["applied"]
+    for key, val in parsed.items():
+        if key not in _LOCAL_ENV_KEYS or not val:
+            continue
+        existing = os.environ.get(key, "")
+        if (
+            existing
+            and existing not in _PLACEHOLDER_VALUES
+            and existing != applied.get(key)
+        ):
+            continue  # explicit env wins, at startup and on every reload
+        os.environ[key] = val
+        applied[key] = val
+
+
+def _invalid_env_lines(text: str) -> list[str]:
+    """Lines that are not blank/comment/``KEY=VALUE`` -- the reload-rejection
+    definition of a syntax error (parse_env itself is lenient and would
+    silently drop them, which is the wrong behaviour for a live reload)."""
+    bad: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].lstrip()
+        key, sep, _val = line.partition("=")
+        if sep != "=" or not key.strip():
+            bad.append(raw)
+    return bad
+
+
+def _maybe_reload_local_env() -> None:
+    """Re-apply the watched local.env if it changed on disk (see block
+    comment above). Cheap: one os.stat when nothing changed."""
+    path = _env_reload["path"]
+    if path is None:
+        return
+    stamp = _stat_stamp(path)
+    if stamp is None or stamp in (_env_reload["stamp"], _env_reload["bad_stamp"]):
+        # Vanished/unreadable (keep last-good; transient SMB/NFS glitches
+        # self-heal), unchanged, or already-rejected version.
+        return
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return
+    bad = _invalid_env_lines(text)
+    if bad:
+        _env_reload["bad_stamp"] = stamp
+        print(
+            f"coord-mcp: NOT reloading {path}: invalid line(s) {bad[:3]!r}; "
+            "keeping last-good config",
+            file=sys.stderr,
+        )
+        return
+    from coordination.envfile import parse_env
+
+    _apply_local_env(parse_env(text))
+    _env_reload["stamp"] = stamp
+    _env_reload["bad_stamp"] = None
+    print(f"coord-mcp: reloaded {path}", file=sys.stderr)
+
+
 def _base_url() -> str:
+    _maybe_reload_local_env()
     return os.environ.get("COORD_API_URL", "http://127.0.0.1:8080").rstrip("/")
 
 
@@ -98,6 +196,7 @@ def _repo_id() -> str:
     placeholders are treated as unset so checked-in examples do not become a
     real repo scope.
     """
+    _maybe_reload_local_env()
     repo_id = os.environ.get("COORD_REPO_ID", "").strip()
     if repo_id in _PLACEHOLDER_VALUES:
         return ""
@@ -105,6 +204,7 @@ def _repo_id() -> str:
 
 
 def _headers(engineer: str | None = None) -> dict[str, str]:
+    _maybe_reload_local_env()
     token = os.environ.get("COORD_AUTH_TOKEN", "")
     h: dict[str, str] = {"Accept": "application/json"}
     if token and token not in _PLACEHOLDER_VALUES:
@@ -1097,23 +1197,21 @@ async def my_requests(
     am I still waiting on?') is the default. Pass ``decision=""`` to
     list every request you've ever filed.
 
-    ``queued`` (v0.22+) flips the view to the live FIFO queue
-    (``claim_queue``) rather than the request_events table. When
+    ``queued`` (v0.22+) flips the view to live claim-queue rows carrying FIFO
+    arrival positions rather than the request_events table. Current dequeue
+    selection also applies priority, age, decay, and periodic fairness. When
     ``True`` the response items carry ``kind='queued'`` and include
     the blocking holder's engineer / pattern so you can see who you
     are waiting on without a second call. ``None`` (default) or
     ``False`` preserves the v0.21 request shape byte-identically so
     pre-v0.22 servers see no difference.
 
-    ``engineer`` selects whose requests to list and MUST match the
-    name used at claim time for queue rows to show up: the server
-    filters queued entries strictly by the ``engineer`` passed to
-    ``claim_files`` (the queue row's ``requester_engineer``). When
-    omitted, falls back to ``COORD_REQUESTER`` / ``COORD_USER`` /
-    ``"agent"`` -- fine for ``request_release`` rows (which use the
-    same env chain) but wrong for queue rows whenever the claim-time
-    engineer differs from the env, so pass it explicitly when
-    checking ``queued=True``.
+    ``engineer`` is the primary requester filter. The wrapper also forwards
+    this MCP process's session id, and current servers OR-match queue rows from
+    that session even when their requester name differs. Pass the claim-time
+    engineer explicitly for older servers or when inspecting another session;
+    otherwise it falls back to ``COORD_REQUESTER`` / ``COORD_USER`` /
+    ``"agent"``.
     """
     requester = (engineer or "").strip() or os.environ.get(
         "COORD_REQUESTER", ""
