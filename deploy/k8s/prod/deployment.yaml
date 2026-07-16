@@ -27,10 +27,10 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       imagePullSecrets:
-        - name: ghcr-pull
+        - name: whcr-pull
       containers:
         - name: coord
-          image: ghcr.io/amittell/coord:v0.46.0@sha256:dc31b48e25d6d57323b369bae8a02559bec708007bfe55095f970aa00770bdd9
+          image: whcr.io/coord/coord:v0.46.0@sha256:937e5ec76131dbbdf87800aa26e4d583c2c9adeb25904b46fc383dcfc32ec1fb
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
