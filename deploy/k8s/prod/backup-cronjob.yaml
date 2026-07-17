@@ -1,13 +1,8 @@
 ---
-# Non-disruptive protection for the coord SPOF (2026-07-17): coord runs a
-# single SQLite replica on a node1-welded PVC. Until true HA lands (a
-# PG-capable coord release + multi-replica), this makes a node1 loss
-# DOWNTIME-only, not DATA-loss: a consistent online SQLite .backup streamed
-# off-node to the kebabstore CIFS share (QNAP snapshots on top), 30 kept.
-#
-# Runs node1-pinned (RWO coord-data is co-mountable by a second pod on the
-# SAME node) with a read-only mount; sqlite3 .backup uses the online-backup
-# API so it is consistent against the live writer regardless of WAL mode.
+# coord-db logical backup (2026-07-17): coord moved to the CNPG pair coord-db.
+# Nightly pg_dump onto the kebabstore CIFS share (QNAP snapshots on top), 30
+# kept. CNPG replication is HA; this is the point-in-time / off-cluster copy.
+# postgres:18 matches the CNPG cluster major (pg_dump aborts on mismatch).
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -15,10 +10,9 @@ metadata:
   namespace: coord
 spec:
   accessModes: ["ReadWriteMany"]
-  storageClassName: smb-writhub-repos   # kebabstore //writhub-repos (off-node, snapshotted)
+  storageClassName: smb-writhub-repos
   resources:
-    requests:
-      storage: 20Gi
+    requests: { storage: 20Gi }
 ---
 apiVersion: batch/v1
 kind: CronJob
@@ -26,7 +20,7 @@ metadata:
   name: coord-db-backup
   namespace: coord
 spec:
-  schedule: "*/30 * * * *"   # every 30 min: coord state is high-churn
+  schedule: "20 4 * * *"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3
@@ -35,32 +29,34 @@ spec:
       template:
         spec:
           restartPolicy: Never
-          nodeSelector:
-            kubernetes.io/hostname: kebabrack-node1.lan   # where coord-data (RWO) lives
+          enableServiceLinks: false
           containers:
-            - name: backup
-              image: alpine
-              command: ["sh", "-c"]
+            - name: dump
+              image: postgres:18
+              envFrom:
+                - secretRef: { name: coord-db-credentials }
+              command: ["sh","-c"]
               args:
                 - |
                   set -e
-                  apk add -q sqlite
                   mkdir -p /backups/coord
-                  f=/backups/coord/coordination-$(date +%Y%m%d-%H%M%S).db
-                  sqlite3 "file:/data/coordination.db?mode=ro" ".backup '$f'"
-                  gzip "$f"
-                  ls -lh "$f.gz"
-                  ls -1t /backups/coord/coordination-*.db.gz | tail -n +31 | xargs -r rm
+                  f=/backups/coord/coord-$(date +%Y%m%d-%H%M%S).sql.gz
+                  PGPASSWORD="$password" pg_dump -h coord-db-rw -U "$username" coord | gzip > "$f"
+                  ls -lh "$f"
+                  ls -1t /backups/coord/coord-*.sql.gz | tail -n +31 | xargs -r rm
               volumeMounts:
-                - name: data
-                  mountPath: /data
-                  readOnly: true
-                - name: backups
-                  mountPath: /backups
+                - { name: backups, mountPath: /backups }
           volumes:
-            - name: data
-              persistentVolumeClaim:
-                claimName: coord-data
             - name: backups
-              persistentVolumeClaim:
-                claimName: coord-backups
+              persistentVolumeClaim: { claimName: coord-backups }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: coord-pdb
+  namespace: coord
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: coord
