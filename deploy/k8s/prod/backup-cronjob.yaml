@@ -1,0 +1,66 @@
+---
+# Non-disruptive protection for the coord SPOF (2026-07-17): coord runs a
+# single SQLite replica on a node1-welded PVC. Until true HA lands (a
+# PG-capable coord release + multi-replica), this makes a node1 loss
+# DOWNTIME-only, not DATA-loss: a consistent online SQLite .backup streamed
+# off-node to the kebabstore CIFS share (QNAP snapshots on top), 30 kept.
+#
+# Runs node1-pinned (RWO coord-data is co-mountable by a second pod on the
+# SAME node) with a read-only mount; sqlite3 .backup uses the online-backup
+# API so it is consistent against the live writer regardless of WAL mode.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: coord-backups
+  namespace: coord
+spec:
+  accessModes: ["ReadWriteMany"]
+  storageClassName: smb-writhub-repos   # kebabstore //writhub-repos (off-node, snapshotted)
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: coord-db-backup
+  namespace: coord
+spec:
+  schedule: "*/30 * * * *"   # every 30 min: coord state is high-churn
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          nodeSelector:
+            kubernetes.io/hostname: kebabrack-node1.lan   # where coord-data (RWO) lives
+          containers:
+            - name: backup
+              image: alpine
+              command: ["sh", "-c"]
+              args:
+                - |
+                  set -e
+                  apk add -q sqlite
+                  mkdir -p /backups/coord
+                  f=/backups/coord/coordination-$(date +%Y%m%d-%H%M%S).db
+                  sqlite3 "file:/data/coordination.db?mode=ro" ".backup '$f'"
+                  gzip "$f"
+                  ls -lh "$f.gz"
+                  ls -1t /backups/coord/coordination-*.db.gz | tail -n +31 | xargs -r rm
+              volumeMounts:
+                - name: data
+                  mountPath: /data
+                  readOnly: true
+                - name: backups
+                  mountPath: /backups
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: coord-data
+            - name: backups
+              persistentVolumeClaim:
+                claimName: coord-backups
