@@ -174,7 +174,7 @@ CREATE INDEX IF NOT EXISTS idx_claims_engineer ON claims (engineer);
 """
 
 
-CURRENT_SCHEMA_VERSION = 19
+CURRENT_SCHEMA_VERSION = 20
 
 
 # v0.28 fairness pass: per-blocking-claim counter that
@@ -642,6 +642,22 @@ MIGRATIONS: list[tuple[int, str]] = [
     (
         19,
         "ALTER TABLE engineer_tokens ADD COLUMN repo TEXT;",
+    ),
+    # v20: the repos registry. Before this, a repo "existed" only as a free
+    # string on claims/tokens, so ``coord tokens create --repo`` accepted any
+    # well-FORMED id -- a typo'd or never-onboarded repo minted a token whose
+    # claims landed under a phantom scope nobody watches (found live
+    # 2026-07-17: tokens minted for repos coord had never seen). Scoped-token
+    # mints now require the repo to be registered here first; ``coord init``
+    # registers the repo it wires, and ``coord repos register`` /
+    # ``tokens create --register`` are the explicit bootstrap paths.
+    (
+        20,
+        "CREATE TABLE repos (\n"
+        "    repo_id TEXT PRIMARY KEY,\n"
+        "    registered_by TEXT,\n"
+        "    registered_at TEXT NOT NULL\n"
+        ");",
     ),
 ]
 
@@ -2816,6 +2832,52 @@ class Database:
             )
             await conn.commit()
         return token_id
+
+    async def register_repo(
+        self,
+        repo_id: str,
+        *,
+        registered_by: str | None = None,
+        now: datetime | None = None,
+    ) -> bool:
+        """v20: add ``repo_id`` to the repos registry. Idempotent -- returns
+        True when the row was inserted, False when it already existed. The id
+        is normalized like every other repo id (raises InvalidRepoId)."""
+        repo_id = normalize_repo_id(repo_id)
+        await self.init()
+        ts = (now or datetime.now(UTC)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        async with self._connect() as conn:
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                "INSERT INTO repos (repo_id, registered_by, registered_at) "
+                "VALUES (?, ?, ?) ON CONFLICT (repo_id) DO NOTHING",
+                (repo_id, registered_by, ts),
+            )
+            await conn.commit()
+            return cur.rowcount > 0
+
+    async def repo_registered(self, repo_id: str) -> bool:
+        """v20: is ``repo_id`` in the registry?"""
+        repo_id = normalize_repo_id(repo_id)
+        await self.init()
+        async with self._connect() as conn:
+            await _configure_sqlite(conn)
+            cur = await conn.execute(
+                "SELECT 1 FROM repos WHERE repo_id = ?", (repo_id,)
+            )
+            return await cur.fetchone() is not None
+
+    async def list_registered_repos(self) -> list[dict[str, Any]]:
+        """v20: every registered repo, oldest first."""
+        await self.init()
+        async with self._connect() as conn:
+            await _configure_sqlite(conn)
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
+                "SELECT repo_id, registered_by, registered_at FROM repos "
+                "ORDER BY registered_at, repo_id"
+            )
+            return [dict(r) for r in await cur.fetchall()]
 
     async def resolve_engineer_token(
         self,

@@ -146,6 +146,7 @@ def test_create_database_path_is_explicit_local_db_opt_in(
             "alex/claude/main",
             "--repo",
             "amittell/requesthub",
+            "--register",
             "--database-path",
             str(db_path),
             "--json",
@@ -227,7 +228,7 @@ def test_create_with_repo_flag_persists_and_lists(
     # Issue #30 slice 2/3: --repo mints a repo-scoped token; list surfaces it.
     db_path = tmp_path / "db.sqlite"
     rc = _run(
-        ["tokens", "create", "eng-a", "--repo", "amittell/coord"],
+        ["tokens", "create", "eng-a", "--repo", "amittell/coord", "--register"],
         db_path,
         monkeypatch,
     )

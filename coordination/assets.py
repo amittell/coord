@@ -257,7 +257,19 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
-ENGINEER="$(git config user.name 2>/dev/null || echo unknown)"
+# v20: the claims-and-conflicts identity is the TOKEN's engineer, not the git
+# committer name -- the two diverging is how a pusher's own claims read as
+# someone else's and block the push (found live 2026-07-17). Ask the service
+# who the token belongs to; fall back to git config only when unauthenticated
+# or the server predates /whoami.
+ENGINEER=""
+if [ -n "${COORD_TOKEN:-}" ]; then
+  ENGINEER="$(curl -fsS --max-time 3 -H "Authorization: Bearer ${COORD_TOKEN}" \
+    "${COORD_URL}/whoami" 2>/dev/null | jq -r '.engineer // empty' 2>/dev/null || true)"
+fi
+if [ -z "${ENGINEER}" ]; then
+  ENGINEER="$(git config user.name 2>/dev/null || echo unknown)"
+fi
 UPSTREAM="${1:-origin}"
 BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
 ZERO_SHA="0000000000000000000000000000000000000000"

@@ -9,6 +9,7 @@ from coordination.cli_init import run_init
 from coordination.cli_mcp import add_mcp_subparser
 from coordination.cli_ops import run_claims, run_release, run_status, run_stop
 from coordination.cli_outbox import add_outbox_subparser
+from coordination.cli_repos import add_repos_subparser
 from coordination.cli_tokens import add_tokens_subparser
 from coordination.cli_start import run_start
 from coordination.cli_update_notice import maybe_emit_update_notice
@@ -244,6 +245,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_outbox_subparser(sub)
     add_engineers_subparser(sub)
     add_tokens_subparser(sub)
+    add_repos_subparser(sub)
     add_mcp_subparser(sub)
 
     internal = sub.add_parser("_serve")

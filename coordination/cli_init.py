@@ -409,6 +409,57 @@ def _update_mcp_json(path: Path) -> bool:
     return True
 
 
+
+_CLAUDE_HOOK_COMMANDS = {
+    "SessionStart": "coord-claude-hook sessionstart",
+    "PreToolUse": "coord-claude-hook pretool",
+    "SessionEnd": "coord-claude-hook sessionend",
+}
+
+
+def _update_claude_settings(path: Path) -> bool:
+    """Merge the coord enforcement hooks into ``.claude/settings.json``
+    (v20). Idempotent: an event whose matcher group already carries a
+    ``coord-claude-hook`` command is left untouched, and every other
+    setting in the file is preserved. Same refusal contract as
+    ``_update_mcp_json``: an unparsable or non-object file is left alone
+    rather than clobbered."""
+    settings: dict = {}
+    if path.exists():
+        try:
+            settings = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            print(f"  ! {path} is not valid JSON; not adding coord hooks")
+            return False
+        if not isinstance(settings, dict):
+            print(f"  ! {path} is not a JSON object; not adding coord hooks")
+            return False
+    hooks = settings.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        print(f"  ! {path} 'hooks' is not an object; not adding coord hooks")
+        return False
+    changed = False
+    for event, command in _CLAUDE_HOOK_COMMANDS.items():
+        groups = hooks.setdefault(event, [])
+        if any(
+            "coord-claude-hook" in (h.get("command") or "")
+            for g in groups
+            if isinstance(g, dict)
+            for h in g.get("hooks", [])
+            if isinstance(h, dict)
+        ):
+            continue
+        entry: dict = {"hooks": [{"type": "command", "command": command}]}
+        if event == "PreToolUse":
+            entry["matcher"] = "Edit|Write|MultiEdit|NotebookEdit"
+        groups.append(entry)
+        changed = True
+    if changed:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    return changed
+
+
 def _update_codex_config(path: Path) -> None:
     """Write Codex's MCP server entry for coord with the documented
     placeholder env block. Codex spawns ``coord-mcp`` without sourcing
@@ -652,6 +703,8 @@ def run_init(args) -> int:
             wiring_failed = True
         ensure_managed_block(repo_root / "CLAUDE.md", CLAUDE_SNIPPET)
         written.append("CLAUDE.md (managed block)")
+        if _update_claude_settings(repo_root / ".claude" / "settings.json"):
+            written.append(".claude/settings.json (coord enforcement hooks)")
     elif tool == "codex":
         _update_codex_config(repo_root / ".codex" / "config.toml")
         ensure_managed_block(repo_root / "AGENTS.md", AGENTS_SNIPPET)

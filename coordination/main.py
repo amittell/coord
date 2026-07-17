@@ -1159,6 +1159,21 @@ async def health() -> str:
     return "ok"
 
 
+@app.get("/whoami")
+async def whoami(request: Request, _: None = Depends(require_auth)) -> dict:
+    """v20: the authenticated identity behind the presented bearer. Lets
+    clients (the MCP wrapper, the pre-push hook, ``coord status``) learn the
+    token's engineer and repo scope instead of guessing from git config --
+    the guess is how claims end up filed under one name while the pre-push
+    hook self-excludes under another (found live 2026-07-17)."""
+    return {
+        "auth_kind": getattr(request.state, "auth_kind", None),
+        "engineer": getattr(request.state, "engineer", None),
+        "repo_scope": getattr(request.state, "token_repo", None),
+        "scoped": bool(getattr(request.state, "token_scoped", False)),
+    }
+
+
 @app.get("/metrics")
 async def metrics_endpoint() -> Response:
     """Prometheus scrape endpoint. Intentionally unauthenticated: this is

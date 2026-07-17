@@ -104,6 +104,7 @@ dev = [
 [project.scripts]
 coord = "coordination.cli:main"
 coord-mcp = "coordination.mcp_server:main"
+coord-claude-hook = "coordination.claude_hooks:main"
 coord-api = "coordination.main:run"
 
 [project.urls]

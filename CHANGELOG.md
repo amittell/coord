@@ -7,7 +7,28 @@ Semantic Versioning.
 
 ## [Unreleased]
 
-(none recorded yet)
+Fleet enforcement (v20 schema), from the 2026-07-17 live audit: two
+fully-initialized repos saw zero claims filed all day, scoped tokens were
+minted for repos the service had never seen, and a pusher's own claims
+blocked their push because the pre-push hook guessed identity from git
+config while claims were filed under the token's engineer.
+
+- **Repos registry + mint validation.** New `repos` table (migration 20),
+  `coord repos register|list`, and `coord tokens create --repo` now refuses
+  an UNREGISTERED repo id (typo protection) unless `--register` is passed to
+  deliberately bootstrap a new repo.
+- **`GET /whoami`.** The authenticated identity behind the presented bearer
+  (engineer, repo scope) so clients stop guessing identity from git config.
+- **Claude Code enforcement hooks** (`coord-claude-hook`, installed into
+  `.claude/settings.json` by `coord init --tool claude`): SessionStart
+  injects active claims + token-scope-mismatch warnings as context;
+  PreToolUse blocks edits to files claimed by OTHERS and auto-claims
+  otherwise-unclaimed files (intent derived from action — no ritual);
+  SessionEnd releases the session's auto-claims. Every network failure and
+  missing-identity case fails OPEN: coord being down never blocks editing.
+- **Pre-push hook identity.** The hook now resolves its engineer from
+  `/whoami` (the token's identity — the same one claims are filed under),
+  falling back to `git config user.name` only when unauthenticated.
 
 ## [0.46.0] - 2026-07-11
 
