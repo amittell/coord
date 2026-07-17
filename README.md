@@ -513,6 +513,7 @@ Start with `docs/integrations/claude-code.md` if your team is primarily on Claud
 | `COORD_WARN_UNSCOPED_TOKEN` | Soft-deprecate unscoped per-engineer tokens (v0.43): the request is still honored, but the response carries an `X-Coord-Token-Warning` nudge (surfaced to agents as `coord_notice` and printed by `coord status`). Set `false` to silence. Default: `true` |
 | `COORD_REQUIRE_SCOPED_TOKEN` | Reject any per-engineer token that is not repo-scoped (v0.42); the shared `COORD_AUTH_TOKEN` stays exempt as the operator escape hatch. Default: `false` |
 | `COORD_OIDC_REPO_CLAIM` | Bind an SSO-minted session token to a repo from this ID-token claim, so OIDC dashboard logins can be repo-scoped instead of operator-wide (v0.42). Default: unset |
+| `COORD_HOT_RELOAD` | MCP wrapper only (v0.47): live re-read and re-discovery of `.coordination/local.env`. On by default; a token/scope edit is re-read on change, and a file created *after* the wrapper started is discovered within ~2s — both without a restart. Set to `0`/`false`/`no`/`off` to pin the startup config (immutable/perf-sensitive deployments). |
 | `COORD_HOST` | Bind host for the API server. Default: `0.0.0.0` |
 | `COORD_PORT` | Bind port for the API server. Default: `8080` |
 | `COORD_LOG_LEVEL` | Uvicorn log level. Default: `info` |

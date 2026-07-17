@@ -103,7 +103,28 @@ _env_reload: dict[str, Any] = {
     "stamp": None,  # (st_mtime_ns, st_size) of the last APPLIED version
     "applied": {},  # key -> value this wrapper set from the file
     "bad_stamp": None,  # stamp of a rejected version (warn once, retry on change)
+    "discover_after": 0.0,  # monotonic deadline to re-attempt discovery (path is None)
 }
+
+# When no local.env was found at startup, re-discovery walks cwd->root; throttle
+# it so that walk does not run on literally every tool call while unconfigured.
+_REDISCOVER_INTERVAL_S = 2.0
+
+
+def _hot_reload_enabled() -> bool:
+    """Whether the per-call re-read/re-discovery of ``local.env`` is active.
+
+    On by default. ``COORD_HOT_RELOAD`` in {0, false, no, off} (case-insensitive)
+    disables it — for immutable-config or perf-sensitive deployments that pin the
+    token via explicit env and never rotate it live. The one-shot startup
+    ``_load_local_env`` runs regardless; only the live reload is gated.
+    """
+    return os.environ.get("COORD_HOT_RELOAD", "").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
 
 
 def _stat_stamp(path: Path) -> tuple[int, int] | None:
@@ -149,10 +170,26 @@ def _invalid_env_lines(text: str) -> list[str]:
 
 
 def _maybe_reload_local_env() -> None:
-    """Re-apply the watched local.env if it changed on disk (see block
-    comment above). Cheap: one os.stat when nothing changed."""
+    """Re-apply the watched local.env if it changed on disk (see block comment
+    above), and — when none was found at startup — periodically re-discover one
+    that appeared later (``coord init`` in a fresh checkout, or an agent wiring a
+    token mid-session). Without the re-discovery a local.env created after launch
+    stayed invisible until a full restart. Cheap: one os.stat when nothing
+    changed. Gated by :func:`_hot_reload_enabled` (``COORD_HOT_RELOAD``)."""
+    if not _hot_reload_enabled():
+        return
     path = _env_reload["path"]
     if path is None:
+        # Nothing watched yet: attempt discovery so a file created post-launch is
+        # picked up without a restart. Throttled — the walk-to-root would
+        # otherwise run on every tool call while unconfigured.
+        now = time.monotonic()
+        if now < _env_reload["discover_after"]:
+            return
+        _env_reload["discover_after"] = now + _REDISCOVER_INTERVAL_S
+        found = _load_local_env()
+        if found is not None:
+            print(f"coord-mcp: discovered {found}", file=sys.stderr)
         return
     stamp = _stat_stamp(path)
     if stamp is None or stamp in (_env_reload["stamp"], _env_reload["bad_stamp"]):

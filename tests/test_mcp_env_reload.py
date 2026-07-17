@@ -24,10 +24,17 @@ def _fresh_reload_state(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         mcp_server,
         "_env_reload",
-        {"path": None, "stamp": None, "applied": {}, "bad_stamp": None},
+        {
+            "path": None,
+            "stamp": None,
+            "applied": {},
+            "bad_stamp": None,
+            "discover_after": 0.0,
+        },
     )
     for key in mcp_server._LOCAL_ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("COORD_HOT_RELOAD", raising=False)
     yield
 
 
@@ -146,3 +153,72 @@ def test_invalid_env_lines_definition() -> None:
     assert mcp_server._invalid_env_lines(good) == []
     assert mcp_server._invalid_env_lines("just words\n") == ["just words"]
     assert mcp_server._invalid_env_lines("=nokey\n") == ["=nokey"]
+
+
+def test_rediscovers_local_env_created_after_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The load-bearing fix: a local.env that did NOT exist at startup (so the
+    startup walk found nothing) must still be picked up live, without a restart
+    — the exact failure that left a freshly-wired agent 401ing all session."""
+    monkeypatch.chdir(tmp_path)
+    mcp_server._load_local_env()  # startup: nothing to find
+    assert mcp_server._env_reload["path"] is None
+    assert "COORD_AUTH_TOKEN" not in os.environ  # unauthenticated (no discovery yet)
+
+    _seed(tmp_path, "COORD_AUTH_TOKEN=late-token\nCOORD_REPO_ID=late/repo\n")
+
+    # The next tool call re-discovers it (discover_after starts at 0.0).
+    assert mcp_server._headers()["Authorization"] == "Bearer late-token"
+    assert mcp_server._repo_id() == "late/repo"
+    assert mcp_server._env_reload["path"] is not None
+
+
+def test_rediscovery_is_throttled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """While unconfigured, the cwd->root walk must not run on every call."""
+    monkeypatch.chdir(tmp_path)
+    mcp_server._load_local_env()
+    calls = {"n": 0}
+    real = mcp_server._load_local_env
+
+    def counting(start=None):
+        calls["n"] += 1
+        return real(start)
+
+    monkeypatch.setattr(mcp_server, "_load_local_env", counting)
+    monkeypatch.setattr(mcp_server.time, "monotonic", lambda: 100.0)
+    mcp_server._headers()  # first attempt runs, sets discover_after=102.0
+    mcp_server._headers()  # same clock -> throttled
+    mcp_server._base_url()  # same clock -> throttled
+    assert calls["n"] == 1
+
+
+def test_hot_reload_can_be_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """COORD_HOT_RELOAD=false pins the startup config: neither live re-reads of a
+    watched file nor re-discovery of a new one happen."""
+    # (a) a change to a watched file is ignored when disabled.
+    env_file = _seed(tmp_path, "COORD_AUTH_TOKEN=first\n")
+    mcp_server._load_local_env(start=tmp_path)
+    monkeypatch.setenv("COORD_HOT_RELOAD", "false")
+    env_file.write_text("COORD_AUTH_TOKEN=second\n", encoding="utf-8")
+    _bump_mtime(env_file)
+    assert mcp_server._headers()["Authorization"] == "Bearer first"
+
+    # (b) re-discovery is also suppressed when disabled.
+    monkeypatch.setattr(
+        mcp_server,
+        "_env_reload",
+        {"path": None, "stamp": None, "applied": {}, "bad_stamp": None, "discover_after": 0.0},
+    )
+    monkeypatch.delenv("COORD_AUTH_TOKEN", raising=False)
+    monkeypatch.chdir(tmp_path)
+    _seed(tmp_path, "COORD_AUTH_TOKEN=third\n")
+    assert "Authorization" not in mcp_server._headers()  # stays unauthenticated
+
+    # Re-enabling picks it up.
+    monkeypatch.setenv("COORD_HOT_RELOAD", "true")
+    assert mcp_server._headers()["Authorization"] == "Bearer third"

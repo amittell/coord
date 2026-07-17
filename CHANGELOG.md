@@ -9,6 +9,30 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.47.0] - 2026-07-17
+
+MCP wrapper hot-reload of `.coordination/local.env`, so a long-lived agent
+session picks up token/scope/URL changes without a restart.
+
+- **Live re-read on change.** The wrapper re-stats the file whenever it is
+  about to use its config and re-applies it on change — unless the new
+  version contains a line that is not blank/comment/`KEY=VALUE`, in which
+  case the last-good config is kept and the bad version is warned about once.
+- **Re-discovery of a config created after startup.** Previously the reload
+  only re-stat'd a file found during the one startup walk; if
+  `.coordination/local.env` was absent then (fresh checkout, or an agent
+  wiring a token mid-session), it stayed invisible until a full restart — an
+  agent that created the file kept `401`-ing all session. The wrapper now
+  re-walks `cwd`→root when nothing is watched yet (throttled to ~2s so it is
+  not a per-call cost while unconfigured) and adopts the file the moment it
+  appears.
+- **`COORD_HOT_RELOAD` toggle.** The whole live-reload path (change-detection
+  and re-discovery) is gated by this env var: on by default; `0`/`false`/
+  `no`/`off` pins the startup config. The one-shot startup load is unaffected.
+
+An explicit value from the shell or `.mcp.json` still wins over a file
+reload, matching the startup ownership rule.
+
 ## [0.46.0] - 2026-07-11
 
 Repo-wide audit-fix campaign (2026-07-08). Behavior changes below; pure
