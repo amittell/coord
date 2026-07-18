@@ -750,3 +750,18 @@ def test_shim_exits_zero_when_helper_missing(tmp_path) -> None:
     # Push allowed: the shim resolves the (now missing) helper and exits 0
     # instead of erroring on a nonexistent exec target.
     assert result.returncode == 0, result.stderr
+
+
+def test_http_errors_route_through_soft_fail() -> None:
+    """v0.48.1: a server that ANSWERS but refuses (401 stale token, 5xx,
+    proxy 502) is an infra/identity gap, not a confirmed conflict. Found
+    live 2026-07-18: a wiped local.env token turned every fleet push into
+    a hard block — exactly the hard-dependency posture better-together
+    forbids. Only a parsed response with has_conflicts=true blocks in
+    advise mode; enforce restores fail-closed for all of these."""
+    assert 'soft_fail "batch conflict check failed with HTTP ${batch_status}"' in PRE_PUSH_SCRIPT
+    assert 'soft_fail "conflict-check response for ${context} was not parseable"' in PRE_PUSH_SCRIPT
+    # No remaining hard exit on the batch HTTP-status branch.
+    assert "returned HTTP ${batch_status}; refusing to push" not in PRE_PUSH_SCRIPT
+    # The 404/405 legacy-server fallback is still a fallback, not a soft_fail.
+    assert 'legacy_conflict_check || exit $?' in PRE_PUSH_SCRIPT

@@ -298,23 +298,37 @@ def _write_local_env(
     repo-scoped tokens into this file -- so a re-init must not clobber a
     working token with the ``set-me`` placeholder (remote mode without
     COORD_AUTH_TOKEN exported) or the shared ``~/.coord/token`` (local
-    mode). Only ``--force`` re-mints/backfills over an existing real token.
-    Unmanaged keys and comments are preserved verbatim via the shared
-    envfile updater.
+    mode). ``--force`` re-mints from the shared token file (local mode) or
+    replaces with an exported COORD_AUTH_TOKEN (remote mode); a forced
+    remote re-init with no replacement exported still preserves the real
+    token, because downgrading it to the placeholder would destroy an
+    unrecoverable credential. Unmanaged keys and comments are preserved
+    verbatim via the shared envfile updater.
     """
     path = repo_root / ".coordination" / "local.env"
     existing_token = read_env_file(path).get("COORD_AUTH_TOKEN", "")
-    preserved = bool(
-        existing_token
-        and existing_token != PLACEHOLDER_AUTH_TOKEN
-        and not force
+    existing_real = bool(
+        existing_token and existing_token != PLACEHOLDER_AUTH_TOKEN
     )
-    if preserved:
-        token = existing_token
-    elif mode == "local":
-        token = ensure_token_file(state_paths()["token_file"])
+    if mode == "local":
+        # --force re-reads the shared token file: always a real credential.
+        token = (
+            existing_token
+            if existing_real and not force
+            else ensure_token_file(state_paths()["token_file"])
+        )
     else:
-        token = os.environ.get("COORD_AUTH_TOKEN", PLACEHOLDER_AUTH_TOKEN)
+        # Remote mode cannot mint. --force only replaces a real token when
+        # COORD_AUTH_TOKEN is exported as the replacement; without one,
+        # forcing a hook/owners refresh must not destroy an unrecoverable
+        # pasted credential by downgrading it to the placeholder (both fleet
+        # repos' tokens were wiped exactly this way, live, 2026-07-18).
+        replacement = os.environ.get("COORD_AUTH_TOKEN", "")
+        if existing_real and (not force or not replacement):
+            token = existing_token
+        else:
+            token = replacement or PLACEHOLDER_AUTH_TOKEN
+    preserved = existing_real and token == existing_token
     # COORD_API_URL powers coord-mcp and user shells; COORD_SERVICE_URL is
     # the legacy name the pre-push hook accepts. Emit both so each inert-data
     # reader picks up the right endpoint -- this is what stops a

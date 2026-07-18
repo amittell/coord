@@ -9,6 +9,20 @@ Semantic Versioning.
 
 (none recorded yet)
 
+## [0.48.1] - 2026-07-18
+
+### Fixed
+
+- `coord init --force` in remote mode no longer downgrades a real pasted
+  `COORD_AUTH_TOKEN` to the `set-me` placeholder when no replacement is
+  exported. Remote mode cannot re-mint, so the forced hook/owners refresh
+  destroyed an unrecoverable credential (both fleet repos, live 2026-07-18).
+- Pre-push hook: a conflict-check response with a non-2xx status (stale
+  token 401, 5xx, proxy errors) and an unparseable response body now route
+  through `soft_fail` like transport errors — warn-and-allow in the default
+  advise mode, blocking only under `COORD_PREPUSH_MODE=enforce`. Confirmed
+  conflicts still block in every mode.
+
 ## [0.48.0] - 2026-07-18
 
 **Better-together posture**: `COORD_PREPUSH_MODE=advise` is now the

@@ -570,9 +570,9 @@ validate_conflict_response() {
   if ! has="$(printf '%s' "${resp}" | jq -r \\
     'if (.has_conflicts | type) == "boolean" then .has_conflicts else error("missing boolean has_conflicts") end' \\
     2>/dev/null)"; then
-    echo "coordination pre-push: invalid conflict-check response for ${context}; refusing to push" >&2
+    echo "coordination pre-push: invalid conflict-check response for ${context}" >&2
     printf '%s\\n' "${resp}" >&2
-    return 1
+    soft_fail "conflict-check response for ${context} was not parseable"
   fi
   if [[ "${has}" == "true" ]]; then
     echo "coordination pre-push: conflict reported for ${context}" >&2
@@ -608,7 +608,10 @@ legacy_conflict_check() {
 # Modern servers accept the complete push as JSON, cutting a 300-file push
 # from 300 HTTP round-trips (plus per-file interpreter spawns) to one (#67).
 # A 404/405 means an older coord server; only that case falls back to the
-# legacy per-file GET contract. Every other error remains fail-closed.
+# legacy per-file GET contract. Every other non-2xx routes through
+# soft_fail: confirmed conflicts block in every mode, but a server that
+# cannot answer (or rejects our credential) only blocks under
+# COORD_PREPUSH_MODE=enforce.
 PATTERNS_JSON="$(printf '%s\\n' "${MODIFIED}" | jq -Rsc 'split("\\n") | map(select(length > 0))')"
 SESSION_IDS_JSON="$(printf '%s' "${SESSION_IDS}" | jq -Rsc 'split("\\n") | map(select(length > 0))')"
 BATCH_PAYLOAD="$(jq -cn \\
@@ -637,9 +640,12 @@ if [[ "${batch_status}" == "404" || "${batch_status}" == "405" ]]; then
 elif [[ "${batch_status}" == 2* ]]; then
   validate_conflict_response "${batch_resp}" "pushed file batch" || exit $?
 else
-  echo "coordination pre-push: batch conflict check returned HTTP ${batch_status}; refusing to push" >&2
+  # The server answered but refused (bad/stale token, 5xx, proxy error).
+  # That is an infra/identity gap, not a confirmed conflict, so advise
+  # mode warns and allows; only COORD_PREPUSH_MODE=enforce blocks here.
+  echo "coordination pre-push: batch conflict check returned HTTP ${batch_status}" >&2
   printf '%s\\n' "${batch_resp}" >&2
-  exit 1
+  soft_fail "batch conflict check failed with HTTP ${batch_status}"
 fi
 
 exit 0
