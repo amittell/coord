@@ -31,9 +31,11 @@ scripts/release.sh              # dry run: validates, builds, prints plan
 scripts/release.sh --publish    # uploads PyPI + pushes image + tags writhub
 ```
 
-Then point the deployment at the new image: edit `deploy/k8s/prod`
-(image `whcr.io/coord/coord:vX.Y.Z`), commit, push — the `coord-prod`
-ArgoCD app rolls the service from writhub.
+The canonical image is `whcr.io/alexm/coord:vX.Y.Z`. Deployment manifests are
+owned by each downstream cluster, not this repository's `deploy/k8s/prod`
+overlay. For kebabrack, build the PostgreSQL-enabled `vX.Y.Z-pg` derivative,
+update `kebabrack-lab/k8s/10b-coord-app.yaml`, and let the
+`cluster-coord-deployment` Argo CD Application roll it out.
 
 Registry/image knobs: `COORD_IMAGE_REGISTRY`, `COORD_IMAGE_NAME`,
 `COORD_IMAGE_PLATFORMS`.

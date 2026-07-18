@@ -187,10 +187,13 @@ def test_runbook_imports_a_fresh_post_drain_snapshot() -> None:
     text = RUNBOOK.read_text(encoding="utf-8")
     assert "set -euo pipefail" in text
     assert "same Bash session" in text
+    assert "COORD_DEPLOYMENT_ARGO_APP=cluster-coord-deployment" in text
     hard_cutover = text.index("## 4. Hard cutover")
     verify = text.index("## 5. Verify")
     cutover = text[hard_cutover:verify]
-    disable_argocd = cutover.index("patch application coord-prod")
+    disable_argocd = cutover.index(
+        'patch application "$COORD_DEPLOYMENT_ARGO_APP"'
+    )
     scale_down = cutover.index("scale deploy/coord --replicas=0")
     pods_deleted = cutover.index("wait_for_no_coord_pods", scale_down)
     final_snapshot = cutover.index("coordination.final-cutover.db")
@@ -204,7 +207,9 @@ def test_runbook_imports_a_fresh_post_drain_snapshot() -> None:
 def test_runbook_waits_for_postgres_pods_to_delete_before_rollback() -> None:
     text = RUNBOOK.read_text(encoding="utf-8")
     rollback = text[text.index("## 6. Rollback") :]
-    disable_argocd = rollback.index("patch application coord-prod")
+    disable_argocd = rollback.index(
+        'patch application "$COORD_DEPLOYMENT_ARGO_APP"'
+    )
     scale_down = rollback.index("scale deploy/coord --replicas=0")
     pods_deleted = rollback.index("wait_for_no_coord_pods", scale_down)
     sqlite_apply = rollback.index('apply -f "$SQLITE_ROLLBACK_MANIFEST"')

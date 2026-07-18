@@ -32,6 +32,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 OVERLAY = REPO_ROOT / "deploy" / "k8s" / "prod"
 MCP_JSON = REPO_ROOT / ".mcp.json"
+RELEASE_SCRIPT = REPO_ROOT / "scripts" / "release.sh"
 
 FORBIDDEN = (
     "YOUR_CLUSTER",
@@ -43,6 +44,11 @@ EXPECTED = {
     "ingress.yaml": ("host: coord.kebabrack.lan",),
     "vaultstaticsecret-auth.yaml": ("path: apps/k8s/coord",),
 }
+
+EXTERNALLY_OWNED = (
+    "deployment.yaml",
+    "vaultstaticsecret-whcr.yaml",
+)
 
 # A coord auth token is a 64-char hex string. Any committed config that
 # matches this shape is almost certainly a real credential leak.
@@ -66,6 +72,21 @@ def test_overlay_has_concrete_values(name: str, needles: tuple[str, ...]) -> Non
     text = (OVERLAY / name).read_text(encoding="utf-8")
     for needle in needles:
         assert needle in text, f"{name} missing required line: {needle!r}"
+
+
+@pytest.mark.parametrize("name", EXTERNALLY_OWNED)
+def test_overlay_does_not_duplicate_cluster_owned_resources(name: str) -> None:
+    assert not (OVERLAY / name).exists(), (
+        f"{name} must stay absent from coord-prod: the Deployment is owned by "
+        "the kebabrack cluster repository and its external pull-secret "
+        "projection has been retired"
+    )
+
+
+def test_release_script_uses_canonical_whcr_namespace() -> None:
+    text = RELEASE_SCRIPT.read_text(encoding="utf-8")
+    assert '${REGISTRY}/alexm/coord' in text
+    assert '${REGISTRY}/coord/coord' not in text
 
 
 def test_mcp_json_does_not_leak_real_token() -> None:

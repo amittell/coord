@@ -9,14 +9,14 @@ third-party PostgreSQL install has no SQLite state to drain or import; use the
 fresh-install quickstart in `docs/deployment.md` instead.
 
 > **WARNING -- ArgoCD (learned from the 2026-07-05 v0.44.0 incident):** the HA
-> manifests live in `deploy/k8s/ha-cutover/`, deliberately OUTSIDE ArgoCD's
-> watched path (`deploy/k8s/prod/`). Never move them into the watched path
+> manifests live in `deploy/k8s/ha-cutover/`, deliberately OUTSIDE the
+> cluster repository's Deployment Application. Never move them into a watched path
 > ahead of the cutover: ArgoCD auto-applies on merge, and doing so activated
 > the cutover prematurely against an image that could not speak Postgres,
 > 401ing the whole fleet. During the cutover itself, ArgoCD's
 > `selfHeal` will fight any manual `kubectl apply` that diverges from
-> `deploy/k8s/prod/` -- disable auto-sync first (step 4) and re-enable it only
-> after the prod manifest in git matches the HA state.
+> the cluster-owned Deployment manifest -- disable auto-sync first (step 4)
+> and re-enable it only after the cluster repository matches the HA state.
 
 This is a **hard-drain** cutover, not a clean break and not a live canary.
 There must be **no window where a SQLite-backed pod and a Postgres-backed pod
@@ -91,8 +91,8 @@ carried across.
 - [ ] Rollback image tag (current SQLite image) and the SQLite PVC are
       recorded; the PVC is **retained**, not deleted, for at least ~2 weeks.
 - [ ] The exact currently deployed SQLite manifest is saved before maintenance
-      (for this repo/ArgoCD layout:
-      `cp deploy/k8s/prod/deployment.yaml ./previous-sqlite-deployment.yaml`)
+      (`kubectl -n coord get deployment coord -o yaml >
+      ./previous-sqlite-deployment.yaml`)
       and reviewed to confirm it pins the current image, one replica, and the
       `coord-data` PVC.
 - [ ] Token create/rotate/revoke and ownership-config changes are frozen from
@@ -109,6 +109,7 @@ writer transition. Set shared variables (adjust to your environment):
 set -euo pipefail
 
 NS=coord                      # kubernetes namespace
+COORD_DEPLOYMENT_ARGO_APP=cluster-coord-deployment
 # Pods are labeled app.kubernetes.io/name=coord (see the Deployment manifests);
 # there is no bare `app=coord` label.
 SQLITE_POD=$(kubectl -n "$NS" get pod -l app.kubernetes.io/name=coord -o jsonpath='{.items[0].metadata.name}')
@@ -303,7 +304,7 @@ No mixed-backend writers. Stop the old writer, then start the new ones.
 ```bash
 # 4a. Disable ArgoCD auto-sync before the first manual mutation. Otherwise
 #     selfHeal can scale the SQLite writer back up during the final snapshot.
-kubectl -n argocd patch application coord-prod --type merge \
+kubectl -n argocd patch application "$COORD_DEPLOYMENT_ARGO_APP" --type merge \
   -p '{"spec":{"syncPolicy":null}}'
 
 # 4b. Stop the SQLite writer completely (scale to 0, do NOT rolling-update).
@@ -399,9 +400,9 @@ kubectl -n "$NS" apply -f deploy/k8s/ha-cutover/deployment.yaml
 kubectl -n "$NS" rollout status deploy/coord --timeout=300s
 ```
 
-Once the cutover is verified (step 5), land the HA manifests in
-`deploy/k8s/prod/` via a normal PR and re-enable ArgoCD auto-sync, so git
-returns to being the source of truth for the now-Postgres prod.
+Once the cutover is verified (step 5), update the cluster repository's
+Deployment manifest via a normal review and re-enable its Argo CD Application,
+so git returns to being the source of truth for the now-Postgres prod.
 
 - [ ] coord scaled to 0 and reported 0 ready **before** the PG-backed pods
       started (this is the split-brain guard -- verify the ordering held).
@@ -473,7 +474,7 @@ Then drain PG writers and bring SQLite back:
 ```bash
 # 6a. Disable ArgoCD auto-sync again (it may have been re-enabled after a
 #     successful verification) so selfHeal cannot restart PostgreSQL writers.
-kubectl -n argocd patch application coord-prod --type merge \
+kubectl -n argocd patch application "$COORD_DEPLOYMENT_ARGO_APP" --type merge \
   -p '{"spec":{"syncPolicy":null}}'
 
 # 6b. Stop the PG-backed replicas entirely.

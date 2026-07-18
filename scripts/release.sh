@@ -43,7 +43,7 @@ for a in "$@"; do
 done
 
 REGISTRY="${COORD_IMAGE_REGISTRY:-whcr.io}"
-IMAGE="${COORD_IMAGE_NAME:-${REGISTRY}/coord/coord}"
+IMAGE="${COORD_IMAGE_NAME:-${REGISTRY}/alexm/coord}"
 PLATFORMS="${COORD_IMAGE_PLATFORMS:-linux/amd64,linux/arm64}"
 
 VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
@@ -86,8 +86,8 @@ echo "release plan for ${TAG}:"
 [ "$SKIP_PYPI" = 0 ] && echo "  1. twine upload dist/*  -> PyPI coord-mcp-server ${VERSION}"
 [ "$SKIP_IMAGE" = 0 ] && echo "  2. buildx ${PLATFORMS} -> ${IMAGE}:${TAG} + :latest (pushed)"
 echo "  3. git tag ${TAG} + push to origin (writhub)"
-echo "  4. THEN: bump deploy/k8s/prod image to ${IMAGE}:${TAG} and commit"
-echo "     (coord-prod ArgoCD app rolls the service from writhub)"
+echo "  4. THEN: update each downstream cluster's Deployment manifest"
+echo "     (kebabrack: build the -pg derivative and update k8s/10b-coord-app.yaml)"
 
 if [ "$PUBLISH" = 0 ]; then
   echo
@@ -110,4 +110,4 @@ fi
 
 git tag -a "${TAG}" -m "coord ${TAG}"
 git push origin "refs/tags/${TAG}"
-echo "release: ${TAG} published. Next: update deploy/k8s/prod image + commit."
+echo "release: ${TAG} published. Next: update downstream Deployment manifests."
