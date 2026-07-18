@@ -323,6 +323,25 @@ async def _create(args: argparse.Namespace) -> int:
     if _refuse_implicit_remote_mode_local_create(args):
         return 1
     db = _database(_db_path(args))
+    # v20: a repo-scoped token requires the repo to be REGISTERED, so a typo'd
+    # or never-onboarded id cannot mint a token whose claims land under a
+    # phantom scope (found live 2026-07-17). --register is the explicit
+    # bootstrap for a genuinely new repo.
+    if repo is not None:
+        if getattr(args, "register", False):
+            if await db.register_repo(repo, registered_by=args.engineer):
+                # stderr: --json consumers own stdout.
+                print(f"Registered repo {repo}.", file=sys.stderr)
+        elif not await db.repo_registered(repo):
+            print(
+                f"Repo '{repo}' is not registered with this coord service.\n"
+                f"If it is genuinely new, either run\n"
+                f"  coord repos register {repo}\n"
+                f"or re-run with --register to register and mint in one step.\n"
+                f"(Registered repos: coord repos list)",
+                file=sys.stderr,
+            )
+            return 1
     raw = generate_raw_token()
     token_id = await db.create_engineer_token(
         args.engineer,
@@ -597,6 +616,15 @@ def add_tokens_subparser(sub: argparse._SubParsersAction) -> None:
             "Bind the token to a repo id (e.g. amittell/coord) so the server "
             "enforces repo scope from auth. Omit for an unscoped (operator) "
             "token that sees all repos"
+        ),
+    )
+    create.add_argument(
+        "--register",
+        action="store_true",
+        help=(
+            "Register the --repo id in the repos registry if it is not "
+            "already, then mint. Without this, minting for an unregistered "
+            "repo is refused (typo protection)"
         ),
     )
     create.add_argument(
