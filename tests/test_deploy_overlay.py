@@ -42,7 +42,6 @@ FORBIDDEN = (
 EXPECTED = {
     "ingress.yaml": ("host: coord.kebabrack.lan",),
     "vaultstaticsecret-auth.yaml": ("path: apps/k8s/coord",),
-    "vaultstaticsecret-ghcr.yaml": ("path: apps/k8s/coord",),
 }
 
 # A coord auth token is a 64-char hex string. Any committed config that

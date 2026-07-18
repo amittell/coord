@@ -24,8 +24,9 @@ The overlay assumes:
 - Default StorageClass: `local-path`
 - Vault Secrets Operator installed with a cluster-shared `VaultAuth`
   at `vault/vault-auth` and a kv-v2 entry at `secret/apps/k8s/coord`
-  with keys `auth_token`, `ghcr_username`, `ghcr_pat`
-- GHCR image is private; pull creds are sourced from the same secret path
+  with key `auth_token`
+- WHCR pull credentials at `secret/infra/whcr`; the Deployment consumes the
+  rendered `whcr-pull` Secret
 
 ## Auth posture
 
@@ -39,8 +40,7 @@ reviewed the dashboard and API exposure model for your environment.
 - `namespace.yaml` - `coord` namespace
 - `vaultstaticsecret-auth.yaml` - syncs `COORD_AUTH_TOKEN` from Vault
   into the `coord-auth` Secret
-- `vaultstaticsecret-ghcr.yaml` - renders a `kubernetes.io/dockerconfigjson`
-  Secret `ghcr-pull` from the `ghcr_username` / `ghcr_pat` fields
+- `vaultstaticsecret-whcr.yaml` - renders the `whcr-pull` registry Secret
 - `pvc.yaml` - 1Gi `local-path` PVC for the SQLite DB
 - `deployment.yaml` - single replica, non-root, pinned image digest,
   bearer-token auth
