@@ -386,6 +386,24 @@ else
   PUSH_INPUT="$(cat || true)"
 fi
 
+# Better-together posture (v0.48): coordination must never be a hard
+# dependency of shipping. COORD_PREPUSH_MODE=advise (default) turns the
+# hook's OWN failures -- coord unreachable, transport errors, unusable
+# stdin -- into loud warnings that ALLOW the push; only a CONFIRMED
+# conflict from a healthy coord still blocks. 'enforce' restores the
+# strict fail-closed behaviour for teams that want coordination as a gate.
+PREPUSH_MODE="${COORD_PREPUSH_MODE:-advise}"
+soft_fail() {
+  echo "coordination pre-push: $1" >&2
+  if [[ "${PREPUSH_MODE}" == "enforce" ]]; then
+    echo "  (COORD_PREPUSH_MODE=enforce: refusing the push)" >&2
+    exit 1
+  fi
+  echo "  (advise mode: allowing the push WITHOUT coordination checks;" >&2
+  echo "   set COORD_PREPUSH_MODE=enforce to make this block instead)" >&2
+  exit 0
+}
+
 # Redirected-but-empty stdin is the signature of an outer wrapper hook
 # that backgrounded us (e.g. astrowars's run_child function pre-fix) or
 # otherwise dropped git's pre-push ref-update stream. The pre-v0.7.2
@@ -395,17 +413,7 @@ fi
 # set. A TTY stdin means "hand-run for testing"; the fallback below
 # only runs in that case.
 if [[ ${STDIN_IS_TTY} -eq 0 && -z "${PUSH_INPUT//[$'\\t\\r\\n ']/}" ]]; then
-  echo "coordination pre-push: stdin was redirected but empty;" >&2
-  echo "  this normally means an outer wrapper hook backgrounded us or did" >&2
-  echo "  not forward git's ref-update stream. Refusing rather than" >&2
-  echo "  silently checking only HEAD vs ${UPSTREAM}/HEAD (would miss" >&2
-  echo "  non-HEAD, new-branch, multi-ref, and deletion pushes)." >&2
-  echo "  Outer-hook fix: cache stdin once into a tempfile and redirect" >&2
-  echo "  the coord call from it, e.g.:" >&2
-  echo "    PUSH_REFS=\\"\\$(mktemp)\\"" >&2
-  echo "    [ ! -t 0 ] && cat > \\"\\$PUSH_REFS\\"" >&2
-  echo "    bash \\"\\$COORD_HOOK\\" \\"\\$@\\" < \\"\\$PUSH_REFS\\"" >&2
-  exit 1
+  soft_fail "stdin was redirected but empty (outer wrapper or linked-worktree quirk) -- cannot determine the pushed ref set"
 fi
 
 MODIFIED=""
@@ -591,8 +599,7 @@ legacy_conflict_check() {
     if ! resp="$(curl -fsS \\
       ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} \\
       "${COORD_URL}/conflicts?pattern=${enc}&engineer=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "${ENGINEER}")${REPO_QS}${SESSION_QS}${BRANCH_QS}")"; then
-      echo "coordination pre-push: conflict check failed for ${file}; refusing to push" >&2
-      return 1
+      soft_fail "conflict check unreachable for ${file}"
     fi
     validate_conflict_response "${resp}" "${file}" || return $?
   done <<< "${MODIFIED}"
@@ -620,8 +627,7 @@ if ! batch_raw="$(printf '%s' "${BATCH_PAYLOAD}" | curl -sS \\
   --data-binary @- \\
   -w $'\\n%{http_code}' \\
   "${COORD_URL}/conflicts/batch")"; then
-  echo "coordination pre-push: batch conflict check failed; refusing to push" >&2
-  exit 1
+  soft_fail "batch conflict check unreachable"
 fi
 
 batch_status="${batch_raw##*$'\\n'}"

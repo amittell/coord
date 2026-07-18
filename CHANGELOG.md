@@ -7,6 +7,17 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+(none recorded yet)
+
+## [0.48.0] - 2026-07-18
+
+**Better-together posture**: `COORD_PREPUSH_MODE=advise` is now the
+pre-push default — the hook's OWN failures (coord unreachable, transport
+errors, unusable stdin from outer wrappers or linked worktrees) warn
+loudly and ALLOW the push; only a confirmed conflict from a healthy coord
+blocks. `enforce` restores strict fail-closed. Coordination is never a
+hard dependency of shipping.
+
 Fleet enforcement (v20 schema), from the 2026-07-17 live audit: two
 fully-initialized repos saw zero claims filed all day, scoped tokens were
 minted for repos the service had never seen, and a pusher's own claims
