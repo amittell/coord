@@ -20,6 +20,7 @@ bucketed, without the client needing to duplicate the grammar.
 from __future__ import annotations
 
 import re
+from typing import overload
 
 # A repo id is one or more path-like segments joined by a single '/':
 # "owner/name" (the canonical GitHub form) or a bare "name" (the CLI's
@@ -34,6 +35,14 @@ MAX_REPO_ID_LEN = 200
 
 class InvalidRepoId(ValueError):
     """Raised when a repo identifier is malformed."""
+
+
+@overload
+def normalize_repo_id(value: str) -> str: ...
+
+
+@overload
+def normalize_repo_id(value: None) -> None: ...
 
 
 def normalize_repo_id(value: str | None) -> str | None:
