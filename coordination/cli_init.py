@@ -430,14 +430,24 @@ _CLAUDE_HOOK_COMMANDS = {
     "SessionEnd": "coord-claude-hook sessionend",
 }
 
+# SessionEnd's Claude Code shutdown budget is only 1.5 seconds by default.
+# Cleanup is advisory and cannot affect Claude's response, so run it in the
+# background and allow enough command time for the terminal session release
+# plus the one-time v0.48 legacy drain.
+_CLAUDE_HOOK_OPTIONS = {
+    "SessionEnd": {"async": True, "timeout": 15},
+}
+
 
 def _update_claude_settings(path: Path) -> bool:
-    """Merge the coord enforcement hooks into ``.claude/settings.json``
-    (v20). Idempotent: an event whose matcher group already carries a
-    ``coord-claude-hook`` command is left untouched, and every other
-    setting in the file is preserved. Same refusal contract as
+    """Merge and reconcile coord hooks in ``.claude/settings.json``.
+
+    Existing exact coord command entries are updated with managed options
+    (notably async SessionEnd), while compound commands, wrong subcommands,
+    foreign hooks, and other settings are preserved. Same refusal contract as
     ``_update_mcp_json``: an unparsable or non-object file is left alone
-    rather than clobbered."""
+    rather than clobbered.
+    """
     settings: dict = {}
     if path.exists():
         try:
@@ -455,15 +465,32 @@ def _update_claude_settings(path: Path) -> bool:
     changed = False
     for event, command in _CLAUDE_HOOK_COMMANDS.items():
         groups = hooks.setdefault(event, [])
-        if any(
-            "coord-claude-hook" in (h.get("command") or "")
-            for g in groups
-            if isinstance(g, dict)
-            for h in g.get("hooks", [])
-            if isinstance(h, dict)
-        ):
+        if not isinstance(groups, list):
+            print(f"  ! {path} hooks.{event} is not a list; not adding coord hooks")
+            return False
+        managed_options = _CLAUDE_HOOK_OPTIONS.get(event, {})
+        found = False
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            group_hooks = group.get("hooks", [])
+            if not isinstance(group_hooks, list):
+                continue
+            for hook in group_hooks:
+                if not isinstance(hook, dict):
+                    continue
+                hook_command = hook.get("command")
+                if not isinstance(hook_command, str) or hook_command.strip() != command:
+                    continue
+                found = True
+                for key, value in managed_options.items():
+                    if hook.get(key) != value:
+                        hook[key] = value
+                        changed = True
+        if found:
             continue
-        entry: dict = {"hooks": [{"type": "command", "command": command}]}
+        hook = {"type": "command", "command": command, **managed_options}
+        entry: dict = {"hooks": [hook]}
         if event == "PreToolUse":
             entry["matcher"] = "Edit|Write|MultiEdit|NotebookEdit"
         groups.append(entry)

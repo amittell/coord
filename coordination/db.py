@@ -23,6 +23,24 @@ from coordination.repo_id import normalize_repo_id
 logger = logging.getLogger(__name__)
 
 
+class SessionLifecycleClosed(Exception):
+    """A DB-level claim-producing transition targeted a closed session."""
+
+    def __init__(self, session_id: str, repo: str | None) -> None:
+        self.session_id = session_id
+        self.repo = repo
+        super().__init__(session_id)
+
+
+class SessionLifecycleOwnershipMismatch(Exception):
+    """A DB-level claim-producing transition used the wrong principal."""
+
+    def __init__(self, session_id: str, repo: str | None) -> None:
+        self.session_id = session_id
+        self.repo = repo
+        super().__init__(session_id)
+
+
 # Transaction seam (HA re-architecture, design Sections 5/7). When a
 # claim-grant runs inside :meth:`Database.transaction`, the bound
 # connection is published here so every Database method invoked in that
@@ -174,7 +192,7 @@ CREATE INDEX IF NOT EXISTS idx_claims_engineer ON claims (engineer);
 """
 
 
-CURRENT_SCHEMA_VERSION = 20
+CURRENT_SCHEMA_VERSION = 21
 
 
 # v0.28 fairness pass: per-blocking-claim counter that
@@ -657,6 +675,43 @@ MIGRATIONS: list[tuple[int, str]] = [
         "    repo_id TEXT PRIMARY KEY,\n"
         "    registered_by TEXT,\n"
         "    registered_at TEXT NOT NULL\n"
+        ");",
+    ),
+    # v21: terminal session lifecycle. SessionEnd closes a (session, repo)
+    # lifecycle atomically with its claims; claim admission checks the same
+    # row under a session lock, so a delayed hook can never recreate claims
+    # after bulk release. The empty repo key is a global wildcard used by
+    # unscoped/operator releases. An exact repo row takes precedence, which
+    # lets SessionStart reopen one repo after a prior global close without
+    # reopening sibling repos accidentally. ``owner_principal`` binds lifecycle
+    # mutation to the credential that first opened/admitted the session.
+    # Cleanup work is journalled in the same transaction as claim closure so a
+    # process crash or one failed waiter cannot strand later queue entries.
+    (
+        21,
+        "CREATE TABLE session_lifecycle (\n"
+        "    session_id TEXT NOT NULL,\n"
+        "    repo TEXT NOT NULL DEFAULT '',\n"
+        "    state TEXT NOT NULL CHECK (state IN ('open', 'closed')),\n"
+        "    owner_principal TEXT,\n"
+        "    updated_at TEXT NOT NULL,\n"
+        "    PRIMARY KEY (session_id, repo)\n"
+        ");\n"
+        "CREATE INDEX idx_session_lifecycle_state "
+        "ON session_lifecycle (state, updated_at);\n"
+        "ALTER TABLE requests ADD COLUMN requester_principal TEXT;\n"
+        "ALTER TABLE requests ADD COLUMN requester_operator INTEGER "
+        "NOT NULL DEFAULT 0;\n"
+        "CREATE TABLE session_release_cleanup (\n"
+        "    claim_id TEXT PRIMARY KEY,\n"
+        "    created_at TEXT NOT NULL,\n"
+        "    attempts INTEGER NOT NULL DEFAULT 0,\n"
+        "    last_error TEXT,\n"
+        "    lease_owner TEXT,\n"
+        "    lease_expires_at TEXT,\n"
+        "    next_attempt_at TEXT,\n"
+        "    relationships_done INTEGER NOT NULL DEFAULT 0,\n"
+        "    queue_done INTEGER NOT NULL DEFAULT 0\n"
         ");",
     ),
 ]
@@ -1252,6 +1307,18 @@ class Database:
         Takes the bound ``conn`` explicitly so the lock is acquired on
         the very connection the grant commits on; a lock on any other
         connection would not serialize the right transaction.
+        """
+        return None
+
+    async def session_lock(
+        self, conn: aiosqlite.Connection, session_id: str
+    ) -> None:
+        """Serialize terminal lifecycle transitions with session claims.
+
+        SQLite's write transaction already serializes these operations. The
+        Postgres backend overrides this with a transaction-scoped advisory
+        lock keyed by session id so create/open/close order identically across
+        replicas and repos.
         """
         return None
 
@@ -3372,69 +3439,256 @@ class Database:
             await conn.commit()
         return [dict(r) for r in rows]
 
-    async def release_for_session(
-        self, session_id: str, *, repo: str | None = None
-    ) -> list[str]:
-        """Release every active claim that was created with the given
-        session_id, regardless of engineer name. Returns the ids of the
-        rows actually closed so the service layer can drain the FIFO
-        queue behind each of them. Intended for end-of-work cleanup so
-        an agent process can reliably tear down everything it produced
-        even when it spawned subagents under multiple engineer names.
+    async def session_lifecycle_row(
+        self,
+        session_id: str,
+        *,
+        repo: str | None = None,
+        conn: aiosqlite.Connection | None = None,
+    ) -> dict[str, Any] | None:
+        """Return the effective exact-or-global lifecycle row."""
+        if not session_id:
+            return None
+        repo_key = repo or ""
+        if conn is not None:
+            cur = await conn.execute(
+                "SELECT session_id, repo, state, owner_principal, updated_at "
+                "FROM session_lifecycle "
+                "WHERE session_id = ? AND (repo = ? OR repo = '') "
+                "ORDER BY CASE WHEN repo = ? THEN 0 ELSE 1 END LIMIT 1",
+                (session_id, repo_key, repo_key),
+            )
+            row = await cur.fetchone()
+        else:
+            async with self._acquire() as (acquired, _owns):
+                cur = await acquired.execute(
+                    "SELECT session_id, repo, state, owner_principal, updated_at "
+                    "FROM session_lifecycle "
+                    "WHERE session_id = ? AND (repo = ? OR repo = '') "
+                    "ORDER BY CASE WHEN repo = ? THEN 0 ELSE 1 END LIMIT 1",
+                    (session_id, repo_key, repo_key),
+                )
+                row = await cur.fetchone()
+        return dict(row) if row is not None else None
 
-        ``repo`` (#30 slice 2/3) scopes the release: when set, only claims
-        tagged with that repo are closed, so a repo-scoped token cannot
-        tear down another repo's work sharing the same session id. None
-        (operator) releases the whole session as before.
+    async def set_session_state(
+        self,
+        session_id: str,
+        *,
+        repo: str | None,
+        state: str,
+        owner_principal: str | None = None,
+        conn: aiosqlite.Connection | None = None,
+    ) -> None:
+        """Set an exact or global lifecycle state inside the caller's txn."""
+        if not session_id:
+            return
+        if state not in {"open", "closed"}:
+            raise ValueError(f"invalid session lifecycle state: {state!r}")
+        now = _utcnow()
+        repo_key = repo or ""
+        async def apply(target: aiosqlite.Connection) -> None:
+            if repo is None:
+                # A global transition moves every existing exact row too.
+                # Later, an exact SessionStart may reopen just its own repo.
+                # Preserve each exact row's owner while changing its state;
+                # operator-wide close/open is authority, not ownership theft.
+                await target.execute(
+                    "UPDATE session_lifecycle SET state = ?, updated_at = ? "
+                    "WHERE session_id = ?",
+                    (state, now, session_id),
+                )
+            await target.execute(
+                "INSERT INTO session_lifecycle "
+                "(session_id, repo, state, owner_principal, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT (session_id, repo) DO UPDATE SET "
+                "state = excluded.state, "
+                "owner_principal = COALESCE(excluded.owner_principal, "
+                "session_lifecycle.owner_principal), "
+                "updated_at = excluded.updated_at",
+                (session_id, repo_key, state, owner_principal, now),
+            )
+        if conn is not None:
+            await apply(conn)
+        else:
+            async with self._acquire() as (acquired, owns):
+                await apply(acquired)
+                if owns:
+                    await acquired.commit()
+
+    async def close_session_claim_rows(
+        self,
+        session_id: str,
+        *,
+        repo: str | None = None,
+        owner_principal: str | None = None,
+    ) -> list[str]:
+        """Atomically mark a lifecycle closed and close its active rows.
+
+        The caller normally holds transaction + session_lock. This helper is
+        deliberately limited to bound-connection work; relationship cleanup
+        happens after commit in :meth:`finalize_session_release`.
         """
         if not session_id:
             return []
-        now = _utcnow()
-        await self.init()
-        # SELECT and UPDATE in a single BEGIN IMMEDIATE transaction so
-        # there is no TOCTOU window where a concurrent release_claims
-        # could close some of these IDs between our SELECT and UPDATE,
-        # causing spurious cascade-resolve calls on already-closed claims.
-        async with self._connect() as conn:
-            conn.row_factory = aiosqlite.Row
-            await _configure_sqlite(conn)
-            await conn.execute("BEGIN IMMEDIATE")
-            try:
-                repo_clause = " AND repo = ?" if repo is not None else ""
-                sel_params: list[Any] = [session_id]
-                if repo is not None:
-                    sel_params.append(repo)
-                cur = await conn.execute(
-                    "SELECT id FROM claims WHERE session_id = ? "
-                    "AND released_at IS NULL" + repo_clause,
-                    sel_params,
+        await self.set_session_state(
+            session_id,
+            repo=repo,
+            state="closed",
+            owner_principal=owner_principal,
+        )
+        repo_clause = " AND repo = ?" if repo is not None else ""
+        params: list[Any] = [session_id]
+        if repo is not None:
+            params.append(repo)
+        async with self._acquire() as (conn, owns):
+            update_params: list[Any] = [_utcnow(), *params]
+            cur = await conn.execute(
+                "UPDATE claims SET released_at = ? "
+                "WHERE session_id = ? AND released_at IS NULL"
+                + repo_clause
+                + " RETURNING id",
+                update_params,
+            )
+            to_close = [str(row["id"]) for row in await cur.fetchall()]
+            if to_close:
+                now = _utcnow()
+                await conn.executemany(
+                    "INSERT INTO session_release_cleanup "
+                    "(claim_id, created_at) VALUES (?, ?) "
+                    "ON CONFLICT (claim_id) DO NOTHING",
+                    [(claim_id, now) for claim_id in to_close],
                 )
-                to_close = [str(r["id"]) for r in await cur.fetchall()]
-                if to_close:
-                    upd_params: list[Any] = [now, session_id]
-                    if repo is not None:
-                        upd_params.append(repo)
-                    await conn.execute(
-                        "UPDATE claims SET released_at = ? "
-                        "WHERE session_id = ? AND released_at IS NULL"
-                        + repo_clause,
-                        upd_params,
-                    )
+            if owns:
                 await conn.commit()
-            except Exception:
-                await conn.rollback()
-                raise
-        # Detach this session's released claims from any coexisting
-        # partners BEFORE cascade-resolving requests, so a partner that
-        # is about to receive a coexist-related event sees a clean
-        # graph (no dangling reference to a claim that no longer
-        # exists).
-        for cid in to_close:
+        return to_close
+
+    async def finalize_session_release(self, claim_ids: list[str]) -> None:
+        """Repair coexist/request relationships after terminal commit."""
+        for cid in claim_ids:
             await self._detach_coexist_partners(cid)
-        for cid in to_close:
+        for cid in claim_ids:
             await self.cascade_resolve_requests_for_claim(
                 cid, release_kind="session-bulk", actor_engineer=None
             )
+
+    async def lease_session_release_cleanup(
+        self,
+        lease_owner: str,
+        *,
+        limit: int = 1000,
+        lease_seconds: int = 300,
+    ) -> list[dict[str, Any]]:
+        """Atomically lease eligible cleanup rows across replicas."""
+        now_dt = datetime.now(UTC).replace(microsecond=0)
+        now = now_dt.isoformat().replace("+00:00", "Z")
+        lease_expires = (now_dt + timedelta(seconds=lease_seconds)).isoformat().replace(
+            "+00:00", "Z"
+        )
+        async with self.transaction() as conn:
+            cur = await conn.execute(
+                "UPDATE session_release_cleanup SET lease_owner = ?, "
+                "lease_expires_at = ? WHERE claim_id IN ("
+                "SELECT claim_id FROM session_release_cleanup WHERE "
+                "(next_attempt_at IS NULL OR datetime(next_attempt_at) <= datetime(?)) "
+                "AND (lease_owner IS NULL OR datetime(lease_expires_at) <= datetime(?)) "
+                "ORDER BY COALESCE(next_attempt_at, created_at), created_at, claim_id "
+                "LIMIT ?) AND (lease_owner IS NULL OR "
+                "datetime(lease_expires_at) <= datetime(?)) RETURNING *",
+                (lease_owner, lease_expires, now, now, limit, now),
+            )
+            rows = await cur.fetchall()
+        return [dict(row) for row in rows]
+
+    async def pending_session_release_cleanup(self) -> list[dict[str, Any]]:
+        """Diagnostic view of all durable cleanup rows (never leases)."""
+        async with self._acquire() as (conn, _owns):
+            cur = await conn.execute(
+                "SELECT * FROM session_release_cleanup ORDER BY created_at, claim_id"
+            )
+            rows = await cur.fetchall()
+        return [dict(row) for row in rows]
+
+    async def mark_session_release_cleanup_stage(
+        self, claim_id: str, lease_owner: str, stage: str
+    ) -> None:
+        if stage not in {"relationships_done", "queue_done"}:
+            raise ValueError(f"unknown cleanup stage: {stage!r}")
+        renewed_until = (
+            datetime.now(UTC).replace(microsecond=0) + timedelta(minutes=5)
+        ).isoformat().replace("+00:00", "Z")
+        async with self._acquire() as (conn, owns):
+            cur = await conn.execute(
+                f"UPDATE session_release_cleanup SET {stage} = 1, "
+                "lease_expires_at = ? "
+                "WHERE claim_id = ? AND lease_owner = ?",
+                (renewed_until, claim_id, lease_owner),
+            )
+            if not cur.rowcount:
+                raise RuntimeError(f"cleanup lease lost for {claim_id}")
+            if owns:
+                await conn.commit()
+
+    async def complete_session_release_cleanup(
+        self, claim_id: str, lease_owner: str
+    ) -> None:
+        async with self._acquire() as (conn, owns):
+            cur = await conn.execute(
+                "DELETE FROM session_release_cleanup WHERE claim_id = ? "
+                "AND lease_owner = ? AND relationships_done = 1 "
+                "AND queue_done = 1",
+                (claim_id, lease_owner),
+            )
+            if not cur.rowcount:
+                raise RuntimeError(f"cleanup lease/stages incomplete for {claim_id}")
+            if owns:
+                await conn.commit()
+
+    async def record_session_release_cleanup_failure(
+        self,
+        claim_id: str,
+        lease_owner: str,
+        error: str,
+        *,
+        retry_after_seconds: int,
+    ) -> None:
+        retry_at = (
+            datetime.now(UTC).replace(microsecond=0)
+            + timedelta(seconds=retry_after_seconds)
+        ).isoformat().replace("+00:00", "Z")
+        async with self._acquire() as (conn, owns):
+            await conn.execute(
+                "UPDATE session_release_cleanup SET attempts = attempts + 1, "
+                "last_error = ?, next_attempt_at = ?, lease_owner = NULL, "
+                "lease_expires_at = NULL WHERE claim_id = ? AND lease_owner = ?",
+                (error[:1000], retry_at, claim_id, lease_owner),
+            )
+            if owns:
+                await conn.commit()
+
+    async def release_for_session(
+        self, session_id: str, *, repo: str | None = None
+    ) -> list[str]:
+        """Close one session lifecycle and all of its active claims.
+
+        Direct DB callers get one atomic transaction. The service layer uses
+        :meth:`close_session_claim_rows` inside its session advisory lock so
+        admission and closure are globally ordered on PostgreSQL too.
+        """
+        if not session_id:
+            return []
+        async with self.transaction() as conn:
+            if repo is not None:
+                await self.repo_lock(conn, repo)
+            await self.session_lock(conn, session_id)
+            to_close = await self.close_session_claim_rows(
+                session_id, repo=repo
+            )
+        await self.finalize_session_release(to_close)
+        # Keep the durable rows for the service/background layer to drain the
+        # FIFO queues; the DB facade can repair relationships but deliberately
+        # does not own claim admission.
         return to_close
 
     async def claim_repo(self, claim_id: str) -> tuple[bool, str | None]:
@@ -4193,6 +4447,8 @@ class Database:
         shortened_expires_at: str,
         new_claim_expires_at: str,
         requested_scope: str | None = None,
+        requester_principal: str | None = None,
+        requester_operator: bool = False,
     ) -> dict[str, Any]:
         """Atomically create a request, log the ``filed`` audit event,
         and shorten the holder's claim TTL.
@@ -4235,16 +4491,19 @@ class Database:
                     """
                     INSERT INTO requests (
                         id, claim_id, requester_engineer, requester_session_id,
+                        requester_principal, requester_operator,
                         requested_pattern, requested_scope, reason, urgency,
                         decision, original_expires_at, shortened_expires_at,
                         created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
                     """,
                     (
                         request_id,
                         claim_id,
                         requester_engineer,
                         requester_session_id,
+                        requester_principal,
+                        int(requester_operator),
                         requested_pattern,
                         requested_scope,
                         reason,
@@ -4331,6 +4590,8 @@ class Database:
         coexist_pattern: str | None = None,
         coexist_symbols: dict[str, list[str]] | None = None,
         min_expires_at: str | None = None,
+        actor_principal: str | None = None,
+        actor_operator: bool = False,
     ) -> dict[str, Any] | None:
         """Record the holder's decision and apply its side-effect.
 
@@ -4437,13 +4698,64 @@ class Database:
                 # connection. Keyed off the holder claim's repo (coalesced
                 # to '' for the NULL-repo bucket inside ``repo_lock``).
                 repo_cur = await conn.execute(
-                    "SELECT repo FROM claims WHERE id = ?", (req["claim_id"],)
+                    "SELECT repo, session_id FROM claims WHERE id = ?",
+                    (req["claim_id"],),
                 )
                 claim_repo_row = await repo_cur.fetchone()
+                claim_repo = (
+                    claim_repo_row["repo"]
+                    if claim_repo_row is not None
+                    else None
+                )
                 await self.repo_lock(
                     conn,
-                    claim_repo_row["repo"] if claim_repo_row is not None else None,
+                    claim_repo,
                 )
+
+                # Decisions that mint a replacement/sibling claim are claim
+                # admission paths too. Serialize them with SessionEnd and
+                # enforce the principal captured at filing/respond time.
+                grant_session: str | None = None
+                grant_principal: str | None = None
+                grant_operator = False
+                if decision == "narrowed" and claim_repo_row is not None:
+                    grant_session = claim_repo_row["session_id"]
+                    grant_principal = actor_principal
+                    grant_operator = actor_operator
+                elif decision == "coexist":
+                    grant_session = req["requester_session_id"]
+                    grant_principal = req["requester_principal"]
+                    grant_operator = bool(req["requester_operator"])
+                if grant_session:
+                    grant_session = str(grant_session)
+                    await self.session_lock(conn, grant_session)
+                    lifecycle = await self.session_lifecycle_row(
+                        grant_session, repo=claim_repo, conn=conn
+                    )
+                    if lifecycle is not None and lifecycle.get("state") == "closed":
+                        raise SessionLifecycleClosed(grant_session, claim_repo)
+                    owner = (
+                        lifecycle.get("owner_principal")
+                        if lifecycle is not None
+                        else None
+                    )
+                    if (
+                        grant_principal is not None
+                        and owner
+                        and grant_principal != owner
+                        and not grant_operator
+                    ):
+                        raise SessionLifecycleOwnershipMismatch(
+                            grant_session, claim_repo
+                        )
+                    if grant_principal is not None:
+                        await self.set_session_state(
+                            grant_session,
+                            repo=claim_repo,
+                            state="open",
+                            owner_principal=owner or grant_principal,
+                            conn=conn,
+                        )
 
                 if decision == "approved":
                     rel_cur = await conn.execute(

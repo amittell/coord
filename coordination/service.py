@@ -12,7 +12,11 @@ from uuid import uuid4
 
 from coordination import metrics
 from coordination.config import Settings, get_settings
-from coordination.db import Database
+from coordination.db import (
+    Database,
+    SessionLifecycleClosed,
+    SessionLifecycleOwnershipMismatch,
+)
 from coordination.engine import (
     _normalize_pattern,
     compute_overlap,
@@ -74,6 +78,30 @@ class RateLimitExceeded(Exception):
         self.scope = scope
         self.detail = detail
         self.retry_after_sec = retry_after_sec
+
+
+class SessionClosedError(Exception):
+    """Claim admission targeted a terminal session lifecycle."""
+
+    def __init__(self, session_id: str, repo: str | None) -> None:
+        self.session_id = session_id
+        self.repo = repo
+        scope = f" in repo {repo!r}" if repo is not None else ""
+        super().__init__(
+            f"session {session_id!r}{scope} is closed; SessionStart must reopen it"
+        )
+
+
+class SessionOwnershipError(Exception):
+    """A non-operator credential tried to mutate another session."""
+
+    def __init__(self, session_id: str, repo: str | None) -> None:
+        self.session_id = session_id
+        self.repo = repo
+        scope = f" in repo {repo!r}" if repo is not None else ""
+        super().__init__(
+            f"session {session_id!r}{scope} belongs to another credential"
+        )
 
 
 class LspUnavailable(Exception):
@@ -999,13 +1027,10 @@ class CoordinationService:
         body: CreateClaimsRequest,
         *,
         auto_promote_allowed: bool = True,
+        session_principal: str | None = None,
+        session_operator: bool = False,
     ) -> CreateClaimsResponse:
         await self.expire_stale_claims()
-        # Activity ping: making a claim is the strongest possible
-        # liveness signal -- bump last_activity for every claim this
-        # session already holds before we decide what's stale.
-        if body.session_id:
-            await self._maybe_touch(body.session_id, body.repo)
         rules = await self._rules()
         # Intake canonicalization: collapse every claim pattern to the same
         # canonical form the overlap engine matches with (backslashes ->
@@ -1110,6 +1135,31 @@ class CoordinationService:
         item_for_cid: dict[str, ClaimItem] = {}
         async with self.db.transaction() as conn:
             await self.db.repo_lock(conn, body.repo)
+            if body.session_id:
+                await self.db.session_lock(conn, body.session_id)
+                lifecycle = await self._authorize_session_lifecycle(
+                    body.session_id,
+                    repo=body.repo,
+                    principal=session_principal,
+                    operator=session_operator,
+                )
+                if lifecycle is not None and lifecycle.get("state") == "closed":
+                    raise SessionClosedError(body.session_id, body.repo)
+                # Authenticate lifecycle ownership before allowing this
+                # request to keep another session's claims alive.
+                await self._maybe_touch(body.session_id, body.repo)
+                if session_principal is not None:
+                    owner = (
+                        lifecycle.get("owner_principal")
+                        if lifecycle is not None
+                        else None
+                    )
+                    await self.db.set_session_state(
+                        body.session_id,
+                        repo=body.repo,
+                        state="open",
+                        owner_principal=owner or session_principal,
+                    )
             active = await self.db.list_active_claims_rows(exclude_engineer=body.engineer)
             # Repo-scoped check (v0.4.0): see check_conflicts for rationale.
             active = [r for r in active if r.get("repo") == body.repo]
@@ -2172,6 +2222,8 @@ class CoordinationService:
         body: ClaimRefactorRequest,
         *,
         auto_promote_allowed: bool = True,
+        session_principal: str | None = None,
+        session_operator: bool = False,
     ) -> CreateClaimsResponse:
         """Expand a (file, symbol) refactor intent into a normal
         ``create_claims`` batch covering the definition and every
@@ -2348,6 +2400,8 @@ class CoordinationService:
             # caller must not trigger it via the refactor path either
             # (v0.42; mirrors the POST /claims gate).
             auto_promote_allowed=auto_promote_allowed,
+            session_principal=session_principal,
+            session_operator=session_operator,
         )
         # Partial-coverage guard. The v0.21 queue enqueues only the
         # single conflicted item, so a wait_seconds grant that arrives
@@ -2468,6 +2522,8 @@ class CoordinationService:
         reason: str | None,
         urgency: str,
         requested_scope: str | None = None,
+        requester_principal: str | None = None,
+        requester_operator: bool = False,
     ) -> dict[str, Any]:
         """Create a release request and shorten the holder's claim TTL.
 
@@ -2538,6 +2594,8 @@ class CoordinationService:
             shortened_expires_at=shortened,
             new_claim_expires_at=new_exp,
             requested_scope=requested_scope,
+            requester_principal=requester_principal,
+            requester_operator=requester_operator,
         )
 
     async def respond_to_request(
@@ -2551,6 +2609,8 @@ class CoordinationService:
         narrowed_pattern: str | None = None,
         coexist_pattern: str | None = None,
         coexist_symbols: dict[str, list[str]] | None = None,
+        actor_principal: str | None = None,
+        actor_operator: bool = False,
     ) -> dict[str, Any] | None:
         """Forward to the DB layer with v0.11 decision verbs.
 
@@ -2622,17 +2682,24 @@ class CoordinationService:
         # inherit the shortened deadline that request_release imposed on the
         # holder's original claim.
         min_expires_at = _expires_at(self.settings.default_ttl_hours)
-        row = await self.db.respond_to_request(
-            request_id=request_id,
-            decision=decision,
-            actor_engineer=actor_engineer,
-            actor_session_id=actor_session_id,
-            note=note,
-            narrowed_pattern=narrowed_pattern,
-            coexist_pattern=coexist_pattern,
-            coexist_symbols=coexist_symbols,
-            min_expires_at=min_expires_at,
-        )
+        try:
+            row = await self.db.respond_to_request(
+                request_id=request_id,
+                decision=decision,
+                actor_engineer=actor_engineer,
+                actor_session_id=actor_session_id,
+                note=note,
+                narrowed_pattern=narrowed_pattern,
+                coexist_pattern=coexist_pattern,
+                coexist_symbols=coexist_symbols,
+                min_expires_at=min_expires_at,
+                actor_principal=actor_principal,
+                actor_operator=actor_operator,
+            )
+        except SessionLifecycleClosed as exc:
+            raise SessionClosedError(exc.session_id, exc.repo) from exc
+        except SessionLifecycleOwnershipMismatch as exc:
+            raise SessionOwnershipError(exc.session_id, exc.repo) from exc
         if row is None:
             return None
         # Drain the FIFO queue for every claim this decision actually
@@ -2843,21 +2910,169 @@ class CoordinationService:
             await self._drain_queue_for(cid)
         return len(released_ids)
 
+    async def _authorize_session_lifecycle(
+        self,
+        session_id: str,
+        *,
+        repo: str | None,
+        principal: str | None,
+        operator: bool,
+    ) -> dict[str, Any] | None:
+        """Check effective lifecycle ownership while session_lock is held."""
+        lifecycle = await self.db.session_lifecycle_row(session_id, repo=repo)
+        owner = lifecycle.get("owner_principal") if lifecycle is not None else None
+        # ``principal=None`` is reserved for trusted in-process callers (queue
+        # drain, tests, and the DB facade). Every authenticated HTTP mutation
+        # supplies a concrete principal at the boundary.
+        if principal is not None and owner and principal != owner and not operator:
+            raise SessionOwnershipError(session_id, repo)
+        return lifecycle
+
+    async def open_session(
+        self,
+        session_id: str,
+        *,
+        repo: str | None = None,
+        principal: str | None = None,
+        operator: bool = False,
+    ) -> None:
+        """Idempotently open a new/resumed session lifecycle."""
+        if not session_id:
+            return
+        async with self.db.transaction() as conn:
+            if repo is not None:
+                await self.db.repo_lock(conn, repo)
+            await self.db.session_lock(conn, session_id)
+            lifecycle = await self._authorize_session_lifecycle(
+                session_id,
+                repo=repo,
+                principal=principal,
+                operator=operator,
+            )
+            owner = (
+                lifecycle.get("owner_principal")
+                if lifecycle is not None
+                else None
+            )
+            await self.db.set_session_state(
+                session_id,
+                repo=repo,
+                state="open",
+                owner_principal=owner or principal,
+            )
+
+    async def check_session(
+        self,
+        session_id: str,
+        *,
+        repo: str | None = None,
+        principal: str | None = None,
+        operator: bool = False,
+    ) -> None:
+        """Authoritatively verify that a lifecycle still admits work."""
+        if not session_id:
+            return
+        async with self.db.transaction() as conn:
+            if repo is not None:
+                await self.db.repo_lock(conn, repo)
+            await self.db.session_lock(conn, session_id)
+            lifecycle = await self._authorize_session_lifecycle(
+                session_id,
+                repo=repo,
+                principal=principal,
+                operator=operator,
+            )
+            if lifecycle is not None and lifecycle.get("state") == "closed":
+                raise SessionClosedError(session_id, repo)
+
     async def release_session(
-        self, session_id: str, *, repo: str | None = None
+        self,
+        session_id: str,
+        *,
+        repo: str | None = None,
+        principal: str | None = None,
+        operator: bool = False,
     ) -> int:
-        """End-of-session bulk release, routed through the service
-        layer so every claim the session held drains its FIFO queue.
-        ``POST /sessions/{id}/release`` is the protocol-recommended
-        cleanup call, so waiters queued behind any of the session's
-        claims must be granted here exactly like an explicit
-        release_claims would. Returns the number of claims closed."""
-        released_ids = await self.db.release_for_session(
-            session_id, repo=repo
-        )
-        for cid in released_ids:
-            await self._drain_queue_for(cid)
+        """Terminally close a session and release its claims atomically.
+
+        session_lock orders this transition against every claim admission,
+        including claims in another repo or replica. Relationship repair and
+        FIFO draining run only after the terminal marker + rows commit.
+        """
+        if not session_id:
+            return 0
+        async with self.db.transaction() as conn:
+            if repo is not None:
+                await self.db.repo_lock(conn, repo)
+            await self.db.session_lock(conn, session_id)
+            lifecycle = await self._authorize_session_lifecycle(
+                session_id,
+                repo=repo,
+                principal=principal,
+                operator=operator,
+            )
+            owner = (
+                lifecycle.get("owner_principal")
+                if lifecycle is not None
+                else None
+            )
+            released_ids = await self.db.close_session_claim_rows(
+                session_id,
+                repo=repo,
+                owner_principal=owner or principal,
+            )
+        await self.drain_session_release_cleanup()
         return len(released_ids)
+
+    async def drain_session_release_cleanup(self, *, limit: int = 1000) -> int:
+        """Idempotently finish journalled relationship and queue cleanup.
+
+        Each row is isolated: one corrupt relationship or transient queue
+        failure is recorded and cannot prevent later released claims from
+        granting their waiters. The background leader retries remaining rows.
+        """
+        lease_owner = str(uuid4())
+        rows = await self.db.lease_session_release_cleanup(
+            lease_owner, limit=limit
+        )
+        completed = 0
+        for row in rows:
+            claim_id = str(row["claim_id"])
+            try:
+                if not bool(row.get("relationships_done")):
+                    await self.db.finalize_session_release([claim_id])
+                    await self.db.mark_session_release_cleanup_stage(
+                        claim_id, lease_owner, "relationships_done"
+                    )
+                if not bool(row.get("queue_done")):
+                    await self._drain_queue_for(claim_id)
+                    await self.db.mark_session_release_cleanup_stage(
+                        claim_id, lease_owner, "queue_done"
+                    )
+                await self.db.complete_session_release_cleanup(
+                    claim_id, lease_owner
+                )
+            except Exception as exc:  # noqa: BLE001 - isolate durable work rows
+                logger.exception(
+                    "session release cleanup failed for claim %s", claim_id
+                )
+                try:
+                    await self.db.record_session_release_cleanup_failure(
+                        claim_id,
+                        lease_owner,
+                        f"{type(exc).__name__}: {exc}",
+                        retry_after_seconds=min(
+                            300, 2 ** min(int(row.get("attempts") or 0), 8)
+                        ),
+                    )
+                except Exception:  # noqa: BLE001 - original work stays durable
+                    logger.exception(
+                        "failed to record session cleanup error for claim %s",
+                        claim_id,
+                    )
+                continue
+            completed += 1
+        return completed
 
     async def expire_stale_claims(self) -> list[str]:
         """TTL/idle sweep plus FIFO-queue drain for every claim the
@@ -3209,6 +3424,15 @@ class CoordinationService:
                 resp = await self.create_claims(
                     grant_body, auto_promote_allowed=False
                 )
+            except SessionClosedError as exc:
+                logger.info(
+                    "FIFO drain: queue %s expired -- requester session is closed: %s",
+                    entry["id"],
+                    exc,
+                )
+                await self.db.mark_queue_expired(entry["id"])
+                _notify_waiter(entry["id"], {"granted_claim_id": None})
+                continue
             except RateLimitExceeded as exc:
                 # v0.30: a queue grant must not blast through the
                 # active-claim cap -- the waiter's engineer is at

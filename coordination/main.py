@@ -45,7 +45,12 @@ from coordination.logging import (
 )
 from coordination.otel import setup_tracing
 from coordination.ownership import parse_ownership_yaml
-from coordination.service import LspUnavailable, RateLimitExceeded
+from coordination.service import (
+    LspUnavailable,
+    RateLimitExceeded,
+    SessionClosedError,
+    SessionOwnershipError,
+)
 from coordination.schemas import (
     ClaimRefactorRequest,
     ConflictBatchRequest,
@@ -194,6 +199,10 @@ async def lifespan(app: FastAPI):
                     await get_service().expire_stale_claims()
                 except Exception:  # pragma: no cover - background cleanup failures are logged
                     logger.exception("Failed to expire stale claims")
+                try:
+                    await get_service().drain_session_release_cleanup()
+                except Exception:  # pragma: no cover - durable rows retry next tick
+                    logger.exception("Failed to drain session release cleanup")
                 # Reap queue rows by their own expires_at so a waiter
                 # stranded by a process restart / crash (its in-memory
                 # event lost) converges to 'expired' instead of holding a
@@ -879,6 +888,20 @@ async def require_auth(
 def _token_repo(request: Request) -> str | None:
     """The repo this request's token is bound to, or None when unscoped."""
     return getattr(request.state, "token_repo", None)
+
+
+def _session_principal(request: Request) -> str:
+    """Stable credential identity for lifecycle ownership checks."""
+    if getattr(request.state, "auth_kind", None) == "per_engineer":
+        engineer = getattr(request.state, "engineer", None)
+        if engineer:
+            # Engineer is the authenticated principal; keeping it stable over
+            # token rotation lets a legitimate replacement credential resume.
+            return f"engineer:{engineer}"
+    if getattr(request.state, "auth_kind", None) == "shared":
+        return "shared-token"
+    # Only reachable in explicitly configured insecure local mode.
+    return "insecure-local"
 
 
 def _normalized_request_repo(value: str | None) -> str | None:
@@ -1646,9 +1669,7 @@ def _login_page_response(
         # Escape '<', '>', '&' so an attacker-controlled error string
         # (none today, but the helper is here so the next refactor
         # cannot regress) cannot inject markup.
-        safe = (
-            error.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        )
+        safe = html_mod.escape(error)
         error_html = f'<p class="error">{safe}</p>'
     csrf_html = ""
     if csrf_token:
@@ -2384,7 +2405,22 @@ async def create_claims(request: Request, body: CreateClaimsRequest, _: None = D
     # conflicting claim must not rewrite deployment-wide config.
     try:
         result = await get_service().create_claims(
-            body, auto_promote_allowed=_token_repo(request) is None
+            body,
+            auto_promote_allowed=_token_repo(request) is None,
+            session_principal=_session_principal(request),
+            session_operator=_token_repo(request) is None,
+        )
+    except SessionOwnershipError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except SessionClosedError as exc:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": str(exc),
+                "code": "session_closed",
+                "session_id": exc.session_id,
+                "repo": exc.repo,
+            },
         )
     except RateLimitExceeded as exc:
         return JSONResponse(
@@ -2416,8 +2452,13 @@ async def claim_refactor(
     body.repo = _enforce_write_repo(request, body.repo)
     try:
         result = await get_service().create_refactor_claims(
-            body, auto_promote_allowed=_token_repo(request) is None
+            body,
+            auto_promote_allowed=_token_repo(request) is None,
+            session_principal=_session_principal(request),
+            session_operator=_token_repo(request) is None,
         )
+    except SessionOwnershipError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except LspUnavailable as exc:
         return JSONResponse(
             status_code=503,
@@ -2427,6 +2468,16 @@ async def claim_refactor(
                     "(COORD_LSP_ENABLED); refactor claims need a live "
                     "language server."
                 )
+            },
+        )
+    except SessionClosedError as exc:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": str(exc),
+                "code": "session_closed",
+                "session_id": exc.session_id,
+                "repo": exc.repo,
             },
         )
     except RateLimitExceeded as exc:
@@ -2641,10 +2692,63 @@ async def conflicts_batch(
     return result.model_dump()
 
 
+@app.post("/sessions/{session_id}/open")
+async def open_session(
+    session_id: str,
+    request: Request,
+    repo: str | None = Query(default=None),
+    _: None = Depends(require_auth),
+) -> dict:
+    """Open a new or resumed terminal lifecycle idempotently."""
+    repo = _enforce_write_repo(request, repo)
+    try:
+        await get_service().open_session(
+            session_id,
+            repo=repo,
+            principal=_session_principal(request),
+            operator=_token_repo(request) is None,
+        )
+    except SessionOwnershipError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    return {"opened": True}
+
+
+@app.post("/sessions/{session_id}/check")
+async def check_session(
+    session_id: str,
+    request: Request,
+    repo: str | None = Query(default=None),
+    _: None = Depends(require_auth),
+) -> Any:
+    """Check terminal state without reopening or otherwise mutating it."""
+    repo = _enforce_write_repo(request, repo)
+    try:
+        await get_service().check_session(
+            session_id,
+            repo=repo,
+            principal=_session_principal(request),
+            operator=_token_repo(request) is None,
+        )
+    except SessionOwnershipError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except SessionClosedError as exc:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": str(exc),
+                "code": "session_closed",
+                "session_id": exc.session_id,
+                "repo": exc.repo,
+            },
+        )
+    return {"open": True}
+
+
 @app.post("/sessions/{session_id}/release")
 async def release_session(
     session_id: str,
     request: Request,
+    repo: str | None = Query(default=None),
     _: None = Depends(require_auth),
 ) -> dict:
     """Release every active claim that was created with the given
@@ -2660,9 +2764,16 @@ async def release_session(
     directly) so every released claim drains its FIFO queue -- waiters
     queued behind this session's claims are granted here exactly like
     an explicit release would grant them."""
-    n = await get_service().release_session(
-        session_id, repo=_token_repo(request)
-    )
+    repo = _enforce_write_repo(request, repo)
+    try:
+        n = await get_service().release_session(
+            session_id,
+            repo=repo,
+            principal=_session_principal(request),
+            operator=_token_repo(request) is None,
+        )
+    except SessionOwnershipError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     return {"released": n}
 
 
@@ -2711,6 +2822,8 @@ async def file_request(
             reason=body.reason,
             urgency=body.urgency,
             requested_scope=body.requested_scope,
+            requester_principal=_session_principal(request),
+            requester_operator=_token_repo(request) is None,
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -2824,7 +2937,13 @@ async def respond_to_request(
             narrowed_pattern=body.narrowed_pattern,
             coexist_pattern=body.coexist_pattern,
             coexist_symbols=body.coexist_symbols,
+            actor_principal=_session_principal(request),
+            actor_operator=_token_repo(request) is None,
         )
+    except SessionOwnershipError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except SessionClosedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if result is None:

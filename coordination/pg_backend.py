@@ -1094,6 +1094,47 @@ class PostgresStore(Database):
             _NS_SEED,
         )
 
+    async def session_lock(self, conn, session_id: str) -> None:
+        # Global per-session ordering: claim admission, SessionStart reopen and
+        # SessionEnd close must serialize even when they address different
+        # repos on different replicas.
+        await self._require_open_tx(conn, "session_lock")
+        key = f"{self._schema}:session:{session_id}"
+        await conn._raw.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, $2))",
+            key,
+            _NS_SEED,
+        )
+
+    async def lease_session_release_cleanup(
+        self,
+        lease_owner: str,
+        *,
+        limit: int = 1000,
+        lease_seconds: int = 300,
+    ) -> list[dict[str, Any]]:
+        """Lease cleanup work with PostgreSQL row locks across replicas."""
+        now_dt = datetime.now(UTC).replace(microsecond=0)
+        now = now_dt.isoformat().replace("+00:00", "Z")
+        lease_expires = (now_dt + timedelta(seconds=lease_seconds)).isoformat().replace(
+            "+00:00", "Z"
+        )
+        async with self.transaction() as conn:
+            cur = await conn.execute(
+                "WITH picked AS (SELECT claim_id FROM session_release_cleanup "
+                "WHERE (next_attempt_at IS NULL OR "
+                "datetime(next_attempt_at) <= datetime(?)) AND "
+                "(lease_owner IS NULL OR datetime(lease_expires_at) <= datetime(?)) "
+                "ORDER BY COALESCE(next_attempt_at, created_at), created_at, claim_id "
+                "LIMIT ? FOR UPDATE SKIP LOCKED) "
+                "UPDATE session_release_cleanup AS cleanup "
+                "SET lease_owner = ?, lease_expires_at = ? FROM picked "
+                "WHERE cleanup.claim_id = picked.claim_id RETURNING cleanup.*",
+                (now, now, limit, lease_owner, lease_expires),
+            )
+            rows = await cur.fetchall()
+        return [dict(row) for row in rows]
+
     @asynccontextmanager
     async def engineer_lock(self, conn, engineer: str):
         # Per-engineer, transaction-scoped advisory lock (design 5.3): held

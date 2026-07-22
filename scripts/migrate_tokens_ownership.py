@@ -116,7 +116,7 @@ EXPECTED_OWNERSHIP_COLUMNS = ("id", "yaml_text", "updated_at")
 # by tests/test_audit_coordination_hardening.py, which asserts equality against
 # coordination.db.CURRENT_SCHEMA_VERSION so this constant cannot silently
 # drift when a new migration lands.
-KNOWN_SCHEMA_VERSION = 20
+KNOWN_SCHEMA_VERSION = 21
 
 # Ephemeral tables that MUST never appear in the generated SQL. Asserted by the
 # self-test; documented here as the contract.
@@ -130,6 +130,8 @@ EPHEMERAL_TABLES = (
     "request_events",
     "conflict_log",
     "webhook_outbox",
+    "session_lifecycle",
+    "session_release_cleanup",
 )
 
 

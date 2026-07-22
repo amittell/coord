@@ -7,7 +7,34 @@ Semantic Versioning.
 
 ## [Unreleased]
 
-(none recorded yet)
+### Fixed
+
+- Claude Code SessionEnd cleanup now uses the hook payload's stable
+  `session_id` and the bulk `POST /sessions/{session_id}/release` endpoint
+  instead of replaying an ever-growing claim-ID list inside Claude's
+  1.5-second shutdown window. PreToolUse caches one auto-claim per distinct
+  path with per-path freshness, forwards `session_id` for
+  self-exclusion/liveness, and keeps a one-time legacy-state drain for
+  sessions upgraded in flight. Session closure is now a terminal,
+  repo-scoped server lifecycle: release and claim admission share a
+  per-session transaction lock, post-close claims receive `409
+  session_closed`, and SessionStart reopens a resumed lifecycle idempotently.
+  Lifecycle mutation is bound to the authenticated engineer (with an explicit
+  unscoped-operator recovery path), and post-commit relationship/queue cleanup
+  is durably journalled, leased across replicas, stage-checkpointed,
+  failure-isolated, and retried with backoff by the background leader. Cached
+  edits verify terminal state at the server, and deferred narrowed/coexist
+  grants use the same repo/session admission locks. Every hook request now
+  carries the same repo identity, and the local
+  cache is partitioned by session and repo inside a private per-user directory
+  with symlink-safe lock handling; it is never trusted for cross-process
+  ordering. Missing session IDs no longer create claims that cannot be safely
+  deduplicated or bulk-released, any claim-time 409 blocks the raced edit, and
+  legacy v0.48 claim files are atomically snapshotted before bounded draining
+  so a concurrent legacy writer cannot be unlinked unseen.
+- `coord init` / `coord upgrade` now reconcile existing managed Claude hooks,
+  installing SessionEnd as an asynchronous command with a 15-second command
+  timeout while preserving foreign hooks and settings.
 
 ## [0.48.1] - 2026-07-18
 

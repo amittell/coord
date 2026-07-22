@@ -23,7 +23,7 @@ import pytest
 
 from coordination.db import Database
 from coordination.schemas import ClaimItem, CreateClaimsRequest
-from coordination.service import CoordinationService
+from coordination.service import CoordinationService, SessionClosedError
 
 _PG_URL = os.environ.get("COORD_DATABASE_URL", "")
 _PG_SELECTED = _PG_URL.startswith("postgresql://") or _PG_URL.startswith(
@@ -84,11 +84,13 @@ async def _claim(
     pattern: str,
     repo: str | None,
     symbols: list[str] | None = None,
+    session_id: str | None = None,
 ):
     return await svc.create_claims(
         CreateClaimsRequest(
             engineer=engineer,
             repo=repo,
+            session_id=session_id,
             claims=[ClaimItem(type="file", pattern=pattern, symbols=symbols)],
         )
     )
@@ -321,6 +323,129 @@ async def test_guarded_rename_serializes_with_concurrent_symbol_grant(
     assert grant_waits_for_lock, "concurrent grant did not wait for the rename lock"
     assert rename_applied is True
     assert grant_result.claim_ids == []
+
+
+async def test_two_instances_session_close_is_terminal(
+    tmp_path: Path,
+) -> None:
+    svc_a = _make_service(tmp_path)
+    svc_b = _second_instance(tmp_path)
+    await svc_a.db.init()
+    await svc_b.db.init()
+    repo = "example-org/app"
+
+    for idx in range(8):
+        session_id = f"terminal-race-{idx}"
+        pattern = f"src/terminal-race-{idx}.py"
+        await svc_a.open_session(session_id, repo=repo)
+        released, claimed = await asyncio.gather(
+            svc_a.release_session(session_id, repo=repo),
+            _claim(
+                svc_b,
+                engineer=f"late-{idx}",
+                pattern=pattern,
+                repo=repo,
+                session_id=session_id,
+            ),
+            return_exceptions=True,
+        )
+
+        assert not isinstance(released, BaseException)
+        if isinstance(claimed, BaseException):
+            assert isinstance(claimed, SessionClosedError)
+            assert released == 0
+        else:
+            assert claimed.claim_ids
+            assert released == 1
+        assert await _active_rows_for_pattern(svc_a, pattern, repo) == []
+
+
+async def test_direct_db_session_close_uses_the_same_terminal_lock(
+    tmp_path: Path,
+) -> None:
+    svc_a = _make_service(tmp_path)
+    svc_b = _second_instance(tmp_path)
+    await svc_a.db.init()
+    await svc_b.db.init()
+    repo = "example-org/app"
+
+    for idx in range(8):
+        session_id = f"direct-terminal-race-{idx}"
+        pattern = f"src/direct-terminal-race-{idx}.py"
+        await svc_a.open_session(session_id, repo=repo)
+        released, claimed = await asyncio.gather(
+            svc_a.db.release_for_session(session_id, repo=repo),
+            _claim(
+                svc_b,
+                engineer=f"direct-late-{idx}",
+                pattern=pattern,
+                repo=repo,
+                session_id=session_id,
+            ),
+            return_exceptions=True,
+        )
+
+        assert not isinstance(released, BaseException)
+        if isinstance(claimed, BaseException):
+            assert isinstance(claimed, SessionClosedError)
+            assert released == []
+        else:
+            assert claimed.claim_ids
+            assert len(released) == 1
+        assert await _active_rows_for_pattern(svc_a, pattern, repo) == []
+
+
+async def test_two_instances_lease_session_cleanup_once(
+    tmp_path: Path,
+) -> None:
+    svc_a = _make_service(tmp_path)
+    svc_b = _second_instance(tmp_path)
+    await svc_a.db.init()
+    await svc_b.db.init()
+    repo = "example-org/app"
+    session_id = "cleanup-lease-race"
+    claimed = await _claim(
+        svc_a,
+        engineer="cleanup-holder",
+        pattern="src/cleanup-lease.py",
+        repo=repo,
+        session_id=session_id,
+    )
+    claim_id = claimed.claim_ids[0]
+    async with svc_a.db.transaction() as conn:
+        await svc_a.db.repo_lock(conn, repo)
+        await svc_a.db.session_lock(conn, session_id)
+        assert await svc_a.db.close_session_claim_rows(
+            session_id, repo=repo
+        ) == [claim_id]
+
+    calls = 0
+    original_a = svc_a._drain_queue_for
+    original_b = svc_b._drain_queue_for
+
+    async def counted_a(closing_id: str) -> None:
+        nonlocal calls
+        calls += 1
+        await original_a(closing_id)
+
+    async def counted_b(closing_id: str) -> None:
+        nonlocal calls
+        calls += 1
+        await original_b(closing_id)
+
+    svc_a._drain_queue_for = counted_a  # type: ignore[method-assign]
+    svc_b._drain_queue_for = counted_b  # type: ignore[method-assign]
+    try:
+        completed = await asyncio.gather(
+            svc_a.drain_session_release_cleanup(),
+            svc_b.drain_session_release_cleanup(),
+        )
+    finally:
+        svc_a._drain_queue_for = original_a  # type: ignore[method-assign]
+        svc_b._drain_queue_for = original_b  # type: ignore[method-assign]
+
+    assert sum(completed) == 1
+    assert calls == 1
 
 
 # ---------------------------------------------------------------------------
