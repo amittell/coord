@@ -687,8 +687,9 @@ def cmd_sessionend(env: dict[str, str], client: CoordClient, payload: dict[str, 
                     _release_session_lock(lock)
 
     # One-time migration path: an upgraded, already-running Claude session
-    # may still have v0.48 claim IDs keyed by its parent process. Native async
-    # SessionEnd gives this slow legacy endpoint time to drain them once.
+    # may still have v0.48 claim IDs keyed by its parent process. The managed
+    # synchronous SessionEnd timeout gives this slow legacy endpoint time to
+    # drain them once without leaving cleanup to a process Claude can cancel.
     # At most two batched requests: one for all currently pending snapshots,
     # then one for a legacy writer that recreated the source while batch one
     # was in flight. Never start a request unless its full network timeout fits
