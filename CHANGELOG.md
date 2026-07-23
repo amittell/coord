@@ -33,8 +33,10 @@ Semantic Versioning.
   legacy v0.48 claim files are atomically snapshotted before bounded draining
   so a concurrent legacy writer cannot be unlinked unseen.
 - `coord init` / `coord upgrade` now reconcile existing managed Claude hooks,
-  installing SessionEnd as an asynchronous command with a 15-second command
-  timeout while preserving foreign hooks and settings.
+  installing SessionEnd synchronously with a 15-second command timeout while
+  preserving foreign hooks and settings. Synchronous execution is required:
+  Claude Code raises its overall shutdown budget from the per-hook timeout,
+  while an asynchronous SessionEnd process can be cancelled as Claude exits.
 
 ## [0.48.1] - 2026-07-18
 

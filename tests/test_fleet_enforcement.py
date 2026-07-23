@@ -743,8 +743,8 @@ class TestClaudeSettingsMerge:
         assert pre["matcher"] == "Edit|Write|MultiEdit|NotebookEdit"
         assert pre["hooks"][0]["command"] == "coord-claude-hook pretool"
         end = settings["hooks"]["SessionEnd"][0]["hooks"][0]
-        assert end["async"] is True
         assert end["timeout"] == 15
+        assert "async" not in end
 
     def test_merge_preserves_existing_and_is_idempotent(self, tmp_path: Path):
         path = tmp_path / ".claude" / "settings.json"
@@ -788,6 +788,7 @@ class TestClaudeSettingsMerge:
                                         "type": "command",
                                         "command": "coord-claude-hook sessionend",
                                         "timeout": 1,
+                                        "async": True,
                                         "custom": "preserved",
                                     },
                                     {"type": "command", "command": "other-cleanup"},
@@ -808,7 +809,6 @@ class TestClaudeSettingsMerge:
             "command": "coord-claude-hook sessionend",
             "timeout": 15,
             "custom": "preserved",
-            "async": True,
         }
         assert foreign_hook == {"type": "command", "command": "other-cleanup"}
         assert not _update_claude_settings(path)

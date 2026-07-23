@@ -430,23 +430,30 @@ _CLAUDE_HOOK_COMMANDS = {
     "SessionEnd": "coord-claude-hook sessionend",
 }
 
-# SessionEnd's Claude Code shutdown budget is only 1.5 seconds by default.
-# Cleanup is advisory and cannot affect Claude's response, so run it in the
-# background and allow enough command time for the terminal session release
-# plus the one-time v0.48 legacy drain.
+# SessionEnd's Claude Code shutdown budget is only 1.5 seconds by default, but
+# the highest per-hook timeout raises that overall budget. Keep cleanup
+# synchronous: an asynchronous SessionEnd process has no later conversation
+# turn to finish in and Claude may cancel it while the process exits.
 _CLAUDE_HOOK_OPTIONS = {
-    "SessionEnd": {"async": True, "timeout": 15},
+    "SessionEnd": {"timeout": 15},
+}
+
+# Options managed by older coord releases that are unsafe for the current
+# lifecycle contract. Reconciliation removes only these exact coord-owned
+# fields and leaves every foreign hook and custom field untouched.
+_CLAUDE_HOOK_REMOVED_OPTIONS = {
+    "SessionEnd": {"async"},
 }
 
 
 def _update_claude_settings(path: Path) -> bool:
     """Merge and reconcile coord hooks in ``.claude/settings.json``.
 
-    Existing exact coord command entries are updated with managed options
-    (notably async SessionEnd), while compound commands, wrong subcommands,
-    foreign hooks, and other settings are preserved. Same refusal contract as
-    ``_update_mcp_json``: an unparsable or non-object file is left alone
-    rather than clobbered.
+    Existing exact coord command entries are updated with managed options and
+    obsolete coord-owned options are removed, while compound commands, wrong
+    subcommands, foreign hooks, and other settings are preserved. Same refusal
+    contract as ``_update_mcp_json``: an unparsable or non-object file is left
+    alone rather than clobbered.
     """
     settings: dict = {}
     if path.exists():
@@ -469,6 +476,7 @@ def _update_claude_settings(path: Path) -> bool:
             print(f"  ! {path} hooks.{event} is not a list; not adding coord hooks")
             return False
         managed_options = _CLAUDE_HOOK_OPTIONS.get(event, {})
+        removed_options = _CLAUDE_HOOK_REMOVED_OPTIONS.get(event, set())
         found = False
         for group in groups:
             if not isinstance(group, dict):
@@ -486,6 +494,10 @@ def _update_claude_settings(path: Path) -> bool:
                 for key, value in managed_options.items():
                     if hook.get(key) != value:
                         hook[key] = value
+                        changed = True
+                for key in removed_options:
+                    if key in hook:
+                        del hook[key]
                         changed = True
         if found:
             continue
