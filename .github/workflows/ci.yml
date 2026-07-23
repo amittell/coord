@@ -171,13 +171,96 @@ jobs:
       - name: Build PostgreSQL derivative and verify pinned driver
         shell: bash
         run: |
+          if docker build \
+            --file Dockerfile.postgres \
+            --build-arg COORD_BASE=coord:ci \
+            --tag coord:must-not-build \
+            .; then
+            echo "::error::PostgreSQL derivative accepted an unpinned base without the CI override" >&2
+            exit 1
+          fi
           docker build \
             --file Dockerfile.postgres \
             --build-arg COORD_BASE=coord:ci \
+            --build-arg ALLOW_UNPINNED_BASE=1 \
             --tag coord:ci-postgres \
             .
           docker run --rm --entrypoint python coord:ci-postgres -c \
             'import asyncpg, coordination; assert asyncpg.__version__ == "0.31.0"; print(coordination.__version__, asyncpg.__version__)'
+
+      - name: Verify PostgreSQL derivative readiness and session lifecycle
+        shell: bash
+        run: |
+          network=coord-ci-postgres
+          database=coord-ci-postgres-db
+          api=coord-ci-postgres-api
+          cleanup() {
+            docker logs "$api" 2>/dev/null || true
+            docker logs "$database" 2>/dev/null || true
+            docker rm --force "$api" "$database" >/dev/null 2>&1 || true
+            docker network rm "$network" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker network create "$network"
+          docker run --detach \
+            --name "$database" \
+            --network "$network" \
+            --env POSTGRES_USER=coord \
+            --env POSTGRES_PASSWORD=coord \
+            --env POSTGRES_DB=coord \
+            postgres:16.14@sha256:be01cf82fc7dbba824acf0a82e150b4b360f3ff93c6631d7844af431e841a95c
+
+          database_ready=0
+          for _ in {1..30}; do
+            if docker exec "$database" pg_isready --username coord --dbname coord; then
+              database_ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$database_ready" -ne 1 ]; then
+            echo "::error::PostgreSQL did not become ready" >&2
+            exit 1
+          fi
+
+          docker run --detach \
+            --name "$api" \
+            --network "$network" \
+            --publish 127.0.0.1:18081:8080 \
+            --env COORD_AUTH_TOKEN=ci-smoke \
+            --env COORD_DATABASE_URL=postgresql://coord:coord@coord-ci-postgres-db:5432/coord \
+            --env COORD_POSTGRES_SCHEMA=coord \
+            coord:ci-postgres
+
+          api_ready=0
+          for _ in {1..30}; do
+            if body="$(curl --fail --silent http://127.0.0.1:18081/readyz)" \
+              && READY_BODY="$body" python -c 'import json, os; data=json.loads(os.environ["READY_BODY"]); assert data["status"] == "ready"'; then
+              api_ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$api_ready" -ne 1 ]; then
+            echo "::error::PostgreSQL derivative did not become ready" >&2
+            exit 1
+          fi
+
+          curl --fail --silent --request POST \
+            --header "Authorization: Bearer ci-smoke" \
+            http://127.0.0.1:18081/sessions/ci-release/open >/dev/null
+          curl --fail --silent --request POST \
+            --header "Authorization: Bearer ci-smoke" \
+            http://127.0.0.1:18081/sessions/ci-release/release >/dev/null
+          check_status="$(
+            curl --silent --output /tmp/session-check.json --write-out '%{http_code}' \
+              --request POST \
+              --header "Authorization: Bearer ci-smoke" \
+              http://127.0.0.1:18081/sessions/ci-release/check
+          )"
+          CHECK_STATUS="$check_status" python -c \
+            'import json, os; data=json.load(open("/tmp/session-check.json")); assert os.environ["CHECK_STATUS"] == "409"; assert data["code"] == "session_closed"; assert data["session_id"] == "ci-release"'
 
       - name: Start image and verify real SQLite readiness
         shell: bash

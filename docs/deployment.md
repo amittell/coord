@@ -147,20 +147,38 @@ ownership rows (and the prior `COORD_DATABASE_PATH`) for the specific install.
 The standard production image intentionally excludes asyncpg, keeping the
 default SQLite artifact smaller and its dependency surface narrower.
 `Dockerfile.postgres` builds a separately tagged derivative from a caller-pinned
-coord base image. It deliberately has no default `COORD_BASE`: production builds
-must identify the exact release digest instead of silently inheriting a moving
-tag.
+coord base image. It deliberately has no default `COORD_BASE` and rejects
+references that do not end in `@sha256:<64 lowercase hex characters>`.
+`ALLOW_UNPINNED_BASE=1` exists only for CI's local `coord:ci` image; never use it
+for a published build.
 
-Build from a checkout containing `requirements-postgres.txt`, publish the
-variant under a distinct tag such as `coord:<release>-postgres`, and verify the
-artifact before deploying it:
+Build from a checkout containing `requirements-postgres.txt`, publish a
+multi-platform versioned variant once, and capture the registry-produced digest.
+Deploy that immutable derivative digest—not its tag—so a rolling fleet cannot
+mix different cached images:
 
 ```bash
 COORD_BASE='whcr.io/alexm/coord:vX.Y.Z@sha256:<digest>'
-docker build -f Dockerfile.postgres \
+COORD_DERIVATIVE='whcr.io/alexm/coord:vX.Y.Z-pg'
+metadata_file="$(mktemp)"
+trap 'rm -f "$metadata_file"' EXIT
+
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  --file Dockerfile.postgres \
   --build-arg "COORD_BASE=$COORD_BASE" \
-  -t coord:postgres .
-docker run --rm --entrypoint python coord:postgres \
+  --tag "$COORD_DERIVATIVE" \
+  --metadata-file "$metadata_file" \
+  --push .
+COORD_DERIVATIVE_DIGEST="$(
+  python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["containerimage.digest"])' \
+    "$metadata_file"
+)"
+docker buildx imagetools inspect \
+  "$COORD_DERIVATIVE@$COORD_DERIVATIVE_DIGEST"
+
+docker run --rm --entrypoint python \
+  "$COORD_DERIVATIVE@$COORD_DERIVATIVE_DIGEST" \
   -c 'import asyncpg, coordination; print(asyncpg.__version__)'
 
 docker run -d --name coord-postgres \
@@ -168,7 +186,7 @@ docker run -d --name coord-postgres \
   -e COORD_DATABASE_URL='postgresql://coord:password@db.example.com:5432/coord' \
   -e COORD_POSTGRES_SCHEMA=coord \
   -p 8080:8080 \
-  coord:postgres
+  "$COORD_DERIVATIVE@$COORD_DERIVATIVE_DIGEST"
 ```
 
 Do not mount `/data` for PostgreSQL state; persistence, backups, TLS, and HA
