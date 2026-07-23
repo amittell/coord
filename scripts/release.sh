@@ -87,6 +87,13 @@ PYTHON_BIN="$(select_release_python)" \
 VERSION=$("$PYTHON_BIN" -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
 TAG="v${VERSION}"
 LOCK_TAG="coord-release-lock-${TAG}"
+RELEASE_RESUME_ID="${COORD_RELEASE_RESUME_ID:-}"
+if [ -n "$RELEASE_RESUME_ID" ] \
+  && ! printf '%s\n' "$RELEASE_RESUME_ID" | grep -Eq '^[0-9a-f]{32}$'
+then
+  fail "COORD_RELEASE_RESUME_ID must be exactly 32 lowercase hex characters"
+fi
+RELEASE_OPERATION_ID="${RELEASE_RESUME_ID:-$("$PYTHON_BIN" -c 'import secrets; print(secrets.token_hex(16))')}"
 
 require_image_tag_absent() {
   local image_ref="$1"
@@ -124,42 +131,107 @@ remote_tag_commit() {
   printf '%s\n' "$commit"
 }
 
+release_lock_payload() {
+  local digest="$1"
+  printf '%s\n' \
+    "coord-release-lock-v2" \
+    "operation_id=${RELEASE_OPERATION_ID}" \
+    "commit=$(git rev-parse HEAD)" \
+    "image=${IMAGE}@${digest}" \
+    "packages=${PACKAGE_FINGERPRINT}"
+}
+
+release_lock_field() {
+  local payload="$1"
+  local field="$2"
+  printf '%s\n' "$payload" \
+    | awk -F= -v field="$field" '$1 == field { sub(/^[^=]*=/, ""); print; exit }'
+}
+
+fetch_remote_release_lock_payload() {
+  local observed_ref payload
+  observed_ref="refs/coord-release/observed-${LOCK_TAG}-$$"
+  git fetch -q --force origin "refs/tags/${LOCK_TAG}:${observed_ref}" \
+    || fail "could not fetch release lock ${LOCK_TAG}"
+  payload="$(git for-each-ref --format='%(contents)' "$observed_ref")"
+  git update-ref -d "$observed_ref"
+  printf '%s\n' "$payload"
+}
+
+validate_release_lock_payload() {
+  local payload="$1"
+  local expected_digest="${2:-}"
+  local locked_commit locked_image locked_operation locked_packages
+  [ "$(printf '%s\n' "$payload" | head -n 1)" = "coord-release-lock-v2" ] \
+    || fail "release lock ${LOCK_TAG} has an unsupported payload"
+  locked_operation="$(release_lock_field "$payload" operation_id)"
+  [ "$locked_operation" = "$RELEASE_OPERATION_ID" ] \
+    || fail "release lock ${LOCK_TAG} belongs to operation ${locked_operation:-unknown}, not ${RELEASE_OPERATION_ID}"
+  locked_commit="$(release_lock_field "$payload" commit)"
+  [ "$locked_commit" = "$(git rev-parse HEAD)" ] \
+    || fail "release lock ${LOCK_TAG} belongs to ${locked_commit:-unknown}, not HEAD"
+  locked_packages="$(release_lock_field "$payload" packages)"
+  [ "$locked_packages" = "$PACKAGE_FINGERPRINT" ] \
+    || fail "release lock ${LOCK_TAG} package hashes do not match the rebuilt artifacts"
+  locked_image="$(release_lock_field "$payload" image)"
+  case "$locked_image" in
+    "${IMAGE}@"*) ;;
+    *)
+      fail "release lock ${LOCK_TAG} has an invalid image binding: ${locked_image:-missing}"
+      ;;
+  esac
+  LOCKED_IMAGE_DIGEST="${locked_image#"${IMAGE}"@}"
+  printf '%s\n' "$LOCKED_IMAGE_DIGEST" \
+    | grep -Eq '^sha256:[0-9a-f]{64}$' \
+    || fail "release lock ${LOCK_TAG} has an invalid image digest"
+  if [ -n "$expected_digest" ] && [ "$LOCKED_IMAGE_DIGEST" != "$expected_digest" ]; then
+    fail "release lock ${LOCK_TAG} binds ${LOCKED_IMAGE_DIGEST}, not ${expected_digest}"
+  fi
+}
+
+load_release_lock_for_resume() {
+  local remote_lines payload
+  remote_lines="$(remote_tag_lines "$LOCK_TAG")" \
+    || fail "could not query release lock ${LOCK_TAG}"
+  [ -n "$remote_lines" ] \
+    || fail "no remote release lock ${LOCK_TAG} exists to resume"
+  payload="$(fetch_remote_release_lock_payload)"
+  validate_release_lock_payload "$payload"
+  image_digest="$LOCKED_IMAGE_DIGEST"
+  echo "release: resuming operation ${RELEASE_OPERATION_ID} at ${image_digest}."
+}
+
 acquire_release_lock() {
-  local head remote_lines remote_commit
-  head="$(git rev-parse HEAD)"
+  local image_digest="$1"
+  local lock_payload remote_lines observed_payload
   remote_lines="$(remote_tag_lines "$LOCK_TAG")" \
     || fail "could not query release lock ${LOCK_TAG}"
   if [ -n "$remote_lines" ]; then
-    remote_commit="$(remote_tag_commit "$remote_lines")"
-    [ "$remote_commit" = "$head" ] \
-      || fail "release lock ${LOCK_TAG} belongs to ${remote_commit}, not ${head}"
-    echo "release: ${LOCK_TAG} already locks this exact commit; resuming."
-    return
+    observed_payload="$(fetch_remote_release_lock_payload)"
+    fail "release lock ${LOCK_TAG} already belongs to operation $(release_lock_field "$observed_payload" operation_id); explicit resume requires COORD_RELEASE_RESUME_ID"
   fi
 
   if git rev-parse -q --verify "refs/tags/${LOCK_TAG}" >/dev/null; then
-    [ "$(git rev-list -n 1 "$LOCK_TAG")" = "$head" ] \
-      || fail "local release lock ${LOCK_TAG} does not point to ${head}"
-  else
-    git tag -a "$LOCK_TAG" \
-      -m "Serialize coord ${TAG} publication at ${head}"
+    fail "local release lock ${LOCK_TAG} already exists without a remote lock; resolve it before publishing"
   fi
+  lock_payload="$(release_lock_payload "$image_digest")"
+  git tag -a "$LOCK_TAG" -m "$lock_payload"
 
   if git push origin "refs/tags/${LOCK_TAG}"; then
-    echo "release: acquired immutable release lock ${LOCK_TAG}."
+    echo "release: acquired ${LOCK_TAG} for operation ${RELEASE_OPERATION_ID}."
     return
   fi
 
-  # A simultaneous publisher may have won the create-only push. Accept that
-  # race only when the winner locked the same exact commit.
+  # A transport failure may hide a successful create. Accept only our exact
+  # operation payload; a concurrent publisher always has a different nonce.
   remote_lines="$(remote_tag_lines "$LOCK_TAG")" \
     || fail "release-lock push failed and the winner could not be queried"
   [ -n "$remote_lines" ] \
     || fail "could not acquire release lock ${LOCK_TAG}"
-  remote_commit="$(remote_tag_commit "$remote_lines")"
-  [ "$remote_commit" = "$head" ] \
-    || fail "release lock race lost to ${remote_commit}, not ${head}"
-  echo "release: concurrent publisher locked the same exact commit; resuming."
+  observed_payload="$(fetch_remote_release_lock_payload)"
+  [ "$observed_payload" = "$lock_payload" ] \
+    || fail "release lock race lost to operation $(release_lock_field "$observed_payload" operation_id)"
+  echo "release: lock push was ambiguous, but the remote contains this exact operation payload."
 }
 
 # ---- preflight ---------------------------------------------------------------
@@ -167,10 +239,13 @@ acquire_release_lock() {
 [ -z "$(git status --porcelain)" ] || fail "working tree not clean"
 git fetch -q origin
 [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] || fail "main not synced with origin (writhub)"
-git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null && fail "tag ${TAG} already exists"
-remote_version_tag="$(remote_tag_lines "$TAG")" \
-  || fail "could not query origin for ${TAG}"
-[ -z "$remote_version_tag" ] || fail "tag ${TAG} already on origin"
+if [ -z "$RELEASE_RESUME_ID" ]; then
+  git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null \
+    && fail "tag ${TAG} already exists"
+  remote_version_tag="$(remote_tag_lines "$TAG")" \
+    || fail "could not query origin for ${TAG}"
+  [ -z "$remote_version_tag" ] || fail "tag ${TAG} already on origin"
+fi
 grep -q "${VERSION}" CHANGELOG.md || echo "release: WARNING -- ${VERSION} not mentioned in CHANGELOG.md" >&2
 
 if [ "$PUBLISH" = 1 ] && { [ "$SKIP_IMAGE" = 1 ] || [ "$SKIP_PYPI" = 1 ]; }; then
@@ -180,7 +255,10 @@ fi
 if [ "$SKIP_IMAGE" = 0 ] && [ "$PUBLISH" = 1 ]; then
   command -v cosign >/dev/null 2>&1 || fail "cosign is required to publish a signed image"
   command -v crane >/dev/null 2>&1 || fail "crane is required to verify attestations and promote tags"
-  [ -n "${COSIGN_SIGNING_KEY:-}" ] || fail "set COSIGN_SIGNING_KEY to the release KMS key"
+  if [ -z "$RELEASE_RESUME_ID" ]; then
+    [ -n "${COSIGN_SIGNING_KEY:-}" ] \
+      || fail "set COSIGN_SIGNING_KEY to the release KMS key"
+  fi
   [ -f release/coord-release.pub ] || fail "missing release public key: release/coord-release.pub"
   [ "$(crane version)" = "$CRANE_VERSION" ] \
     || fail "crane $(crane version) does not match required ${CRANE_VERSION}"
@@ -203,7 +281,9 @@ PY
   then
     fail "cosign ${cosign_version} is older than required ${COSIGN_MIN_VERSION}"
   fi
-  require_image_tag_absent "${IMAGE}:${TAG}"
+  if [ -z "$RELEASE_RESUME_ID" ]; then
+    require_image_tag_absent "${IMAGE}:${TAG}"
+  fi
 fi
 
 if [ "$SKIP_PYPI" = 0 ]; then
@@ -236,6 +316,22 @@ trap cleanup_build_venv EXIT
 cleanup_build_venv
 trap - EXIT
 ls -1 dist/
+PACKAGE_FINGERPRINT="$(
+  "$PYTHON_BIN" - <<'PY'
+import hashlib
+import json
+from pathlib import Path
+
+artifacts = {
+    path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+    for path in sorted(Path("dist").iterdir())
+    if path.is_file()
+}
+if not artifacts:
+    raise SystemExit("dist/ contains no package artifacts")
+print(json.dumps(artifacts, sort_keys=True, separators=(",", ":")))
+PY
+)" || fail "could not fingerprint release package artifacts"
 
 PYPI_STATE="skipped"
 PYPI_MISSING=()
@@ -262,6 +358,8 @@ fi
 # ---- plan / publish ----------------------------------------------------------
 echo
 echo "release plan for ${TAG}:"
+echo "  operation: ${RELEASE_OPERATION_ID}"
+[ -n "$RELEASE_RESUME_ID" ] && echo "  mode: explicit validated resume"
 [ "$SKIP_IMAGE" = 0 ] && echo "  1. buildx ${PLATFORMS} -> candidate (SBOM + provenance)"
 [ "$SKIP_IMAGE" = 0 ] && echo "     validate + sign + verify while official tags remain absent"
 [ "$SKIP_IMAGE" = 0 ] && echo "     acquire create-only git lock ${LOCK_TAG}"
@@ -278,43 +376,50 @@ if [ "$PUBLISH" = 0 ]; then
 fi
 
 if [ "$SKIP_IMAGE" = 0 ]; then
-  echo "release: building + pushing attested image ${IMAGE}:${TAG} (${PLATFORMS})..."
-  candidate_tag="${IMAGE}:candidate-${TAG}-$(git rev-parse --short=12 HEAD)"
-  image_metadata="$(mktemp)"
-  cleanup_image_files() {
-    rm -f "$image_metadata"
-  }
-  trap cleanup_image_files EXIT
-  docker buildx build --platform "${PLATFORMS}" \
-    -t "$candidate_tag" \
-    --attest="type=sbom,generator=${SBOM_GENERATOR}" \
-    --provenance="mode=max,builder-id=${BUILDER_ID}" \
-    --metadata-file "$image_metadata" \
-    --push .
-  image_digest="$(
-    "$PYTHON_BIN" -c 'import json, sys; print(json.load(open(sys.argv[1]))["containerimage.digest"])' \
-      "$image_metadata"
-  )"
-  printf '%s\n' "$image_digest" \
-    | grep -Eq '^sha256:[0-9a-f]{64}$' \
-    || fail "buildx returned an invalid image digest: $image_digest"
   attestation_args=()
   IFS=',' read -r -a release_platforms <<< "$PLATFORMS"
   for platform in "${release_platforms[@]}"; do
     attestation_args+=(--platform "$platform")
   done
+  if [ -n "$RELEASE_RESUME_ID" ]; then
+    load_release_lock_for_resume
+  else
+    echo "release: building + pushing attested image ${IMAGE}:${TAG} (${PLATFORMS})..."
+    candidate_tag="${IMAGE}:candidate-${TAG}-$(git rev-parse --short=12 HEAD)-${RELEASE_OPERATION_ID}"
+    image_metadata="$(mktemp)"
+    cleanup_image_files() {
+      rm -f "$image_metadata"
+    }
+    trap cleanup_image_files EXIT
+    docker buildx build --platform "${PLATFORMS}" \
+      -t "$candidate_tag" \
+      --attest="type=sbom,generator=${SBOM_GENERATOR}" \
+      --provenance="mode=max,builder-id=${BUILDER_ID}" \
+      --metadata-file "$image_metadata" \
+      --push .
+    image_digest="$(
+      "$PYTHON_BIN" -c 'import json, sys; print(json.load(open(sys.argv[1]))["containerimage.digest"])' \
+        "$image_metadata"
+    )"
+    printf '%s\n' "$image_digest" \
+      | grep -Eq '^sha256:[0-9a-f]{64}$' \
+      || fail "buildx returned an invalid image digest: $image_digest"
+  fi
   "$PYTHON_BIN" scripts/verify_image_attestations.py \
     --image "${IMAGE}@${image_digest}" \
     --builder-id "${BUILDER_ID}" \
     "${attestation_args[@]}"
-  echo "release: signing ${IMAGE}@${image_digest}..."
-  cosign sign --yes --key "${COSIGN_SIGNING_KEY}" "${IMAGE}@${image_digest}"
+  if [ -z "$RELEASE_RESUME_ID" ]; then
+    echo "release: signing ${IMAGE}@${image_digest}..."
+    cosign sign --yes --key "${COSIGN_SIGNING_KEY}" "${IMAGE}@${image_digest}"
+  fi
   cosign verify \
     --key release/coord-release.pub \
     "${IMAGE}@${image_digest}" >/dev/null
+  if [ -z "$RELEASE_RESUME_ID" ]; then
+    acquire_release_lock "$image_digest"
+  fi
 fi
-
-acquire_release_lock
 
 if [ "$SKIP_PYPI" = 0 ]; then
   if [ "$PYPI_STATE" = "absent" ] || [ "$PYPI_STATE" = "partial" ]; then
@@ -346,24 +451,74 @@ if [ "$SKIP_PYPI" = 0 ]; then
 fi
 
 if [ "$SKIP_IMAGE" = 0 ]; then
-  # The registry has no standard conditional-create operation for a tag.
-  # Recheck immediately before the only official manifest PUT; the immutable
-  # git lock above serializes every supported publisher for this repository.
-  require_image_tag_absent "${IMAGE}:${TAG}"
-  echo "release: promoting verified digest to official tags..."
-  crane tag "${IMAGE}@${image_digest}" "$TAG"
-  crane tag "${IMAGE}@${image_digest}" latest
-  [ "$(crane digest "${IMAGE}:${TAG}")" = "$image_digest" ] \
-    || fail "${IMAGE}:${TAG} did not resolve to the verified digest"
+  # Every post-lock mutation is idempotent and content-checked. An explicit
+  # resume uses the digest bound into the lock rather than rebuilding a
+  # run-specific provenance index.
+  version_probe_error="$(mktemp)"
+  if existing_version_digest="$(
+    crane digest "${IMAGE}:${TAG}" 2>"$version_probe_error"
+  )"; then
+    [ "$existing_version_digest" = "$image_digest" ] \
+      || fail "${IMAGE}:${TAG} exists at ${existing_version_digest}, not ${image_digest}"
+    version_tag_exists=1
+  elif grep -Fq "MANIFEST_UNKNOWN" "$version_probe_error"; then
+    version_tag_exists=0
+  else
+    cat "$version_probe_error" >&2
+    fail "could not establish the state of ${IMAGE}:${TAG}"
+  fi
+  rm -f "$version_probe_error"
+
+  echo "release: ensuring official tags resolve to the locked digest..."
+  latest_probe_error="$(mktemp)"
+  if existing_latest_digest="$(
+    crane digest "${IMAGE}:latest" 2>"$latest_probe_error"
+  )"; then
+    if [ "$existing_latest_digest" != "$image_digest" ]; then
+      crane tag "${IMAGE}@${image_digest}" latest
+    fi
+  elif grep -Fq "MANIFEST_UNKNOWN" "$latest_probe_error"; then
+    crane tag "${IMAGE}@${image_digest}" latest
+  else
+    cat "$latest_probe_error" >&2
+    fail "could not establish the state of ${IMAGE}:latest"
+  fi
+  rm -f "$latest_probe_error"
   [ "$(crane digest "${IMAGE}:latest")" = "$image_digest" ] \
-    || fail "${IMAGE}:latest did not resolve to the verified digest"
+    || fail "${IMAGE}:latest did not resolve to the locked digest"
+  if [ "$version_tag_exists" = 0 ]; then
+    crane tag "${IMAGE}@${image_digest}" "$TAG"
+  fi
+  [ "$(crane digest "${IMAGE}:${TAG}")" = "$image_digest" ] \
+    || fail "${IMAGE}:${TAG} did not resolve to the locked digest"
   printf '%s@%s\n' "$IMAGE" "$image_digest" \
     > "dist/coord-${TAG}-image-digest.txt"
+  printf '%s\n' "$RELEASE_OPERATION_ID" \
+    > "dist/coord-${TAG}-release-operation-id.txt"
   echo "release: verified signed image ${IMAGE}@${image_digest}"
-  cleanup_image_files
-  trap - EXIT
+  if [ -z "$RELEASE_RESUME_ID" ]; then
+    cleanup_image_files
+    trap - EXIT
+  fi
 fi
 
-git tag -a "${TAG}" -m "coord ${TAG}"
-git push origin "refs/tags/${TAG}"
+head="$(git rev-parse HEAD)"
+if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+  [ "$(git rev-list -n 1 "$TAG")" = "$head" ] \
+    || fail "local tag ${TAG} does not point to ${head}"
+else
+  git tag -a "${TAG}" -m "coord ${TAG}"
+fi
+remote_version_tag="$(remote_tag_lines "$TAG")" \
+  || fail "could not query remote tag ${TAG}"
+if [ -z "$remote_version_tag" ]; then
+  if ! git push origin "refs/tags/${TAG}"; then
+    remote_version_tag="$(remote_tag_lines "$TAG")" \
+      || fail "tag push failed and remote state could not be queried"
+  fi
+fi
+[ -n "$remote_version_tag" ] \
+  || fail "tag ${TAG} was not published"
+[ "$(remote_tag_commit "$remote_version_tag")" = "$head" ] \
+  || fail "remote tag ${TAG} does not point to ${head}"
 echo "release: ${TAG} published. Next: update downstream Deployment manifests."

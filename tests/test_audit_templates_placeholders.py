@@ -33,6 +33,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import subprocess
 import tomllib
 from collections.abc import Callable
 from pathlib import Path
@@ -245,11 +246,144 @@ def test_github_free_release_is_attested_signed_and_verified() -> None:
     assert 'PYPI_STATE" = "partial"' in script
     assert "post_upload_state" in script
     assert "require_image_tag_absent" in script
-    assert script.count('require_image_tag_absent "${IMAGE}:${TAG}"') == 2
+    assert script.count('require_image_tag_absent "${IMAGE}:${TAG}"') == 1
     assert "coord-release-lock-${TAG}" in script
+    assert "coord-release-lock-v2" in script
+    assert "operation_id=${RELEASE_OPERATION_ID}" in script
+    assert "image=${IMAGE}@${digest}" in script
+    assert "packages=${PACKAGE_FINGERPRINT}" in script
+    assert "COORD_RELEASE_RESUME_ID" in script
+    assert "explicit resume requires COORD_RELEASE_RESUME_ID" in script
+    assert "concurrent publisher locked the same exact commit" not in script
+    assert 'candidate-${TAG}-$(git rev-parse --short=12 HEAD)-${RELEASE_OPERATION_ID}' in script
+    dry_exit = script.index('if [ "$PUBLISH" = 0 ]')
+    image_push = script.index("docker buildx build", dry_exit)
+    lock_acquisition = script.index('acquire_release_lock "$image_digest"', image_push)
+    assert dry_exit < image_push < lock_acquisition
+    assert "version_tag_exists=1" in script
+    assert "remote tag ${TAG} does not point to ${head}" in script
     assert 'SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"' in script
     assert "Python >=3.11" in script
     assert "python3 -m venv" not in script
+
+
+def test_release_lock_rejects_same_commit_competitor_and_validates_resume(
+    tmp_path: Path,
+) -> None:
+    script = RELEASE_SCRIPT.read_text(encoding="utf-8")
+    functions = script[
+        script.index("remote_tag_lines()") : script.index(
+            "# ---- preflight"
+        )
+    ]
+    remote = tmp_path / "remote.git"
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True)
+    subprocess.run(["git", "init", "-b", "main", str(first)], check=True)
+    (first / "seed").write_text("release lock fixture\n", encoding="utf-8")
+    for key, value in (
+        ("user.name", "Release Test"),
+        ("user.email", "release-test@example.invalid"),
+    ):
+        subprocess.run(
+            ["git", "config", key, value],
+            cwd=first,
+            check=True,
+        )
+    subprocess.run(["git", "add", "seed"], cwd=first, check=True)
+    subprocess.run(["git", "commit", "-m", "seed"], cwd=first, check=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(remote)],
+        cwd=first,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "push", "-u", "origin", "main"],
+        cwd=first,
+        check=True,
+    )
+    subprocess.run(["git", "clone", str(remote), str(second)], check=True)
+    subprocess.run(["git", "checkout", "main"], cwd=second, check=True)
+    for repo in (first, second):
+        subprocess.run(
+            ["git", "config", "user.name", "Release Test"],
+            cwd=repo,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "release-test@example.invalid"],
+            cwd=repo,
+            check=True,
+        )
+
+    harness = f"""\
+set -euo pipefail
+fail() {{ echo "release: $*" >&2; exit 1; }}
+IMAGE=registry.example/coord
+TAG=v0.49.0
+LOCK_TAG=coord-release-lock-${{TAG}}
+RELEASE_OPERATION_ID="$1"
+PACKAGE_FINGERPRINT="$2"
+{functions}
+case "$3" in
+  acquire) acquire_release_lock sha256:{"1" * 64} ;;
+  resume)
+    load_release_lock_for_resume
+    printf '%s\\n' "$image_digest"
+    ;;
+esac
+"""
+
+    operation_a = "a" * 32
+    operation_b = "b" * 32
+    packages = '{"coord.whl":"abc","coord.tar.gz":"def"}'
+    first_result = subprocess.run(
+        ["bash", "-c", harness, "release-test", operation_a, packages, "acquire"],
+        cwd=first,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert first_result.returncode == 0, first_result.stderr
+
+    competitor = subprocess.run(
+        ["bash", "-c", harness, "release-test", operation_b, packages, "acquire"],
+        cwd=second,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert competitor.returncode != 0
+    assert f"already belongs to operation {operation_a}" in competitor.stderr
+
+    resume = subprocess.run(
+        ["bash", "-c", harness, "release-test", operation_a, packages, "resume"],
+        cwd=second,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert resume.returncode == 0, resume.stderr
+    assert f"sha256:{'1' * 64}" in resume.stdout
+
+    divergent_packages = subprocess.run(
+        [
+            "bash",
+            "-c",
+            harness,
+            "release-test",
+            operation_a,
+            '{"coord.whl":"different"}',
+            "resume",
+        ],
+        cwd=second,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert divergent_packages.returncode != 0
+    assert "package hashes do not match" in divergent_packages.stderr
 
 
 def test_release_dependency_inputs_are_exact_and_locks_are_hash_complete() -> None:
@@ -591,12 +725,31 @@ def test_attestation_verifier_rehashes_top_level_index() -> None:
     image, _manifests, _blobs = _attested_index_fixture()
     raw_index = b'{"manifests":[]}'
 
-    with pytest.raises(ValueError, match="index content hashes to"):
+    with pytest.raises(ValueError, match="OCI JSON content hashes to"):
         verify_image_attestations(
             image,
             {"linux/amd64", "linux/arm64"},
             builder_id=EXPECTED_BUILDER_ID,
             inspect_raw=lambda _reference: raw_index,
+        )
+
+
+def test_attestation_verifier_rehashes_linked_attestation_manifest() -> None:
+    image, manifests, blobs = _attested_index_fixture()
+    amd64_attestation = "registry.example/coord@sha256:" + "3" * 64
+
+    def inspect(reference: str) -> bytes | dict[str, object]:
+        if reference == amd64_attestation:
+            return b'{"layers":[]}'
+        return manifests[reference]
+
+    with pytest.raises(ValueError, match="OCI JSON content hashes to"):
+        verify_image_attestations(
+            image,
+            {"linux/amd64", "linux/arm64"},
+            builder_id=EXPECTED_BUILDER_ID,
+            inspect_raw=inspect,
+            fetch_blob=lambda reference, _insecure: blobs[reference],
         )
 
 

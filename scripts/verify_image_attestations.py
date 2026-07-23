@@ -207,7 +207,7 @@ def _decode_inspected_json(
             actual_digest = "sha256:" + hashlib.sha256(inspected).hexdigest()
             if actual_digest != expected_digest:
                 raise ValueError(
-                    f"{reference} index content hashes to {actual_digest}, "
+                    f"{reference} OCI JSON content hashes to {actual_digest}, "
                     f"expected {expected_digest}"
                 )
         value = json.loads(inspected)
@@ -315,6 +315,7 @@ def verify_image_attestations(
         attestation_manifest = _decode_inspected_json(
             attestation_reference,
             inspect_raw(attestation_reference),
+            expected_digest=attestation,
         )
         layers = attestation_manifest.get("layers")
         if not isinstance(layers, list):

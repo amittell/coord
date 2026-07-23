@@ -31,10 +31,11 @@ Semantic Versioning.
   required platform. CI exercises this contract for both the base and
   PostgreSQL derivative images.
 - Official release publication is create-only across WritHub, the registry,
-  and PyPI: an immutable git release-lock tag binds the source commit,
-  registry tag absence is proved again immediately before promotion, and a
-  partial PyPI upload resumes only when every existing filename and SHA-256
-  matches the locally rebuilt artifact set.
+  and PyPI: an immutable annotated git release-lock tag binds one unique
+  operation ID to the source commit, authenticated image digest, and exact
+  package hashes. Same-commit concurrent publishers are rejected. Explicit
+  post-lock resume revalidates that complete binding and idempotently finishes
+  only matching PyPI, image-tag, receipt, and WritHub-tag state.
 
 ### Fixed
 

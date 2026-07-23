@@ -75,10 +75,12 @@ and linked platform subject, signs the immutable index digest through Vault,
 and verifies it against the literal committed public key (the official release
 path has no public-key override). Only after the candidate is authenticated does
 the script acquire a create-only `coord-release-lock-vX.Y.Z` tag on the exact
-release commit and upload the immutable PyPI artifacts; it then rechecks that
-the official image tag is absent immediately before promoting the same digest
-to `vX.Y.Z` and `latest`. The permanent lock serializes every supported
-publisher and makes an interrupted release resumable only from the same commit.
+release commit. The annotated lock payload also binds a unique 128-bit
+operation ID, the authenticated image digest, and the exact filename/SHA-256
+map of the rebuilt package artifacts. A competing publisher—even from the same
+commit—has a different operation ID and must stop. The lock holder uploads the
+immutable PyPI artifacts and idempotently ensures `latest`, `vX.Y.Z`, the local
+digest receipt, and the WritHub git tag all resolve to the locked state.
 The OCI Distribution API has no conditional tag-create operation, so registry
 credentials must not be used to publish release tags outside this locked path.
 A verifier or signer failure therefore cannot publish the PyPI version or move
@@ -88,8 +90,23 @@ pairs in the newly built `dist/` directory, uploads only the missing
 files, and then requires the complete remote set to match exactly. Package
 builds set `SOURCE_DATE_EPOCH` from the release commit so that comparison is
 reproducible.
+
+For an interrupted post-lock release, copy the operation ID printed by the
+original run (it is also stored in the annotated
+`coord-release-lock-vX.Y.Z` tag) and resume explicitly:
+
+```sh
+COORD_RELEASE_RESUME_ID=<32-lowercase-hex> scripts/release.sh --publish
+```
+
+Resume rebuilds and rehashes the package artifacts, validates every lock field,
+re-verifies attestations and the committed-key signature on the locked image
+digest without rebuilding it, accepts existing PyPI/image/git artifacts only
+when they match, and continues the remaining steps. Merely sharing the same
+source commit never grants permission to resume another publisher's operation.
 The authenticated reference is written to
-`dist/coord-vX.Y.Z-image-digest.txt`.
+`dist/coord-vX.Y.Z-image-digest.txt`; the corresponding operation receipt is
+`dist/coord-vX.Y.Z-release-operation-id.txt`.
 
 Deployment manifests are owned by each downstream cluster, not this
 repository's `deploy/k8s/prod` overlay. For kebabrack, first verify the base
