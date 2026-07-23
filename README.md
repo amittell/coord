@@ -72,7 +72,7 @@ pip install 'coord-mcp-server[symbols]'   # drop [symbols] if you do not need tr
 Pin to a specific release for reproducible installs:
 
 ```bash
-pip install 'coord-mcp-server==0.48.1'
+pip install 'coord-mcp-server==0.49.0'
 ```
 
 ### Option 3: Docker (self-hosted server)
@@ -86,7 +86,7 @@ docker run -d \
   -e COORD_AUTH_TOKEN="$(openssl rand -hex 32)" \
   -p 8080:8080 \
   -v coord-data:/data \
-  ghcr.io/amittell/coord:v0.48.1
+  ghcr.io/amittell/coord:v0.49.0
 ```
 
 The image is multi-arch (linux/amd64 + linux/arm64), keyless-signed with cosign, and ships SBOM + SLSA provenance attestations. Kubernetes manifests live under `deploy/k8s/` and `docs/deployment.md` has the full operator notes.
@@ -121,10 +121,10 @@ guide](docs/deployment.md#optional-postgresql-backend-beta) and the separate
 
 ```bash
 coord --version
-# coord 0.48.1
+# coord 0.49.0
 
 curl -fsS http://127.0.0.1:8080/readyz
-# {"status":"ready","version":"0.48.1",...}
+# {"status":"ready","version":"0.49.0",...}
 ```
 
 The CLI surface is intentionally small:
@@ -185,13 +185,13 @@ pipx inject coord-mcp-server 'coord-mcp-server[symbols]'
 pip install --upgrade 'coord-mcp-server[symbols]'
 
 # docker (self-hosted server)
-docker pull ghcr.io/amittell/coord:v0.48.1
+docker pull ghcr.io/amittell/coord:v0.49.0
 docker rm -f coord
 docker run -d --name coord \
   -e COORD_AUTH_TOKEN="$EXISTING_TOKEN" \
   -p 8080:8080 \
   -v coord-data:/data \
-  ghcr.io/amittell/coord:v0.48.1
+  ghcr.io/amittell/coord:v0.49.0
 ```
 
 When you point at a shared team server, the server operator owns the container upgrade. End users only need to upgrade their local CLI plus MCP wrapper to match.
@@ -212,10 +212,10 @@ coord doctor         # confirms the new wiring is healthy
 
 ```bash
 coord --version
-# coord 0.48.1
+# coord 0.49.0
 
 curl -fsS http://127.0.0.1:8080/readyz | python3 -m json.tool
-#   "version": "0.48.1"
+#   "version": "0.49.0"
 ```
 
 If your CLI and the running server disagree on version, the dashboard footer and the once-per-24h CLI update notice will both flag it. Set `COORD_NO_UPDATE_CHECK=1` if you are intentionally pinned to an older release.
@@ -225,11 +225,11 @@ If your CLI and the running server disagree on version, the dashboard footer and
 For reproducible installs across a team:
 
 ```bash
-pipx install 'coord-mcp-server==0.48.1'
+pipx install 'coord-mcp-server==0.49.0'
 # or
-pip install 'coord-mcp-server==0.48.1'
+pip install 'coord-mcp-server==0.49.0'
 # or, in a Dockerfile / Kubernetes manifest:
-#   image: ghcr.io/amittell/coord:v0.48.1
+#   image: ghcr.io/amittell/coord:v0.49.0
 ```
 
 The full release history lives on PyPI (<https://pypi.org/project/coord-mcp-server/#history>) and as GitHub releases (<https://github.com/amittell/coord/releases>). `CHANGELOG.md` has the per-version notes.

@@ -168,6 +168,17 @@ jobs:
           # branches. Only main refreshes the shared, minimal build cache.
           cache-to: ${{ github.event_name == 'push' && 'type=gha,scope=docker-ci,mode=min' || '' }}
 
+      - name: Build PostgreSQL derivative and verify pinned driver
+        shell: bash
+        run: |
+          docker build \
+            --file Dockerfile.postgres \
+            --build-arg COORD_BASE=coord:ci \
+            --tag coord:ci-postgres \
+            .
+          docker run --rm --entrypoint python coord:ci-postgres -c \
+            'import asyncpg, coordination; assert asyncpg.__version__ == "0.31.0"; print(coordination.__version__, asyncpg.__version__)'
+
       - name: Start image and verify real SQLite readiness
         shell: bash
         run: |
