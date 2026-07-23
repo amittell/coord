@@ -51,6 +51,9 @@ path; the workflow file stays for the day GitHub returns.
 
    Revoke that token when the release finishes. A release must stop if either
    the image signature or the committed-key verification fails.
+5. **crane 0.21.7 exactly**: the release verifier fetches each in-toto blob,
+   hashes its bytes, and validates its predicate and subject before promotion.
+   Pinning the verifier version keeps official tag mutation behavior stable.
 
 ## Cutting a release
 
@@ -60,12 +63,13 @@ scripts/release.sh              # dry run: validates, builds, prints plan
 scripts/release.sh --publish    # uploads PyPI + pushes image + tags writhub
 ```
 
-The canonical image is `whcr.io/alexm/coord:vX.Y.Z`. The script publishes one
-multi-platform index with BuildKit SBOM and maximum provenance attestations,
-checks that every platform has both linked predicates, signs the immutable index
-digest through Vault, verifies it against the literal committed public key (the
-official release path has no public-key override), and writes the authenticated
-reference to
+The canonical image is `whcr.io/alexm/coord:vX.Y.Z`. The script first pushes a
+non-official candidate tag, checks every in-toto layer's content hash, predicate,
+and linked platform subject, signs the immutable index digest through Vault,
+verifies it against the literal committed public key (the official release path
+has no public-key override), and only then promotes that digest to `vX.Y.Z` and
+`latest`. A verifier or signer failure therefore cannot move an official tag.
+The authenticated reference is written to
 `dist/coord-vX.Y.Z-image-digest.txt`.
 
 Deployment manifests are owned by each downstream cluster, not this

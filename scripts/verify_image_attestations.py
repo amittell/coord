@@ -11,6 +11,7 @@ provenance predicates for every requested platform.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import subprocess
@@ -43,11 +44,25 @@ def _inspect_raw(reference: str) -> dict[str, Any]:
     return value
 
 
+def _fetch_blob(reference: str, insecure: bool) -> bytes:
+    command = ["crane"]
+    if insecure:
+        command.append("--insecure")
+    command.extend(["blob", reference])
+    return subprocess.run(
+        command,
+        check=True,
+        stdout=subprocess.PIPE,
+    ).stdout
+
+
 def verify_image_attestations(
     image: str,
     required_platforms: set[str],
     *,
     inspect_raw: Callable[[str], dict[str, Any]] = _inspect_raw,
+    fetch_blob: Callable[[str, bool], bytes] = _fetch_blob,
+    insecure: bool = False,
 ) -> None:
     match = re.fullmatch(r"(.+)@(sha256:[0-9a-f]{64})", image)
     if match is None:
@@ -118,16 +133,81 @@ def verify_image_attestations(
             raise ValueError(
                 f"{image} platform {platform} attestation has no layers"
             )
-        predicates = {
-            annotations.get("in-toto.io/predicate-type")
-            for layer in layers
-            if isinstance(layer, dict)
-            and layer.get("mediaType") == "application/vnd.in-toto+json"
-            and isinstance(
-                annotations := layer.get("annotations"),
-                dict,
+        predicates: set[str] = set()
+        for layer in layers:
+            if (
+                not isinstance(layer, dict)
+                or layer.get("mediaType") != "application/vnd.in-toto+json"
+            ):
+                continue
+            layer_digest = layer.get("digest")
+            if (
+                not isinstance(layer_digest, str)
+                or _DIGEST.fullmatch(layer_digest) is None
+            ):
+                raise ValueError(
+                    f"{image} platform {platform} has an invalid "
+                    "in-toto layer digest"
+                )
+            payload = fetch_blob(
+                f"{repository}@{layer_digest}",
+                insecure,
             )
-        }
+            actual_digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+            if actual_digest != layer_digest:
+                raise ValueError(
+                    f"{image} platform {platform} in-toto layer content "
+                    f"hashes to {actual_digest}, expected {layer_digest}"
+                )
+            try:
+                statement = json.loads(payload)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"{image} platform {platform} has malformed in-toto JSON"
+                ) from exc
+            if not isinstance(statement, dict):
+                raise ValueError(
+                    f"{image} platform {platform} in-toto payload is not "
+                    "a statement object"
+                )
+            predicate = statement.get("predicateType")
+            annotations = layer.get("annotations")
+            advertised = (
+                annotations.get("in-toto.io/predicate-type")
+                if isinstance(annotations, dict)
+                else None
+            )
+            if predicate != advertised:
+                raise ValueError(
+                    f"{image} platform {platform} predicate annotation "
+                    f"{advertised!r} disagrees with payload {predicate!r}"
+                )
+            if not isinstance(predicate, str):
+                raise ValueError(
+                    f"{image} platform {platform} has no predicateType"
+                )
+            subjects = statement.get("subject")
+            if not isinstance(subjects, list) or not subjects:
+                raise ValueError(
+                    f"{image} platform {platform} in-toto statement has "
+                    "no subjects"
+                )
+            subject_hex = subject.removeprefix("sha256:")
+            subject_digests = [
+                item.get("digest", {}).get("sha256")
+                for item in subjects
+                if isinstance(item, dict)
+                and isinstance(item.get("digest"), dict)
+            ]
+            if (
+                len(subject_digests) != len(subjects)
+                or any(value != subject_hex for value in subject_digests)
+            ):
+                raise ValueError(
+                    f"{image} platform {platform} in-toto subjects do not "
+                    f"match linked manifest {subject}"
+                )
+            predicates.add(predicate)
         missing_predicates = _REQUIRED_PREDICATES - predicates
         if missing_predicates:
             raise ValueError(
@@ -149,14 +229,28 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         required=True,
         help="required os/architecture; repeat for every platform",
     )
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        help="allow plain HTTP when fetching blobs from a local test registry",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     try:
-        verify_image_attestations(args.image, set(args.platform))
-    except (ValueError, subprocess.CalledProcessError, json.JSONDecodeError) as exc:
+        verify_image_attestations(
+            args.image,
+            set(args.platform),
+            insecure=args.insecure,
+        )
+    except (
+        OSError,
+        ValueError,
+        subprocess.CalledProcessError,
+        json.JSONDecodeError,
+    ) as exc:
         raise SystemExit(f"image attestation verification failed: {exc}") from exc
     print(
         f"verified SBOM + SLSA provenance for "

@@ -158,6 +158,8 @@ Coord release public key before Docker is allowed to consume it. A tag or digest
 without a valid release signature is not a trusted release record:
 
 ```bash
+set -euo pipefail
+
 COORD_BASE_REPOSITORY='whcr.io/alexm/coord'
 COORD_BASE_TAG='vX.Y.Z'
 COORD_BASE_DIGEST="$(
@@ -181,8 +183,12 @@ dedicated transit Vault; downstream publishers should substitute their own KMS
 key and committed public key:
 
 ```bash
+set -euo pipefail
+
 COSIGN_SIGNING_KEY='hashivault://coord-release'
-COORD_DERIVATIVE='whcr.io/alexm/coord:vX.Y.Z-pg'
+COORD_DERIVATIVE_REPOSITORY='whcr.io/alexm/coord'
+COORD_DERIVATIVE_TAG='vX.Y.Z-pg'
+COORD_DERIVATIVE_CANDIDATE="$COORD_DERIVATIVE_REPOSITORY:candidate-$COORD_DERIVATIVE_TAG-$(git rev-parse --short=12 HEAD)"
 metadata_file="$(mktemp)"
 trap 'rm -f "$metadata_file"' EXIT
 
@@ -191,7 +197,7 @@ docker buildx build \
   --file Dockerfile.postgres \
   --build-arg "COORD_BASE_REPOSITORY=$COORD_BASE_REPOSITORY" \
   --build-arg "COORD_BASE_DIGEST=${COORD_BASE_DIGEST#sha256:}" \
-  --tag "$COORD_DERIVATIVE" \
+  --tag "$COORD_DERIVATIVE_CANDIDATE" \
   --attest=type=sbom,generator=docker.io/docker/buildkit-syft-scanner@sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68 \
   --provenance=mode=max \
   --metadata-file "$metadata_file" \
@@ -200,21 +206,29 @@ COORD_DERIVATIVE_DIGEST="$(
   python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["containerimage.digest"])' \
     "$metadata_file"
 )"
+printf '%s\n' "$COORD_DERIVATIVE_DIGEST" \
+  | grep -Eq '^sha256:[0-9a-f]{64}$'
 docker buildx imagetools inspect \
-  "$COORD_DERIVATIVE@$COORD_DERIVATIVE_DIGEST"
+  "$COORD_DERIVATIVE_REPOSITORY@$COORD_DERIVATIVE_DIGEST"
 python3 scripts/verify_image_attestations.py \
-  --image "$COORD_DERIVATIVE@$COORD_DERIVATIVE_DIGEST" \
+  --image "$COORD_DERIVATIVE_REPOSITORY@$COORD_DERIVATIVE_DIGEST" \
   --platform linux/amd64 \
   --platform linux/arm64
 cosign sign --yes \
   --key "$COSIGN_SIGNING_KEY" \
-  "$COORD_DERIVATIVE@$COORD_DERIVATIVE_DIGEST"
+  "$COORD_DERIVATIVE_REPOSITORY@$COORD_DERIVATIVE_DIGEST"
 cosign verify \
   --key release/coord-release.pub \
-  "$COORD_DERIVATIVE@$COORD_DERIVATIVE_DIGEST" >/dev/null
+  "$COORD_DERIVATIVE_REPOSITORY@$COORD_DERIVATIVE_DIGEST" >/dev/null
+crane tag \
+  "$COORD_DERIVATIVE_REPOSITORY@$COORD_DERIVATIVE_DIGEST" \
+  "$COORD_DERIVATIVE_TAG"
+test "$(
+  crane digest "$COORD_DERIVATIVE_REPOSITORY:$COORD_DERIVATIVE_TAG"
+)" = "$COORD_DERIVATIVE_DIGEST"
 
 docker run --rm --entrypoint python \
-  "$COORD_DERIVATIVE@$COORD_DERIVATIVE_DIGEST" \
+  "$COORD_DERIVATIVE_REPOSITORY@$COORD_DERIVATIVE_DIGEST" \
   -c 'import asyncpg, coordination; print(asyncpg.__version__)'
 
 docker run -d --name coord-postgres \
@@ -222,7 +236,7 @@ docker run -d --name coord-postgres \
   -e COORD_DATABASE_URL='postgresql://coord:password@db.example.com:5432/coord' \
   -e COORD_POSTGRES_SCHEMA=coord \
   -p 8080:8080 \
-  "$COORD_DERIVATIVE@$COORD_DERIVATIVE_DIGEST"
+  "$COORD_DERIVATIVE_REPOSITORY@$COORD_DERIVATIVE_DIGEST"
 ```
 
 Deploy the verified immutable derivative digest—not its tag—so a rolling fleet

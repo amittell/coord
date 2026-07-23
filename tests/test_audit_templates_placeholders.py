@@ -31,6 +31,7 @@ Three drift classes shipped historically and are pinned here:
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import tomllib
 from pathlib import Path
@@ -193,17 +194,27 @@ def test_github_free_release_is_attested_signed_and_verified() -> None:
         "scripts/verify_image_attestations.py",
         "cosign sign --yes --key",
         "cosign verify",
-        "release/coord-release.pub",
+        "--key release/coord-release.pub",
         "dist/coord-${TAG}-image-digest.txt",
         'COSIGN_MIN_VERSION="3.0.6"',
+        'CRANE_VERSION="0.21.7"',
     ):
         assert required in script, (
             f"scripts/release.sh lost required supply-chain fence {required!r}"
         )
     assert "COSIGN_SIGNING_KEY" in script
-    assert 'COSIGN_PUBLIC_KEY="release/coord-release.pub"' in script
-    assert "${COSIGN_PUBLIC_KEY:-" not in script
+    assert "COSIGN_PUBLIC_KEY" not in script
     assert re.search(r"sha256:\[0-9a-f\]\{64\}", script)
+    build = script.index("docker buildx build")
+    verify_attestations = script.index("scripts/verify_image_attestations.py")
+    sign = script.index("cosign sign --yes")
+    verify_signature = script.index("cosign verify", sign)
+    promote = script.index("crane tag", verify_signature)
+    assert build < verify_attestations < sign < verify_signature < promote
+    build_command = script[build:verify_attestations]
+    assert '-t "$candidate_tag"' in build_command
+    assert '-t "${IMAGE}:${TAG}"' not in build_command
+    assert '-t "${IMAGE}:latest"' not in build_command
 
 
 def test_release_identity_commits_only_a_public_key() -> None:
@@ -232,6 +243,9 @@ def test_ci_and_deploy_docs_exercise_the_signed_multiarch_contract() -> None:
     assert "docker/buildkit-syft-scanner@sha256:" in workflow
     assert "scripts/verify_image_attestations.py" in workflow
     assert "--provenance=mode=max" in workflow
+    assert "go-containerregistry_Linux_x86_64.tar.gz" in workflow
+    assert "1a57bc98207fa1c0d04bf760699099e26f8383499bfd55b99c1b919a928a7230" in workflow
+    assert "--insecure" in workflow
     assert "tonistiigi/binfmt:qemu-v10.2.3@sha256:" in workflow
     assert "tonistiigi/binfmt:latest" not in workflow
     assert "tonistiigi/binfmt:qemu-v10.2.3@sha256:" in release_workflow
@@ -244,12 +258,21 @@ def test_ci_and_deploy_docs_exercise_the_signed_multiarch_contract() -> None:
     assert "docker/buildkit-syft-scanner@sha256:" in docs
     assert "scripts/verify_image_attestations.py" in docs
     assert "--provenance=mode=max" in docs
+    assert docs.count("set -euo pipefail") >= 2
+    assert "COORD_DERIVATIVE_CANDIDATE" in docs
+    assert "crane tag" in docs
     assert 'path "transit/sign/coord-release/*"' in release_docs
     assert "Never give the release process a\n   Vault root token" in release_docs
     assert "Revoke that token when the release finishes" in release_docs
+    assert "crane 0.21.7 exactly" in release_docs
+    assert "failure therefore cannot move an official tag" in release_docs
 
 
-def _attested_index_fixture() -> tuple[str, dict[str, dict[str, object]]]:
+def _attested_index_fixture() -> tuple[
+    str,
+    dict[str, dict[str, object]],
+    dict[str, bytes],
+]:
     repository = "registry.example/coord"
     index_digest = "sha256:" + "0" * 64
     amd64_digest = "sha256:" + "1" * 64
@@ -273,28 +296,42 @@ def _attested_index_fixture() -> tuple[str, dict[str, dict[str, object]]]:
             },
         }
 
-    def predicates() -> dict[str, object]:
-        return {
-            "layers": [
+    blobs: dict[str, bytes] = {}
+
+    def predicates(subject: str) -> dict[str, object]:
+        layers: list[dict[str, object]] = []
+        for predicate in (
+            "https://spdx.dev/Document",
+            "https://slsa.dev/provenance/v1",
+        ):
+            payload = json.dumps(
+                {
+                    "_type": "https://in-toto.io/Statement/v1",
+                    "subject": [
+                        {
+                            "name": "pkg:docker/registry.example/coord",
+                            "digest": {"sha256": subject.removeprefix("sha256:")},
+                        }
+                    ],
+                    "predicateType": predicate,
+                    "predicate": {},
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+            digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+            blobs[f"{repository}@{digest}"] = payload
+            layers.append(
                 {
                     "mediaType": "application/vnd.in-toto+json",
-                    "annotations": {
-                        "in-toto.io/predicate-type": "https://spdx.dev/Document"
-                    },
-                },
-                {
-                    "mediaType": "application/vnd.in-toto+json",
-                    "annotations": {
-                        "in-toto.io/predicate-type": (
-                            "https://slsa.dev/provenance/v1"
-                        )
-                    },
-                },
-            ]
-        }
+                    "digest": digest,
+                    "annotations": {"in-toto.io/predicate-type": predicate},
+                }
+            )
+        return {"layers": layers}
 
     image = f"{repository}@{index_digest}"
-    fixtures = {
+    manifests = {
         image: {
             "manifests": [
                 platform(amd64_digest, "amd64"),
@@ -303,29 +340,113 @@ def _attested_index_fixture() -> tuple[str, dict[str, dict[str, object]]]:
                 link(arm64_digest, arm64_attestation),
             ]
         },
-        f"{repository}@{amd64_attestation}": predicates(),
-        f"{repository}@{arm64_attestation}": predicates(),
+        f"{repository}@{amd64_attestation}": predicates(amd64_digest),
+        f"{repository}@{arm64_attestation}": predicates(arm64_digest),
     }
-    return image, fixtures
+    return image, manifests, blobs
 
 
 def test_attestation_verifier_requires_both_predicates_per_platform() -> None:
-    image, fixtures = _attested_index_fixture()
+    image, manifests, blobs = _attested_index_fixture()
     verify_image_attestations(
         image,
         {"linux/amd64", "linux/arm64"},
-        inspect_raw=fixtures.__getitem__,
+        inspect_raw=manifests.__getitem__,
+        fetch_blob=lambda reference, _insecure: blobs[reference],
     )
 
     arm64_attestation = "registry.example/coord@sha256:" + "4" * 64
-    layers = fixtures[arm64_attestation]["layers"]
+    layers = manifests[arm64_attestation]["layers"]
     assert isinstance(layers, list)
     layers.pop(0)
     with pytest.raises(ValueError, match="linux/arm64.*spdx"):
         verify_image_attestations(
             image,
             {"linux/amd64", "linux/arm64"},
-            inspect_raw=fixtures.__getitem__,
+            inspect_raw=manifests.__getitem__,
+            fetch_blob=lambda reference, _insecure: blobs[reference],
+        )
+
+
+def test_attestation_verifier_rejects_annotation_payload_disagreement() -> None:
+    image, manifests, blobs = _attested_index_fixture()
+    attestation = manifests["registry.example/coord@sha256:" + "3" * 64]
+    layers = attestation["layers"]
+    assert isinstance(layers, list)
+    first = layers[0]
+    assert isinstance(first, dict)
+    annotations = first["annotations"]
+    assert isinstance(annotations, dict)
+    annotations["in-toto.io/predicate-type"] = "https://example.invalid/lie"
+
+    with pytest.raises(ValueError, match="annotation.*disagrees"):
+        verify_image_attestations(
+            image,
+            {"linux/amd64", "linux/arm64"},
+            inspect_raw=manifests.__getitem__,
+            fetch_blob=lambda reference, _insecure: blobs[reference],
+        )
+
+
+def test_attestation_verifier_rejects_mismatched_subject() -> None:
+    image, manifests, blobs = _attested_index_fixture()
+    attestation = manifests["registry.example/coord@sha256:" + "3" * 64]
+    layers = attestation["layers"]
+    assert isinstance(layers, list)
+    first = layers[0]
+    assert isinstance(first, dict)
+    old_digest = first["digest"]
+    assert isinstance(old_digest, str)
+    old_reference = f"registry.example/coord@{old_digest}"
+    statement = json.loads(blobs[old_reference])
+    statement["subject"][0]["digest"]["sha256"] = "f" * 64
+    payload = json.dumps(
+        statement,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    new_digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+    first["digest"] = new_digest
+    blobs[f"registry.example/coord@{new_digest}"] = payload
+
+    with pytest.raises(ValueError, match="subjects do not match"):
+        verify_image_attestations(
+            image,
+            {"linux/amd64", "linux/arm64"},
+            inspect_raw=manifests.__getitem__,
+            fetch_blob=lambda reference, _insecure: blobs[reference],
+        )
+
+
+def test_attestation_verifier_rejects_malformed_or_corrupt_blob() -> None:
+    image, manifests, blobs = _attested_index_fixture()
+    attestation = manifests["registry.example/coord@sha256:" + "3" * 64]
+    layers = attestation["layers"]
+    assert isinstance(layers, list)
+    first = layers[0]
+    assert isinstance(first, dict)
+    old_digest = first["digest"]
+    assert isinstance(old_digest, str)
+    reference = f"registry.example/coord@{old_digest}"
+    blobs[reference] = b"corrupt"
+    with pytest.raises(ValueError, match="hashes to"):
+        verify_image_attestations(
+            image,
+            {"linux/amd64", "linux/arm64"},
+            inspect_raw=manifests.__getitem__,
+            fetch_blob=lambda value, _insecure: blobs[value],
+        )
+
+    malformed = b"{"
+    malformed_digest = "sha256:" + hashlib.sha256(malformed).hexdigest()
+    first["digest"] = malformed_digest
+    blobs[f"registry.example/coord@{malformed_digest}"] = malformed
+    with pytest.raises(ValueError, match="malformed in-toto JSON"):
+        verify_image_attestations(
+            image,
+            {"linux/amd64", "linux/arm64"},
+            inspect_raw=manifests.__getitem__,
+            fetch_blob=lambda value, _insecure: blobs[value],
         )
 
 

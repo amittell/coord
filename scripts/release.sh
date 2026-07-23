@@ -49,8 +49,8 @@ done
 REGISTRY="${COORD_IMAGE_REGISTRY:-whcr.io}"
 IMAGE="${COORD_IMAGE_NAME:-${REGISTRY}/alexm/coord}"
 PLATFORMS="${COORD_IMAGE_PLATFORMS:-linux/amd64,linux/arm64}"
-COSIGN_PUBLIC_KEY="release/coord-release.pub"
 COSIGN_MIN_VERSION="3.0.6"
+CRANE_VERSION="0.21.7"
 SBOM_GENERATOR="docker.io/docker/buildkit-syft-scanner@sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68"
 
 VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
@@ -69,8 +69,11 @@ grep -q "${VERSION}" CHANGELOG.md || echo "release: WARNING -- ${VERSION} not me
 
 if [ "$SKIP_IMAGE" = 0 ] && [ "$PUBLISH" = 1 ]; then
   command -v cosign >/dev/null 2>&1 || fail "cosign is required to publish a signed image"
+  command -v crane >/dev/null 2>&1 || fail "crane is required to verify attestations and promote tags"
   [ -n "${COSIGN_SIGNING_KEY:-}" ] || fail "set COSIGN_SIGNING_KEY to the release KMS key"
-  [ -f "$COSIGN_PUBLIC_KEY" ] || fail "missing release public key: $COSIGN_PUBLIC_KEY"
+  [ -f release/coord-release.pub ] || fail "missing release public key: release/coord-release.pub"
+  [ "$(crane version)" = "$CRANE_VERSION" ] \
+    || fail "crane $(crane version) does not match required ${CRANE_VERSION}"
   cosign_version="$(
     cosign version --json \
       | python3 -c 'import json, sys; print(json.load(sys.stdin)["gitVersion"].removeprefix("v"))'
@@ -90,6 +93,15 @@ PY
   then
     fail "cosign ${cosign_version} is older than required ${COSIGN_MIN_VERSION}"
   fi
+  image_probe_error="$(mktemp)"
+  if crane digest "${IMAGE}:${TAG}" >/dev/null 2>"$image_probe_error"; then
+    fail "official image tag already exists: ${IMAGE}:${TAG}"
+  fi
+  if ! grep -Fq "MANIFEST_UNKNOWN" "$image_probe_error"; then
+    cat "$image_probe_error" >&2
+    fail "could not prove official image tag is absent: ${IMAGE}:${TAG}"
+  fi
+  rm -f "$image_probe_error"
 fi
 
 if [ "$SKIP_PYPI" = 0 ]; then
@@ -116,8 +128,8 @@ ls -1 dist/
 echo
 echo "release plan for ${TAG}:"
 [ "$SKIP_PYPI" = 0 ] && echo "  1. twine upload dist/*  -> PyPI coord-mcp-server ${VERSION}"
-[ "$SKIP_IMAGE" = 0 ] && echo "  2. buildx ${PLATFORMS} -> ${IMAGE}:${TAG} + :latest (SBOM + provenance)"
-[ "$SKIP_IMAGE" = 0 ] && echo "     sign + verify the immutable image digest with ${COSIGN_PUBLIC_KEY}"
+[ "$SKIP_IMAGE" = 0 ] && echo "  2. buildx ${PLATFORMS} -> candidate (SBOM + provenance)"
+[ "$SKIP_IMAGE" = 0 ] && echo "     validate + sign + verify, then promote the digest to ${IMAGE}:${TAG} + :latest"
 echo "  3. git tag ${TAG} + push to origin (writhub)"
 echo "  4. THEN: update each downstream cluster's Deployment manifest"
 echo "     (kebabrack: build the -pg derivative and update k8s/10b-coord-app.yaml)"
@@ -137,13 +149,14 @@ fi
 
 if [ "$SKIP_IMAGE" = 0 ]; then
   echo "release: building + pushing attested image ${IMAGE}:${TAG} (${PLATFORMS})..."
+  candidate_tag="${IMAGE}:candidate-${TAG}-$(git rev-parse --short=12 HEAD)"
   image_metadata="$(mktemp)"
   cleanup_image_files() {
     rm -f "$image_metadata"
   }
   trap cleanup_image_files EXIT
   docker buildx build --platform "${PLATFORMS}" \
-    -t "${IMAGE}:${TAG}" -t "${IMAGE}:latest" \
+    -t "$candidate_tag" \
     --attest="type=sbom,generator=${SBOM_GENERATOR}" \
     --provenance=mode=max \
     --metadata-file "$image_metadata" \
@@ -166,8 +179,15 @@ if [ "$SKIP_IMAGE" = 0 ]; then
   echo "release: signing ${IMAGE}@${image_digest}..."
   cosign sign --yes --key "${COSIGN_SIGNING_KEY}" "${IMAGE}@${image_digest}"
   cosign verify \
-    --key "$COSIGN_PUBLIC_KEY" \
+    --key release/coord-release.pub \
     "${IMAGE}@${image_digest}" >/dev/null
+  echo "release: promoting verified digest to official tags..."
+  crane tag "${IMAGE}@${image_digest}" "$TAG"
+  crane tag "${IMAGE}@${image_digest}" latest
+  [ "$(crane digest "${IMAGE}:${TAG}")" = "$image_digest" ] \
+    || fail "${IMAGE}:${TAG} did not resolve to the verified digest"
+  [ "$(crane digest "${IMAGE}:latest")" = "$image_digest" ] \
+    || fail "${IMAGE}:latest did not resolve to the verified digest"
   printf '%s@%s\n' "$IMAGE" "$image_digest" \
     > "dist/coord-${TAG}-image-digest.txt"
   echo "release: verified signed image ${IMAGE}@${image_digest}"

@@ -152,6 +152,21 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
+      - name: Install pinned crane for attestation blob verification
+        shell: bash
+        run: |
+          archive="$RUNNER_TEMP/go-containerregistry_Linux_x86_64.tar.gz"
+          curl --fail --location --retry 3 \
+            --output "$archive" \
+            https://github.com/google/go-containerregistry/releases/download/v0.21.7/go-containerregistry_Linux_x86_64.tar.gz
+          printf '%s  %s\n' \
+            1a57bc98207fa1c0d04bf760699099e26f8383499bfd55b99c1b919a928a7230 \
+            "$archive" \
+            | sha256sum --check -
+          tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP" crane
+          test "$("$RUNNER_TEMP/crane" version)" = "0.21.7"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
       - name: Start pinned ephemeral registry
         run: |
           docker run --detach \
@@ -235,7 +250,8 @@ jobs:
           python scripts/verify_image_attestations.py \
             --image "127.0.0.1:5000/coord@$derivative_digest" \
             --platform linux/amd64 \
-            --platform linux/arm64
+            --platform linux/arm64 \
+            --insecure
 
           docker pull --platform linux/amd64 \
             "127.0.0.1:5000/coord:ci@$BASE_DIGEST"
