@@ -247,8 +247,13 @@ class TestReleaseWorkflowPublicationFence:
         assert set(triggers) == {"workflow_dispatch"}
         inputs = triggers["workflow_dispatch"]["inputs"]
         assert "overwrite" not in inputs
+        assert inputs["version"]["required"] is False
+        assert inputs["oidc_trigger_tag"]["required"] is False
         concurrency = workflow["concurrency"]
-        assert concurrency["group"] == "${{ github.workflow }}-candidate-publisher"
+        assert concurrency["group"] == (
+            "${{ github.workflow }}-"
+            "${{ inputs.oidc_trigger_tag || inputs.version }}"
+        )
         assert concurrency["cancel-in-progress"] is False
 
     def test_candidate_is_authenticated_without_an_official_promotion(self) -> None:
@@ -277,14 +282,221 @@ class TestReleaseWorkflowPublicationFence:
         assert build < verify_attestations < verify_signature
         assert "--builder-id \"$BUILDER_ID\"" in steps[verify_attestations]["run"]
         assert all("crane tag" not in str(step.get("run") or "") for step in steps)
-        assert workflow["jobs"]["publish-pypi"]["if"] == (
-            "github.event_name == 'push'"
+        checkout = next(
+            step for step in steps if step.get("name") == "Check out repository"
         )
-        assert workflow["jobs"]["bump-manifest"]["if"] == (
-            "github.event_name == 'push'"
+        assert checkout["with"]["persist-credentials"] is False
+        authorization_job = workflow["jobs"]["authorize-pypi"]
+        assert authorization_job["if"] == (
+            "inputs.oidc_trigger_tag != '' "
+            "&& github.ref == 'refs/heads/main'"
         )
+        assert authorization_job["permissions"] == {"contents": "read"}
+        assert "environment" not in authorization_job
+        authorization_steps = [
+            str(step) for step in authorization_job["steps"]
+        ]
+        authorization_checkouts = [
+            step
+            for step in authorization_job["steps"]
+            if str(step.get("uses") or "").startswith("actions/checkout@")
+        ]
+        assert len(authorization_checkouts) == 2
+        assert all(
+            step["with"]["persist-credentials"] is False
+            for step in authorization_checkouts
+        )
+        authorization = next(
+            index
+            for index, step in enumerate(authorization_steps)
+            if "Verify Vault-signed release authorization" in step
+        )
+        assert "cosign verify-blob" in authorization_steps[authorization]
+        assert "release/coord-release.pub" in authorization_steps[authorization]
+        artifact = next(
+            index
+            for index, step in enumerate(authorization_steps)
+            if "actions/upload-artifact@" in step
+        )
+        assert authorization < artifact
+        assert all("Classify existing PyPI" not in step for step in authorization_steps)
+
+        gate = workflow["jobs"]["gate-pypi"]
+        assert gate["needs"] == "authorize-pypi"
+        assert gate["permissions"] == {"contents": "read", "actions": "read"}
+        assert "environment" not in gate
+        gate_steps = [str(step) for step in gate["steps"]]
+        gate_checkout = next(
+            index
+            for index, step in enumerate(gate_steps)
+            if "Check out locked-main verifier without credentials" in step
+        )
+        gate_download = next(
+            index
+            for index, step in enumerate(gate_steps)
+            if "actions/download-artifact@" in step
+        )
+        gate_recheck = next(
+            index
+            for index, step in enumerate(gate_steps)
+            if "Recheck exact signed package hashes" in step
+        )
+        gate_classifier = next(
+            index
+            for index, step in enumerate(gate_steps)
+            if "Classify existing PyPI release" in step
+        )
+        assert gate_checkout < gate_download < gate_recheck < gate_classifier
+        assert "scripts/check_pypi_release.py" in gate_steps[gate_classifier]
+        gate_text = "\n".join(gate_steps)
+        assert "release-source" not in gate_text
+        assert "python -m build" not in gate_text
+
+        pypi = workflow["jobs"]["publish-pypi"]
+        assert "needs.gate-pypi.outputs.state == 'absent'" in pypi["if"]
+        assert "needs.gate-pypi.outputs.state == 'partial'" in pypi["if"]
+        assert "!= 'exact'" not in pypi["if"]
+        assert "github.ref == 'refs/heads/main'" in pypi["if"]
+        assert pypi["environment"]["name"] == "pypi"
+        assert pypi["permissions"] == {"id-token": "write", "actions": "read"}
+        pypi_steps = [str(step) for step in pypi["steps"]]
+        publish = next(
+            index
+            for index, step in enumerate(pypi_steps)
+            if "pypa/gh-action-pypi-publish@" in step
+        )
+        recheck = next(
+            index
+            for index, step in enumerate(pypi_steps)
+            if "Recheck exact signed package hashes" in step
+        )
+        assert recheck < publish
+        pypi_text = "\n".join(pypi_steps)
+        assert "actions/download-artifact@" in pypi_text
+        assert "actions/checkout@" not in pypi_text
+        assert "actions/setup-python@" not in pypi_text
+        assert "pip install" not in pypi_text
+        assert "python -m build" not in pypi_text
+        assert "scripts/" not in pypi_text
+        assert "bump-manifest" not in workflow["jobs"]
+        assert "git push origin HEAD:main" not in str(workflow)
+        assert "password:" not in str(pypi)
         assert "SKIP_SIGNING" not in str(workflow)
         assert "git push origin \"${VERSION}\" --force" not in str(workflow)
+
+    @pytest.mark.parametrize(
+        "candidate",
+        ("", "bad/value", "bad\nextra=tag", "bad\rvalue", "x" * 106),
+    )
+    def test_candidate_label_rejects_output_and_tag_injection(
+        self,
+        tmp_path: Path,
+        candidate: str,
+    ) -> None:
+        workflow = self._workflow()
+        steps = workflow["jobs"]["publish-image"]["steps"]
+        resolve = next(
+            step for step in steps if step.get("name") == "Resolve candidate label"
+        )
+        output = tmp_path / "output"
+        result = subprocess.run(
+            ["bash", "-c", resolve["run"]],
+            env={
+                **os.environ,
+                "INPUT_VERSION": candidate,
+                "GITHUB_OUTPUT": str(output),
+            },
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode != 0
+
+    def test_candidate_label_produces_exactly_one_candidate_tag(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        workflow = self._workflow()
+        steps = workflow["jobs"]["publish-image"]["steps"]
+        resolve = next(
+            step for step in steps if step.get("name") == "Resolve candidate label"
+        )
+        compose = next(
+            step for step in steps if step.get("name") == "Compose candidate image tag"
+        )
+        resolved = tmp_path / "resolved"
+        result = subprocess.run(
+            ["bash", "-c", resolve["run"]],
+            env={
+                **os.environ,
+                "INPUT_VERSION": "v0.49.0-review1",
+                "GITHUB_OUTPUT": str(resolved),
+            },
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        assert resolved.read_text(encoding="utf-8") == "tag=v0.49.0-review1\n"
+
+        tags = tmp_path / "tags"
+        result = subprocess.run(
+            ["bash", "-c", compose["run"]],
+            env={
+                **os.environ,
+                "IMAGE": "ghcr.io/amittell/coord",
+                "VERSION": "v0.49.0-review1",
+                "COMMIT_SHA": "a" * 40,
+                "GITHUB_OUTPUT": str(tags),
+            },
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        assert tags.read_text(encoding="utf-8") == (
+            "tags=ghcr.io/amittell/coord:"
+            "candidate-v0.49.0-review1-aaaaaaaaaaaa\n"
+        )
+
+    def test_fresh_pypi_gate_ignores_poisoned_build_workspace_classifier(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        workflow = self._workflow()
+        gate_steps = workflow["jobs"]["gate-pypi"]["steps"]
+        classifier = next(
+            step
+            for step in gate_steps
+            if step.get("name") == "Classify existing PyPI release"
+        )
+        trusted = tmp_path / "scripts"
+        poisoned = tmp_path / "release-source" / "scripts"
+        trusted.mkdir()
+        poisoned.mkdir(parents=True)
+        (trusted / "check_pypi_release.py").write_text(
+            "print('conflict')\n",
+            encoding="utf-8",
+        )
+        (poisoned / "check_pypi_release.py").write_text(
+            "print('absent')\n",
+            encoding="utf-8",
+        )
+        output = tmp_path / "output"
+        result = subprocess.run(
+            ["bash", "-e", "-o", "pipefail", "-c", classifier["run"]],
+            cwd=tmp_path,
+            env={
+                **os.environ,
+                "VERSION": "0.49.0",
+                "GITHUB_OUTPUT": str(output),
+            },
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode != 0
+        assert not output.exists()
 
     @pytest.mark.skipif(
         os.name == "nt",
@@ -533,7 +745,24 @@ class TestCiMatrixCoversClassifiers:
             "./.github/workflows/postgres.yml"
         )
         assert jobs["publish-image"]["needs"] == "postgres-gate"
+        assert jobs["authorize-pypi"]["needs"] == "postgres-gate"
         assert jobs["publish-pypi"]["needs"] == [
             "postgres-gate",
-            "publish-image",
+            "authorize-pypi",
+            "gate-pypi",
         ]
+        assert jobs["gate-pypi"]["needs"] == "authorize-pypi"
+        assert jobs["verify-pypi"]["needs"] == [
+            "authorize-pypi",
+            "publish-pypi",
+        ]
+
+
+def test_release_authority_files_have_codeowners() -> None:
+    codeowners = (REPO_ROOT / ".github" / "CODEOWNERS").read_text(
+        encoding="utf-8"
+    )
+    assert "/.github/CODEOWNERS @amittell" in codeowners
+    assert "/.github/workflows/release.yml @amittell" in codeowners
+    assert "/scripts/release.sh @amittell" in codeowners
+    assert "/release/coord-release.pub @amittell" in codeowners

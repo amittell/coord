@@ -1,0 +1,5 @@
+# Release authority and its verification boundary require owner review.
+/.github/CODEOWNERS @amittell
+/.github/workflows/release.yml @amittell
+/scripts/release.sh @amittell
+/release/coord-release.pub @amittell

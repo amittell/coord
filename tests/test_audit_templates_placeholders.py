@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 import tomllib
@@ -213,6 +214,14 @@ def test_github_free_release_is_attested_signed_and_verified() -> None:
         'CRANE_VERSION="0.21.7"',
         "COORD_RELEASE_PYTHON",
         '"$PYTHON_BIN" -m venv',
+        "release_authorization_statement",
+        "cosign sign-blob --yes",
+        'PYPI_PUBLISHER="${COORD_PYPI_PUBLISHER:-github-oidc}"',
+        "github-oidc:amittell/coord:.github/workflows/release.yml:pypi",
+        "build_python=${BUILD_PYTHON_VERSION}",
+        "gh workflow run release.yml",
+        'git tag --no-sign -a "$LOCK_TAG"',
+        'git tag --no-sign -a "$PYPI_OIDC_TRIGGER_TAG"',
     ):
         assert required in script, (
             f"scripts/release.sh lost required supply-chain fence {required!r}"
@@ -221,21 +230,43 @@ def test_github_free_release_is_attested_signed_and_verified() -> None:
     assert "COSIGN_PUBLIC_KEY" not in script
     assert re.search(r"sha256:\[0-9a-f\]\{64\}", script)
     build = script.index("docker buildx build")
-    verify_attestations = script.index("scripts/verify_image_attestations.py")
+    preflight = script.index("# ---- preflight")
+    verifier_preflight = script.index(
+        "  verify_github_oidc_verifier", preflight
+    )
+    controls_preflight = script.index(
+        "  audit_github_oidc_controls", verifier_preflight
+    )
+    assert preflight < verifier_preflight < controls_preflight < build
+    verify_attestations = script.index(
+        "scripts/verify_image_attestations.py", build
+    )
     sign = script.index("cosign sign --yes")
     verify_signature = script.index("cosign verify", sign)
     release_lock = script.index("acquire_release_lock", verify_signature)
-    pypi_upload = script.index('"${twine_command[@]}" upload', verify_signature)
-    promote = script.index("crane tag", verify_signature)
+    oidc_authorization = script.index(
+        '    ensure_github_oidc_trigger "$image_digest"', release_lock
+    )
+    oidc_dispatch = script.index(
+        "    dispatch_github_oidc_publish", oidc_authorization
+    )
+    pypi_wait = script.index(
+        "    wait_for_github_oidc_publish", oidc_dispatch
+    )
+    promote = script.index("crane tag", pypi_wait)
     assert (
         build
         < verify_attestations
         < sign
         < verify_signature
         < release_lock
-        < pypi_upload
+        < oidc_authorization
+        < oidc_dispatch
+        < pypi_wait
         < promote
     )
+    token_fallback = script.index('"${twine_command[@]}" upload', oidc_authorization)
+    assert token_fallback < promote
     build_command = script[build:verify_attestations]
     assert '-t "$candidate_tag"' in build_command
     assert '-t "${IMAGE}:${TAG}"' not in build_command
@@ -252,6 +283,12 @@ def test_github_free_release_is_attested_signed_and_verified() -> None:
     assert "operation_id=${RELEASE_OPERATION_ID}" in script
     assert "image=${IMAGE}@${digest}" in script
     assert "packages=${PACKAGE_FINGERPRINT}" in script
+    assert "publisher=${PYPI_OIDC_PUBLISHER}" in script
+    assert "build_python=${BUILD_PYTHON_VERSION}" in script
+    assert (
+        'PYPI_OIDC_TRIGGER_TAG="coord-pypi-${TAG}-${RELEASE_OPERATION_ID}"'
+        in script
+    )
     assert "COORD_RELEASE_RESUME_ID" in script
     assert "explicit resume requires COORD_RELEASE_RESUME_ID" in script
     assert "concurrent publisher locked the same exact commit" not in script
@@ -263,8 +300,303 @@ def test_github_free_release_is_attested_signed_and_verified() -> None:
     assert "version_tag_exists=1" in script
     assert "remote tag ${TAG} does not point to ${head}" in script
     assert 'SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"' in script
-    assert "Python >=3.11" in script
+    assert "CPython 3.11-3.14" in script
+    assert (
+        "not ((3, 11) <= sys.version_info[:2] <= (3, 14))"
+        in script
+    )
     assert "python3 -m venv" not in script
+
+
+def test_github_oidc_trigger_is_operation_bound_and_signature_checked(
+    tmp_path: Path,
+) -> None:
+    script = RELEASE_SCRIPT.read_text(encoding="utf-8")
+    functions = script[
+        script.index("release_authorization_statement()")
+        : script.index("wait_for_github_oidc_publish()")
+    ]
+    remote = tmp_path / "github.git"
+    repo = tmp_path / "repo"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True)
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True)
+    (repo / "seed").write_text("OIDC authorization fixture\n", encoding="utf-8")
+    (repo / "release").mkdir()
+    (repo / "release" / "coord-release.pub").write_text(
+        "test-public-key\n",
+        encoding="utf-8",
+    )
+    for key, value in (
+        ("user.name", "Release Test"),
+        ("user.email", "release-test@example.invalid"),
+        ("tag.gpgSign", "true"),
+        ("gpg.program", "false"),
+    ):
+        subprocess.run(["git", "config", key, value], cwd=repo, check=True)
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "seed"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "remote", "add", "github", str(remote)],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "push", "-u", "github", "main"],
+        cwd=repo,
+        check=True,
+    )
+
+    git_wrapper = bin_dir / "git"
+    git_wrapper.write_text(
+        """#!/usr/bin/env python3
+import os
+import sys
+
+if sys.argv[1:] == ["remote", "get-url", "github"]:
+    print("https://github.com/amittell/coord.git")
+    raise SystemExit(0)
+os.execv("/usr/bin/git", ["/usr/bin/git", *sys.argv[1:]])
+""",
+        encoding="utf-8",
+    )
+    cosign_wrapper = bin_dir / "cosign"
+    cosign_wrapper.write_text(
+        """#!/usr/bin/env python3
+import hashlib
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+bundle = Path(args[args.index("--bundle") + 1])
+statement = Path(args[-1])
+digest = hashlib.sha256(statement.read_bytes()).hexdigest()
+if args[0] == "sign-blob":
+    bundle.write_text(digest, encoding="utf-8")
+    raise SystemExit(0)
+if args[0] == "verify-blob":
+    raise SystemExit(0 if bundle.read_text(encoding="utf-8") == digest else 1)
+raise SystemExit(2)
+""",
+        encoding="utf-8",
+    )
+    git_wrapper.chmod(0o755)
+    cosign_wrapper.chmod(0o755)
+
+    operation_id = "a" * 32
+    trigger_tag = f"coord-pypi-v0.49.0-{operation_id}"
+    harness = f"""\
+set -euo pipefail
+fail() {{ echo "release: $*" >&2; exit 1; }}
+VERSION=0.49.0
+TAG=v0.49.0
+IMAGE=whcr.io/alexm/coord
+RELEASE_OPERATION_ID={operation_id}
+PACKAGE_FINGERPRINT='{{"coord.whl":"{"1" * 64}"}}'
+BUILD_PYTHON_VERSION=3.12
+PYPI_OIDC_PUBLISHER=github-oidc:amittell/coord:.github/workflows/release.yml:pypi
+PYPI_OIDC_TRIGGER_TAG={trigger_tag}
+PYPI_GITHUB_REMOTE=github
+PYTHON_BIN=python3
+{functions}
+ensure_github_oidc_trigger sha256:{"2" * 64}
+"""
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "COSIGN_SIGNING_KEY": "fake",
+    }
+    first = subprocess.run(
+        ["bash", "-c", harness],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert first.returncode == 0, first.stderr
+    assert "published Vault-authorized GitHub OIDC trigger" in first.stdout
+
+    replay = subprocess.run(
+        ["bash", "-c", harness],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert replay.returncode == 0, replay.stderr
+    assert "already matches the locked release" in replay.stdout
+
+    subprocess.run(
+        ["git", "push", "github", f":refs/tags/{trigger_tag}"],
+        cwd=repo,
+        check=True,
+    )
+    retry = subprocess.run(
+        ["bash", "-c", harness],
+        cwd=repo,
+        env={**env, "COSIGN_SIGNING_KEY": ""},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert retry.returncode == 0, retry.stderr
+    assert "retrying previously verified local" in retry.stdout
+
+    subprocess.run(["git", "tag", "-d", trigger_tag], cwd=repo, check=True)
+    forged_payload = "\n".join(
+        (
+            "coord-pypi-trigger-v1",
+            "statement_base64=YmFk",
+            "bundle_base64=YmFk",
+        )
+    )
+    subprocess.run(
+        ["git", "tag", "--no-sign", "-a", trigger_tag, "-m", forged_payload],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "push", "--force", "github", f"refs/tags/{trigger_tag}"],
+        cwd=repo,
+        check=True,
+    )
+    forged = subprocess.run(
+        ["bash", "-c", harness],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert forged.returncode != 0
+    assert "release authorization signature is invalid" in forged.stderr
+
+
+def test_github_oidc_dispatch_audits_live_protection_before_workflow(
+    tmp_path: Path,
+) -> None:
+    script = RELEASE_SCRIPT.read_text(encoding="utf-8")
+    function = script[
+        script.index("audit_github_oidc_controls()")
+        : script.index("wait_for_github_oidc_publish()")
+    ]
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh_log = tmp_path / "gh-workflow.log"
+    gh_wrapper = bin_dir / "gh"
+    gh_wrapper.write_text(
+        """#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+if args[:2] == ["auth", "status"]:
+    raise SystemExit(0)
+if args[:2] == ["workflow", "run"]:
+    Path(os.environ["GH_LOG"]).write_text(" ".join(args), encoding="utf-8")
+    raise SystemExit(0)
+if args[0] != "api":
+    raise SystemExit(2)
+endpoint = args[1]
+if endpoint.endswith("/deployment-branch-policies"):
+    print(json.dumps({
+        "branch_policies": [{"name": "main", "type": "branch"}],
+    }))
+elif endpoint.endswith("/environments/pypi"):
+    drift = os.environ.get("GH_DRIFT")
+    reviewers = [] if drift == "reviewer" else [
+        {"type": "User", "reviewer": {"login": "amittell"}},
+    ]
+    if drift == "extra-user":
+        reviewers.append({"type": "User", "reviewer": {"login": "mallory"}})
+    if drift == "extra-team":
+        reviewers.append({"type": "Team", "reviewer": {"slug": "release-admins"}})
+    print(json.dumps({
+        "can_admins_bypass": False,
+        "protection_rules": [{
+            "type": "required_reviewers",
+            "reviewers": reviewers,
+        }],
+        "deployment_branch_policy": {
+            "custom_branch_policies": True,
+            "protected_branches": False,
+        },
+    }))
+elif endpoint.endswith("/branches/main/protection"):
+    drift = os.environ.get("GH_DRIFT")
+    print(json.dumps({
+        "required_pull_request_reviews": {
+            "require_code_owner_reviews": True,
+            "dismiss_stale_reviews": drift != "stale-reviews",
+            "require_last_push_approval": True,
+            "required_approving_review_count": 1,
+        },
+        "enforce_admins": {"enabled": drift != "admin-enforcement"},
+        "required_linear_history": {"enabled": True},
+        "allow_force_pushes": {"enabled": False},
+        "allow_deletions": {"enabled": False},
+        "lock_branch": {"enabled": drift != "branch-lock"},
+    }))
+else:
+    raise SystemExit(2)
+""",
+        encoding="utf-8",
+    )
+    gh_wrapper.chmod(0o755)
+    harness = f"""\
+set -euo pipefail
+fail() {{ echo "release: $*" >&2; exit 1; }}
+PYTHON_BIN=python3
+PYPI_OIDC_TRIGGER_TAG=coord-pypi-v0.49.0-{"a" * 32}
+{function}
+dispatch_github_oidc_publish
+"""
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "GH_LOG": str(gh_log),
+    }
+    accepted = subprocess.run(
+        ["bash", "-c", harness],
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert accepted.returncode == 0, accepted.stderr
+    dispatch = gh_log.read_text(encoding="utf-8")
+    assert "--ref main" in dispatch
+    assert "--field oidc_trigger_tag=coord-pypi-v0.49.0-" in dispatch
+
+    for drift in (
+        "reviewer",
+        "extra-user",
+        "extra-team",
+        "stale-reviews",
+        "admin-enforcement",
+        "branch-lock",
+    ):
+        rejected_log = tmp_path / f"rejected-{drift}.log"
+        rejected = subprocess.run(
+            ["bash", "-c", harness],
+            env={
+                **env,
+                "GH_DRIFT": drift,
+                "GH_LOG": str(rejected_log),
+            },
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert rejected.returncode != 0
+        assert "protections do not match the release contract" in rejected.stderr
+        assert not rejected_log.exists()
 
 
 def test_release_lock_rejects_same_commit_competitor_and_validates_resume(
@@ -306,16 +638,17 @@ def test_release_lock_rejects_same_commit_competitor_and_validates_resume(
     subprocess.run(["git", "clone", str(remote), str(second)], check=True)
     subprocess.run(["git", "checkout", "main"], cwd=second, check=True)
     for repo in (first, second):
-        subprocess.run(
-            ["git", "config", "user.name", "Release Test"],
-            cwd=repo,
-            check=True,
-        )
-        subprocess.run(
-            ["git", "config", "user.email", "release-test@example.invalid"],
-            cwd=repo,
-            check=True,
-        )
+        for key, value in (
+            ("user.name", "Release Test"),
+            ("user.email", "release-test@example.invalid"),
+            ("tag.gpgSign", "true"),
+            ("gpg.program", "false"),
+        ):
+            subprocess.run(
+                ["git", "config", key, value],
+                cwd=repo,
+                check=True,
+            )
 
     harness = f"""\
 set -euo pipefail
@@ -535,6 +868,14 @@ def test_ci_and_deploy_docs_exercise_the_signed_multiarch_contract() -> None:
     assert "crane 0.21.7 exactly" in release_docs
     assert "failure therefore cannot publish" in release_docs
     assert "filename and SHA-256" in release_docs
+    assert "PyPI Trusted Publisher" in release_docs
+    assert "Vault-signed" in release_docs
+    assert "authorization" in release_docs
+    assert "COORD_PYPI_PUBLISHER=github-oidc|token" in release_docs
+    assert "Never put that token in the" in release_docs
+    assert "`main` branch only" in release_docs
+    assert "no repository checkout" in release_docs
+    assert "inert signed" in release_docs
     assert "github.com/amittell/coord/pkgs/container/coord" not in (
         REPO_ROOT / "README.md"
     ).read_text(encoding="utf-8")

@@ -1,27 +1,28 @@
-name: release candidate validation
+name: release candidate validation and PyPI OIDC
+run-name: ${{ inputs.oidc_trigger_tag != '' && format('PyPI OIDC {0}', inputs.oidc_trigger_tag) || format('candidate {0}', inputs.version) }}
 
 on:
-  # The authoritative publisher is scripts/release.sh, backed by the
-  # repository's committed release key and immutable WritHub release lock.
-  # GitHub Actions intentionally has no tag trigger and cannot publish an
-  # official image tag, PyPI artifact, GitHub Release, or deployment bump.
+  # Both modes run the workflow committed on protected main. The signed
+  # operation tag is inert authorization data, never an Actions trigger.
   workflow_dispatch:
     inputs:
       version:
         description: "Candidate label (e.g. v0.49.0-review1); never promoted to an official tag."
-        required: true
+        required: false
+        type: string
+      oidc_trigger_tag:
+        description: "Vault-signed coord-pypi-v... authorization tag; release automation only."
+        required: false
         type: string
 
 permissions:
   contents: read
-  packages: write
-  id-token: write
-  attestations: write
 
-# Serialize candidate labels because registry tag creation is not an atomic
-# create-if-absent operation.
+# One operation tag maps to one serialized run. A repeated dispatch waits
+# behind the first; after it completes the unprivileged classifier observes
+# exact PyPI state and skips the protected environment.
 concurrency:
-  group: ${{ github.workflow }}-candidate-publisher
+  group: ${{ github.workflow }}-${{ inputs.oidc_trigger_tag || inputs.version }}
   cancel-in-progress: false
 
 # Registry and repo name are overridable via repo/org Actions variables so
@@ -44,11 +45,19 @@ jobs:
   postgres-gate:
     name: Verify PostgreSQL backend before publishing
     uses: ./.github/workflows/postgres.yml
+    permissions:
+      contents: read
 
   publish-image:
     name: Build, authenticate, and retain candidate image
     needs: postgres-gate
+    if: inputs.oidc_trigger_tag == ''
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
     env:
       IMAGE_NAME: ${{ vars.IMAGE_REGISTRY || 'ghcr.io' }}/${{ vars.IMAGE_REPO || format('{0}/coord', github.repository_owner) }}
     outputs:
@@ -58,6 +67,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: Set up QEMU (multi-arch emulation)
         uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3  # v4.1.0
@@ -90,11 +101,11 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
         run: |
           tag="$INPUT_VERSION"
-          if [ -z "$tag" ]; then
-            echo "::error::could not resolve candidate label" >&2
+          if [[ ! "$tag" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,104}$ ]]; then
+            echo "::error::candidate label must be one safe Docker tag component (1..105 chars)" >&2
             exit 1
           fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
 
       - name: Install pinned crane for fail-closed tag checks
         shell: bash
@@ -118,11 +129,9 @@ jobs:
           VERSION: ${{ steps.version.outputs.tag }}
           COMMIT_SHA: ${{ github.sha }}
         run: |
-          {
-            echo 'tags<<EOF'
-            echo "${IMAGE}:candidate-${VERSION}-${COMMIT_SHA:0:12}"
-            echo 'EOF'
-          } >> "$GITHUB_OUTPUT"
+          printf 'tags=%s\n' \
+            "${IMAGE}:candidate-${VERSION}-${COMMIT_SHA:0:12}" \
+            >> "$GITHUB_OUTPUT"
 
       # Candidate writes are create-only too. Authentication, transport, and
       # server failures are not evidence that the tag is absent.
@@ -209,69 +218,442 @@ jobs:
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
             "$IMAGE_AND_DIGEST" >/dev/null
 
-  # Disabled historical PyPI publisher. It stays visible while operators
-  # remove the old GitHub trusted-publisher registration, but cannot run.
+  # PyPI is the only official artifact GitHub may publish. The existing
+  # Trusted Publisher exchanges this job's OIDC identity for a short-lived
+  # PyPI token, but only after the committed release key verifies a signed
+  # authorization produced by scripts/release.sh. GitHub has no WritHub,
+  # WHCR-push, Vault, version-tag, or deployment credential.
   #   project name = coord-mcp-server
   #   owner        = amittell
   #   repo         = coord
   #   workflow     = release.yml
   #   environment  = pypi
-  publish-pypi:
-    name: Publish Python package to PyPI
-    needs: [postgres-gate, publish-image]
+  authorize-pypi:
+    name: Verify Vault-authorized PyPI release
+    needs: postgres-gate
     runs-on: ubuntu-latest
-    # Historical implementation retained for operator reference only. The
-    # authoritative scripts/release.sh path owns PyPI publication.
-    if: github.event_name == 'push'
-    environment:
-      name: pypi
-      url: https://pypi.org/p/coord-mcp-server
+    if: inputs.oidc_trigger_tag != '' && github.ref == 'refs/heads/main'
     permissions:
-      id-token: write       # required for OIDC trusted publishing
-      contents: read        # required for checkout
+      contents: read
+    outputs:
+      version: ${{ steps.authorization.outputs.version }}
+      image: ${{ steps.authorization.outputs.image }}
+      packages: ${{ steps.authorization.outputs.packages }}
+      source_commit: ${{ steps.authorization.outputs.source_commit }}
+      operation_id: ${{ steps.authorization.outputs.operation_id }}
+      build_python: ${{ steps.authorization.outputs.build_python }}
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-
-      - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
         with:
-          python-version: "3.14"
+          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Install hash-locked build frontend and backend
-        run: python -m pip install --require-hashes -r requirements-build.txt
-
-      - name: Verify tag matches pyproject version
-        env:
-          REF_NAME: ${{ github.ref_name }}
+      - name: Install pinned crane
+        shell: bash
         run: |
-          pyproject_version=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')
-          tag_version="${REF_NAME#v}"
-          if [ "$pyproject_version" != "$tag_version" ]; then
-            echo "::error::pyproject.toml version ($pyproject_version) does not match git tag ($tag_version)" >&2
+          archive="$RUNNER_TEMP/go-containerregistry_Linux_x86_64.tar.gz"
+          curl --fail --location --retry 3 \
+            --output "$archive" \
+            https://github.com/google/go-containerregistry/releases/download/v0.21.7/go-containerregistry_Linux_x86_64.tar.gz
+          printf '%s  %s\n' \
+            1a57bc98207fa1c0d04bf760699099e26f8383499bfd55b99c1b919a928a7230 \
+            "$archive" \
+            | sha256sum --check -
+          tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP" crane
+          test "$("$RUNNER_TEMP/crane" version)" = "0.21.7"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2
+        with:
+          cosign-release: "v3.0.6"
+
+      - name: Verify Vault-signed release authorization
+        id: authorization
+        shell: bash
+        env:
+          TRIGGER_TAG: ${{ inputs.oidc_trigger_tag }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TRIGGER_TAG" =~ ^coord-pypi-v([0-9]+\.[0-9]+\.[0-9]+)-([0-9a-f]{32})$ ]]; then
+            echo "::error::invalid PyPI OIDC trigger tag: $TRIGGER_TAG" >&2
             exit 1
           fi
-          echo "Version match: $pyproject_version == $tag_version"
+          version="${BASH_REMATCH[1]}"
+          operation_id="${BASH_REMATCH[2]}"
+
+          trigger_ref="refs/oidc/${GITHUB_RUN_ID}"
+          git fetch --force origin "refs/tags/${TRIGGER_TAG}:${trigger_ref}"
+          source_commit="$(git rev-parse "${trigger_ref}^{}")"
+          printf '%s\n' "$source_commit" | grep -Eq '^[0-9a-f]{40}$'
+          payload="$(git for-each-ref --format='%(contents)' "$trigger_ref")"
+          python3 - "$payload" <<'PY'
+          import sys
+
+          lines = sys.argv[1].splitlines()
+          if len(lines) != 3 or lines[0] != "coord-pypi-trigger-v1":
+              raise SystemExit("unsupported or non-canonical PyPI trigger payload")
+          if not lines[1].startswith("statement_base64="):
+              raise SystemExit("non-canonical PyPI trigger statement field")
+          if not lines[2].startswith("bundle_base64="):
+              raise SystemExit("non-canonical PyPI trigger bundle field")
+          PY
+          field() {
+            printf '%s\n' "$payload" \
+              | awk -F= -v field="$1" '$1 == field { sub(/^[^=]*=/, ""); print; exit }'
+          }
+          statement_b64="$(field statement_base64)"
+          bundle_b64="$(field bundle_base64)"
+          [ -n "$statement_b64" ] && [ -n "$bundle_b64" ] || {
+            echo "::error::trigger is missing its signed release authorization" >&2
+            exit 1
+          }
+          printf '%s' "$statement_b64" \
+            | python3 -c 'import base64,sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read(), validate=True))' \
+            > "$RUNNER_TEMP/release-statement"
+          printf '%s' "$bundle_b64" \
+            | python3 -c 'import base64,sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read(), validate=True))' \
+            > "$RUNNER_TEMP/release-bundle.json"
+          cosign verify-blob \
+            --key release/coord-release.pub \
+            --bundle "$RUNNER_TEMP/release-bundle.json" \
+            "$RUNNER_TEMP/release-statement" >/dev/null
+
+          statement="$(
+            cat "$RUNNER_TEMP/release-statement"
+          )"
+          python3 - "$statement" <<'PY'
+          import sys
+
+          lines = sys.argv[1].splitlines()
+          expected_keys = [
+              "coord-pypi-authorization-v2",
+              "operation_id=",
+              "version=",
+              "commit=",
+              "image=",
+              "packages=",
+              "build_python=",
+              "publisher=",
+          ]
+          if len(lines) != len(expected_keys):
+              raise SystemExit("non-canonical release authorization line count")
+          for line, prefix in zip(lines, expected_keys, strict=True):
+              if not line.startswith(prefix):
+                  raise SystemExit(
+                      f"non-canonical release authorization field: expected {prefix!r}"
+                  )
+          PY
+          statement_field() {
+            printf '%s\n' "$statement" \
+              | awk -F= -v field="$1" '$1 == field { sub(/^[^=]*=/, ""); print; exit }'
+          }
+          [ "$(printf '%s\n' "$statement" | head -n 1)" = "coord-pypi-authorization-v2" ]
+          [ "$(statement_field operation_id)" = "$operation_id" ]
+          [ "$(statement_field version)" = "$version" ]
+          [ "$(statement_field commit)" = "$source_commit" ]
+          [ "$(statement_field publisher)" = \
+            "github-oidc:amittell/coord:.github/workflows/release.yml:pypi" ]
+          image="$(statement_field image)"
+          packages="$(statement_field packages)"
+          build_python="$(statement_field build_python)"
+          printf '%s\n' "$image" \
+            | grep -Eq '^whcr\.io/alexm/coord@sha256:[0-9a-f]{64}$'
+          printf '%s\n' "$build_python" | grep -Eq '^3\.(11|12|13|14)$'
+          python3 - "$packages" <<'PY'
+          import json
+          import re
+          import sys
+
+          packages = json.loads(sys.argv[1])
+          if not isinstance(packages, dict) or not packages:
+              raise SystemExit("empty package fingerprint")
+          for name, digest in packages.items():
+              if "/" in name or name in {".", ".."}:
+                  raise SystemExit(f"unsafe package name: {name!r}")
+              if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                  raise SystemExit(f"invalid digest for {name!r}")
+          PY
+          {
+            echo "version=$version"
+            echo "source_commit=$source_commit"
+            echo "operation_id=$operation_id"
+            echo "image=$image"
+            echo "packages=$packages"
+            echo "build_python=$build_python"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check out the signed release source without credentials
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ steps.authorization.outputs.source_commit }}
+          path: release-source
+          persist-credentials: false
+
+      - name: Match signed source version
+        env:
+          VERSION: ${{ steps.authorization.outputs.version }}
+        run: |
+          pyproject_version="$(
+            python3 -c 'import tomllib; print(tomllib.load(open("release-source/pyproject.toml","rb"))["project"]["version"])'
+          )"
+          [ "$VERSION" = "$pyproject_version" ] || {
+            echo "::error::signed version $VERSION does not match release source $pyproject_version" >&2
+            exit 1
+          }
+
+      - name: Verify authenticated WHCR release candidate
+        env:
+          IMAGE: ${{ steps.authorization.outputs.image }}
+        run: |
+          python3 scripts/verify_image_attestations.py \
+            --image "$IMAGE" \
+            --builder-id https://writhub.io/alexm/coord/builders/github-free-release/v1 \
+            --platform linux/amd64 \
+            --platform linux/arm64
+          cosign verify \
+            --key release/coord-release.pub \
+            "$IMAGE" >/dev/null
+
+      - name: Set up signed build Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: ${{ steps.authorization.outputs.build_python }}
+
+      - name: Install hash-locked build frontend and backend
+        working-directory: release-source
+        run: python -m pip install --require-hashes -r requirements-build.txt
 
       - name: Build sdist + wheel
+        working-directory: release-source
         run: |
           SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
           export SOURCE_DATE_EPOCH
           python -m build --no-isolation
 
+      - name: Match exact Vault-authorized package hashes
+        env:
+          EXPECTED_PACKAGES: ${{ steps.authorization.outputs.packages }}
+        run: |
+          actual="$(
+            python - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          print(json.dumps(
+              {
+                  path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                  for path in sorted(Path("release-source/dist").iterdir())
+                  if path.is_file()
+              },
+              sort_keys=True,
+              separators=(",", ":"),
+          ))
+          PY
+          )"
+          [ "$actual" = "$EXPECTED_PACKAGES" ] || {
+            echo "::error::rebuilt package hashes differ from the signed release authorization" >&2
+            exit 1
+          }
+
+      - name: Preserve the exact verified package bytes
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: coord-pypi-${{ steps.authorization.outputs.operation_id }}
+          path: release-source/dist/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  # Package build code ran in authorize-pypi, so PyPI state classification
+  # happens on a fresh runner. This job executes no signed source or package
+  # code: it checks out only locked-main verifier code, downloads the exact
+  # same-run artifact, rehashes it, and classifies remote state.
+  gate-pypi:
+    name: Gate protected PyPI environment
+    needs: authorize-pypi
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      state: ${{ steps.pypi-state.outputs.state }}
+    steps:
+      - name: Check out locked-main verifier without credentials
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Download exact package bytes
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: coord-pypi-${{ needs.authorize-pypi.outputs.operation_id }}
+          path: dist
+
+      - name: Recheck exact signed package hashes
+        env:
+          EXPECTED_PACKAGES: ${{ needs.authorize-pypi.outputs.packages }}
+        run: |
+          actual="$(
+            python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          print(json.dumps(
+              {
+                  path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                  for path in sorted(Path("dist").iterdir())
+                  if path.is_file()
+              },
+              sort_keys=True,
+              separators=(",", ":"),
+          ))
+          PY
+          )"
+          [ "$actual" = "$EXPECTED_PACKAGES" ] || {
+            echo "::error::fresh-gate package hashes differ from signed authorization" >&2
+            exit 1
+          }
+
       - name: Classify existing PyPI release
         id: pypi-state
         env:
-          VERSION: ${{ github.ref_name }}
+          VERSION: ${{ needs.authorize-pypi.outputs.version }}
         run: |
           result="$(
-            python scripts/check_pypi_release.py \
+            python3 scripts/check_pypi_release.py \
               --project coord-mcp-server \
-              --version "${VERSION#v}" \
+              --version "$VERSION" \
               --dist-dir dist
           )"
-          echo "result=$result" >> "$GITHUB_OUTPUT"
-          echo "state=${result%%|*}" >> "$GITHUB_OUTPUT"
+          state="${result%%|*}"
+          case "$state" in
+            absent | partial | exact) ;;
+            *)
+              echo "::error::unexpected PyPI state: $state" >&2
+              exit 1
+              ;;
+          esac
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+
+  # The protected environment is entered only after the unprivileged
+  # authorization job has verified the Vault signature, image, and package
+  # bytes. This avoids presenting reviewers with approval prompts for forged
+  # tags. The OIDC job executes no repository or package build code: it only
+  # downloads the verified artifact, rehashes it with runner Python, and calls
+  # the pinned publisher action.
+  publish-pypi:
+    name: Publish Python package to PyPI
+    needs:
+      - postgres-gate
+      - authorize-pypi
+      - gate-pypi
+    runs-on: ubuntu-latest
+    if: >-
+      github.ref == 'refs/heads/main'
+      && (
+        needs.gate-pypi.outputs.state == 'absent'
+        || needs.gate-pypi.outputs.state == 'partial'
+      )
+    environment:
+      name: pypi
+      url: https://pypi.org/p/coord-mcp-server
+    permissions:
+      id-token: write       # required for OIDC trusted publishing
+      actions: read         # download this run's verified artifact
+    steps:
+      - name: Download exact package bytes from the unprivileged gate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: coord-pypi-${{ needs.authorize-pypi.outputs.operation_id }}
+          path: dist
+
+      - name: Recheck exact signed package hashes
+        env:
+          EXPECTED_PACKAGES: ${{ needs.authorize-pypi.outputs.packages }}
+        run: |
+          actual="$(
+            python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          print(json.dumps(
+              {
+                  path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                  for path in sorted(Path("dist").iterdir())
+                  if path.is_file()
+              },
+              sort_keys=True,
+              separators=(",", ":"),
+          ))
+          PY
+          )"
+          [ "$actual" = "$EXPECTED_PACKAGES" ] || {
+            echo "::error::OIDC-job package hashes differ from the signed release authorization" >&2
+            exit 1
+          }
+
+      # PyPI has no atomic create-version transaction. Recheck the exact
+      # remote subset immediately before the publisher action to narrow the
+      # gate/publish race without executing repository code in this job.
+      - name: Recheck PyPI subset immediately before OIDC publish
+        id: pypi-state
+        env:
+          VERSION: ${{ needs.authorize-pypi.outputs.version }}
+          EXPECTED_PACKAGES: ${{ needs.authorize-pypi.outputs.packages }}
+        run: |
+          state="$(
+            python3 - "$VERSION" "$EXPECTED_PACKAGES" <<'PY'
+          import json
+          import sys
+          import urllib.error
+          import urllib.request
+
+          version = sys.argv[1]
+          expected = json.loads(sys.argv[2])
+          try:
+              with urllib.request.urlopen(
+                  f"https://pypi.org/pypi/coord-mcp-server/{version}/json",
+                  timeout=20,
+              ) as response:
+                  payload = json.load(response)
+          except urllib.error.HTTPError as exc:
+              if exc.code != 404:
+                  raise
+              payload = {"urls": []}
+
+          remote = {}
+          for row in payload.get("urls", []):
+              name = row["filename"]
+              digest = row["digests"]["sha256"]
+              if name in remote and remote[name] != digest:
+                  raise SystemExit(f"conflicting duplicate PyPI filename: {name}")
+              remote[name] = digest
+          for name, digest in remote.items():
+              if expected.get(name) != digest:
+                  raise SystemExit(
+                      f"PyPI contains unauthorized artifact {name} ({digest})"
+                  )
+          if remote == expected:
+              print("exact")
+          elif remote:
+              print("partial")
+          else:
+              print("absent")
+          PY
+          )"
+          case "$state" in
+            absent | partial | exact) ;;
+            *)
+              echo "::error::unexpected immediate PyPI state: $state" >&2
+              exit 1
+              ;;
+          esac
+          echo "state=$state" >> "$GITHUB_OUTPUT"
 
       - name: Publish to PyPI
         if: steps.pypi-state.outputs.state != 'exact'
@@ -283,15 +665,40 @@ jobs:
           # local subset, so skip-existing resumes only that safe state.
           skip-existing: true
 
+  verify-pypi:
+    name: Verify complete exact PyPI artifact set
+    needs:
+      - authorize-pypi
+      - publish-pypi
+    if: >-
+      always()
+      && needs.authorize-pypi.result == 'success'
+      && needs.publish-pypi.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Check out protected-main release verifier
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Download exact package bytes
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: coord-pypi-${{ needs.authorize-pypi.outputs.operation_id }}
+          path: dist
+
       - name: Verify complete exact PyPI artifact set
         env:
-          VERSION: ${{ github.ref_name }}
+          VERSION: ${{ needs.authorize-pypi.outputs.version }}
         run: |
           for attempt in 1 2 3 4 5; do
             result="$(
-              python scripts/check_pypi_release.py \
+              python3 scripts/check_pypi_release.py \
                 --project coord-mcp-server \
-                --version "${VERSION#v}" \
+                --version "$VERSION" \
                 --dist-dir dist
             )"
             [ "$result" = "exact" ] && exit 0
@@ -299,97 +706,3 @@ jobs:
           done
           echo "::error::PyPI did not converge to the exact complete artifact set: $result" >&2
           exit 1
-
-  # Disabled historical manifest publisher. Production promotion is owned by
-  # the GitOps release train, never by this candidate validation workflow.
-  bump-manifest:
-    name: Bump prod deployment manifest
-    runs-on: ubuntu-latest
-    needs: publish-image
-    # Production promotion is GitOps-owned and never runs from this candidate
-    # validation workflow.
-    if: github.event_name == 'push'
-    permissions:
-      contents: write
-    steps:
-      - name: Check out main
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-        with:
-          # Land the bump on main, not on the tag ref. The tag is
-          # immutable; what ArgoCD watches is the moving main branch.
-          ref: main
-          fetch-depth: 0
-          # Default GITHUB_TOKEN has contents:write at the workflow level,
-          # which lets a subsequent `git push origin HEAD:main` succeed.
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Rewrite image pin in deploy/k8s/prod/deployment.yaml
-        env:
-          IMAGE: ${{ needs.publish-image.outputs.image-name }}
-          VERSION: ${{ needs.publish-image.outputs.version-tag }}
-          DIGEST: ${{ needs.publish-image.outputs.image-digest }}
-        run: |
-          python3 - <<'PY'
-          import os
-          import pathlib
-          import re
-
-          manifest = pathlib.Path("deploy/k8s/prod/deployment.yaml")
-          image = os.environ["IMAGE"]
-          version = os.environ["VERSION"]
-          digest = os.environ["DIGEST"]
-          if not (image and version and digest):
-              raise SystemExit(
-                  f"missing required input: IMAGE={image!r} VERSION={version!r} "
-                  f"DIGEST={digest!r}"
-              )
-
-          target = f"{image}:{version}@{digest}"
-          text = manifest.read_text(encoding="utf-8")
-          # The pinned reference lives on the first `image:` line in the
-          # Deployment spec; match its leading indent and value.
-          pattern = re.compile(r"^(\s*image:\s+)\S+(\s*)$", re.MULTILINE)
-          new_text, count = pattern.subn(rf"\g<1>{target}\g<2>", text, count=1)
-          if count != 1:
-              raise SystemExit(
-                  f"no image: line matched in {manifest}; cannot auto-bump"
-              )
-          if new_text == text:
-              print(f"manifest already pins {target}; nothing to do")
-              raise SystemExit(0)
-          manifest.write_text(new_text, encoding="utf-8")
-          print(f"updated {manifest} -> {target}")
-          PY
-
-      - name: Commit and push deployment manifest
-        env:
-          VERSION: ${{ needs.publish-image.outputs.version-tag }}
-          DIGEST: ${{ needs.publish-image.outputs.image-digest }}
-        run: |
-          # Identity matches the GitHub Actions bot so the commit shows
-          # up cleanly in repo history.
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-
-          if git diff --quiet -- deploy/k8s/prod/deployment.yaml; then
-            echo "deploy/k8s/prod/deployment.yaml unchanged after rewrite; skipping commit"
-            exit 0
-          fi
-
-          git add deploy/k8s/prod/deployment.yaml
-          # `[skip ci]` in the commit message is a GitHub Actions
-          # convention: any workflow triggered by this push is skipped.
-          # release.yml only triggers on tag pushes, but ci.yml would
-          # otherwise run a full test matrix on a
-          # one-line manifest change. ArgoCD watches git directly
-          # and reconciles regardless of CI status.
-          git commit \
-            -m "ops: bump prod deployment to ${VERSION}" \
-            -m "Automated by .github/workflows/release.yml after the publish-image job for ${VERSION} succeeded. Image digest: ${DIGEST}." \
-            -m "[skip ci]"
-
-          # Rebase against any commits that landed on main while the
-          # release was building, then push. Failure here surfaces to
-          # the operator instead of silently leaving the manifest behind.
-          git pull --rebase origin main
-          git push origin HEAD:main

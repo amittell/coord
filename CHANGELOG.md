@@ -15,9 +15,19 @@ Semantic Versioning.
   `ghcr.io/amittell/coord` path to `whcr.io/alexm/coord`. Official images are
   now signed by the repository release identity
   (`release/coord-release.pub`) through the Vault-backed GitHub-free release
-  path. The GitHub Actions release workflow is manual candidate validation
-  only: it has no tag trigger and cannot publish an official image tag, PyPI
-  artifact, GitHub Release, or production manifest change.
+  path. GitHub Actions remains manual candidate validation for images and has
+  one narrow official role: the existing PyPI Trusted Publisher may publish
+  only after verifying a canonical Vault-signed authorization bound to the
+  admitted commit, WritHub release-lock operation, authenticated WHCR digest,
+  exact package hashes, build-Python version, and protected `pypi` environment.
+  The signed operation tag is inert data: an admin-enforced, read-only
+  protected-main verifier authenticates it, checks out the signed source
+  commit separately, and builds without OIDC, while the OIDC job only
+  downloads and rehashes those verified bytes before invoking the pinned
+  publisher. A fresh no-OIDC runner classifies PyPI after package build code
+  has exited, so build code cannot corrupt the environment gate. It cannot
+  publish an official image tag, acquire the WritHub lock, create the WritHub
+  version tag, publish a GitHub Release, or change a production manifest.
 - Release images now use digest-pinned Dockerfile frontends, Python bases,
   QEMU/binfmt, and SBOM generators; immutable Debian snapshot repositories;
   exact system-package versions; and hash-complete Python runtime, optional,
