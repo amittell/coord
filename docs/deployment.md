@@ -145,26 +145,21 @@ ownership rows (and the prior `COORD_DATABASE_PATH`) for the specific install.
 ### PostgreSQL-enabled container
 
 The standard production image intentionally excludes asyncpg, keeping the
-default SQLite artifact smaller and its dependency surface narrower. Build a
-separately tagged derivative from the same pinned coord release:
-
-```dockerfile
-ARG COORD_BASE=ghcr.io/amittell/coord:<release>@sha256:<digest>
-FROM ${COORD_BASE}
-USER root
-COPY requirements-postgres.txt /tmp/requirements-postgres.txt
-RUN /opt/venv/bin/pip install --no-cache-dir \
-      -r /tmp/requirements-postgres.txt \
-    && rm /tmp/requirements-postgres.txt
-USER coord
-```
+default SQLite artifact smaller and its dependency surface narrower.
+`Dockerfile.postgres` builds a separately tagged derivative from a caller-pinned
+coord base image. It deliberately has no default `COORD_BASE`: production builds
+must identify the exact release digest instead of silently inheriting a moving
+tag.
 
 Build from a checkout containing `requirements-postgres.txt`, publish the
 variant under a distinct tag such as `coord:<release>-postgres`, and verify the
 artifact before deploying it:
 
 ```bash
-docker build -f Dockerfile.postgres -t coord:postgres .
+COORD_BASE='whcr.io/alexm/coord:vX.Y.Z@sha256:<digest>'
+docker build -f Dockerfile.postgres \
+  --build-arg "COORD_BASE=$COORD_BASE" \
+  -t coord:postgres .
 docker run --rm --entrypoint python coord:postgres \
   -c 'import asyncpg, coordination; print(asyncpg.__version__)'
 

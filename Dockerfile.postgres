@@ -1,0 +1,14 @@
+# syntax=docker/dockerfile:1.7
+
+# PostgreSQL is an explicit derivative of an already-built coord image. Require
+# the caller to name that base so production builds can pin the exact release
+# digest instead of silently inheriting a moving tag.
+ARG COORD_BASE
+FROM ${COORD_BASE}
+
+USER root
+COPY requirements-postgres.txt /tmp/requirements-postgres.txt
+RUN /opt/venv/bin/pip install --no-cache-dir \
+      -r /tmp/requirements-postgres.txt \
+    && rm /tmp/requirements-postgres.txt
+USER coord
