@@ -52,6 +52,7 @@ PLATFORMS="${COORD_IMAGE_PLATFORMS:-linux/amd64,linux/arm64}"
 COSIGN_MIN_VERSION="3.0.6"
 CRANE_VERSION="0.21.7"
 SBOM_GENERATOR="docker.io/docker/buildkit-syft-scanner@sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68"
+BUILDER_ID="https://writhub.io/alexm/coord/builders/github-free-release/v1"
 
 VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
 TAG="v${VERSION}"
@@ -106,10 +107,6 @@ fi
 
 if [ "$SKIP_PYPI" = 0 ]; then
   PYPI_TOKEN="${PYPI_TOKEN:-$(cat ~/.config/pypi/token 2>/dev/null || true)}"
-  [ -n "${PYPI_TOKEN}" ] || fail "no PyPI token: set \$PYPI_TOKEN or ~/.config/pypi/token (see header)"
-  curl -sf -m 10 "https://pypi.org/pypi/coord-mcp-server/json" \
-    | python3 -c "import json,sys; vs=json.load(sys.stdin)['releases']; sys.exit(1 if '${VERSION}' in vs else 0)" \
-    || fail "coord-mcp-server ${VERSION} already on PyPI (PyPI versions are immutable -- bump pyproject)"
 fi
 
 # ---- tests -------------------------------------------------------------------
@@ -121,15 +118,69 @@ fi
 # ---- build -------------------------------------------------------------------
 echo "release: building sdist + wheel..."
 rm -rf dist/
+SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+export SOURCE_DATE_EPOCH
 python3 -m build --outdir dist/ >/dev/null 2>&1 || .venv/bin/python -m build --outdir dist/ >/dev/null
 ls -1 dist/
+
+PYPI_STATE="skipped"
+if [ "$SKIP_PYPI" = 0 ]; then
+  PYPI_STATE="$(
+    python3 - "$VERSION" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+from urllib.error import HTTPError, URLError
+from urllib.request import urlopen
+
+version = sys.argv[1]
+try:
+    with urlopen(
+        "https://pypi.org/pypi/coord-mcp-server/json",
+        timeout=10,
+    ) as response:
+        release = json.load(response)["releases"].get(version)
+except (HTTPError, URLError, KeyError, ValueError) as exc:
+    raise SystemExit(f"could not query PyPI release state: {exc}")
+
+if not release:
+    print("absent")
+    raise SystemExit(0)
+
+remote = {
+    item["filename"]: item["digests"]["sha256"]
+    for item in release
+}
+local = {
+    path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+    for path in Path("dist").iterdir()
+    if path.is_file()
+}
+if remote != local:
+    raise SystemExit(
+        "coord-mcp-server "
+        f"{version} already exists on PyPI with artifacts that do not "
+        "exactly match dist/"
+    )
+print("exact")
+PY
+  )" || fail "could not establish an exact PyPI release state"
+  if [ "$PYPI_STATE" = "absent" ]; then
+    [ -n "${PYPI_TOKEN}" ] \
+      || fail "no PyPI token: set \$PYPI_TOKEN or ~/.config/pypi/token (see header)"
+  elif [ "$PYPI_STATE" != "exact" ]; then
+    fail "unexpected PyPI release state: $PYPI_STATE"
+  fi
+fi
 
 # ---- plan / publish ----------------------------------------------------------
 echo
 echo "release plan for ${TAG}:"
-[ "$SKIP_PYPI" = 0 ] && echo "  1. twine upload dist/*  -> PyPI coord-mcp-server ${VERSION}"
-[ "$SKIP_IMAGE" = 0 ] && echo "  2. buildx ${PLATFORMS} -> candidate (SBOM + provenance)"
-[ "$SKIP_IMAGE" = 0 ] && echo "     validate + sign + verify, then promote the digest to ${IMAGE}:${TAG} + :latest"
+[ "$SKIP_IMAGE" = 0 ] && echo "  1. buildx ${PLATFORMS} -> candidate (SBOM + provenance)"
+[ "$SKIP_IMAGE" = 0 ] && echo "     validate + sign + verify while official tags remain absent"
+[ "$SKIP_PYPI" = 0 ] && echo "  2. twine upload dist/*  -> PyPI coord-mcp-server ${VERSION}"
+[ "$SKIP_IMAGE" = 0 ] && echo "     promote the authenticated digest to ${IMAGE}:${TAG} + :latest"
 echo "  3. git tag ${TAG} + push to origin (writhub)"
 echo "  4. THEN: update each downstream cluster's Deployment manifest"
 echo "     (kebabrack: build the -pg derivative and update k8s/10b-coord-app.yaml)"
@@ -138,13 +189,6 @@ if [ "$PUBLISH" = 0 ]; then
   echo
   echo "DRY RUN complete -- nothing published. Re-run with --publish."
   exit 0
-fi
-
-if [ "$SKIP_PYPI" = 0 ]; then
-  echo "release: uploading to PyPI..."
-  TWINE_USERNAME=__token__ TWINE_PASSWORD="${PYPI_TOKEN}" \
-    python3 -m twine upload --non-interactive dist/* \
-    || TWINE_USERNAME=__token__ TWINE_PASSWORD="${PYPI_TOKEN}" .venv/bin/python -m twine upload --non-interactive dist/*
 fi
 
 if [ "$SKIP_IMAGE" = 0 ]; then
@@ -158,7 +202,7 @@ if [ "$SKIP_IMAGE" = 0 ]; then
   docker buildx build --platform "${PLATFORMS}" \
     -t "$candidate_tag" \
     --attest="type=sbom,generator=${SBOM_GENERATOR}" \
-    --provenance=mode=max \
+    --provenance="mode=max,builder-id=${BUILDER_ID}" \
     --metadata-file "$image_metadata" \
     --push .
   image_digest="$(
@@ -181,6 +225,20 @@ if [ "$SKIP_IMAGE" = 0 ]; then
   cosign verify \
     --key release/coord-release.pub \
     "${IMAGE}@${image_digest}" >/dev/null
+fi
+
+if [ "$SKIP_PYPI" = 0 ]; then
+  if [ "$PYPI_STATE" = "absent" ]; then
+    echo "release: uploading to PyPI..."
+    TWINE_USERNAME=__token__ TWINE_PASSWORD="${PYPI_TOKEN}" \
+      python3 -m twine upload --non-interactive dist/* \
+      || TWINE_USERNAME=__token__ TWINE_PASSWORD="${PYPI_TOKEN}" .venv/bin/python -m twine upload --non-interactive dist/*
+  else
+    echo "release: PyPI ${VERSION} already matches dist/ exactly; resuming."
+  fi
+fi
+
+if [ "$SKIP_IMAGE" = 0 ]; then
   echo "release: promoting verified digest to official tags..."
   crane tag "${IMAGE}@${image_digest}" "$TAG"
   crane tag "${IMAGE}@${image_digest}" latest

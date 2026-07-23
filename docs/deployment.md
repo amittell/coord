@@ -190,7 +190,23 @@ COORD_DERIVATIVE_REPOSITORY='whcr.io/alexm/coord'
 COORD_DERIVATIVE_TAG='vX.Y.Z-pg'
 COORD_DERIVATIVE_CANDIDATE="$COORD_DERIVATIVE_REPOSITORY:candidate-$COORD_DERIVATIVE_TAG-$(git rev-parse --short=12 HEAD)"
 metadata_file="$(mktemp)"
-trap 'rm -f "$metadata_file"' EXIT
+tag_probe_error="$(mktemp)"
+trap 'rm -f "$metadata_file" "$tag_probe_error"' EXIT
+
+test "$(crane version)" = '0.21.7'
+if crane digest \
+  "$COORD_DERIVATIVE_REPOSITORY:$COORD_DERIVATIVE_TAG" \
+  >/dev/null 2>"$tag_probe_error"
+then
+  echo "refusing to replace released derivative tag: $COORD_DERIVATIVE_TAG" >&2
+  exit 1
+fi
+if ! grep -Fq 'MANIFEST_UNKNOWN' "$tag_probe_error"; then
+  cat "$tag_probe_error" >&2
+  echo "could not prove derivative tag is absent; refusing to publish" >&2
+  exit 1
+fi
+rm -f "$tag_probe_error"
 
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
@@ -199,7 +215,7 @@ docker buildx build \
   --build-arg "COORD_BASE_DIGEST=${COORD_BASE_DIGEST#sha256:}" \
   --tag "$COORD_DERIVATIVE_CANDIDATE" \
   --attest=type=sbom,generator=docker.io/docker/buildkit-syft-scanner@sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68 \
-  --provenance=mode=max \
+  --provenance=mode=max,builder-id=https://writhub.io/alexm/coord/builders/github-free-release/v1 \
   --metadata-file "$metadata_file" \
   --push .
 COORD_DERIVATIVE_DIGEST="$(

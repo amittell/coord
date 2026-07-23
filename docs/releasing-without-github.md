@@ -66,9 +66,14 @@ scripts/release.sh --publish    # uploads PyPI + pushes image + tags writhub
 The canonical image is `whcr.io/alexm/coord:vX.Y.Z`. The script first pushes a
 non-official candidate tag, checks every in-toto layer's content hash, predicate,
 and linked platform subject, signs the immutable index digest through Vault,
-verifies it against the literal committed public key (the official release path
-has no public-key override), and only then promotes that digest to `vX.Y.Z` and
-`latest`. A verifier or signer failure therefore cannot move an official tag.
+and verifies it against the literal committed public key (the official release
+path has no public-key override). Only after the candidate is authenticated does
+the script upload the immutable PyPI artifacts; it then promotes the same digest
+to `vX.Y.Z` and `latest`. A verifier or signer failure therefore cannot publish
+the PyPI version or move an official image tag. If an interrupted run already
+uploaded PyPI, a retry resumes only when every remote filename and SHA-256
+exactly matches the newly built `dist/` artifacts. Package builds set
+`SOURCE_DATE_EPOCH` from the release commit so that comparison is reproducible.
 The authenticated reference is written to
 `dist/coord-vX.Y.Z-image-digest.txt`.
 

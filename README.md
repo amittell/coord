@@ -4,7 +4,6 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/coord-mcp-server.svg)](https://pypi.org/project/coord-mcp-server/)
 [![CI](https://github.com/amittell/coord/actions/workflows/ci.yml/badge.svg)](https://github.com/amittell/coord/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
-[![Container image](https://img.shields.io/badge/ghcr.io-coord-blue)](https://github.com/amittell/coord/pkgs/container/coord)
 
 `coord` is a small coordination layer for teams running multiple agent sessions against the same codebase. It gives Claude Code, Codex CLI, and Cursor a shared source of truth for active file/module claims so agents can check, claim, and release work before they step on each other. Agent sessions keep their claims alive implicitly via activity pings; operators can extend a specific claim over HTTP (`POST /claims/{id}/extend`).
 

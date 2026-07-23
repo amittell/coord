@@ -200,7 +200,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: 127.0.0.1:5000/coord:ci
           sbom: generator=docker.io/docker/buildkit-syft-scanner@sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68
-          provenance: mode=max
+          provenance: mode=max,builder-id=https://writhub.io/alexm/coord/builders/ci/v1
           cache-from: type=gha,scope=docker-ci
           # PR merge refs are ephemeral and their caches cannot help later
           # branches. Only main refreshes the shared, minimal build cache.
@@ -234,7 +234,7 @@ jobs:
             --build-arg "COORD_BASE_DIGEST=${BASE_DIGEST#sha256:}" \
             --tag 127.0.0.1:5000/coord:ci-postgres \
             --attest=type=sbom,generator=docker.io/docker/buildkit-syft-scanner@sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68 \
-            --provenance=mode=max \
+            --provenance=mode=max,builder-id=https://writhub.io/alexm/coord/builders/ci/v1 \
             --metadata-file "$metadata_file" \
             --push \
             .

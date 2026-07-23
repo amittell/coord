@@ -23,6 +23,149 @@ _REQUIRED_PREDICATES = {
     "https://spdx.dev/Document",
     "https://slsa.dev/provenance/v1",
 }
+_STATEMENT_TYPE = "https://in-toto.io/Statement/v1"
+_SPDX_PREDICATE = "https://spdx.dev/Document"
+_SLSA_PREDICATE = "https://slsa.dev/provenance/v1"
+
+
+def _nonempty_string(
+    value: Any,
+    *,
+    field: str,
+    image: str,
+    platform: str,
+) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(
+            f"{image} platform {platform} attestation field {field} "
+            "must be a non-empty string"
+        )
+    return value
+
+
+def _validate_spdx_predicate(
+    predicate: dict[str, Any],
+    *,
+    image: str,
+    platform: str,
+) -> None:
+    if predicate.get("spdxVersion") != "SPDX-2.3":
+        raise ValueError(
+            f"{image} platform {platform} SPDX predicate must declare "
+            "spdxVersion SPDX-2.3"
+        )
+    if predicate.get("dataLicense") != "CC0-1.0":
+        raise ValueError(
+            f"{image} platform {platform} SPDX predicate must declare "
+            "dataLicense CC0-1.0"
+        )
+    if predicate.get("SPDXID") != "SPDXRef-DOCUMENT":
+        raise ValueError(
+            f"{image} platform {platform} SPDX predicate must identify "
+            "SPDXRef-DOCUMENT"
+        )
+    _nonempty_string(
+        predicate.get("name"),
+        field="predicate.name",
+        image=image,
+        platform=platform,
+    )
+    namespace = _nonempty_string(
+        predicate.get("documentNamespace"),
+        field="predicate.documentNamespace",
+        image=image,
+        platform=platform,
+    )
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*:[^#\s]+", namespace) is None:
+        raise ValueError(
+            f"{image} platform {platform} SPDX documentNamespace must be "
+            "an absolute URI without a fragment"
+        )
+    creation_info = predicate.get("creationInfo")
+    if not isinstance(creation_info, dict):
+        raise ValueError(
+            f"{image} platform {platform} SPDX predicate has no creationInfo"
+        )
+    _nonempty_string(
+        creation_info.get("created"),
+        field="predicate.creationInfo.created",
+        image=image,
+        platform=platform,
+    )
+    creators = creation_info.get("creators")
+    if (
+        not isinstance(creators, list)
+        or not creators
+        or any(not isinstance(item, str) or not item.strip() for item in creators)
+    ):
+        raise ValueError(
+            f"{image} platform {platform} SPDX creationInfo.creators "
+            "must contain non-empty strings"
+        )
+
+
+def _validate_slsa_predicate(
+    predicate: dict[str, Any],
+    *,
+    image: str,
+    platform: str,
+) -> None:
+    build_definition = predicate.get("buildDefinition")
+    if not isinstance(build_definition, dict):
+        raise ValueError(
+            f"{image} platform {platform} SLSA predicate has no buildDefinition"
+        )
+    _nonempty_string(
+        build_definition.get("buildType"),
+        field="predicate.buildDefinition.buildType",
+        image=image,
+        platform=platform,
+    )
+    if not isinstance(build_definition.get("externalParameters"), dict):
+        raise ValueError(
+            f"{image} platform {platform} SLSA buildDefinition has no "
+            "externalParameters object"
+        )
+    run_details = predicate.get("runDetails")
+    if not isinstance(run_details, dict):
+        raise ValueError(
+            f"{image} platform {platform} SLSA predicate has no runDetails"
+        )
+    builder = run_details.get("builder")
+    if not isinstance(builder, dict):
+        raise ValueError(
+            f"{image} platform {platform} SLSA runDetails has no builder"
+        )
+    _nonempty_string(
+        builder.get("id"),
+        field="predicate.runDetails.builder.id",
+        image=image,
+        platform=platform,
+    )
+
+
+def _validate_statement_predicate(
+    statement: dict[str, Any],
+    predicate_type: str,
+    *,
+    image: str,
+    platform: str,
+) -> None:
+    if statement.get("_type") != _STATEMENT_TYPE:
+        raise ValueError(
+            f"{image} platform {platform} attestation must declare "
+            f"_type {_STATEMENT_TYPE}"
+        )
+    predicate = statement.get("predicate")
+    if not isinstance(predicate, dict):
+        raise ValueError(
+            f"{image} platform {platform} {predicate_type} predicate "
+            "must be an object"
+        )
+    if predicate_type == _SPDX_PREDICATE:
+        _validate_spdx_predicate(predicate, image=image, platform=platform)
+    elif predicate_type == _SLSA_PREDICATE:
+        _validate_slsa_predicate(predicate, image=image, platform=platform)
 
 
 def _inspect_raw(reference: str) -> dict[str, Any]:
@@ -186,6 +329,12 @@ def verify_image_attestations(
                 raise ValueError(
                     f"{image} platform {platform} has no predicateType"
                 )
+            _validate_statement_predicate(
+                statement,
+                predicate,
+                image=image,
+                platform=platform,
+            )
             subjects = statement.get("subject")
             if not isinstance(subjects, list) or not subjects:
                 raise ValueError(
