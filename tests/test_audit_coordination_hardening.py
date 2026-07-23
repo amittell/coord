@@ -29,6 +29,7 @@ import json
 import logging as pylogging
 import math
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -464,15 +465,19 @@ class TestCiMatrixCoversClassifiers:
     def test_docker_smoke_starts_authenticated_sqlite_service(self) -> None:
         ci = self._workflow("ci.yml")
         docker = ci["jobs"]["docker-build"]
-        commands = "\n".join(
-            str(step.get("run") or "")
+        sqlite_step = next(
+            step
             for step in docker["steps"]
+            if step.get("name") == "Start image and verify real SQLite readiness"
         )
+        commands = str(sqlite_step.get("run") or "")
         assert "--env COORD_AUTH_TOKEN=ci-smoke" in commands
         assert "/readyz" in commands
         assert "sqlite3.connect" in commands
         assert "import asyncpg" not in commands
         assert 'find_spec("asyncpg") is None' in commands
+        assert "coord:ci-postgres" not in commands
+        assert re.search(r"\bcoord:ci\b", commands)
         assert docker["env"]["DOCKER_BUILD_RECORD_UPLOAD"] == "false"
 
     def test_every_ci_job_has_a_bounded_timeout(self) -> None:
