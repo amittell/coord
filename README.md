@@ -86,7 +86,7 @@ docker run -d \
   -e COORD_AUTH_TOKEN="$(openssl rand -hex 32)" \
   -p 8080:8080 \
   -v coord-data:/data \
-  ghcr.io/amittell/coord:v0.49.0
+  whcr.io/alexm/coord:v0.49.0
 ```
 
 The image is multi-arch (linux/amd64 + linux/arm64), keyless-signed with cosign, and ships SBOM + SLSA provenance attestations. Kubernetes manifests live under `deploy/k8s/` and `docs/deployment.md` has the full operator notes.
@@ -185,13 +185,13 @@ pipx inject coord-mcp-server 'coord-mcp-server[symbols]'
 pip install --upgrade 'coord-mcp-server[symbols]'
 
 # docker (self-hosted server)
-docker pull ghcr.io/amittell/coord:v0.49.0
+docker pull whcr.io/alexm/coord:v0.49.0
 docker rm -f coord
 docker run -d --name coord \
   -e COORD_AUTH_TOKEN="$EXISTING_TOKEN" \
   -p 8080:8080 \
   -v coord-data:/data \
-  ghcr.io/amittell/coord:v0.49.0
+  whcr.io/alexm/coord:v0.49.0
 ```
 
 When you point at a shared team server, the server operator owns the container upgrade. End users only need to upgrade their local CLI plus MCP wrapper to match.
@@ -229,7 +229,7 @@ pipx install 'coord-mcp-server==0.49.0'
 # or
 pip install 'coord-mcp-server==0.49.0'
 # or, in a Dockerfile / Kubernetes manifest:
-#   image: ghcr.io/amittell/coord:v0.49.0
+#   image: whcr.io/alexm/coord:v0.49.0
 ```
 
 The full release history lives on PyPI (<https://pypi.org/project/coord-mcp-server/#history>) and as GitHub releases (<https://github.com/amittell/coord/releases>). `CHANGELOG.md` has the per-version notes.

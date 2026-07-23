@@ -152,12 +152,16 @@ def test_readme_version_pins_match_pyproject() -> None:
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
     pip_pins = re.findall(r"coord-mcp-server==(\d+\.\d+\.\d+)", readme)
-    image_pins = re.findall(r"ghcr\.io/amittell/coord:v(\d+\.\d+\.\d+)", readme)
+    image_pins = re.findall(r"whcr\.io/alexm/coord:v(\d+\.\d+\.\d+)", readme)
     version_outputs = re.findall(r"# coord (\d+\.\d+\.\d+)", readme)
     readyz_outputs = re.findall(r'"version"\s*:\s*"(\d+\.\d+\.\d+)"', readme)
 
     pins = pip_pins + image_pins + version_outputs + readyz_outputs
     assert pins, "expected at least one version pin in README.md"
+    assert "ghcr.io/amittell/coord" not in readme, (
+        "README.md points at the retired GHCR publication path; "
+        "use the canonical whcr.io/alexm/coord image"
+    )
     stale = sorted({p for p in pins if p != version})
     assert not stale, (
         f"README.md pins {stale} but pyproject.toml says {version}; "
