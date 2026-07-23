@@ -89,7 +89,12 @@ docker run -d \
   whcr.io/alexm/coord:v0.49.0
 ```
 
-The image is multi-arch (linux/amd64 + linux/arm64), keyless-signed with cosign, and ships SBOM + SLSA provenance attestations. Kubernetes manifests live under `deploy/k8s/` and `docs/deployment.md` has the full operator notes.
+The image is multi-arch (linux/amd64 + linux/arm64), signed with cosign by the
+Coord release identity, and ships SBOM + SLSA provenance attestations. Production
+operators should verify `release/coord-release.pub` and deploy the resulting
+immutable digest rather than trusting the tag alone. Kubernetes manifests live
+under `deploy/k8s/`; `docs/deployment.md` has the full verification and operator
+notes.
 
 ### Optional PostgreSQL backend (beta)
 

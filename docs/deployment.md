@@ -152,14 +152,34 @@ coord base image. It deliberately has no defaults for
 `FROM repository@sha256:digest`, so a mutable base cannot execute even an
 `ONBUILD` instruction before admission.
 
-Build from a checkout containing `requirements-postgres.txt`, publish a
-multi-platform versioned variant once, and capture the registry-produced digest.
-Deploy that immutable derivative digest—not its tag—so a rolling fleet cannot
-mix different cached images:
+Build from the exact release checkout containing `requirements-postgres.txt`.
+Resolve the base tag to a digest and authenticate that digest with the committed
+Coord release public key before Docker is allowed to consume it. A tag or digest
+without a valid release signature is not a trusted release record:
 
 ```bash
 COORD_BASE_REPOSITORY='whcr.io/alexm/coord'
-COORD_BASE_DIGEST='<64 lowercase hex characters, without sha256:>'
+COORD_BASE_TAG='vX.Y.Z'
+COORD_BASE_DIGEST="$(
+  docker buildx imagetools inspect \
+    "$COORD_BASE_REPOSITORY:$COORD_BASE_TAG" \
+    --format '{{json .Manifest}}' \
+    | python3 -c 'import json, sys; print(json.load(sys.stdin)["digest"])'
+)"
+cosign verify \
+  --key release/coord-release.pub \
+  "$COORD_BASE_REPOSITORY@$COORD_BASE_DIGEST" >/dev/null
+```
+
+Only after that verification succeeds, publish a multi-platform derivative with
+BuildKit SBOM and maximum provenance attestations, sign its immutable digest
+with the release KMS key, and verify the signature with the public key. The
+upstream GitHub-free release key is `hashivault://coord-release` in the
+dedicated transit Vault; downstream publishers should substitute their own KMS
+key and committed public key:
+
+```bash
+COSIGN_SIGNING_KEY='hashivault://coord-release'
 COORD_DERIVATIVE='whcr.io/alexm/coord:vX.Y.Z-pg'
 metadata_file="$(mktemp)"
 trap 'rm -f "$metadata_file"' EXIT
@@ -168,8 +188,10 @@ docker buildx build \
   --platform linux/amd64,linux/arm64 \
   --file Dockerfile.postgres \
   --build-arg "COORD_BASE_REPOSITORY=$COORD_BASE_REPOSITORY" \
-  --build-arg "COORD_BASE_DIGEST=$COORD_BASE_DIGEST" \
+  --build-arg "COORD_BASE_DIGEST=${COORD_BASE_DIGEST#sha256:}" \
   --tag "$COORD_DERIVATIVE" \
+  --sbom=true \
+  --provenance=mode=max \
   --metadata-file "$metadata_file" \
   --push .
 COORD_DERIVATIVE_DIGEST="$(
@@ -178,6 +200,12 @@ COORD_DERIVATIVE_DIGEST="$(
 )"
 docker buildx imagetools inspect \
   "$COORD_DERIVATIVE@$COORD_DERIVATIVE_DIGEST"
+cosign sign --yes \
+  --key "$COSIGN_SIGNING_KEY" \
+  "$COORD_DERIVATIVE@$COORD_DERIVATIVE_DIGEST"
+cosign verify \
+  --key release/coord-release.pub \
+  "$COORD_DERIVATIVE@$COORD_DERIVATIVE_DIGEST" >/dev/null
 
 docker run --rm --entrypoint python \
   "$COORD_DERIVATIVE@$COORD_DERIVATIVE_DIGEST" \
@@ -190,6 +218,11 @@ docker run -d --name coord-postgres \
   -p 8080:8080 \
   "$COORD_DERIVATIVE@$COORD_DERIVATIVE_DIGEST"
 ```
+
+Deploy the verified immutable derivative digest—not its tag—so a rolling fleet
+cannot mix different cached images. The signature authenticates the publisher;
+the digest preserves the exact bytes; and the SBOM/provenance attestations stay
+attached to the signed multi-platform index for audit and incident response.
 
 Do not mount `/data` for PostgreSQL state; persistence, backups, TLS, and HA
 belong to the PostgreSQL deployment. Do not set `COORD_DATABASE_URL` on the

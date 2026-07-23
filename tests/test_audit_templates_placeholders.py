@@ -21,6 +21,11 @@ Three drift classes shipped historically and are pinned here:
 3. README install/upgrade examples pinned ``coord-mcp-server==0.28.2``
    on a v0.45 repo. Every version pin in README.md must match
    ``pyproject.toml``'s ``[project].version``.
+
+4. The GitHub-free release path once pushed an unsigned image with no
+   SBOM/provenance while the README claimed every image was keyless-signed.
+   The release script, committed public key, CI multi-arch build, and deploy
+   verification commands must remain one fail-closed contract.
 """
 
 from __future__ import annotations
@@ -48,6 +53,11 @@ MCP_JSON_TEMPLATES = (
     TEMPLATES / ".cursor" / "mcp.json.example",
 )
 CODEX_TEMPLATE = TEMPLATES / ".codex" / "config.toml.example"
+CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+DEPLOYMENT_DOC = REPO_ROOT / "docs" / "deployment.md"
+GITHUB_FREE_RELEASE_DOC = REPO_ROOT / "docs" / "releasing-without-github.md"
+RELEASE_SCRIPT = REPO_ROOT / "scripts" / "release.sh"
+RELEASE_PUBLIC_KEY = REPO_ROOT / "release" / "coord-release.pub"
 
 
 def test_placeholder_constants_are_recognized_by_the_wrapper() -> None:
@@ -167,3 +177,57 @@ def test_readme_version_pins_match_pyproject() -> None:
         f"README.md pins {stale} but pyproject.toml says {version}; "
         f"update the install/upgrade/verify examples"
     )
+
+
+def test_github_free_release_is_attested_signed_and_verified() -> None:
+    script = RELEASE_SCRIPT.read_text(encoding="utf-8")
+    for required in (
+        "--platform \"${PLATFORMS}\"",
+        "--sbom=true",
+        "--provenance=mode=max",
+        "--metadata-file \"$image_metadata\"",
+        "cosign sign --yes --key",
+        "cosign verify",
+        "release/coord-release.pub",
+        "dist/coord-${TAG}-image-digest.txt",
+    ):
+        assert required in script, (
+            f"scripts/release.sh lost required supply-chain fence {required!r}"
+        )
+    assert "COSIGN_SIGNING_KEY" in script
+    assert re.search(r"sha256:\[0-9a-f\]\{64\}", script)
+
+
+def test_release_identity_commits_only_a_public_key() -> None:
+    public_key = RELEASE_PUBLIC_KEY.read_text(encoding="utf-8")
+    assert public_key.startswith("-----BEGIN PUBLIC KEY-----\n")
+    assert public_key.endswith("-----END PUBLIC KEY-----\n")
+    assert "PRIVATE KEY" not in public_key
+    private_key_candidates = tuple((REPO_ROOT / "release").glob("*.key"))
+    assert not private_key_candidates, (
+        "release/ must never contain an exportable signing key; "
+        f"found {private_key_candidates}"
+    )
+
+
+def test_ci_and_deploy_docs_exercise_the_signed_multiarch_contract() -> None:
+    workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+    docs = DEPLOYMENT_DOC.read_text(encoding="utf-8")
+    release_docs = GITHUB_FREE_RELEASE_DOC.read_text(encoding="utf-8")
+
+    assert "127.0.0.1:5000/coord:ci" in workflow
+    assert "steps.base-build.outputs.digest" in workflow
+    assert "docker image inspect coord:ci" not in workflow
+    assert workflow.count("platforms: linux/amd64,linux/arm64") >= 1
+    assert "--platform linux/amd64,linux/arm64" in workflow
+    assert "--sbom=true" in workflow
+    assert "--provenance=mode=max" in workflow
+
+    assert docs.count("cosign verify") >= 2
+    assert "cosign sign --yes" in docs
+    assert "release/coord-release.pub" in docs
+    assert "--sbom=true" in docs
+    assert "--provenance=mode=max" in docs
+    assert 'path "transit/sign/coord-release/*"' in release_docs
+    assert "Never give the release process a\n   Vault root token" in release_docs
+    assert "Revoke that token when the release finishes" in release_docs

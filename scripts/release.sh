@@ -18,6 +18,10 @@
 #   PyPI:  $PYPI_TOKEN, or ~/.config/pypi/token (0600). Mint at
 #          pypi.org -> Account settings -> API tokens, scope it to project
 #          "coord-mcp-server", store in k3s Vault secret/infra/pypi too.
+#   Image signing: $COSIGN_SIGNING_KEY names the release KMS key. The upstream
+#          GitHub-free release uses hashivault://coord-release in the dedicated
+#          transit Vault and commits only its public key at
+#          release/coord-release.pub. The private key never leaves Vault.
 #   whcr:  docker login whcr.io (user alexm; password in k3s Vault
 #          secret/infra/whcr). Big layers: login to the LAN NodePort
 #          (kebabrack-node1.lan:30502) instead -- Cloudflare caps ~100MB bodies.
@@ -45,6 +49,7 @@ done
 REGISTRY="${COORD_IMAGE_REGISTRY:-whcr.io}"
 IMAGE="${COORD_IMAGE_NAME:-${REGISTRY}/alexm/coord}"
 PLATFORMS="${COORD_IMAGE_PLATFORMS:-linux/amd64,linux/arm64}"
+COSIGN_PUBLIC_KEY="${COSIGN_PUBLIC_KEY:-release/coord-release.pub}"
 
 VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
 TAG="v${VERSION}"
@@ -59,6 +64,12 @@ git fetch -q origin
 git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null && fail "tag ${TAG} already exists"
 git ls-remote --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1 && fail "tag ${TAG} already on origin"
 grep -q "${VERSION}" CHANGELOG.md || echo "release: WARNING -- ${VERSION} not mentioned in CHANGELOG.md" >&2
+
+if [ "$SKIP_IMAGE" = 0 ] && [ "$PUBLISH" = 1 ]; then
+  command -v cosign >/dev/null 2>&1 || fail "cosign is required to publish a signed image"
+  [ -n "${COSIGN_SIGNING_KEY:-}" ] || fail "set COSIGN_SIGNING_KEY to the release KMS key"
+  [ -f "$COSIGN_PUBLIC_KEY" ] || fail "missing release public key: $COSIGN_PUBLIC_KEY"
+fi
 
 if [ "$SKIP_PYPI" = 0 ]; then
   PYPI_TOKEN="${PYPI_TOKEN:-$(cat ~/.config/pypi/token 2>/dev/null || true)}"
@@ -84,7 +95,8 @@ ls -1 dist/
 echo
 echo "release plan for ${TAG}:"
 [ "$SKIP_PYPI" = 0 ] && echo "  1. twine upload dist/*  -> PyPI coord-mcp-server ${VERSION}"
-[ "$SKIP_IMAGE" = 0 ] && echo "  2. buildx ${PLATFORMS} -> ${IMAGE}:${TAG} + :latest (pushed)"
+[ "$SKIP_IMAGE" = 0 ] && echo "  2. buildx ${PLATFORMS} -> ${IMAGE}:${TAG} + :latest (SBOM + provenance)"
+[ "$SKIP_IMAGE" = 0 ] && echo "     sign + verify the immutable image digest with ${COSIGN_PUBLIC_KEY}"
 echo "  3. git tag ${TAG} + push to origin (writhub)"
 echo "  4. THEN: update each downstream cluster's Deployment manifest"
 echo "     (kebabrack: build the -pg derivative and update k8s/10b-coord-app.yaml)"
@@ -103,9 +115,64 @@ if [ "$SKIP_PYPI" = 0 ]; then
 fi
 
 if [ "$SKIP_IMAGE" = 0 ]; then
-  echo "release: building + pushing image ${IMAGE}:${TAG} (${PLATFORMS})..."
+  echo "release: building + pushing attested image ${IMAGE}:${TAG} (${PLATFORMS})..."
+  image_metadata="$(mktemp)"
+  image_index="$(mktemp)"
+  cleanup_image_files() {
+    rm -f "$image_metadata" "$image_index"
+  }
+  trap cleanup_image_files EXIT
   docker buildx build --platform "${PLATFORMS}" \
-    -t "${IMAGE}:${TAG}" -t "${IMAGE}:latest" --push .
+    -t "${IMAGE}:${TAG}" -t "${IMAGE}:latest" \
+    --sbom=true \
+    --provenance=mode=max \
+    --metadata-file "$image_metadata" \
+    --push .
+  image_digest="$(
+    python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["containerimage.digest"])' \
+      "$image_metadata"
+  )"
+  printf '%s\n' "$image_digest" \
+    | grep -Eq '^sha256:[0-9a-f]{64}$' \
+    || fail "buildx returned an invalid image digest: $image_digest"
+  docker buildx imagetools inspect "${IMAGE}@${image_digest}" \
+    --raw > "$image_index"
+  python3 - "$image_index" "${PLATFORMS}" <<'PY'
+import json
+import sys
+
+index = json.load(open(sys.argv[1]))
+required = set(sys.argv[2].split(","))
+manifests = index.get("manifests", [])
+platforms = {
+    (item.get("platform") or {}).get("os", "")
+    + "/"
+    + (item.get("platform") or {}).get("architecture", "")
+    for item in manifests
+}
+attestations = [
+    item
+    for item in manifests
+    if (item.get("annotations") or {}).get("vnd.docker.reference.type")
+    == "attestation-manifest"
+]
+if not required <= platforms:
+    raise SystemExit(f"release image missing platforms: {required - platforms}")
+if len(attestations) < len(required):
+    raise SystemExit(
+        "release image is missing BuildKit SBOM/provenance attestation manifests"
+    )
+PY
+  echo "release: signing ${IMAGE}@${image_digest}..."
+  cosign sign --yes --key "${COSIGN_SIGNING_KEY}" "${IMAGE}@${image_digest}"
+  cosign verify \
+    --key "$COSIGN_PUBLIC_KEY" \
+    "${IMAGE}@${image_digest}" >/dev/null
+  printf '%s@%s\n' "$IMAGE" "$image_digest" \
+    > "dist/coord-${TAG}-image-digest.txt"
+  echo "release: verified signed image ${IMAGE}@${image_digest}"
+  cleanup_image_files
+  trap - EXIT
 fi
 
 git tag -a "${TAG}" -m "coord ${TAG}"
