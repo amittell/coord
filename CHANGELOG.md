@@ -7,6 +7,8 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.49.0] - 2026-07-23
+
 ### Fixed
 
 - Claude Code SessionEnd cleanup now uses the hook payload's stable
