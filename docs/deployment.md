@@ -147,8 +147,10 @@ ownership rows (and the prior `COORD_DATABASE_PATH`) for the specific install.
 The standard production image intentionally excludes asyncpg, keeping the
 default SQLite artifact smaller and its dependency surface narrower.
 `Dockerfile.postgres` builds a separately tagged derivative from a caller-pinned
-coord base image. It deliberately has no default `COORD_BASE` and rejects
-references that do not end in `@sha256:<64 lowercase hex characters>`.
+coord base image. It deliberately has no defaults for
+`COORD_BASE_REPOSITORY` or `COORD_BASE_DIGEST`; the Dockerfile constructs
+`FROM repository@sha256:digest`, so a mutable base cannot execute even an
+`ONBUILD` instruction before admission.
 
 Build from a checkout containing `requirements-postgres.txt`, publish a
 multi-platform versioned variant once, and capture the registry-produced digest.
@@ -156,7 +158,8 @@ Deploy that immutable derivative digest—not its tag—so a rolling fleet canno
 mix different cached images:
 
 ```bash
-COORD_BASE='whcr.io/alexm/coord:vX.Y.Z@sha256:<digest>'
+COORD_BASE_REPOSITORY='whcr.io/alexm/coord'
+COORD_BASE_DIGEST='<64 lowercase hex characters, without sha256:>'
 COORD_DERIVATIVE='whcr.io/alexm/coord:vX.Y.Z-pg'
 metadata_file="$(mktemp)"
 trap 'rm -f "$metadata_file"' EXIT
@@ -164,7 +167,8 @@ trap 'rm -f "$metadata_file"' EXIT
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
   --file Dockerfile.postgres \
-  --build-arg "COORD_BASE=$COORD_BASE" \
+  --build-arg "COORD_BASE_REPOSITORY=$COORD_BASE_REPOSITORY" \
+  --build-arg "COORD_BASE_DIGEST=$COORD_BASE_DIGEST" \
   --tag "$COORD_DERIVATIVE" \
   --metadata-file "$metadata_file" \
   --push .

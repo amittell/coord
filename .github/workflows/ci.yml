@@ -173,10 +173,11 @@ jobs:
         run: |
           if docker build \
             --file Dockerfile.postgres \
-            --build-arg COORD_BASE=coord:ci \
+            --build-arg COORD_BASE_REPOSITORY=coord \
+            --build-arg COORD_BASE_DIGEST=not-a-digest \
             --tag coord:must-not-build \
             .; then
-            echo "::error::PostgreSQL derivative accepted an unpinned base" >&2
+            echo "::error::PostgreSQL derivative accepted an invalid base digest" >&2
             exit 1
           fi
           pinned_base="$(
@@ -188,9 +189,12 @@ jobs:
             echo "::error::loaded base image has no repository digest: $pinned_base" >&2
             exit 1
           fi
+          base_repository="${pinned_base%@sha256:*}"
+          base_digest="${pinned_base##*@sha256:}"
           docker build \
             --file Dockerfile.postgres \
-            --build-arg "COORD_BASE=$pinned_base" \
+            --build-arg "COORD_BASE_REPOSITORY=$base_repository" \
+            --build-arg "COORD_BASE_DIGEST=$base_digest" \
             --tag coord:ci-postgres \
             .
           docker run --rm --entrypoint python coord:ci-postgres -c \

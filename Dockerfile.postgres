@@ -1,15 +1,13 @@
 # syntax=docker/dockerfile:1.7
 
-# PostgreSQL is an explicit derivative of an already-built coord image. Require
-# the caller to name that base so production builds can pin the exact release
-# digest instead of silently inheriting a moving tag.
-ARG COORD_BASE
-FROM ${COORD_BASE}
+# PostgreSQL is an explicit derivative of an already-built coord image.
+# Repository and digest are separate so Docker must resolve an immutable
+# reference before it can execute any base-controlled ONBUILD instruction.
+ARG COORD_BASE_REPOSITORY
+ARG COORD_BASE_DIGEST
+FROM ${COORD_BASE_REPOSITORY}@sha256:${COORD_BASE_DIGEST}
 
-ARG COORD_BASE
 USER root
-RUN printf '%s\n' "${COORD_BASE}" \
-      | grep -Eq '@sha256:[0-9a-f]{64}$'
 COPY requirements-postgres.txt /tmp/requirements-postgres.txt
 RUN /opt/venv/bin/pip install --no-cache-dir \
       -r /tmp/requirements-postgres.txt \
