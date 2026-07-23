@@ -2,12 +2,12 @@
 #
 # Release coord without GitHub: PyPI (twine) + whcr.io image + writhub tag.
 #
-# The GitHub Actions release pipeline (release.yml: OIDC trusted publishing
-# to PyPI + ghcr.io image push) died with the account suspension. This is
-# the GitHub-free path against the same artifacts:
+# This is the sole authoritative publisher. The GitHub Actions release
+# workflow is manual candidate validation only and cannot publish official
+# artifacts:
 #
-#   sdist+wheel -> PyPI            (API token; OIDC is GitHub/GitLab-only,
-#                                   re-enable trusted publishing when GH returns)
+#   sdist+wheel -> PyPI            (project-scoped API token; the historical
+#                                   GitHub trusted publisher must stay retired)
 #   multi-arch image -> whcr.io    (WritHub Container Registry)
 #   vX.Y.Z tag -> writhub origin
 #
@@ -31,7 +31,7 @@
 # qemu). Usage:
 #   scripts/release.sh              # validate + build + show plan
 #   scripts/release.sh --publish    # actually upload/push/tag
-#   scripts/release.sh --publish --skip-tests --skip-image
+#   scripts/release.sh --publish --skip-tests
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
@@ -54,10 +54,113 @@ CRANE_VERSION="0.21.7"
 SBOM_GENERATOR="docker.io/docker/buildkit-syft-scanner@sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68"
 BUILDER_ID="https://writhub.io/alexm/coord/builders/github-free-release/v1"
 
-VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
-TAG="v${VERSION}"
-
 fail() { echo "release: $*" >&2; exit 1; }
+
+select_release_python() {
+  local candidate
+  local -a candidates
+  if [ -n "${COORD_RELEASE_PYTHON:-}" ]; then
+    candidates=("$COORD_RELEASE_PYTHON")
+  else
+    candidates=(
+      .venv/bin/python
+      python3.14
+      python3.13
+      python3.12
+      python3.11
+      python3
+    )
+  fi
+  for candidate in "${candidates[@]}"; do
+    if command -v "$candidate" >/dev/null 2>&1 \
+      && "$candidate" -c 'import sys; raise SystemExit(sys.version_info < (3, 11))'
+    then
+      command -v "$candidate"
+      return
+    fi
+  done
+  return 1
+}
+
+PYTHON_BIN="$(select_release_python)" \
+  || fail "release requires Python >=3.11; set COORD_RELEASE_PYTHON to a supported interpreter"
+VERSION=$("$PYTHON_BIN" -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+TAG="v${VERSION}"
+LOCK_TAG="coord-release-lock-${TAG}"
+
+require_image_tag_absent() {
+  local image_ref="$1"
+  local image_probe_error
+  image_probe_error="$(mktemp)"
+  if crane digest "$image_ref" >/dev/null 2>"$image_probe_error"; then
+    rm -f "$image_probe_error"
+    fail "official image tag already exists: ${image_ref}"
+  fi
+  if ! grep -Fq "MANIFEST_UNKNOWN" "$image_probe_error"; then
+    cat "$image_probe_error" >&2
+    rm -f "$image_probe_error"
+    fail "could not prove official image tag is absent: ${image_ref}"
+  fi
+  rm -f "$image_probe_error"
+}
+
+remote_tag_lines() {
+  local tag="$1"
+  git ls-remote --tags origin \
+    "refs/tags/${tag}" \
+    "refs/tags/${tag}^{}"
+}
+
+remote_tag_commit() {
+  local lines="$1"
+  local commit
+  commit="$(
+    printf '%s\n' "$lines" \
+      | awk '$2 ~ /\^\{\}$/ { print $1; exit }'
+  )"
+  if [ -z "$commit" ]; then
+    commit="$(printf '%s\n' "$lines" | awk 'NF { print $1; exit }')"
+  fi
+  printf '%s\n' "$commit"
+}
+
+acquire_release_lock() {
+  local head remote_lines remote_commit
+  head="$(git rev-parse HEAD)"
+  remote_lines="$(remote_tag_lines "$LOCK_TAG")" \
+    || fail "could not query release lock ${LOCK_TAG}"
+  if [ -n "$remote_lines" ]; then
+    remote_commit="$(remote_tag_commit "$remote_lines")"
+    [ "$remote_commit" = "$head" ] \
+      || fail "release lock ${LOCK_TAG} belongs to ${remote_commit}, not ${head}"
+    echo "release: ${LOCK_TAG} already locks this exact commit; resuming."
+    return
+  fi
+
+  if git rev-parse -q --verify "refs/tags/${LOCK_TAG}" >/dev/null; then
+    [ "$(git rev-list -n 1 "$LOCK_TAG")" = "$head" ] \
+      || fail "local release lock ${LOCK_TAG} does not point to ${head}"
+  else
+    git tag -a "$LOCK_TAG" \
+      -m "Serialize coord ${TAG} publication at ${head}"
+  fi
+
+  if git push origin "refs/tags/${LOCK_TAG}"; then
+    echo "release: acquired immutable release lock ${LOCK_TAG}."
+    return
+  fi
+
+  # A simultaneous publisher may have won the create-only push. Accept that
+  # race only when the winner locked the same exact commit.
+  remote_lines="$(remote_tag_lines "$LOCK_TAG")" \
+    || fail "release-lock push failed and the winner could not be queried"
+  [ -n "$remote_lines" ] \
+    || fail "could not acquire release lock ${LOCK_TAG}"
+  remote_commit="$(remote_tag_commit "$remote_lines")"
+  [ "$remote_commit" = "$head" ] \
+    || fail "release lock race lost to ${remote_commit}, not ${head}"
+  echo "release: concurrent publisher locked the same exact commit; resuming."
+}
 
 # ---- preflight ---------------------------------------------------------------
 [ "$(git branch --show-current)" = "main" ] || fail "not on main"
@@ -65,8 +168,14 @@ fail() { echo "release: $*" >&2; exit 1; }
 git fetch -q origin
 [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] || fail "main not synced with origin (writhub)"
 git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null && fail "tag ${TAG} already exists"
-git ls-remote --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1 && fail "tag ${TAG} already on origin"
+remote_version_tag="$(remote_tag_lines "$TAG")" \
+  || fail "could not query origin for ${TAG}"
+[ -z "$remote_version_tag" ] || fail "tag ${TAG} already on origin"
 grep -q "${VERSION}" CHANGELOG.md || echo "release: WARNING -- ${VERSION} not mentioned in CHANGELOG.md" >&2
+
+if [ "$PUBLISH" = 1 ] && { [ "$SKIP_IMAGE" = 1 ] || [ "$SKIP_PYPI" = 1 ]; }; then
+  fail "--publish requires both the authenticated image and PyPI artifact paths"
+fi
 
 if [ "$SKIP_IMAGE" = 0 ] && [ "$PUBLISH" = 1 ]; then
   command -v cosign >/dev/null 2>&1 || fail "cosign is required to publish a signed image"
@@ -77,9 +186,9 @@ if [ "$SKIP_IMAGE" = 0 ] && [ "$PUBLISH" = 1 ]; then
     || fail "crane $(crane version) does not match required ${CRANE_VERSION}"
   cosign_version="$(
     cosign version --json \
-      | python3 -c 'import json, sys; print(json.load(sys.stdin)["gitVersion"].removeprefix("v"))'
+      | "$PYTHON_BIN" -c 'import json, sys; print(json.load(sys.stdin)["gitVersion"].removeprefix("v"))'
   )" || fail "could not determine the installed cosign version"
-  if ! python3 - "$cosign_version" "$COSIGN_MIN_VERSION" <<'PY'
+  if ! "$PYTHON_BIN" - "$cosign_version" "$COSIGN_MIN_VERSION" <<'PY'
 import re
 import sys
 
@@ -94,15 +203,7 @@ PY
   then
     fail "cosign ${cosign_version} is older than required ${COSIGN_MIN_VERSION}"
   fi
-  image_probe_error="$(mktemp)"
-  if crane digest "${IMAGE}:${TAG}" >/dev/null 2>"$image_probe_error"; then
-    fail "official image tag already exists: ${IMAGE}:${TAG}"
-  fi
-  if ! grep -Fq "MANIFEST_UNKNOWN" "$image_probe_error"; then
-    cat "$image_probe_error" >&2
-    fail "could not prove official image tag is absent: ${IMAGE}:${TAG}"
-  fi
-  rm -f "$image_probe_error"
+  require_image_tag_absent "${IMAGE}:${TAG}"
 fi
 
 if [ "$SKIP_PYPI" = 0 ]; then
@@ -112,7 +213,7 @@ fi
 # ---- tests -------------------------------------------------------------------
 if [ "$SKIP_TESTS" = 0 ]; then
   echo "release: running test suite..."
-  .venv/bin/python -m pytest -q || fail "tests failed"
+  "$PYTHON_BIN" -m pytest -q || fail "tests failed"
 fi
 
 # ---- build -------------------------------------------------------------------
@@ -120,53 +221,37 @@ echo "release: building sdist + wheel..."
 rm -rf dist/
 SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
 export SOURCE_DATE_EPOCH
-python3 -m build --outdir dist/ >/dev/null 2>&1 || .venv/bin/python -m build --outdir dist/ >/dev/null
+build_venv="$(mktemp -d)"
+cleanup_build_venv() {
+  rm -rf "$build_venv"
+}
+trap cleanup_build_venv EXIT
+"$PYTHON_BIN" -m venv "$build_venv"
+"$build_venv/bin/pip" install \
+  --require-hashes \
+  -r requirements-build.txt >/dev/null
+"$build_venv/bin/python" -m build \
+  --no-isolation \
+  --outdir dist/ >/dev/null
+cleanup_build_venv
+trap - EXIT
 ls -1 dist/
 
 PYPI_STATE="skipped"
+PYPI_MISSING=()
 if [ "$SKIP_PYPI" = 0 ]; then
-  PYPI_STATE="$(
-    python3 - "$VERSION" <<'PY'
-import hashlib
-import json
-from pathlib import Path
-import sys
-from urllib.error import HTTPError, URLError
-from urllib.request import urlopen
-
-version = sys.argv[1]
-try:
-    with urlopen(
-        "https://pypi.org/pypi/coord-mcp-server/json",
-        timeout=10,
-    ) as response:
-        release = json.load(response)["releases"].get(version)
-except (HTTPError, URLError, KeyError, ValueError) as exc:
-    raise SystemExit(f"could not query PyPI release state: {exc}")
-
-if not release:
-    print("absent")
-    raise SystemExit(0)
-
-remote = {
-    item["filename"]: item["digests"]["sha256"]
-    for item in release
-}
-local = {
-    path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-    for path in Path("dist").iterdir()
-    if path.is_file()
-}
-if remote != local:
-    raise SystemExit(
-        "coord-mcp-server "
-        f"{version} already exists on PyPI with artifacts that do not "
-        "exactly match dist/"
-    )
-print("exact")
-PY
+  pypi_result="$(
+    "$PYTHON_BIN" scripts/check_pypi_release.py \
+      --project coord-mcp-server \
+      --version "$VERSION" \
+      --dist-dir dist
   )" || fail "could not establish an exact PyPI release state"
-  if [ "$PYPI_STATE" = "absent" ]; then
+  IFS='|' read -r -a pypi_fields <<< "$pypi_result"
+  PYPI_STATE="${pypi_fields[0]}"
+  PYPI_MISSING=("${pypi_fields[@]:1}")
+  if [ "$PYPI_STATE" = "absent" ] || [ "$PYPI_STATE" = "partial" ]; then
+    [ "${#PYPI_MISSING[@]}" -gt 0 ] \
+      || fail "${PYPI_STATE} PyPI state did not identify missing artifacts"
     [ -n "${PYPI_TOKEN}" ] \
       || fail "no PyPI token: set \$PYPI_TOKEN or ~/.config/pypi/token (see header)"
   elif [ "$PYPI_STATE" != "exact" ]; then
@@ -179,7 +264,8 @@ echo
 echo "release plan for ${TAG}:"
 [ "$SKIP_IMAGE" = 0 ] && echo "  1. buildx ${PLATFORMS} -> candidate (SBOM + provenance)"
 [ "$SKIP_IMAGE" = 0 ] && echo "     validate + sign + verify while official tags remain absent"
-[ "$SKIP_PYPI" = 0 ] && echo "  2. twine upload dist/*  -> PyPI coord-mcp-server ${VERSION}"
+[ "$SKIP_IMAGE" = 0 ] && echo "     acquire create-only git lock ${LOCK_TAG}"
+[ "$SKIP_PYPI" = 0 ] && echo "  2. twine upload missing dist artifacts -> PyPI coord-mcp-server ${VERSION}"
 [ "$SKIP_IMAGE" = 0 ] && echo "     promote the authenticated digest to ${IMAGE}:${TAG} + :latest"
 echo "  3. git tag ${TAG} + push to origin (writhub)"
 echo "  4. THEN: update each downstream cluster's Deployment manifest"
@@ -206,7 +292,7 @@ if [ "$SKIP_IMAGE" = 0 ]; then
     --metadata-file "$image_metadata" \
     --push .
   image_digest="$(
-    python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["containerimage.digest"])' \
+    "$PYTHON_BIN" -c 'import json, sys; print(json.load(open(sys.argv[1]))["containerimage.digest"])' \
       "$image_metadata"
   )"
   printf '%s\n' "$image_digest" \
@@ -217,8 +303,9 @@ if [ "$SKIP_IMAGE" = 0 ]; then
   for platform in "${release_platforms[@]}"; do
     attestation_args+=(--platform "$platform")
   done
-  python3 scripts/verify_image_attestations.py \
+  "$PYTHON_BIN" scripts/verify_image_attestations.py \
     --image "${IMAGE}@${image_digest}" \
+    --builder-id "${BUILDER_ID}" \
     "${attestation_args[@]}"
   echo "release: signing ${IMAGE}@${image_digest}..."
   cosign sign --yes --key "${COSIGN_SIGNING_KEY}" "${IMAGE}@${image_digest}"
@@ -227,18 +314,42 @@ if [ "$SKIP_IMAGE" = 0 ]; then
     "${IMAGE}@${image_digest}" >/dev/null
 fi
 
+acquire_release_lock
+
 if [ "$SKIP_PYPI" = 0 ]; then
-  if [ "$PYPI_STATE" = "absent" ]; then
-    echo "release: uploading to PyPI..."
+  if [ "$PYPI_STATE" = "absent" ] || [ "$PYPI_STATE" = "partial" ]; then
+    pypi_paths=()
+    for filename in "${PYPI_MISSING[@]}"; do
+      [ -f "dist/${filename}" ] \
+        || fail "PyPI state checker returned a missing local artifact: ${filename}"
+      pypi_paths+=("dist/${filename}")
+    done
+    if "$PYTHON_BIN" -c 'import twine' >/dev/null 2>&1; then
+      twine_command=("$PYTHON_BIN" -m twine)
+    else
+      fail "twine is not installed in the release interpreter ${PYTHON_BIN}"
+    fi
+    echo "release: uploading ${#pypi_paths[@]} missing PyPI artifact(s)..."
     TWINE_USERNAME=__token__ TWINE_PASSWORD="${PYPI_TOKEN}" \
-      python3 -m twine upload --non-interactive dist/* \
-      || TWINE_USERNAME=__token__ TWINE_PASSWORD="${PYPI_TOKEN}" .venv/bin/python -m twine upload --non-interactive dist/*
+      "${twine_command[@]}" upload --non-interactive "${pypi_paths[@]}"
+    post_upload_state="$(
+      "$PYTHON_BIN" scripts/check_pypi_release.py \
+        --project coord-mcp-server \
+        --version "$VERSION" \
+        --dist-dir dist
+    )" || fail "could not verify PyPI after upload"
+    [ "$post_upload_state" = "exact" ] \
+      || fail "PyPI upload did not produce the exact complete artifact set"
   else
     echo "release: PyPI ${VERSION} already matches dist/ exactly; resuming."
   fi
 fi
 
 if [ "$SKIP_IMAGE" = 0 ]; then
+  # The registry has no standard conditional-create operation for a tag.
+  # Recheck immediately before the only official manifest PUT; the immutable
+  # git lock above serializes every supported publisher for this repository.
+  require_image_tag_absent "${IMAGE}:${TAG}"
   echo "release: promoting verified digest to official tags..."
   crane tag "${IMAGE}@${image_digest}" "$TAG"
   crane tag "${IMAGE}@${image_digest}" latest

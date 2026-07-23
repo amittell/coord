@@ -1,9 +1,10 @@
 # Releasing coord without GitHub
 
-The GitHub release pipeline (`.github/workflows/release.yml`) published to
-PyPI via **OIDC trusted publishing** and pushed images to **ghcr.io** — both
-unavailable while the GitHub account is suspended. This is the replacement
-path; the workflow file stays for the day GitHub returns.
+The former GitHub release pipeline published to PyPI via OIDC trusted
+publishing and pushed images to GHCR. `scripts/release.sh` is now the sole
+authoritative publisher. `.github/workflows/release.yml` is manual,
+candidate-only supply-chain validation and cannot publish official artifacts
+or deploy.
 
 ## One-time setup
 
@@ -14,8 +15,8 @@ path; the workflow file stays for the day GitHub returns.
    OIDC note: PyPI trusted publishing only accepts allowlisted CI issuers
    (GitHub Actions, GitLab.com, Google Cloud, ActiveState). Self-hosted
    WritHub CI cannot be one, so a token is the GitHub-free mechanism.
-   When GitHub unsuspends, the existing trusted-publisher config on PyPI
-   resumes working alongside the token.
+   Remove the historical GitHub trusted-publisher registration so it cannot
+   become a second release authority later.
 2. **whcr.io login**: `docker login whcr.io` as `alexm` (password: k3s Vault
    `secret/infra/whcr`). For layers >~100MB use the LAN endpoint instead
    (`kebabrack-node1.lan:30502`, needs docker `insecure-registries`) —
@@ -54,6 +55,11 @@ path; the workflow file stays for the day GitHub returns.
 5. **crane 0.21.7 exactly**: the release verifier fetches each in-toto blob,
    hashes its bytes, and validates its predicate and subject before promotion.
    Pinning the verifier version keeps official tag mutation behavior stable.
+6. **Python 3.11 or newer**: the script prefers `.venv/bin/python`, then
+   searches versioned Python executables before `python3`. It fails closed on
+   an older interpreter (notably macOS `/usr/bin/python3` 3.9). Set
+   `COORD_RELEASE_PYTHON=/absolute/path/to/python` to select an explicit
+   supported interpreter.
 
 ## Cutting a release
 
@@ -68,12 +74,20 @@ non-official candidate tag, checks every in-toto layer's content hash, predicate
 and linked platform subject, signs the immutable index digest through Vault,
 and verifies it against the literal committed public key (the official release
 path has no public-key override). Only after the candidate is authenticated does
-the script upload the immutable PyPI artifacts; it then promotes the same digest
-to `vX.Y.Z` and `latest`. A verifier or signer failure therefore cannot publish
-the PyPI version or move an official image tag. If an interrupted run already
-uploaded PyPI, a retry resumes only when every remote filename and SHA-256
-exactly matches the newly built `dist/` artifacts. Package builds set
-`SOURCE_DATE_EPOCH` from the release commit so that comparison is reproducible.
+the script acquire a create-only `coord-release-lock-vX.Y.Z` tag on the exact
+release commit and upload the immutable PyPI artifacts; it then rechecks that
+the official image tag is absent immediately before promoting the same digest
+to `vX.Y.Z` and `latest`. The permanent lock serializes every supported
+publisher and makes an interrupted release resumable only from the same commit.
+The OCI Distribution API has no conditional tag-create operation, so registry
+credentials must not be used to publish release tags outside this locked path.
+A verifier or signer failure therefore cannot publish the PyPI version or move
+an official image tag. If an interrupted run uploaded only part of the PyPI
+release, a retry accepts the remote subset only for matching filename and SHA-256
+pairs in the newly built `dist/` directory, uploads only the missing
+files, and then requires the complete remote set to match exactly. Package
+builds set `SOURCE_DATE_EPOCH` from the release commit so that comparison is
+reproducible.
 The authenticated reference is written to
 `dist/coord-vX.Y.Z-image-digest.txt`.
 

@@ -10,6 +10,7 @@ FROM ${COORD_BASE_REPOSITORY}@sha256:${COORD_BASE_DIGEST}
 USER root
 COPY requirements-postgres.txt /tmp/requirements-postgres.txt
 RUN /opt/venv/bin/pip install --no-cache-dir \
+      --require-hashes \
       -r /tmp/requirements-postgres.txt \
     && rm /tmp/requirements-postgres.txt
 USER coord

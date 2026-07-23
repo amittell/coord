@@ -1,0 +1,3 @@
+# Exact PostgreSQL driver pin for the explicit derivative image.
+# requirements-postgres.txt is the hash-complete generated lock.
+asyncpg==0.31.0

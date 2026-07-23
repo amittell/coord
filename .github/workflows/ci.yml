@@ -50,7 +50,7 @@ jobs:
         run: mypy coordination
 
       - name: Run OpenTelemetry enabled-path tests
-        run: pytest tests/test_otel.py -q
+        run: python -m pytest tests/test_otel.py -q
 
   test:
     name: sqlite (ubuntu py${{ matrix.python-version }})
@@ -82,7 +82,7 @@ jobs:
           python -m pip install ".[dev]"
 
       - name: Run full SQLite suite
-        run: pytest -q
+        run: python -m pytest -q
 
   platform:
     name: platform smoke (${{ matrix.os }} py3.14)
@@ -120,7 +120,7 @@ jobs:
             "pytest-timeout>=2.3.1"
 
       - name: Run platform-specific smoke suite
-        run: pytest -q -m platform
+        run: python -m pytest -q -m platform
 
   lint-workflows:
     name: lint workflows (actionlint)
@@ -225,6 +225,12 @@ jobs:
             echo "::error::base build returned an invalid registry digest: $BASE_DIGEST" >&2
             exit 1
           fi
+          python scripts/verify_image_attestations.py \
+            --image "127.0.0.1:5000/coord@$BASE_DIGEST" \
+            --builder-id https://writhub.io/alexm/coord/builders/ci/v1 \
+            --platform linux/amd64 \
+            --platform linux/arm64 \
+            --insecure
           metadata_file="$(mktemp)"
           trap 'rm -f "$metadata_file"' EXIT
           docker buildx build \
@@ -249,6 +255,7 @@ jobs:
           fi
           python scripts/verify_image_attestations.py \
             --image "127.0.0.1:5000/coord@$derivative_digest" \
+            --builder-id https://writhub.io/alexm/coord/builders/ci/v1 \
             --platform linux/amd64 \
             --platform linux/arm64 \
             --insecure

@@ -107,6 +107,7 @@ def _validate_spdx_predicate(
 def _validate_slsa_predicate(
     predicate: dict[str, Any],
     *,
+    builder_id: str,
     image: str,
     platform: str,
 ) -> None:
@@ -136,18 +137,24 @@ def _validate_slsa_predicate(
         raise ValueError(
             f"{image} platform {platform} SLSA runDetails has no builder"
         )
-    _nonempty_string(
+    actual_builder_id = _nonempty_string(
         builder.get("id"),
         field="predicate.runDetails.builder.id",
         image=image,
         platform=platform,
     )
+    if actual_builder_id != builder_id:
+        raise ValueError(
+            f"{image} platform {platform} SLSA builder id "
+            f"{actual_builder_id!r} does not match expected {builder_id!r}"
+        )
 
 
 def _validate_statement_predicate(
     statement: dict[str, Any],
     predicate_type: str,
     *,
+    builder_id: str,
     image: str,
     platform: str,
 ) -> None:
@@ -165,10 +172,15 @@ def _validate_statement_predicate(
     if predicate_type == _SPDX_PREDICATE:
         _validate_spdx_predicate(predicate, image=image, platform=platform)
     elif predicate_type == _SLSA_PREDICATE:
-        _validate_slsa_predicate(predicate, image=image, platform=platform)
+        _validate_slsa_predicate(
+            predicate,
+            builder_id=builder_id,
+            image=image,
+            platform=platform,
+        )
 
 
-def _inspect_raw(reference: str) -> dict[str, Any]:
+def _inspect_raw(reference: str) -> bytes:
     result = subprocess.run(
         [
             "docker",
@@ -181,7 +193,29 @@ def _inspect_raw(reference: str) -> dict[str, Any]:
         check=True,
         stdout=subprocess.PIPE,
     )
-    value = json.loads(result.stdout)
+    return result.stdout
+
+
+def _decode_inspected_json(
+    reference: str,
+    inspected: bytes | dict[str, Any],
+    *,
+    expected_digest: str | None = None,
+) -> dict[str, Any]:
+    if isinstance(inspected, bytes):
+        if expected_digest is not None:
+            actual_digest = "sha256:" + hashlib.sha256(inspected).hexdigest()
+            if actual_digest != expected_digest:
+                raise ValueError(
+                    f"{reference} index content hashes to {actual_digest}, "
+                    f"expected {expected_digest}"
+                )
+        value = json.loads(inspected)
+    else:
+        # Dict injection keeps the pure verifier unit-testable. Production
+        # inspection always returns bytes and therefore always exercises the
+        # top-level digest fence above.
+        value = inspected
     if not isinstance(value, dict):
         raise ValueError(f"{reference} did not resolve to an OCI JSON object")
     return value
@@ -203,7 +237,8 @@ def verify_image_attestations(
     image: str,
     required_platforms: set[str],
     *,
-    inspect_raw: Callable[[str], dict[str, Any]] = _inspect_raw,
+    builder_id: str,
+    inspect_raw: Callable[[str], bytes | dict[str, Any]] = _inspect_raw,
     fetch_blob: Callable[[str, bool], bytes] = _fetch_blob,
     insecure: bool = False,
 ) -> None:
@@ -215,8 +250,14 @@ def verify_image_attestations(
         )
     if not required_platforms:
         raise ValueError("at least one required platform must be supplied")
+    if not builder_id.strip():
+        raise ValueError("builder_id must be a non-empty string")
     repository = match.group(1)
-    index = inspect_raw(image)
+    index = _decode_inspected_json(
+        image,
+        inspect_raw(image),
+        expected_digest=match.group(2),
+    )
     manifests = index.get("manifests")
     if not isinstance(manifests, list):
         raise ValueError(f"{image} is not a multi-platform OCI index")
@@ -270,7 +311,11 @@ def verify_image_attestations(
                 f"{image} platform {platform} ({subject}) has no linked "
                 "attestation manifest"
             )
-        attestation_manifest = inspect_raw(f"{repository}@{attestation}")
+        attestation_reference = f"{repository}@{attestation}"
+        attestation_manifest = _decode_inspected_json(
+            attestation_reference,
+            inspect_raw(attestation_reference),
+        )
         layers = attestation_manifest.get("layers")
         if not isinstance(layers, list):
             raise ValueError(
@@ -332,6 +377,7 @@ def verify_image_attestations(
             _validate_statement_predicate(
                 statement,
                 predicate,
+                builder_id=builder_id,
                 image=image,
                 platform=platform,
             )
@@ -379,6 +425,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="required os/architecture; repeat for every platform",
     )
     parser.add_argument(
+        "--builder-id",
+        required=True,
+        help="exact SLSA runDetails.builder.id required on every platform",
+    )
+    parser.add_argument(
         "--insecure",
         action="store_true",
         help="allow plain HTTP when fetching blobs from a local test registry",
@@ -392,6 +443,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         verify_image_attestations(
             args.image,
             set(args.platform),
+            builder_id=args.builder_id,
             insecure=args.insecure,
         )
     except (

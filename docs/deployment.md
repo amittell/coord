@@ -55,7 +55,12 @@ All other `COORD_*` variables (scope limits, TTLs, cleanup cadence) are optional
 docker build -t coordination .
 ```
 
-If you publish to a registry, tag and push with whatever scheme your team uses. The included `.github/workflows/release.yml` publishes the image to `ghcr.io/<github-owner>/coord` on every `v*` git tag, tagging both `:latest` and `:<tag>` (e.g. `ghcr.io/your-org/coord:v0.1.0`). Update the referenced image path in any downstream manifests to match your fork.
+If you publish to a registry, tag and push with whatever scheme your team uses.
+The included `.github/workflows/release.yml` is manual candidate validation
+only: it has no git-tag trigger and never creates an official version or
+`latest` tag. Upstream official releases use `scripts/release.sh` and the
+canonical `whcr.io/alexm/coord` repository. Update downstream manifests to the
+registry and immutable digest your deployment trusts.
 
 ## Kubernetes
 
@@ -228,6 +233,7 @@ docker buildx imagetools inspect \
   "$COORD_DERIVATIVE_REPOSITORY@$COORD_DERIVATIVE_DIGEST"
 python3 scripts/verify_image_attestations.py \
   --image "$COORD_DERIVATIVE_REPOSITORY@$COORD_DERIVATIVE_DIGEST" \
+  --builder-id https://writhub.io/alexm/coord/builders/github-free-release/v1 \
   --platform linux/amd64 \
   --platform linux/arm64
 cosign sign --yes \
@@ -236,6 +242,24 @@ cosign sign --yes \
 cosign verify \
   --key release/coord-release.pub \
   "$COORD_DERIVATIVE_REPOSITORY@$COORD_DERIVATIVE_DIGEST" >/dev/null
+
+# OCI registries do not offer conditional tag creation. Repeat the fail-closed
+# absence proof immediately before the only official manifest PUT, and keep
+# derivative publication inside the same single-operator release ceremony.
+: > "$tag_probe_error"
+if crane digest \
+  "$COORD_DERIVATIVE_REPOSITORY:$COORD_DERIVATIVE_TAG" \
+  >/dev/null 2>"$tag_probe_error"
+then
+  echo "refusing to replace released derivative tag: $COORD_DERIVATIVE_TAG" >&2
+  exit 1
+fi
+if ! grep -Fq 'MANIFEST_UNKNOWN' "$tag_probe_error"; then
+  cat "$tag_probe_error" >&2
+  echo "could not prove derivative tag is absent immediately before promotion" >&2
+  exit 1
+fi
+
 crane tag \
   "$COORD_DERIVATIVE_REPOSITORY@$COORD_DERIVATIVE_DIGEST" \
   "$COORD_DERIVATIVE_TAG"
@@ -896,7 +920,14 @@ The `.mcp.json` / `.codex/config.toml` tracked templates keep their placeholder 
 
 ## Supply chain
 
-Every image published by `.github/workflows/release.yml` ships with four independent supply-chain signals attached:
+The authoritative `scripts/release.sh` path publishes a candidate first,
+verifies it, signs the immutable digest with the key corresponding to
+`release/coord-release.pub`, and only then promotes that digest to the
+create-only official tag. The manual `.github/workflows/release.yml` path is
+candidate validation only and cannot publish an official tag, PyPI artifact,
+GitHub Release, or deployment change.
+
+Every GitHub validation candidate carries four independent supply-chain signals:
 
 - An SPDX SBOM attestation produced by BuildKit (`sbom: true`), attached to the image manifest as an OCI referrer. Pull it with `cosign download sbom <image>@<digest>` or inspect with `docker buildx imagetools inspect <image> --format '{{json .SBOM}}'`.
 - A SLSA build provenance attestation produced by BuildKit with `provenance: mode=max`, covering the builder identity, source materials, and full invocation metadata.
@@ -910,24 +941,33 @@ cosign verify \
   ghcr.io/<owner>/coord@sha256:<digest>
 ```
 
-Consumers who want a minimal gate should verify at least the cosign signature on deployment; the SBOM and provenance records are additionally useful for vulnerability triage and incident response. See `.github/workflows/README.md` for the full list of signals, the `SKIP_ATTESTATION` and `SKIP_SIGNING` escape hatches for environments without Sigstore or GHE attestations support, and how the cosign-installer action is pinned.
+The repository verifier rehashes the top-level OCI index and every in-toto
+blob, requires both predicates for every supported platform, and requires the
+exact builder identity supplied by the release path. Production consumers must
+verify the repository-key signature and immutable digest documented in
+`docs/releasing-without-github.md`; a GitHub candidate signature is not an
+official release identity.
 
 ## GitHub Enterprise
 
-The shipped release workflow (`.github/workflows/release.yml`) publishes to `ghcr.io` by default, but the registry host and repo path are overridable via repo or org Actions variables so you can publish to your own GHE container registry without forking the workflow:
+The manual candidate workflow publishes to `ghcr.io` by default, but the
+registry host and repo path are overridable via repo or org Actions variables:
 
 - `vars.IMAGE_REGISTRY` - registry hostname, for example `containers.ghe.example.com`. Defaults to `ghcr.io`.
 - `vars.IMAGE_REPO` - path under the registry, for example `platform/coord`. Defaults to `<repository_owner>/coord`.
 
 Set these under Settings -> Secrets and variables -> Actions -> Variables. Login uses `${{ secrets.GITHUB_TOKEN }}` against whatever registry you configure. Some GHE setups require a Personal Access Token with `write:packages` to push images to the configured registry; if the default `GITHUB_TOKEN` is rejected by your registry, store a PAT as a repo secret and swap it into the `docker/login-action` step. See `.github/workflows/README.md` for details.
 
-`actions/attest-build-provenance@v2` requires **GitHub Enterprise Server 3.10 or later** with the attestations feature enabled. On older GHE, or where the feature is disabled, comment out the "Attest build provenance" step or the release workflow will fail at that point. The image push itself is unaffected by that step being removed.
+`actions/attest-build-provenance` requires **GitHub Enterprise Server 3.10 or
+later** with the attestations feature enabled. GitHub candidate validation may
+omit that repository-native record via `SKIP_ATTESTATION=true`; the mandatory
+BuildKit SBOM/SLSA verification and candidate cosign verification remain.
 
 Networking: the service itself is a plain HTTP API. Corporate TLS termination, SSO in front of the dashboard, and egress policies to reach the container registry all apply at the standard enterprise-ingress layer - there is nothing coord-specific to configure beyond the registry overrides above.
 
 Restrictions observed:
 
-- `actions/attest-build-provenance` is the only step that is GHE-version gated; everything else (checkout, buildx, login, build-push, softprops release) is available across all supported GHE versions at the pinned action versions.
+- `actions/attest-build-provenance` is the only step that is GHE-version gated; checkout, buildx, login, and build-push use pinned action revisions.
 - Outbound network from runners must reach the configured registry host; for air-gapped enterprises, use a self-hosted runner inside the same network as the registry.
 
 ## Monorepos and virtual file systems (Scalar, Git VFS)

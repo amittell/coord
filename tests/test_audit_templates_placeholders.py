@@ -49,6 +49,7 @@ from coordination.cli_init import (
     _update_mcp_json,
 )
 from coordination.mcp_server import _PLACEHOLDER_VALUES
+from scripts.check_pypi_release import classify_release
 from scripts.verify_image_attestations import verify_image_attestations
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -65,6 +66,14 @@ DEPLOYMENT_DOC = REPO_ROOT / "docs" / "deployment.md"
 GITHUB_FREE_RELEASE_DOC = REPO_ROOT / "docs" / "releasing-without-github.md"
 RELEASE_SCRIPT = REPO_ROOT / "scripts" / "release.sh"
 RELEASE_PUBLIC_KEY = REPO_ROOT / "release" / "coord-release.pub"
+REQUIREMENT_LOCKS = (
+    REPO_ROOT / "requirements-build.txt",
+    REPO_ROOT / "requirements.txt",
+    REPO_ROOT / "requirements-otel.txt",
+    REPO_ROOT / "requirements-postgres.txt",
+)
+REQUIREMENT_INPUTS = tuple(path.with_suffix(".in") for path in REQUIREMENT_LOCKS)
+EXPECTED_BUILDER_ID = "https://mobyproject.org/buildkit@v1"
 
 
 def test_placeholder_constants_are_recognized_by_the_wrapper() -> None:
@@ -194,12 +203,15 @@ def test_github_free_release_is_attested_signed_and_verified() -> None:
         '--provenance="mode=max,builder-id=${BUILDER_ID}"',
         "--metadata-file \"$image_metadata\"",
         "scripts/verify_image_attestations.py",
+        '--builder-id "${BUILDER_ID}"',
         "cosign sign --yes --key",
         "cosign verify",
         "--key release/coord-release.pub",
         "dist/coord-${TAG}-image-digest.txt",
         'COSIGN_MIN_VERSION="3.0.6"',
         'CRANE_VERSION="0.21.7"',
+        "COORD_RELEASE_PYTHON",
+        '"$PYTHON_BIN" -m venv',
     ):
         assert required in script, (
             f"scripts/release.sh lost required supply-chain fence {required!r}"
@@ -211,13 +223,15 @@ def test_github_free_release_is_attested_signed_and_verified() -> None:
     verify_attestations = script.index("scripts/verify_image_attestations.py")
     sign = script.index("cosign sign --yes")
     verify_signature = script.index("cosign verify", sign)
-    pypi_upload = script.index("python3 -m twine upload", verify_signature)
+    release_lock = script.index("acquire_release_lock", verify_signature)
+    pypi_upload = script.index('"${twine_command[@]}" upload', verify_signature)
     promote = script.index("crane tag", verify_signature)
     assert (
         build
         < verify_attestations
         < sign
         < verify_signature
+        < release_lock
         < pypi_upload
         < promote
     )
@@ -225,9 +239,100 @@ def test_github_free_release_is_attested_signed_and_verified() -> None:
     assert '-t "$candidate_tag"' in build_command
     assert '-t "${IMAGE}:${TAG}"' not in build_command
     assert '-t "${IMAGE}:latest"' not in build_command
-    assert "remote != local" in script
-    assert '"exact"' in script
+    assert "scripts/check_pypi_release.py" in script
+    assert "--require-hashes" in script
+    assert "--no-isolation" in script
+    assert 'PYPI_STATE" = "partial"' in script
+    assert "post_upload_state" in script
+    assert "require_image_tag_absent" in script
+    assert script.count('require_image_tag_absent "${IMAGE}:${TAG}"') == 2
+    assert "coord-release-lock-${TAG}" in script
     assert 'SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"' in script
+    assert "Python >=3.11" in script
+    assert "python3 -m venv" not in script
+
+
+def test_release_dependency_inputs_are_exact_and_locks_are_hash_complete() -> None:
+    for input_path in REQUIREMENT_INPUTS:
+        requirements = [
+            line.strip()
+            for line in input_path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        assert requirements, f"{input_path} has no dependency inputs"
+        assert all(
+            "==" in requirement or requirement.startswith("-r ")
+            for requirement in requirements
+        ), (
+            f"{input_path} contains an unpinned requirement"
+        )
+
+    for lock_path in REQUIREMENT_LOCKS:
+        logical_lines: list[str] = []
+        current = ""
+        for raw_line in lock_path.read_text(encoding="utf-8").splitlines():
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            current = f"{current} {stripped}".strip()
+            if stripped.endswith("\\"):
+                current = current[:-1].rstrip()
+                continue
+            logical_lines.append(current)
+            current = ""
+        assert not current, f"{lock_path} ends in an incomplete continuation"
+        assert logical_lines, f"{lock_path} has no locked requirements"
+        unhashed = [line for line in logical_lines if "--hash=sha256:" not in line]
+        assert not unhashed, f"{lock_path} has unhashed requirements: {unhashed}"
+
+    dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    postgres = (REPO_ROOT / "Dockerfile.postgres").read_text(encoding="utf-8")
+    pyproject = tomllib.loads(
+        (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    assert dockerfile.count("--require-hashes") == 1
+    assert "--no-build-isolation" in dockerfile
+    assert "pip install --upgrade" not in dockerfile
+    assert "snapshot.debian.org/archive/debian/20260713T000000Z" in dockerfile
+    assert "git=1:2.47.3-0+deb13u1" in dockerfile
+    assert "--require-hashes" in postgres
+    assert pyproject["build-system"]["requires"] == ["hatchling==1.31.0"]
+
+
+@pytest.mark.parametrize(
+    ("remote", "expected"),
+    [
+        ({}, ("absent", ["coord.tar.gz", "coord.whl"])),
+        ({"coord.whl": "wheel"}, ("partial", ["coord.tar.gz"])),
+        (
+            {"coord.whl": "wheel", "coord.tar.gz": "sdist"},
+            ("exact", []),
+        ),
+    ],
+)
+def test_pypi_release_classifier_accepts_only_matching_subsets(
+    remote: dict[str, str],
+    expected: tuple[str, list[str]],
+) -> None:
+    local = {"coord.whl": "wheel", "coord.tar.gz": "sdist"}
+    assert classify_release(local, remote) == expected
+
+
+@pytest.mark.parametrize(
+    ("local", "remote"),
+    [
+        ({"coord.whl": "wheel"}, {"coord.whl": "different"}),
+        ({"coord.whl": "wheel"}, {"unexpected.whl": "other"}),
+        ({"../coord.whl": "wheel"}, {}),
+        ({}, {}),
+    ],
+)
+def test_pypi_release_classifier_rejects_unsafe_or_divergent_state(
+    local: dict[str, str],
+    remote: dict[str, str],
+) -> None:
+    with pytest.raises(ValueError):
+        classify_release(local, remote)
 
 
 def test_release_identity_commits_only_a_public_key() -> None:
@@ -255,6 +360,10 @@ def test_ci_and_deploy_docs_exercise_the_signed_multiarch_contract() -> None:
     assert "--platform linux/amd64,linux/arm64" in workflow
     assert "docker/buildkit-syft-scanner@sha256:" in workflow
     assert "scripts/verify_image_attestations.py" in workflow
+    assert workflow.count("scripts/verify_image_attestations.py") >= 2
+    assert workflow.count(
+        "--builder-id https://writhub.io/alexm/coord/builders/ci/v1"
+    ) >= 2
     assert "provenance: mode=max,builder-id=" in workflow
     assert "--provenance=mode=max,builder-id=" in workflow
     assert "go-containerregistry_Linux_x86_64.tar.gz" in workflow
@@ -265,12 +374,17 @@ def test_ci_and_deploy_docs_exercise_the_signed_multiarch_contract() -> None:
     assert "tonistiigi/binfmt:qemu-v10.2.3@sha256:" in release_workflow
     assert "tonistiigi/binfmt:latest" not in release_workflow
     assert "docker/buildkit-syft-scanner@sha256:" in release_workflow
+    assert "--builder-id \"$BUILDER_ID\"" in release_workflow
 
     assert docs.count("cosign verify") >= 2
     assert "cosign sign --yes" in docs
     assert "release/coord-release.pub" in docs
     assert "docker/buildkit-syft-scanner@sha256:" in docs
     assert "scripts/verify_image_attestations.py" in docs
+    assert (
+        "--builder-id "
+        "https://writhub.io/alexm/coord/builders/github-free-release/v1"
+    ) in docs
     assert "--provenance=mode=max,builder-id=" in docs
     assert docs.count("set -euo pipefail") >= 2
     assert "COORD_DERIVATIVE_CANDIDATE" in docs
@@ -285,7 +399,7 @@ def test_ci_and_deploy_docs_exercise_the_signed_multiarch_contract() -> None:
     assert "Never give the release process a\n   Vault root token" in release_docs
     assert "Revoke that token when the release finishes" in release_docs
     assert "crane 0.21.7 exactly" in release_docs
-    assert "failure therefore cannot publish\n" in release_docs
+    assert "failure therefore cannot publish" in release_docs
     assert "filename and SHA-256" in release_docs
     assert "github.com/amittell/coord/pkgs/container/coord" not in (
         REPO_ROOT / "README.md"
@@ -432,6 +546,7 @@ def test_attestation_verifier_requires_both_predicates_per_platform() -> None:
     verify_image_attestations(
         image,
         {"linux/amd64", "linux/arm64"},
+        builder_id=EXPECTED_BUILDER_ID,
         inspect_raw=manifests.__getitem__,
         fetch_blob=lambda reference, _insecure: blobs[reference],
     )
@@ -444,8 +559,44 @@ def test_attestation_verifier_requires_both_predicates_per_platform() -> None:
         verify_image_attestations(
             image,
             {"linux/amd64", "linux/arm64"},
+            builder_id=EXPECTED_BUILDER_ID,
             inspect_raw=manifests.__getitem__,
             fetch_blob=lambda reference, _insecure: blobs[reference],
+        )
+
+
+def test_attestation_verifier_rejects_unexpected_builder_identity() -> None:
+    image, manifests, blobs = _attested_index_fixture()
+    _rewrite_fixture_statement(
+        manifests,
+        blobs,
+        lambda statement: statement["predicate"]["runDetails"]["builder"].__setitem__(
+            "id",
+            "https://example.invalid/untrusted-builder",
+        ),
+        layer_index=1,
+    )
+
+    with pytest.raises(ValueError, match="builder id.*does not match expected"):
+        verify_image_attestations(
+            image,
+            {"linux/amd64", "linux/arm64"},
+            builder_id=EXPECTED_BUILDER_ID,
+            inspect_raw=manifests.__getitem__,
+            fetch_blob=lambda reference, _insecure: blobs[reference],
+        )
+
+
+def test_attestation_verifier_rehashes_top_level_index() -> None:
+    image, _manifests, _blobs = _attested_index_fixture()
+    raw_index = b'{"manifests":[]}'
+
+    with pytest.raises(ValueError, match="index content hashes to"):
+        verify_image_attestations(
+            image,
+            {"linux/amd64", "linux/arm64"},
+            builder_id=EXPECTED_BUILDER_ID,
+            inspect_raw=lambda _reference: raw_index,
         )
 
 
@@ -464,6 +615,7 @@ def test_attestation_verifier_rejects_annotation_payload_disagreement() -> None:
         verify_image_attestations(
             image,
             {"linux/amd64", "linux/arm64"},
+            builder_id=EXPECTED_BUILDER_ID,
             inspect_raw=manifests.__getitem__,
             fetch_blob=lambda reference, _insecure: blobs[reference],
         )
@@ -484,6 +636,7 @@ def test_attestation_verifier_rejects_mismatched_subject() -> None:
         verify_image_attestations(
             image,
             {"linux/amd64", "linux/arm64"},
+            builder_id=EXPECTED_BUILDER_ID,
             inspect_raw=manifests.__getitem__,
             fetch_blob=lambda reference, _insecure: blobs[reference],
         )
@@ -504,6 +657,7 @@ def test_attestation_verifier_rejects_wrong_statement_type() -> None:
         verify_image_attestations(
             image,
             {"linux/amd64", "linux/arm64"},
+            builder_id=EXPECTED_BUILDER_ID,
             inspect_raw=manifests.__getitem__,
             fetch_blob=lambda reference, _insecure: blobs[reference],
         )
@@ -524,6 +678,7 @@ def test_attestation_verifier_rejects_empty_predicates(layer_index: int) -> None
         verify_image_attestations(
             image,
             {"linux/amd64", "linux/arm64"},
+            builder_id=EXPECTED_BUILDER_ID,
             inspect_raw=manifests.__getitem__,
             fetch_blob=lambda reference, _insecure: blobs[reference],
         )
@@ -544,6 +699,7 @@ def test_attestation_verifier_rejects_malformed_or_corrupt_blob() -> None:
         verify_image_attestations(
             image,
             {"linux/amd64", "linux/arm64"},
+            builder_id=EXPECTED_BUILDER_ID,
             inspect_raw=manifests.__getitem__,
             fetch_blob=lambda value, _insecure: blobs[value],
         )
@@ -556,6 +712,7 @@ def test_attestation_verifier_rejects_malformed_or_corrupt_blob() -> None:
         verify_image_attestations(
             image,
             {"linux/amd64", "linux/arm64"},
+            builder_id=EXPECTED_BUILDER_ID,
             inspect_raw=manifests.__getitem__,
             fetch_blob=lambda value, _insecure: blobs[value],
         )

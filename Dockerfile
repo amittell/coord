@@ -14,21 +14,24 @@ WORKDIR /build
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Install pinned runtime dependencies first for better layer caching.
+# Install hash-locked build tools (including pip itself) and runtime
+# dependencies first for better layer caching. Every index artifact is
+# selected by exact version and SHA-256.
 # requirements-otel.txt bundles the OPTIONAL OpenTelemetry tracing stack so
 # COORD_OTEL_ENABLED can be toggled at runtime without rebuilding; drop that
 # -r for a slimmer, tracing-less image. The default production image remains
 # SQLite-only and deliberately does NOT install requirements-postgres.txt;
 # PostgreSQL operators build an explicit variant with that optional driver.
-COPY requirements.txt requirements-otel.txt /build/
-RUN pip install --upgrade pip && \
-    pip install -r /build/requirements.txt \
+COPY requirements-build.txt requirements-otel.txt /build/
+RUN pip install --require-hashes \
+        -r /build/requirements-build.txt \
         -r /build/requirements-otel.txt
 
-# Install the app itself with no deps - they are already pinned above.
+# Install the app itself with no dependencies or isolated index access: the
+# exact Hatchling backend and its dependencies are already hash-locked above.
 COPY pyproject.toml README.md /build/
 COPY coordination /build/coordination
-RUN pip install --no-deps .
+RUN pip install --no-deps --no-build-isolation .
 
 # --- Runtime stage: clean slim base, non-root user, app + venv copied in ---
 FROM python:3.14-slim@sha256:cea0e6040540fb2b965b6e7fb5ffa00871e632eef63719f0ea54bca189ce14a6 AS runtime
@@ -41,10 +44,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     COORD_PORT=8080
 
 # Install git so COORD_REPO_ROOT can use `git ls-files` for accurate overlap
-# detection. Keep the layer small by suppressing recommended packages and
-# discarding the apt cache.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends git \
+# detection. The digest-pinned base records its matching Debian snapshot in
+# debian.sources comments; make that immutable source explicit and pin git too.
+RUN sed -i \
+      -e 's|URIs: http://deb.debian.org/debian$|URIs: http://snapshot.debian.org/archive/debian/20260713T000000Z|' \
+      -e 's|URIs: http://deb.debian.org/debian-security$|URIs: http://snapshot.debian.org/archive/debian-security/20260713T000000Z|' \
+      /etc/apt/sources.list.d/debian.sources \
+    && apt-get -o Acquire::Check-Valid-Until=false update \
+    && apt-get install -y --no-install-recommends git=1:2.47.3-0+deb13u1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Create a non-root user and the data directory it will own.

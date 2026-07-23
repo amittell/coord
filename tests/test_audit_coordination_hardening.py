@@ -231,38 +231,60 @@ class TestMigrationScriptSchemaLockstep:
         )
 
 
-class TestReleaseWorkflowDispatchGuard:
+class TestReleaseWorkflowPublicationFence:
     def _workflow(self) -> dict:
         raw = (REPO_ROOT / ".github" / "workflows" / "release.yml").read_text(
             encoding="utf-8"
         )
         return yaml.safe_load(raw)
 
-    def test_overwrite_input_defined(self) -> None:
+    def test_overwrite_escape_hatch_is_removed_and_publishers_are_serialized(
+        self,
+    ) -> None:
         workflow = self._workflow()
         # PyYAML parses the bare `on` key as boolean True.
         triggers = workflow.get("on") or workflow.get(True)
+        assert set(triggers) == {"workflow_dispatch"}
         inputs = triggers["workflow_dispatch"]["inputs"]
-        assert "overwrite" in inputs
-        assert inputs["overwrite"]["type"] == "boolean"
-        assert inputs["overwrite"].get("default") is False
+        assert "overwrite" not in inputs
+        concurrency = workflow["concurrency"]
+        assert concurrency["group"] == "${{ github.workflow }}-candidate-publisher"
+        assert concurrency["cancel-in-progress"] is False
 
-    def test_guard_step_refuses_existing_tag_on_dispatch(self) -> None:
+    def test_candidate_is_authenticated_without_an_official_promotion(self) -> None:
         workflow = self._workflow()
         steps = workflow["jobs"]["publish-image"]["steps"]
-        guards = [
+        guard = next(
             step
             for step in steps
-            if "imagetools inspect" in str(step.get("run") or "")
-        ]
-        assert len(guards) == 1, (
-            "release.yml must carry exactly one registry-tag republish guard"
+            if step.get("name") == "Refuse to republish an existing candidate tag"
         )
-        guard = guards[0]
-        condition = str(guard.get("if") or "")
-        assert "workflow_dispatch" in condition
-        assert "inputs.overwrite != true" in condition
+        assert 'crane digest "$CANDIDATE"' in guard["run"]
         assert "exit 1" in guard["run"]
+        candidate = next(
+            step for step in steps if step.get("name") == "Compose candidate image tag"
+        )
+        assert "candidate-${VERSION}-${COMMIT_SHA:0:12}" in candidate["run"]
+
+        step_names = [str(step.get("name") or "") for step in steps]
+        build = step_names.index("Build and push image")
+        verify_attestations = step_names.index(
+            "Verify both platform SBOM and provenance attestations"
+        )
+        verify_signature = step_names.index(
+            "Sign and verify candidate digest with workflow identity"
+        )
+        assert build < verify_attestations < verify_signature
+        assert "--builder-id \"$BUILDER_ID\"" in steps[verify_attestations]["run"]
+        assert all("crane tag" not in str(step.get("run") or "") for step in steps)
+        assert workflow["jobs"]["publish-pypi"]["if"] == (
+            "github.event_name == 'push'"
+        )
+        assert workflow["jobs"]["bump-manifest"]["if"] == (
+            "github.event_name == 'push'"
+        )
+        assert "SKIP_SIGNING" not in str(workflow)
+        assert "git push origin \"${VERSION}\" --force" not in str(workflow)
 
     @pytest.mark.skipif(
         os.name == "nt",
@@ -272,16 +294,12 @@ class TestReleaseWorkflowDispatchGuard:
         ("mode", "expected_returncode", "expected_output"),
         [
             ("existing", 1, "already exists in the registry"),
-            ("missing", 0, "not present in the registry"),
-            ("missing-manifest", 0, "not present in the registry"),
-            ("missing-code", 0, "not present in the registry"),
-            ("ambiguous-missing", 1, "refusing to publish"),
-            ("transient", 1, "refusing to publish"),
-            ("auth", 1, "refusing to publish"),
-            ("server", 1, "refusing to publish"),
+            ("missing", 0, ""),
+            ("transient", 1, "could not prove"),
+            ("auth", 1, "could not prove"),
         ],
     )
-    def test_guard_fails_closed_except_for_specific_missing_manifest(
+    def test_initial_guard_fails_closed_except_for_manifest_unknown(
         self,
         tmp_path: Path,
         mode: str,
@@ -293,32 +311,20 @@ class TestReleaseWorkflowDispatchGuard:
         guard = next(
             step
             for step in steps
-            if "imagetools inspect" in str(step.get("run") or "")
+            if step.get("name") == "Refuse to republish an existing candidate tag"
         )
 
         fake_bin = tmp_path / "bin"
         fake_bin.mkdir()
-        fake_docker = fake_bin / "docker"
-        fake_docker.write_text(
+        fake_crane = fake_bin / "crane"
+        fake_crane.write_text(
             """#!/bin/sh
-case "$FAKE_DOCKER_MODE" in
+case "$FAKE_CRANE_MODE" in
   existing)
     exit 0
     ;;
   missing)
-    echo 'ERROR: ghcr.io/octo/coord:v1: not found' >&2
-    exit 1
-    ;;
-  missing-manifest)
-    echo 'ERROR: manifest unknown: manifest unknown' >&2
-    exit 1
-    ;;
-  missing-code)
     echo '{"errors":[{"code":"MANIFEST_UNKNOWN"}]}' >&2
-    exit 1
-    ;;
-  ambiguous-missing)
-    echo 'ERROR: registry endpoint: not found' >&2
     exit 1
     ;;
   transient)
@@ -329,23 +335,18 @@ case "$FAKE_DOCKER_MODE" in
     echo 'ERROR: unexpected status from HEAD request: 401 Unauthorized' >&2
     exit 1
     ;;
-  server)
-    echo 'ERROR: unexpected status from HEAD request: 503 Service Unavailable' >&2
-    exit 1
-    ;;
 esac
 exit 2
 """,
             encoding="utf-8",
         )
-        fake_docker.chmod(0o755)
+        fake_crane.chmod(0o755)
 
         env = os.environ.copy()
         env.update(
             {
-                "FAKE_DOCKER_MODE": mode,
-                "IMAGE": "ghcr.io/octo/coord",
-                "VERSION": "v1",
+                "FAKE_CRANE_MODE": mode,
+                "CANDIDATE": "ghcr.io/octo/coord:candidate-v1-deadbeef",
                 "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
             }
         )
@@ -494,6 +495,20 @@ class TestCiMatrixCoversClassifiers:
                 for job in workflow["jobs"].values()
             )
 
+    def test_ci_invokes_pytest_as_a_module_from_repo_root(self) -> None:
+        offenders: list[str] = []
+        for workflow_name in ("ci.yml", "compatibility.yml", "postgres.yml"):
+            workflow = self._workflow(workflow_name)
+            for job_name, job in workflow["jobs"].items():
+                for step in job.get("steps", []):
+                    command = str(step.get("run") or "")
+                    if re.search(r"(?m)^\s*pytest\b", command):
+                        offenders.append(f"{workflow_name}:{job_name}")
+        assert not offenders, (
+            "bare pytest can omit the repository root from sys.path and "
+            f"break imports from scripts/: {offenders}"
+        )
+
     def test_postgres_path_gate_has_no_stale_explicit_paths(self) -> None:
         postgres = self._workflow("postgres.yml")
         triggers = postgres.get("on") or postgres.get(True)
@@ -518,4 +533,7 @@ class TestCiMatrixCoversClassifiers:
             "./.github/workflows/postgres.yml"
         )
         assert jobs["publish-image"]["needs"] == "postgres-gate"
-        assert jobs["publish-pypi"]["needs"] == "postgres-gate"
+        assert jobs["publish-pypi"]["needs"] == [
+            "postgres-gate",
+            "publish-image",
+        ]

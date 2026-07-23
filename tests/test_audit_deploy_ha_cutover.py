@@ -43,14 +43,18 @@ REQ_POSTGRES = REPO_ROOT / "requirements-postgres.txt"
 def test_requirements_postgres_pins_asyncpg() -> None:
     text = REQ_POSTGRES.read_text(encoding="utf-8")
     pins = [
-        line.strip()
+        line.strip().removesuffix("\\").strip()
         for line in text.splitlines()
-        if line.strip() and not line.strip().startswith("#")
+        if line.strip()
+        and not line.strip().startswith(("#", "--hash="))
     ]
     assert any(re.fullmatch(r"asyncpg==\d+\.\d+(\.\d+)?", p) for p in pins), (
         "requirements-postgres.txt must pin asyncpg exactly (asyncpg==X.Y.Z); "
         f"got {pins!r}. Explicit PostgreSQL builds need a reproducible driver "
         "layer even though the default image does not install it."
+    )
+    assert "--hash=sha256:" in text, (
+        "requirements-postgres.txt must hash-lock every asyncpg distribution"
     )
 
 

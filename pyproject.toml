@@ -115,7 +115,7 @@ Issues = "https://github.com/amittell/coord/issues"
 Documentation = "https://github.com/amittell/coord/tree/main/docs"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.31.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]

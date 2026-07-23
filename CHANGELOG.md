@@ -9,6 +9,33 @@ Semantic Versioning.
 
 ## [0.49.0] - 2026-07-23
 
+### Changed
+
+- The canonical production container moved from the retired
+  `ghcr.io/amittell/coord` path to `whcr.io/alexm/coord`. Official images are
+  now signed by the repository release identity
+  (`release/coord-release.pub`) through the Vault-backed GitHub-free release
+  path. The GitHub Actions release workflow is manual candidate validation
+  only: it has no tag trigger and cannot publish an official image tag, PyPI
+  artifact, GitHub Release, or production manifest change.
+- Release images now use digest-pinned Dockerfile frontends, Python bases,
+  QEMU/binfmt, and SBOM generators; immutable Debian snapshot repositories;
+  exact system-package versions; and hash-complete Python runtime, optional,
+  PostgreSQL, and build-backend locks. Package builds use the locked backend
+  without build isolation. The release script now selects and enforces Python
+  3.11+ instead of accidentally using macOS `/usr/bin/python3` 3.9; operators
+  may set `COORD_RELEASE_PYTHON` explicitly.
+- Image attestation verification now rehashes the top-level OCI index and
+  every in-toto blob, requires the exact release-path builder identity, and
+  verifies both SPDX 2.3 SBOM and SLSA provenance predicates for every
+  required platform. CI exercises this contract for both the base and
+  PostgreSQL derivative images.
+- Official release publication is create-only across WritHub, the registry,
+  and PyPI: an immutable git release-lock tag binds the source commit,
+  registry tag absence is proved again immediately before promotion, and a
+  partial PyPI upload resumes only when every existing filename and SHA-256
+  matches the locally rebuilt artifact set.
+
 ### Fixed
 
 - Claude Code SessionEnd cleanup now uses the hook payload's stable
@@ -2134,3 +2161,6 @@ The hook redesign was prompted by an agent in astrowars rewriting the hook on it
 ### Added
 
 - Initial release.
+
+[Unreleased]: https://github.com/amittell/coord/compare/v0.49.0...HEAD
+[0.49.0]: https://github.com/amittell/coord/compare/v0.48.1...v0.49.0

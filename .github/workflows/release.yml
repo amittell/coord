@@ -1,34 +1,27 @@
-name: release
+name: release candidate validation
 
 on:
-  push:
-    tags:
-      - "v*"
-  # Manual trigger so maintainers can push a tagged image without cutting
-  # a real git tag (handy for release candidates or rebuilding an old tag).
+  # The authoritative publisher is scripts/release.sh, backed by the
+  # repository's committed release key and immutable WritHub release lock.
+  # GitHub Actions intentionally has no tag trigger and cannot publish an
+  # official image tag, PyPI artifact, GitHub Release, or deployment bump.
   workflow_dispatch:
     inputs:
       version:
-        description: "Image version tag (e.g. v0.1.0-rc1). Used as the image tag; :latest is NOT pushed on manual runs."
+        description: "Candidate label (e.g. v0.49.0-review1); never promoted to an official tag."
         required: true
         type: string
-      overwrite:
-        description: "Republish over an existing image tag. Off by default: a dispatch whose tag already exists in the registry fails instead of silently replacing the published bits."
-        required: false
-        type: boolean
-        default: false
 
 permissions:
-  contents: write       # needed for softprops/action-gh-release on tag pushes
-  packages: write       # needed to push to GHCR
-  id-token: write       # needed for build provenance attestation (SLSA)
-  attestations: write   # needed for actions/attest-build-provenance
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
 
-# Never cancel an in-flight release: a half-pushed multi-arch image is worse
-# than a short queue. Grouping by workflow+ref keeps two tag pushes from
-# racing each other for the same ref.
+# Serialize candidate labels because registry tag creation is not an atomic
+# create-if-absent operation.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-candidate-publisher
   cancel-in-progress: false
 
 # Registry and repo name are overridable via repo/org Actions variables so
@@ -42,6 +35,7 @@ concurrency:
 env:
   REGISTRY: ${{ vars.IMAGE_REGISTRY || 'ghcr.io' }}
   IMAGE_REPO: ${{ vars.IMAGE_REPO || format('{0}/coord', github.repository_owner) }}
+  BUILDER_ID: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
 jobs:
   # A release is the final point at which dormant-but-supported PostgreSQL
@@ -52,7 +46,7 @@ jobs:
     uses: ./.github/workflows/postgres.yml
 
   publish-image:
-    name: Build and push container image
+    name: Build, authenticate, and retain candidate image
     needs: postgres-gate
     runs-on: ubuntu-latest
     env:
@@ -90,88 +84,63 @@ jobs:
           lower=$(printf '%s' "$RAW_IMAGE" | tr '[:upper:]' '[:lower:]')
           echo "name=$lower" >> "$GITHUB_OUTPUT"
 
-      # Resolve the image version tag.
-      #  - tag push:           use github.ref_name (e.g. v0.1.0)
-      #  - workflow_dispatch:  use the user-supplied inputs.version
-      - name: Resolve version tag
+      - name: Resolve candidate label
         id: version
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          REF_NAME: ${{ github.ref_name }}
           INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            tag="$INPUT_VERSION"
-          else
-            tag="$REF_NAME"
-          fi
+          tag="$INPUT_VERSION"
           if [ -z "$tag" ]; then
-            echo "::error::could not resolve image version tag" >&2
+            echo "::error::could not resolve candidate label" >&2
             exit 1
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-      # Republish guard for manual dispatches. A dispatch takes its image
-      # tag verbatim from inputs.version with no tie to pyproject.toml or a
-      # git tag, so dispatching an already-released version would push new
-      # bits (built from whatever ref was selected) over the existing
-      # registry tag. Digest-pinned consumers are unaffected, but anyone
-      # consuming the plain version tag (the GitHub Release body advertises
-      # image:tag; the ha-cutover repin instruction is tag-oriented) would
-      # silently get different code under the same version. Fail fast when
-      # the tag already exists unless the operator explicitly opted in via
-      # the overwrite input. Runs after the registry login above so private
-      # registries resolve. Inspect failures are ambiguous (missing manifest,
-      # auth, DNS, rate limit, or registry outage), so only recognized
-      # manifest-not-found responses are safe to publish; everything else
-      # fails closed.
-      - name: Refuse to republish an existing image tag (manual dispatch)
-        if: github.event_name == 'workflow_dispatch' && inputs.overwrite != true
-        env:
-          IMAGE: ${{ steps.image.outputs.name }}
-          VERSION: ${{ steps.version.outputs.tag }}
+      - name: Install pinned crane for fail-closed tag checks
+        shell: bash
         run: |
-          inspect_error="$(mktemp)"
-          trap 'rm -f "$inspect_error"' EXIT
+          archive="$RUNNER_TEMP/go-containerregistry_Linux_x86_64.tar.gz"
+          curl --fail --location --retry 3 \
+            --output "$archive" \
+            https://github.com/google/go-containerregistry/releases/download/v0.21.7/go-containerregistry_Linux_x86_64.tar.gz
+          printf '%s  %s\n' \
+            1a57bc98207fa1c0d04bf760699099e26f8383499bfd55b99c1b919a928a7230 \
+            "$archive" \
+            | sha256sum --check -
+          tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP" crane
+          test "$("$RUNNER_TEMP/crane" version)" = "0.21.7"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
 
-          if docker buildx imagetools inspect "${IMAGE}:${VERSION}" >/dev/null 2>"$inspect_error"; then
-            echo "::error::${IMAGE}:${VERSION} already exists in the registry; re-run with overwrite=true to intentionally replace it" >&2
-            exit 1
-          else
-            inspect_status=$?
-          fi
-
-          inspect_message="$(cat "$inspect_error")"
-          if printf '%s\n' "$inspect_message" | grep -Eq '"code"[[:space:]]*:[[:space:]]*"(MANIFEST_UNKNOWN|NAME_UNKNOWN)"' || \
-             printf '%s\n' "$inspect_message" | grep -Eiq '(^|[^[:alnum:]])(manifest|name)[[:space:]]+unknown([^[:alnum:]]|$)' || \
-             printf '%s\n' "$inspect_message" | grep -Fq -- "${IMAGE}:${VERSION}: not found"; then
-            echo "${IMAGE}:${VERSION} not present in the registry; safe to publish."
-            exit 0
-          fi
-
-          echo "::error::could not verify whether ${IMAGE}:${VERSION} exists; refusing to publish" >&2
-          printf '%s\n' "$inspect_message" >&2
-          exit "$inspect_status"
-
-      # Build the tag list.
-      #  - tag push:           push both :<version> and :latest
-      #  - workflow_dispatch:  push ONLY :<version> so we do not clobber
-      #                        the production :latest pointer with an rc.
-      - name: Compose image tags
+      - name: Compose candidate image tag
         id: tags
         env:
-          EVENT_NAME: ${{ github.event_name }}
           IMAGE: ${{ steps.image.outputs.name }}
           VERSION: ${{ steps.version.outputs.tag }}
+          COMMIT_SHA: ${{ github.sha }}
         run: |
           {
             echo 'tags<<EOF'
-            echo "${IMAGE}:${VERSION}"
-            if [ "$EVENT_NAME" != "workflow_dispatch" ]; then
-              echo "${IMAGE}:latest"
-            fi
+            echo "${IMAGE}:candidate-${VERSION}-${COMMIT_SHA:0:12}"
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
+
+      # Candidate writes are create-only too. Authentication, transport, and
+      # server failures are not evidence that the tag is absent.
+      - name: Refuse to republish an existing candidate tag
+        env:
+          CANDIDATE: ${{ steps.tags.outputs.tags }}
+        run: |
+          probe_error="$(mktemp)"
+          trap 'rm -f "$probe_error"' EXIT
+          if crane digest "$CANDIDATE" >/dev/null 2>"$probe_error"; then
+            echo "::error::$CANDIDATE already exists in the registry" >&2
+            exit 1
+          fi
+          if ! grep -Fq "MANIFEST_UNKNOWN" "$probe_error"; then
+            cat "$probe_error" >&2
+            echo "::error::could not prove $CANDIDATE is absent" >&2
+            exit 1
+          fi
 
       # BuildKit-native supply-chain signals:
       #  - sbom: true emits an SPDX SBOM as an attestation attached to the
@@ -191,7 +160,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.tags.outputs.tags }}
           sbom: generator=docker.io/docker/buildkit-syft-scanner@sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68
-          provenance: mode=max
+          provenance: mode=max,builder-id=${{ env.BUILDER_ID }}
 
       # Emit an SLSA build provenance attestation for the pushed image.
       # Consumers can verify supply-chain integrity with `gh attestation verify`.
@@ -210,70 +179,50 @@ jobs:
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
 
-      # Install cosign for keyless signing. The installer fetches a fixed
-      # cosign CLI release and puts it on PATH. Pinned by SHA per the
-      # project's third-party action pinning policy.
-      #
-      # Each of the four supply-chain signals (buildkit-sbom, buildkit-
-      # provenance, attest-build-provenance, cosign) is independent. We
-      # guard cosign with `always() && SKIP_SIGNING != true` so a failure
-      # in an earlier signal (e.g. attest-build-provenance on a private
-      # user-owned repo) does not cascade-skip the remaining signals.
+      - name: Verify both platform SBOM and provenance attestations
+        env:
+          IMAGE_AND_DIGEST: "${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}"
+        run: |
+          python3 scripts/verify_image_attestations.py \
+            --image "$IMAGE_AND_DIGEST" \
+            --builder-id "$BUILDER_ID" \
+            --platform linux/amd64 \
+            --platform linux/arm64
+
+      # Candidate authentication never has an unsigned escape hatch. This
+      # keyless identity is deliberately candidate-only; official releases
+      # use release/coord-release.pub through scripts/release.sh.
       - name: Install cosign
-        if: ${{ always() && vars.SKIP_SIGNING != 'true' && steps.build.outputs.digest != '' }}
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2
         with:
           cosign-release: "v3.0.6"
 
-      # Sign the pushed image with cosign in keyless mode. The signature
-      # is issued against this workflow's OIDC identity (no private keys
-      # stored anywhere) and uploaded to the Rekor transparency log.
-      # Consumers verify with `cosign verify --certificate-identity-regexp
-      # '^https://github.com/<owner>/<repo>/.github/workflows/release.yml@'
-      # --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
-      # <image>@<digest>`. Gated behind SKIP_SIGNING=true for operators on
-      # networks that cannot reach the Sigstore public good instance.
-      - name: Sign image with cosign (keyless)
-        if: ${{ always() && vars.SKIP_SIGNING != 'true' && steps.build.outputs.digest != '' }}
+      - name: Sign and verify candidate digest with workflow identity
         env:
           COSIGN_EXPERIMENTAL: "1"
           IMAGE_AND_DIGEST: "${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}"
+          EXPECTED_IDENTITY: "https://github.com/${{ github.workflow_ref }}"
         run: |
           cosign sign --yes "${IMAGE_AND_DIGEST}"
+          cosign verify \
+            --certificate-identity "$EXPECTED_IDENTITY" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "$IMAGE_AND_DIGEST" >/dev/null
 
-      # Create a GitHub Release with auto-generated notes, only for real
-      # tag pushes. Skipped on workflow_dispatch since there is no tag to
-      # attach the release to.
-      - name: Create GitHub Release
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b  # v3.0.1
-        with:
-          generate_release_notes: true
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
-          body: |
-            Container image: `${{ steps.image.outputs.name }}:${{ steps.version.outputs.tag }}`
-            Digest: `${{ steps.build.outputs.digest }}`
-
-  # Publish the Python package to PyPI via OIDC trusted publishing.
-  # No API tokens stored in repo secrets -- pypa/gh-action-pypi-publish
-  # exchanges this workflow's GitHub OIDC identity for a short-lived
-  # PyPI token at publish time. Requires a pending publisher registered
-  # at https://pypi.org/manage/account/publishing/ before the first
-  # publish succeeds; bootstrap via:
+  # Disabled historical PyPI publisher. It stays visible while operators
+  # remove the old GitHub trusted-publisher registration, but cannot run.
   #   project name = coord-mcp-server
   #   owner        = amittell
   #   repo         = coord
   #   workflow     = release.yml
   #   environment  = pypi
-  #
-  # Tag pushes publish to PyPI; workflow_dispatch publishes nothing
-  # (no version bump means no new artifact to upload).
   publish-pypi:
     name: Publish Python package to PyPI
-    needs: postgres-gate
+    needs: [postgres-gate, publish-image]
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    # Historical implementation retained for operator reference only. The
+    # authoritative scripts/release.sh path owns PyPI publication.
+    if: github.event_name == 'push'
     environment:
       name: pypi
       url: https://pypi.org/p/coord-mcp-server
@@ -287,10 +236,10 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
         with:
-          python-version: "3.12"
+          python-version: "3.14"
 
-      - name: Install build backend
-        run: python -m pip install --upgrade build
+      - name: Install hash-locked build frontend and backend
+        run: python -m pip install --require-hashes -r requirements-build.txt
 
       - name: Verify tag matches pyproject version
         env:
@@ -305,31 +254,61 @@ jobs:
           echo "Version match: $pyproject_version == $tag_version"
 
       - name: Build sdist + wheel
-        run: python -m build
+        run: |
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          export SOURCE_DATE_EPOCH
+          python -m build --no-isolation
+
+      - name: Classify existing PyPI release
+        id: pypi-state
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          result="$(
+            python scripts/check_pypi_release.py \
+              --project coord-mcp-server \
+              --version "${VERSION#v}" \
+              --dist-dir dist
+          )"
+          echo "result=$result" >> "$GITHUB_OUTPUT"
+          echo "state=${result%%|*}" >> "$GITHUB_OUTPUT"
 
       - name: Publish to PyPI
+        if: steps.pypi-state.outputs.state != 'exact'
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b  # v1.13.0
         with:
           # Trusted publisher exchange happens automatically when the
           # workflow's OIDC token is presented to PyPI; no api token needed.
-          # Skip-existing handles re-runs of an already-published version
-          # gracefully.
+          # The preceding classifier proved any existing files are an exact
+          # local subset, so skip-existing resumes only that safe state.
           skip-existing: true
 
-  # After a real tag push, rewrite deploy/k8s/prod/deployment.yaml so the
-  # kebabrack live overlay picks up the image we just built. Without this
-  # job the manifest drifts behind every release and ArgoCD keeps pinning
-  # the cluster to whatever version a human last hand-edited. See
-  # docs/design/roadmap.md "v0.28.1" for the original gap (a 14-version
-  # drift between v0.13.0 and v0.28.0).
-  #
-  # Skipped on workflow_dispatch: manual rebuilds and release candidates
-  # should never silently flip production.
+      - name: Verify complete exact PyPI artifact set
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+            result="$(
+              python scripts/check_pypi_release.py \
+                --project coord-mcp-server \
+                --version "${VERSION#v}" \
+                --dist-dir dist
+            )"
+            [ "$result" = "exact" ] && exit 0
+            [ "$attempt" -eq 5 ] || sleep 2
+          done
+          echo "::error::PyPI did not converge to the exact complete artifact set: $result" >&2
+          exit 1
+
+  # Disabled historical manifest publisher. Production promotion is owned by
+  # the GitOps release train, never by this candidate validation workflow.
   bump-manifest:
     name: Bump prod deployment manifest
     runs-on: ubuntu-latest
     needs: publish-image
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    # Production promotion is GitOps-owned and never runs from this candidate
+    # validation workflow.
+    if: github.event_name == 'push'
     permissions:
       contents: write
     steps:
@@ -382,7 +361,7 @@ jobs:
           print(f"updated {manifest} -> {target}")
           PY
 
-      - name: Commit, push, and retag at the deployment-ready commit
+      - name: Commit and push deployment manifest
         env:
           VERSION: ${{ needs.publish-image.outputs.version-tag }}
           DIGEST: ${{ needs.publish-image.outputs.image-digest }}
@@ -400,10 +379,8 @@ jobs:
           git add deploy/k8s/prod/deployment.yaml
           # `[skip ci]` in the commit message is a GitHub Actions
           # convention: any workflow triggered by this push is skipped.
-          # release.yml only triggers on tag pushes (and the moved
-          # tag below is pushed by GITHUB_TOKEN, which GitHub
-          # documents as NOT triggering downstream workflows), but
-          # ci.yml would otherwise run a full test matrix on a
+          # release.yml only triggers on tag pushes, but ci.yml would
+          # otherwise run a full test matrix on a
           # one-line manifest change. ArgoCD watches git directly
           # and reconciles regardless of CI status.
           git commit \
@@ -416,43 +393,3 @@ jobs:
           # the operator instead of silently leaving the manifest behind.
           git pull --rebase origin main
           git push origin HEAD:main
-
-          # Move the version tag forward to this new commit.
-          #
-          # When the maintainer pushes a tag locally, the tag points
-          # at the commit that bumped pyproject.toml + CHANGELOG --
-          # but the manifest in that commit still pins the PREVIOUS
-          # image. After this job runs, main carries a manifest pin
-          # to the new image. Without this retag, ``git describe HEAD``
-          # would keep resolving to the previous version tag (because
-          # the maintainer's tagged commit is on a now-orphan branch
-          # after the rebase above) and the tag's tree would describe
-          # an outdated deployment state.
-          #
-          # We move the tag forward to the bot's just-committed
-          # commit, which has:
-          #   1. the new pyproject + CHANGELOG (from the rebased
-          #      commit it sits on top of)
-          #   2. the manifest pinned to the freshly-published image
-          # That commit IS the deployment-ready snapshot, and is
-          # what ``git checkout vX.Y.Z`` should land on.
-          #
-          # Image artefacts (the cosigned image digest, the BuildKit
-          # + GitHub provenance attestations, the GitHub Release
-          # body, the PyPI wheel) are all keyed off the IMAGE digest,
-          # not the git ref -- moving the tag does not invalidate any
-          # of them. The GitHub Release page's "Tagged at" timestamp
-          # and commit link update to the new commit, which is the
-          # intended outcome.
-          #
-          # The force-push uses ``GITHUB_TOKEN`` (the workflow's
-          # default token), and GitHub guarantees pushes made by that
-          # token do not trigger workflows -- so the retag does not
-          # recursively re-run release.yml. See:
-          # https://docs.github.com/en/actions/security-guides/automatic-token-authentication
-          # ("When you use the repository's GITHUB_TOKEN ... events ...
-          # will not create a new workflow run.")
-          git tag -f -a "${VERSION}" \
-            -m "${VERSION} (deployment-ready commit; manifest pins ${DIGEST})" \
-            HEAD
-          git push origin "${VERSION}" --force
