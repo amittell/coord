@@ -163,9 +163,11 @@ COORD_BASE_TAG='vX.Y.Z'
 COORD_BASE_DIGEST="$(
   docker buildx imagetools inspect \
     "$COORD_BASE_REPOSITORY:$COORD_BASE_TAG" \
-    --format '{{json .Manifest}}' \
-    | python3 -c 'import json, sys; print(json.load(sys.stdin)["digest"])'
+    --raw \
+    | python3 -c 'import hashlib, sys; print("sha256:" + hashlib.sha256(sys.stdin.buffer.read()).hexdigest())'
 )"
+printf '%s\n' "$COORD_BASE_DIGEST" \
+  | grep -Eq '^sha256:[0-9a-f]{64}$'
 cosign verify \
   --key release/coord-release.pub \
   "$COORD_BASE_REPOSITORY@$COORD_BASE_DIGEST" >/dev/null
@@ -190,7 +192,7 @@ docker buildx build \
   --build-arg "COORD_BASE_REPOSITORY=$COORD_BASE_REPOSITORY" \
   --build-arg "COORD_BASE_DIGEST=${COORD_BASE_DIGEST#sha256:}" \
   --tag "$COORD_DERIVATIVE" \
-  --sbom=true \
+  --attest=type=sbom,generator=docker.io/docker/buildkit-syft-scanner@sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68 \
   --provenance=mode=max \
   --metadata-file "$metadata_file" \
   --push .
@@ -200,6 +202,10 @@ COORD_DERIVATIVE_DIGEST="$(
 )"
 docker buildx imagetools inspect \
   "$COORD_DERIVATIVE@$COORD_DERIVATIVE_DIGEST"
+python3 scripts/verify_image_attestations.py \
+  --image "$COORD_DERIVATIVE@$COORD_DERIVATIVE_DIGEST" \
+  --platform linux/amd64 \
+  --platform linux/arm64
 cosign sign --yes \
   --key "$COSIGN_SIGNING_KEY" \
   "$COORD_DERIVATIVE@$COORD_DERIVATIVE_DIGEST"

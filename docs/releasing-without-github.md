@@ -62,8 +62,10 @@ scripts/release.sh --publish    # uploads PyPI + pushes image + tags writhub
 
 The canonical image is `whcr.io/alexm/coord:vX.Y.Z`. The script publishes one
 multi-platform index with BuildKit SBOM and maximum provenance attestations,
-signs the immutable index digest through Vault, verifies it with the committed
-public key, and writes the authenticated reference to
+checks that every platform has both linked predicates, signs the immutable index
+digest through Vault, verifies it against the literal committed public key (the
+official release path has no public-key override), and writes the authenticated
+reference to
 `dist/coord-vX.Y.Z-image-digest.txt`.
 
 Deployment manifests are owned by each downstream cluster, not this

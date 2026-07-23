@@ -35,6 +35,8 @@ import re
 import tomllib
 from pathlib import Path
 
+import pytest
+
 from coordination.assets import PRE_PUSH_SCRIPT
 from coordination.cli_init import (
     PLACEHOLDER_API_URL,
@@ -44,6 +46,7 @@ from coordination.cli_init import (
     _update_mcp_json,
 )
 from coordination.mcp_server import _PLACEHOLDER_VALUES
+from scripts.verify_image_attestations import verify_image_attestations
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATES = REPO_ROOT / "templates"
@@ -54,6 +57,7 @@ MCP_JSON_TEMPLATES = (
 )
 CODEX_TEMPLATE = TEMPLATES / ".codex" / "config.toml.example"
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+RELEASE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "release.yml"
 DEPLOYMENT_DOC = REPO_ROOT / "docs" / "deployment.md"
 GITHUB_FREE_RELEASE_DOC = REPO_ROOT / "docs" / "releasing-without-github.md"
 RELEASE_SCRIPT = REPO_ROOT / "scripts" / "release.sh"
@@ -183,18 +187,22 @@ def test_github_free_release_is_attested_signed_and_verified() -> None:
     script = RELEASE_SCRIPT.read_text(encoding="utf-8")
     for required in (
         "--platform \"${PLATFORMS}\"",
-        "--sbom=true",
+        '--attest="type=sbom,generator=${SBOM_GENERATOR}"',
         "--provenance=mode=max",
         "--metadata-file \"$image_metadata\"",
+        "scripts/verify_image_attestations.py",
         "cosign sign --yes --key",
         "cosign verify",
         "release/coord-release.pub",
         "dist/coord-${TAG}-image-digest.txt",
+        'COSIGN_MIN_VERSION="3.0.6"',
     ):
         assert required in script, (
             f"scripts/release.sh lost required supply-chain fence {required!r}"
         )
     assert "COSIGN_SIGNING_KEY" in script
+    assert 'COSIGN_PUBLIC_KEY="release/coord-release.pub"' in script
+    assert "${COSIGN_PUBLIC_KEY:-" not in script
     assert re.search(r"sha256:\[0-9a-f\]\{64\}", script)
 
 
@@ -212,6 +220,7 @@ def test_release_identity_commits_only_a_public_key() -> None:
 
 def test_ci_and_deploy_docs_exercise_the_signed_multiarch_contract() -> None:
     workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+    release_workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
     docs = DEPLOYMENT_DOC.read_text(encoding="utf-8")
     release_docs = GITHUB_FREE_RELEASE_DOC.read_text(encoding="utf-8")
 
@@ -220,14 +229,122 @@ def test_ci_and_deploy_docs_exercise_the_signed_multiarch_contract() -> None:
     assert "docker image inspect coord:ci" not in workflow
     assert workflow.count("platforms: linux/amd64,linux/arm64") >= 1
     assert "--platform linux/amd64,linux/arm64" in workflow
-    assert "--sbom=true" in workflow
+    assert "docker/buildkit-syft-scanner@sha256:" in workflow
+    assert "scripts/verify_image_attestations.py" in workflow
     assert "--provenance=mode=max" in workflow
+    assert "tonistiigi/binfmt:qemu-v10.2.3@sha256:" in workflow
+    assert "tonistiigi/binfmt:latest" not in workflow
+    assert "tonistiigi/binfmt:qemu-v10.2.3@sha256:" in release_workflow
+    assert "tonistiigi/binfmt:latest" not in release_workflow
+    assert "docker/buildkit-syft-scanner@sha256:" in release_workflow
 
     assert docs.count("cosign verify") >= 2
     assert "cosign sign --yes" in docs
     assert "release/coord-release.pub" in docs
-    assert "--sbom=true" in docs
+    assert "docker/buildkit-syft-scanner@sha256:" in docs
+    assert "scripts/verify_image_attestations.py" in docs
     assert "--provenance=mode=max" in docs
     assert 'path "transit/sign/coord-release/*"' in release_docs
     assert "Never give the release process a\n   Vault root token" in release_docs
     assert "Revoke that token when the release finishes" in release_docs
+
+
+def _attested_index_fixture() -> tuple[str, dict[str, dict[str, object]]]:
+    repository = "registry.example/coord"
+    index_digest = "sha256:" + "0" * 64
+    amd64_digest = "sha256:" + "1" * 64
+    arm64_digest = "sha256:" + "2" * 64
+    amd64_attestation = "sha256:" + "3" * 64
+    arm64_attestation = "sha256:" + "4" * 64
+
+    def platform(digest: str, architecture: str) -> dict[str, object]:
+        return {
+            "digest": digest,
+            "platform": {"os": "linux", "architecture": architecture},
+        }
+
+    def link(subject: str, digest: str) -> dict[str, object]:
+        return {
+            "digest": digest,
+            "platform": {"os": "unknown", "architecture": "unknown"},
+            "annotations": {
+                "vnd.docker.reference.type": "attestation-manifest",
+                "vnd.docker.reference.digest": subject,
+            },
+        }
+
+    def predicates() -> dict[str, object]:
+        return {
+            "layers": [
+                {
+                    "mediaType": "application/vnd.in-toto+json",
+                    "annotations": {
+                        "in-toto.io/predicate-type": "https://spdx.dev/Document"
+                    },
+                },
+                {
+                    "mediaType": "application/vnd.in-toto+json",
+                    "annotations": {
+                        "in-toto.io/predicate-type": (
+                            "https://slsa.dev/provenance/v1"
+                        )
+                    },
+                },
+            ]
+        }
+
+    image = f"{repository}@{index_digest}"
+    fixtures = {
+        image: {
+            "manifests": [
+                platform(amd64_digest, "amd64"),
+                link(amd64_digest, amd64_attestation),
+                platform(arm64_digest, "arm64"),
+                link(arm64_digest, arm64_attestation),
+            ]
+        },
+        f"{repository}@{amd64_attestation}": predicates(),
+        f"{repository}@{arm64_attestation}": predicates(),
+    }
+    return image, fixtures
+
+
+def test_attestation_verifier_requires_both_predicates_per_platform() -> None:
+    image, fixtures = _attested_index_fixture()
+    verify_image_attestations(
+        image,
+        {"linux/amd64", "linux/arm64"},
+        inspect_raw=fixtures.__getitem__,
+    )
+
+    arm64_attestation = "registry.example/coord@sha256:" + "4" * 64
+    layers = fixtures[arm64_attestation]["layers"]
+    assert isinstance(layers, list)
+    layers.pop(0)
+    with pytest.raises(ValueError, match="linux/arm64.*spdx"):
+        verify_image_attestations(
+            image,
+            {"linux/amd64", "linux/arm64"},
+            inspect_raw=fixtures.__getitem__,
+        )
+
+
+def test_release_docker_inputs_are_digest_pinned() -> None:
+    dockerfiles = (
+        REPO_ROOT / "Dockerfile",
+        REPO_ROOT / "Dockerfile.postgres",
+    )
+    for path in dockerfiles:
+        first_line = path.read_text(encoding="utf-8").splitlines()[0]
+        assert re.fullmatch(
+            r"# syntax=docker/dockerfile:1\.7@sha256:[0-9a-f]{64}",
+            first_line,
+        ), f"{path.name} has a mutable Dockerfile frontend: {first_line}"
+
+    base = dockerfiles[0].read_text(encoding="utf-8")
+    from_lines = [line for line in base.splitlines() if line.startswith("FROM ")]
+    assert from_lines
+    assert all(
+        re.match(r"FROM python:3\.14-slim@sha256:[0-9a-f]{64}", line)
+        for line in from_lines
+    ), f"Dockerfile has a mutable Python base: {from_lines}"

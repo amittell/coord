@@ -49,7 +49,9 @@ done
 REGISTRY="${COORD_IMAGE_REGISTRY:-whcr.io}"
 IMAGE="${COORD_IMAGE_NAME:-${REGISTRY}/alexm/coord}"
 PLATFORMS="${COORD_IMAGE_PLATFORMS:-linux/amd64,linux/arm64}"
-COSIGN_PUBLIC_KEY="${COSIGN_PUBLIC_KEY:-release/coord-release.pub}"
+COSIGN_PUBLIC_KEY="release/coord-release.pub"
+COSIGN_MIN_VERSION="3.0.6"
+SBOM_GENERATOR="docker.io/docker/buildkit-syft-scanner@sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68"
 
 VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
 TAG="v${VERSION}"
@@ -69,6 +71,25 @@ if [ "$SKIP_IMAGE" = 0 ] && [ "$PUBLISH" = 1 ]; then
   command -v cosign >/dev/null 2>&1 || fail "cosign is required to publish a signed image"
   [ -n "${COSIGN_SIGNING_KEY:-}" ] || fail "set COSIGN_SIGNING_KEY to the release KMS key"
   [ -f "$COSIGN_PUBLIC_KEY" ] || fail "missing release public key: $COSIGN_PUBLIC_KEY"
+  cosign_version="$(
+    cosign version --json \
+      | python3 -c 'import json, sys; print(json.load(sys.stdin)["gitVersion"].removeprefix("v"))'
+  )" || fail "could not determine the installed cosign version"
+  if ! python3 - "$cosign_version" "$COSIGN_MIN_VERSION" <<'PY'
+import re
+import sys
+
+def version(value: str) -> tuple[int, int, int]:
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", value)
+    if match is None:
+        raise SystemExit(1)
+    return tuple(map(int, match.groups()))
+
+raise SystemExit(0 if version(sys.argv[1]) >= version(sys.argv[2]) else 1)
+PY
+  then
+    fail "cosign ${cosign_version} is older than required ${COSIGN_MIN_VERSION}"
+  fi
 fi
 
 if [ "$SKIP_PYPI" = 0 ]; then
@@ -117,14 +138,13 @@ fi
 if [ "$SKIP_IMAGE" = 0 ]; then
   echo "release: building + pushing attested image ${IMAGE}:${TAG} (${PLATFORMS})..."
   image_metadata="$(mktemp)"
-  image_index="$(mktemp)"
   cleanup_image_files() {
-    rm -f "$image_metadata" "$image_index"
+    rm -f "$image_metadata"
   }
   trap cleanup_image_files EXIT
   docker buildx build --platform "${PLATFORMS}" \
     -t "${IMAGE}:${TAG}" -t "${IMAGE}:latest" \
-    --sbom=true \
+    --attest="type=sbom,generator=${SBOM_GENERATOR}" \
     --provenance=mode=max \
     --metadata-file "$image_metadata" \
     --push .
@@ -135,34 +155,14 @@ if [ "$SKIP_IMAGE" = 0 ]; then
   printf '%s\n' "$image_digest" \
     | grep -Eq '^sha256:[0-9a-f]{64}$' \
     || fail "buildx returned an invalid image digest: $image_digest"
-  docker buildx imagetools inspect "${IMAGE}@${image_digest}" \
-    --raw > "$image_index"
-  python3 - "$image_index" "${PLATFORMS}" <<'PY'
-import json
-import sys
-
-index = json.load(open(sys.argv[1]))
-required = set(sys.argv[2].split(","))
-manifests = index.get("manifests", [])
-platforms = {
-    (item.get("platform") or {}).get("os", "")
-    + "/"
-    + (item.get("platform") or {}).get("architecture", "")
-    for item in manifests
-}
-attestations = [
-    item
-    for item in manifests
-    if (item.get("annotations") or {}).get("vnd.docker.reference.type")
-    == "attestation-manifest"
-]
-if not required <= platforms:
-    raise SystemExit(f"release image missing platforms: {required - platforms}")
-if len(attestations) < len(required):
-    raise SystemExit(
-        "release image is missing BuildKit SBOM/provenance attestation manifests"
-    )
-PY
+  attestation_args=()
+  IFS=',' read -r -a release_platforms <<< "$PLATFORMS"
+  for platform in "${release_platforms[@]}"; do
+    attestation_args+=(--platform "$platform")
+  done
+  python3 scripts/verify_image_attestations.py \
+    --image "${IMAGE}@${image_digest}" \
+    "${attestation_args[@]}"
   echo "release: signing ${IMAGE}@${image_digest}..."
   cosign sign --yes --key "${COSIGN_SIGNING_KEY}" "${IMAGE}@${image_digest}"
   cosign verify \

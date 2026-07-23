@@ -161,6 +161,10 @@ jobs:
 
       - name: Set up QEMU (multi-arch emulation)
         uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3  # v4.1.0
+        with:
+          image: docker.io/tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: arm64
+          cache-image: false
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
@@ -180,7 +184,7 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: 127.0.0.1:5000/coord:ci
-          sbom: true
+          sbom: generator=docker.io/docker/buildkit-syft-scanner@sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68
           provenance: mode=max
           cache-from: type=gha,scope=docker-ci
           # PR merge refs are ephemeral and their caches cannot help later
@@ -214,7 +218,7 @@ jobs:
             --build-arg COORD_BASE_REPOSITORY=127.0.0.1:5000/coord \
             --build-arg "COORD_BASE_DIGEST=${BASE_DIGEST#sha256:}" \
             --tag 127.0.0.1:5000/coord:ci-postgres \
-            --sbom=true \
+            --attest=type=sbom,generator=docker.io/docker/buildkit-syft-scanner@sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68 \
             --provenance=mode=max \
             --metadata-file "$metadata_file" \
             --push \
@@ -228,22 +232,10 @@ jobs:
             echo "::error::derivative build returned an invalid registry digest: $derivative_digest" >&2
             exit 1
           fi
-          docker buildx imagetools inspect \
-            "127.0.0.1:5000/coord@$derivative_digest" \
-            --raw > /tmp/coord-postgres-index.json
-          python - <<'PY'
-          import json
-
-          index = json.load(open("/tmp/coord-postgres-index.json"))
-          platforms = {
-              (item.get("platform") or {}).get("os", "")
-              + "/"
-              + (item.get("platform") or {}).get("architecture", "")
-              for item in index.get("manifests", [])
-          }
-          required = {"linux/amd64", "linux/arm64"}
-          assert required <= platforms, (required, platforms)
-          PY
+          python scripts/verify_image_attestations.py \
+            --image "127.0.0.1:5000/coord@$derivative_digest" \
+            --platform linux/amd64 \
+            --platform linux/arm64
 
           docker pull --platform linux/amd64 \
             "127.0.0.1:5000/coord:ci@$BASE_DIGEST"
