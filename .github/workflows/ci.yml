@@ -176,13 +176,21 @@ jobs:
             --build-arg COORD_BASE=coord:ci \
             --tag coord:must-not-build \
             .; then
-            echo "::error::PostgreSQL derivative accepted an unpinned base without the CI override" >&2
+            echo "::error::PostgreSQL derivative accepted an unpinned base" >&2
+            exit 1
+          fi
+          pinned_base="$(
+            docker image inspect coord:ci \
+              --format '{{index .RepoDigests 0}}'
+          )"
+          if ! printf '%s\n' "$pinned_base" \
+            | grep -Eq '@sha256:[0-9a-f]{64}$'; then
+            echo "::error::loaded base image has no repository digest: $pinned_base" >&2
             exit 1
           fi
           docker build \
             --file Dockerfile.postgres \
-            --build-arg COORD_BASE=coord:ci \
-            --build-arg ALLOW_UNPINNED_BASE=1 \
+            --build-arg "COORD_BASE=$pinned_base" \
             --tag coord:ci-postgres \
             .
           docker run --rm --entrypoint python coord:ci-postgres -c \

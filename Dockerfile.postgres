@@ -7,12 +7,9 @@ ARG COORD_BASE
 FROM ${COORD_BASE}
 
 ARG COORD_BASE
-ARG ALLOW_UNPINNED_BASE=0
 USER root
-RUN if [ "${ALLOW_UNPINNED_BASE}" != "1" ]; then \
-      printf '%s\n' "${COORD_BASE}" \
-        | grep -Eq '@sha256:[0-9a-f]{64}$'; \
-    fi
+RUN printf '%s\n' "${COORD_BASE}" \
+      | grep -Eq '@sha256:[0-9a-f]{64}$'
 COPY requirements-postgres.txt /tmp/requirements-postgres.txt
 RUN /opt/venv/bin/pip install --no-cache-dir \
       -r /tmp/requirements-postgres.txt \

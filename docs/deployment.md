@@ -149,8 +149,6 @@ default SQLite artifact smaller and its dependency surface narrower.
 `Dockerfile.postgres` builds a separately tagged derivative from a caller-pinned
 coord base image. It deliberately has no default `COORD_BASE` and rejects
 references that do not end in `@sha256:<64 lowercase hex characters>`.
-`ALLOW_UNPINNED_BASE=1` exists only for CI's local `coord:ci` image; never use it
-for a published build.
 
 Build from a checkout containing `requirements-postgres.txt`, publish a
 multi-platform versioned variant once, and capture the registry-produced digest.
