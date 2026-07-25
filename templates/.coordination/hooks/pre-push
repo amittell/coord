@@ -243,13 +243,34 @@ diff_for_ref() {
     return 0
   fi
 
-  # Branch already exists on the remote: diff exactly what's being added.
+  # Branch already exists on the remote.
   if [[ -n "${remote_sha}" && "${remote_sha}" != "${ZERO_SHA}" ]]; then
-    diff_names "${remote_sha}" "${local_sha}"
-    return
+    # Fast-forward: the remote head is an ancestor of what we are pushing, so
+    # a two-dot diff is exactly the commits being added. Unchanged behaviour.
+    if git merge-base --is-ancestor "${remote_sha}" "${local_sha}" 2>/dev/null; then
+      diff_names "${remote_sha}" "${local_sha}"
+      return
+    fi
+    # Divergent history (rebase, amend, force-push). remote_sha and local_sha
+    # sit on DIFFERENT bases, so a two-dot diff between them enumerates every
+    # file that landed upstream in between -- files this push does not touch.
+    # That made the mandated rebase-before-admit flow collide with unrelated
+    # agents' claims (coord#9).
+    #
+    # merge-base "${remote_sha}" "${local_sha}" does NOT fix this: it returns
+    # the last commit the two SHARE, i.e. the OLD base, so the range still
+    # spans the whole upstream advance. (Measured: 22 files vs the 2 the push
+    # actually changed.) The three-dot form remote...local is defined as
+    # merge-base(remote,local)..local and fails identically.
+    #
+    # Fall through to the integration-base path below, which merge-bases the
+    # LOCAL head against the configured base ref -- the expression the
+    # first-push case has always used correctly.
+    :
   fi
 
-  # First push of this branch: prefer an explicit/configured integration
+  # First push of this branch, OR a divergent (rebased/amended) push that fell
+  # through from above: prefer an explicit/configured integration
   # base, then a resolvable tracking base, and only then remote HEAD. This
   # prevents a one-file branch cut from pre-prod from checking the entire
   # pre-prod-vs-main delta (#68). Fall back to the empty tree if no remote

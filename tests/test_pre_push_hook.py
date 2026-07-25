@@ -765,3 +765,91 @@ def test_http_errors_route_through_soft_fail() -> None:
     assert "returned HTTP ${batch_status}; refusing to push" not in PRE_PUSH_SCRIPT
     # The 404/405 legacy-server fallback is still a fallback, not a soft_fail.
     assert 'legacy_conflict_check || exit $?' in PRE_PUSH_SCRIPT
+
+
+def test_rebased_force_push_does_not_claim_upstream_files(tmp_path) -> None:
+    """coord#9: a force-push after rebase must not enumerate upstream files.
+
+    Before the fix the existing-branch path took a two-dot diff from the OLD
+    remote head to the rebased local head. Those sit on divergent bases, so the
+    range also contained every file that landed on the integration base in
+    between -- files the push does not touch. Real fleet impact: unrelated
+    agents' claims on those files blocked a docs-only push, and the mandated
+    rebase-before-admit flow was what manufactured the collision.
+
+    Note merge-base(remote, local) does NOT fix this -- it returns the last
+    commit the two SHARE, i.e. the old base -- which is why the assertion below
+    is on the integration base, not on the remote head.
+    """
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("bash not available on this platform")
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+    _git(repo, "add", "seed.txt")
+    _git(repo, "commit", "-q", "-m", "seed")
+    _git(repo, "branch", "-M", "main")
+    old_main = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "update-ref", "refs/remotes/origin/main", old_main)
+    _git(
+        repo,
+        "symbolic-ref",
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/main",
+    )
+
+    # The branch, cut from the OLD main, changing exactly one file.
+    _git(repo, "switch", "-q", "-c", "feature")
+    (repo / "mine.txt").write_text("mine\n", encoding="utf-8")
+    _git(repo, "add", "mine.txt")
+    _git(repo, "commit", "-q", "-m", "my only change")
+    old_head = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "update-ref", "refs/heads/feature", old_head)
+
+    # main advances with somebody else's file (this is what another agent
+    # holds a claim on in the real incident).
+    _git(repo, "switch", "-q", "main")
+    (repo / "theirs.txt").write_text("theirs\n", encoding="utf-8")
+    _git(repo, "add", "theirs.txt")
+    _git(repo, "commit", "-q", "-m", "upstream advance")
+    new_main = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "update-ref", "refs/remotes/origin/main", new_main)
+
+    # Rebase the branch onto the new main -- the mandated flow.
+    _git(repo, "switch", "-q", "feature")
+    _git(repo, "rebase", "origin/main")
+    new_head = _git(repo, "rev-parse", "HEAD")
+
+    fragment = tmp_path / "diff-fragment.sh"
+    fragment.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'UPSTREAM="origin"\n'
+        'ZERO_SHA="0000000000000000000000000000000000000000"\n'
+        'EMPTY_TREE="$(git hash-object -t tree /dev/null)"\n'
+        f"{_extract_diff_functions(PRE_PUSH_SCRIPT)}"
+        # remote still points at the pre-rebase head: the force-push case.
+        f'diff_for_ref refs/heads/feature "{new_head}" '
+        f'refs/heads/feature "{old_head}"\n',
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [bash, str(fragment)],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    files = result.stdout.split()
+    assert files == ["mine.txt"], (
+        "a rebased force-push must enumerate only the files it changes; "
+        f"got {files}"
+    )
+    assert "theirs.txt" not in files, (
+        "upstream files leaked into the pushed batch -- this is the coord#9 "
+        "regression, and it is what blocks a push on another agent's claim"
+    )
