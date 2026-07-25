@@ -106,6 +106,46 @@ def seam_conn():
     return seam_connection
 
 
+@pytest.fixture(autouse=True)
+def _isolate_coord_env_namespace():
+    """Restore every ``COORD_*`` environment variable after each test.
+
+    The name is deliberately narrow: this isolates the ``COORD_*`` NAMESPACE,
+    not "coord's environment". The package also reads ``CLAUDE_SESSION_ID``
+    and ``APPDATA``, which are out of scope here and safe to leave alone --
+    both are read-only in ``coordination`` (``os.environ.get``, no assignment
+    anywhere), so neither can produce the leak below. A test that sets them
+    via ``monkeypatch`` is restored by ``monkeypatch`` itself; only a
+    non-monkeypatch, process-global write can escape a test, and no such
+    writer exists for them. If one is ever added, widen this fixture with it.
+
+    ``mcp_server._load_local_env`` deliberately bootstraps ``os.environ``
+    from the nearest ``.coordination/local.env`` -- correct for the
+    long-lived MCP wrapper, but process-global. When the suite runs from a
+    real checkout, any test that exercises that load path permanently
+    exports the checkout's own ``COORD_REPO_ID`` (and URL/token) into the
+    test process, and every later test that consults ``os.environ`` first
+    (``claude_hooks._repo_id``) inherits it. Observed live: running
+    ``test_mcp_server.py`` before ``test_fleet_enforcement.py`` flipped
+    four hook tests from green to red because claims suddenly carried
+    ``repo=amittell/coord``. Tests pass alone, fail warm -- the classic
+    order-pollution signature. Snapshotting and restoring the ``COORD_*``
+    namespace makes every test order-independent regardless of which
+    module leaked first; intentional per-test env still goes through
+    ``monkeypatch.setenv`` exactly as before.
+    """
+    saved = {k: v for k, v in os.environ.items() if k.startswith("COORD_")}
+    yield
+    for key in [k for k in os.environ if k.startswith("COORD_")]:
+        if key in saved:
+            os.environ[key] = saved[key]
+        else:
+            del os.environ[key]
+    for key, val in saved.items():
+        if key not in os.environ:
+            os.environ[key] = val
+
+
 def _is_coordination_task(task: "asyncio.Task") -> bool:
     """True when ``task`` is running a coroutine defined in the
     ``coordination`` package (so the drain below only touches this

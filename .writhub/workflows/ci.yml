@@ -1,0 +1,37 @@
+name: ci
+# WritHub CI plane (design 0002): auto-dispatched on Change-open; a
+# .writhub/workflows/ci.yml SHADOWS .github/workflows/ci.yml at execution, so
+# the act runner executes this instead of the GitHub-oriented matrix. The
+# on-block follows the proven act-parseable convention (a bare `push:`/
+# `pull_request:` mapping with no values is mis-parsed by act as "no stages").
+#
+# No actions/setup-python: its tool-cache tar extraction chowns to uid 1001,
+# which the rootless checks-lane container forbids ("Cannot change ownership",
+# observed on the coord #10 run). The act image's system python3 is used
+# directly, with an explicit floor guard so a too-old image fails loudly
+# instead of half-running the suite.
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: python floor (>= 3.11 per pyproject requires-python)
+        run: |
+          python3 -c 'import sys; v=sys.version_info; print(f"python {v.major}.{v.minor}.{v.micro}"); sys.exit(0 if v >= (3, 11) else 1)'
+      - name: syntax gate
+        run: python3 -m compileall -q coordination tests scripts
+      - name: install
+        run: |
+          python3 -m venv /tmp/ci-venv
+          /tmp/ci-venv/bin/python -m pip install --quiet --upgrade pip
+          /tmp/ci-venv/bin/python -m pip install --quiet -e .[dev]
+      - name: ruff
+        run: /tmp/ci-venv/bin/python -m ruff check .
+      - name: mypy
+        run: /tmp/ci-venv/bin/python -m mypy coordination
+      - name: pytest
+        run: /tmp/ci-venv/bin/python -m pytest -q
