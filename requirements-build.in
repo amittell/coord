@@ -1,0 +1,6 @@
+# Exact PEP 517 frontend/backend pins for deterministic release builds and
+# isolated-free image builds.
+# requirements-build.txt is the hash-complete generated lock.
+build==1.3.0
+hatchling==1.31.0
+pip==25.3

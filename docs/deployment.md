@@ -55,7 +55,12 @@ All other `COORD_*` variables (scope limits, TTLs, cleanup cadence) are optional
 docker build -t coordination .
 ```
 
-If you publish to a registry, tag and push with whatever scheme your team uses. The included `.github/workflows/release.yml` publishes the image to `ghcr.io/<github-owner>/coord` on every `v*` git tag, tagging both `:latest` and `:<tag>` (e.g. `ghcr.io/your-org/coord:v0.1.0`). Update the referenced image path in any downstream manifests to match your fork.
+If you publish to a registry, tag and push with whatever scheme your team uses.
+The included `.github/workflows/release.yml` is manual candidate validation
+only: it has no git-tag trigger and never creates an official version or
+`latest` tag. Upstream official releases use `scripts/release.sh` and the
+canonical `whcr.io/alexm/coord` repository. Update downstream manifests to the
+registry and immutable digest your deployment trusts.
 
 ## Kubernetes
 
@@ -145,27 +150,125 @@ ownership rows (and the prior `COORD_DATABASE_PATH`) for the specific install.
 ### PostgreSQL-enabled container
 
 The standard production image intentionally excludes asyncpg, keeping the
-default SQLite artifact smaller and its dependency surface narrower. Build a
-separately tagged derivative from the same pinned coord release:
+default SQLite artifact smaller and its dependency surface narrower.
+`Dockerfile.postgres` builds a separately tagged derivative from a caller-pinned
+coord base image. It deliberately has no defaults for
+`COORD_BASE_REPOSITORY` or `COORD_BASE_DIGEST`; the Dockerfile constructs
+`FROM repository@sha256:digest`, so a mutable base cannot execute even an
+`ONBUILD` instruction before admission.
 
-```dockerfile
-ARG COORD_BASE=ghcr.io/amittell/coord:<release>@sha256:<digest>
-FROM ${COORD_BASE}
-USER root
-COPY requirements-postgres.txt /tmp/requirements-postgres.txt
-RUN /opt/venv/bin/pip install --no-cache-dir \
-      -r /tmp/requirements-postgres.txt \
-    && rm /tmp/requirements-postgres.txt
-USER coord
-```
-
-Build from a checkout containing `requirements-postgres.txt`, publish the
-variant under a distinct tag such as `coord:<release>-postgres`, and verify the
-artifact before deploying it:
+Build from the exact release checkout containing `requirements-postgres.txt`.
+Resolve the base tag to a digest and authenticate that digest with the committed
+Coord release public key before Docker is allowed to consume it. A tag or digest
+without a valid release signature is not a trusted release record:
 
 ```bash
-docker build -f Dockerfile.postgres -t coord:postgres .
-docker run --rm --entrypoint python coord:postgres \
+set -euo pipefail
+
+COORD_BASE_REPOSITORY='whcr.io/alexm/coord'
+COORD_BASE_TAG='vX.Y.Z'
+COORD_BASE_DIGEST="$(
+  docker buildx imagetools inspect \
+    "$COORD_BASE_REPOSITORY:$COORD_BASE_TAG" \
+    --raw \
+    | python3 -c 'import hashlib, sys; print("sha256:" + hashlib.sha256(sys.stdin.buffer.read()).hexdigest())'
+)"
+printf '%s\n' "$COORD_BASE_DIGEST" \
+  | grep -Eq '^sha256:[0-9a-f]{64}$'
+cosign verify \
+  --key release/coord-release.pub \
+  "$COORD_BASE_REPOSITORY@$COORD_BASE_DIGEST" >/dev/null
+```
+
+Only after that verification succeeds, publish a multi-platform derivative with
+BuildKit SBOM and maximum provenance attestations, sign its immutable digest
+with the release KMS key, and verify the signature with the public key. The
+upstream GitHub-free release key is `hashivault://coord-release` in the
+dedicated transit Vault; downstream publishers should substitute their own KMS
+key and committed public key:
+
+```bash
+set -euo pipefail
+
+COSIGN_SIGNING_KEY='hashivault://coord-release'
+COORD_DERIVATIVE_REPOSITORY='whcr.io/alexm/coord'
+COORD_DERIVATIVE_TAG='vX.Y.Z-pg'
+COORD_DERIVATIVE_CANDIDATE="$COORD_DERIVATIVE_REPOSITORY:candidate-$COORD_DERIVATIVE_TAG-$(git rev-parse --short=12 HEAD)"
+metadata_file="$(mktemp)"
+tag_probe_error="$(mktemp)"
+trap 'rm -f "$metadata_file" "$tag_probe_error"' EXIT
+
+test "$(crane version)" = '0.21.7'
+if crane digest \
+  "$COORD_DERIVATIVE_REPOSITORY:$COORD_DERIVATIVE_TAG" \
+  >/dev/null 2>"$tag_probe_error"
+then
+  echo "refusing to replace released derivative tag: $COORD_DERIVATIVE_TAG" >&2
+  exit 1
+fi
+if ! grep -Fq 'MANIFEST_UNKNOWN' "$tag_probe_error"; then
+  cat "$tag_probe_error" >&2
+  echo "could not prove derivative tag is absent; refusing to publish" >&2
+  exit 1
+fi
+rm -f "$tag_probe_error"
+
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  --file Dockerfile.postgres \
+  --build-arg "COORD_BASE_REPOSITORY=$COORD_BASE_REPOSITORY" \
+  --build-arg "COORD_BASE_DIGEST=${COORD_BASE_DIGEST#sha256:}" \
+  --tag "$COORD_DERIVATIVE_CANDIDATE" \
+  --attest=type=sbom,generator=docker.io/docker/buildkit-syft-scanner@sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68 \
+  --provenance=mode=max,builder-id=https://writhub.io/alexm/coord/builders/github-free-release/v1 \
+  --metadata-file "$metadata_file" \
+  --push .
+COORD_DERIVATIVE_DIGEST="$(
+  python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["containerimage.digest"])' \
+    "$metadata_file"
+)"
+printf '%s\n' "$COORD_DERIVATIVE_DIGEST" \
+  | grep -Eq '^sha256:[0-9a-f]{64}$'
+docker buildx imagetools inspect \
+  "$COORD_DERIVATIVE_REPOSITORY@$COORD_DERIVATIVE_DIGEST"
+python3 scripts/verify_image_attestations.py \
+  --image "$COORD_DERIVATIVE_REPOSITORY@$COORD_DERIVATIVE_DIGEST" \
+  --builder-id https://writhub.io/alexm/coord/builders/github-free-release/v1 \
+  --platform linux/amd64 \
+  --platform linux/arm64
+cosign sign --yes \
+  --key "$COSIGN_SIGNING_KEY" \
+  "$COORD_DERIVATIVE_REPOSITORY@$COORD_DERIVATIVE_DIGEST"
+cosign verify \
+  --key release/coord-release.pub \
+  "$COORD_DERIVATIVE_REPOSITORY@$COORD_DERIVATIVE_DIGEST" >/dev/null
+
+# OCI registries do not offer conditional tag creation. Repeat the fail-closed
+# absence proof immediately before the only official manifest PUT, and keep
+# derivative publication inside the same single-operator release ceremony.
+: > "$tag_probe_error"
+if crane digest \
+  "$COORD_DERIVATIVE_REPOSITORY:$COORD_DERIVATIVE_TAG" \
+  >/dev/null 2>"$tag_probe_error"
+then
+  echo "refusing to replace released derivative tag: $COORD_DERIVATIVE_TAG" >&2
+  exit 1
+fi
+if ! grep -Fq 'MANIFEST_UNKNOWN' "$tag_probe_error"; then
+  cat "$tag_probe_error" >&2
+  echo "could not prove derivative tag is absent immediately before promotion" >&2
+  exit 1
+fi
+
+crane tag \
+  "$COORD_DERIVATIVE_REPOSITORY@$COORD_DERIVATIVE_DIGEST" \
+  "$COORD_DERIVATIVE_TAG"
+test "$(
+  crane digest "$COORD_DERIVATIVE_REPOSITORY:$COORD_DERIVATIVE_TAG"
+)" = "$COORD_DERIVATIVE_DIGEST"
+
+docker run --rm --entrypoint python \
+  "$COORD_DERIVATIVE_REPOSITORY@$COORD_DERIVATIVE_DIGEST" \
   -c 'import asyncpg, coordination; print(asyncpg.__version__)'
 
 docker run -d --name coord-postgres \
@@ -173,8 +276,13 @@ docker run -d --name coord-postgres \
   -e COORD_DATABASE_URL='postgresql://coord:password@db.example.com:5432/coord' \
   -e COORD_POSTGRES_SCHEMA=coord \
   -p 8080:8080 \
-  coord:postgres
+  "$COORD_DERIVATIVE_REPOSITORY@$COORD_DERIVATIVE_DIGEST"
 ```
+
+Deploy the verified immutable derivative digest—not its tag—so a rolling fleet
+cannot mix different cached images. The signature authenticates the publisher;
+the digest preserves the exact bytes; and the SBOM/provenance attestations stay
+attached to the signed multi-platform index for audit and incident response.
 
 Do not mount `/data` for PostgreSQL state; persistence, backups, TLS, and HA
 belong to the PostgreSQL deployment. Do not set `COORD_DATABASE_URL` on the
@@ -812,7 +920,14 @@ The `.mcp.json` / `.codex/config.toml` tracked templates keep their placeholder 
 
 ## Supply chain
 
-Every image published by `.github/workflows/release.yml` ships with four independent supply-chain signals attached:
+The authoritative `scripts/release.sh` path publishes a candidate first,
+verifies it, signs the immutable digest with the key corresponding to
+`release/coord-release.pub`, and only then promotes that digest to the
+create-only official tag. The manual `.github/workflows/release.yml` path is
+candidate validation only and cannot publish an official tag, PyPI artifact,
+GitHub Release, or deployment change.
+
+Every GitHub validation candidate carries four independent supply-chain signals:
 
 - An SPDX SBOM attestation produced by BuildKit (`sbom: true`), attached to the image manifest as an OCI referrer. Pull it with `cosign download sbom <image>@<digest>` or inspect with `docker buildx imagetools inspect <image> --format '{{json .SBOM}}'`.
 - A SLSA build provenance attestation produced by BuildKit with `provenance: mode=max`, covering the builder identity, source materials, and full invocation metadata.
@@ -826,24 +941,33 @@ cosign verify \
   ghcr.io/<owner>/coord@sha256:<digest>
 ```
 
-Consumers who want a minimal gate should verify at least the cosign signature on deployment; the SBOM and provenance records are additionally useful for vulnerability triage and incident response. See `.github/workflows/README.md` for the full list of signals, the `SKIP_ATTESTATION` and `SKIP_SIGNING` escape hatches for environments without Sigstore or GHE attestations support, and how the cosign-installer action is pinned.
+The repository verifier rehashes the top-level OCI index and every in-toto
+blob, requires both predicates for every supported platform, and requires the
+exact builder identity supplied by the release path. Production consumers must
+verify the repository-key signature and immutable digest documented in
+`docs/releasing-without-github.md`; a GitHub candidate signature is not an
+official release identity.
 
 ## GitHub Enterprise
 
-The shipped release workflow (`.github/workflows/release.yml`) publishes to `ghcr.io` by default, but the registry host and repo path are overridable via repo or org Actions variables so you can publish to your own GHE container registry without forking the workflow:
+The manual candidate workflow publishes to `ghcr.io` by default, but the
+registry host and repo path are overridable via repo or org Actions variables:
 
 - `vars.IMAGE_REGISTRY` - registry hostname, for example `containers.ghe.example.com`. Defaults to `ghcr.io`.
 - `vars.IMAGE_REPO` - path under the registry, for example `platform/coord`. Defaults to `<repository_owner>/coord`.
 
 Set these under Settings -> Secrets and variables -> Actions -> Variables. Login uses `${{ secrets.GITHUB_TOKEN }}` against whatever registry you configure. Some GHE setups require a Personal Access Token with `write:packages` to push images to the configured registry; if the default `GITHUB_TOKEN` is rejected by your registry, store a PAT as a repo secret and swap it into the `docker/login-action` step. See `.github/workflows/README.md` for details.
 
-`actions/attest-build-provenance@v2` requires **GitHub Enterprise Server 3.10 or later** with the attestations feature enabled. On older GHE, or where the feature is disabled, comment out the "Attest build provenance" step or the release workflow will fail at that point. The image push itself is unaffected by that step being removed.
+`actions/attest-build-provenance` requires **GitHub Enterprise Server 3.10 or
+later** with the attestations feature enabled. GitHub candidate validation may
+omit that repository-native record via `SKIP_ATTESTATION=true`; the mandatory
+BuildKit SBOM/SLSA verification and candidate cosign verification remain.
 
 Networking: the service itself is a plain HTTP API. Corporate TLS termination, SSO in front of the dashboard, and egress policies to reach the container registry all apply at the standard enterprise-ingress layer - there is nothing coord-specific to configure beyond the registry overrides above.
 
 Restrictions observed:
 
-- `actions/attest-build-provenance` is the only step that is GHE-version gated; everything else (checkout, buildx, login, build-push, softprops release) is available across all supported GHE versions at the pinned action versions.
+- `actions/attest-build-provenance` is the only step that is GHE-version gated; checkout, buildx, login, and build-push use pinned action revisions.
 - Outbound network from runners must reach the configured registry host; for air-gapped enterprises, use a self-hosted runner inside the same network as the registry.
 
 ## Monorepos and virtual file systems (Scalar, Git VFS)

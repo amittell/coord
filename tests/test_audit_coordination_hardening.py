@@ -29,6 +29,7 @@ import json
 import logging as pylogging
 import math
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -230,38 +231,272 @@ class TestMigrationScriptSchemaLockstep:
         )
 
 
-class TestReleaseWorkflowDispatchGuard:
+class TestReleaseWorkflowPublicationFence:
     def _workflow(self) -> dict:
         raw = (REPO_ROOT / ".github" / "workflows" / "release.yml").read_text(
             encoding="utf-8"
         )
         return yaml.safe_load(raw)
 
-    def test_overwrite_input_defined(self) -> None:
+    def test_overwrite_escape_hatch_is_removed_and_publishers_are_serialized(
+        self,
+    ) -> None:
         workflow = self._workflow()
         # PyYAML parses the bare `on` key as boolean True.
         triggers = workflow.get("on") or workflow.get(True)
+        assert set(triggers) == {"workflow_dispatch"}
         inputs = triggers["workflow_dispatch"]["inputs"]
-        assert "overwrite" in inputs
-        assert inputs["overwrite"]["type"] == "boolean"
-        assert inputs["overwrite"].get("default") is False
+        assert "overwrite" not in inputs
+        assert inputs["version"]["required"] is False
+        assert inputs["oidc_trigger_tag"]["required"] is False
+        concurrency = workflow["concurrency"]
+        assert concurrency["group"] == (
+            "${{ github.workflow }}-"
+            "${{ inputs.oidc_trigger_tag || inputs.version }}"
+        )
+        assert concurrency["cancel-in-progress"] is False
 
-    def test_guard_step_refuses_existing_tag_on_dispatch(self) -> None:
+    def test_candidate_is_authenticated_without_an_official_promotion(self) -> None:
         workflow = self._workflow()
         steps = workflow["jobs"]["publish-image"]["steps"]
-        guards = [
+        guard = next(
             step
             for step in steps
-            if "imagetools inspect" in str(step.get("run") or "")
-        ]
-        assert len(guards) == 1, (
-            "release.yml must carry exactly one registry-tag republish guard"
+            if step.get("name") == "Refuse to republish an existing candidate tag"
         )
-        guard = guards[0]
-        condition = str(guard.get("if") or "")
-        assert "workflow_dispatch" in condition
-        assert "inputs.overwrite != true" in condition
+        assert 'crane digest "$CANDIDATE"' in guard["run"]
         assert "exit 1" in guard["run"]
+        candidate = next(
+            step for step in steps if step.get("name") == "Compose candidate image tag"
+        )
+        assert "candidate-${VERSION}-${COMMIT_SHA:0:12}" in candidate["run"]
+
+        step_names = [str(step.get("name") or "") for step in steps]
+        build = step_names.index("Build and push image")
+        verify_attestations = step_names.index(
+            "Verify both platform SBOM and provenance attestations"
+        )
+        verify_signature = step_names.index(
+            "Sign and verify candidate digest with workflow identity"
+        )
+        assert build < verify_attestations < verify_signature
+        assert "--builder-id \"$BUILDER_ID\"" in steps[verify_attestations]["run"]
+        assert all("crane tag" not in str(step.get("run") or "") for step in steps)
+        checkout = next(
+            step for step in steps if step.get("name") == "Check out repository"
+        )
+        assert checkout["with"]["persist-credentials"] is False
+        authorization_job = workflow["jobs"]["authorize-pypi"]
+        assert authorization_job["if"] == (
+            "inputs.oidc_trigger_tag != '' "
+            "&& github.ref == 'refs/heads/main'"
+        )
+        assert authorization_job["permissions"] == {"contents": "read"}
+        assert "environment" not in authorization_job
+        authorization_steps = [
+            str(step) for step in authorization_job["steps"]
+        ]
+        authorization_checkouts = [
+            step
+            for step in authorization_job["steps"]
+            if str(step.get("uses") or "").startswith("actions/checkout@")
+        ]
+        assert len(authorization_checkouts) == 2
+        assert all(
+            step["with"]["persist-credentials"] is False
+            for step in authorization_checkouts
+        )
+        authorization = next(
+            index
+            for index, step in enumerate(authorization_steps)
+            if "Verify Vault-signed release authorization" in step
+        )
+        assert "cosign verify-blob" in authorization_steps[authorization]
+        assert "release/coord-release.pub" in authorization_steps[authorization]
+        artifact = next(
+            index
+            for index, step in enumerate(authorization_steps)
+            if "actions/upload-artifact@" in step
+        )
+        assert authorization < artifact
+        assert all("Classify existing PyPI" not in step for step in authorization_steps)
+
+        gate = workflow["jobs"]["gate-pypi"]
+        assert gate["needs"] == "authorize-pypi"
+        assert gate["permissions"] == {"contents": "read", "actions": "read"}
+        assert "environment" not in gate
+        gate_steps = [str(step) for step in gate["steps"]]
+        gate_checkout = next(
+            index
+            for index, step in enumerate(gate_steps)
+            if "Check out locked-main verifier without credentials" in step
+        )
+        gate_download = next(
+            index
+            for index, step in enumerate(gate_steps)
+            if "actions/download-artifact@" in step
+        )
+        gate_recheck = next(
+            index
+            for index, step in enumerate(gate_steps)
+            if "Recheck exact signed package hashes" in step
+        )
+        gate_classifier = next(
+            index
+            for index, step in enumerate(gate_steps)
+            if "Classify existing PyPI release" in step
+        )
+        assert gate_checkout < gate_download < gate_recheck < gate_classifier
+        assert "scripts/check_pypi_release.py" in gate_steps[gate_classifier]
+        gate_text = "\n".join(gate_steps)
+        assert "release-source" not in gate_text
+        assert "python -m build" not in gate_text
+
+        pypi = workflow["jobs"]["publish-pypi"]
+        assert "needs.gate-pypi.outputs.state == 'absent'" in pypi["if"]
+        assert "needs.gate-pypi.outputs.state == 'partial'" in pypi["if"]
+        assert "!= 'exact'" not in pypi["if"]
+        assert "github.ref == 'refs/heads/main'" in pypi["if"]
+        assert pypi["environment"]["name"] == "pypi"
+        assert pypi["permissions"] == {"id-token": "write", "actions": "read"}
+        pypi_steps = [str(step) for step in pypi["steps"]]
+        publish = next(
+            index
+            for index, step in enumerate(pypi_steps)
+            if "pypa/gh-action-pypi-publish@" in step
+        )
+        recheck = next(
+            index
+            for index, step in enumerate(pypi_steps)
+            if "Recheck exact signed package hashes" in step
+        )
+        assert recheck < publish
+        pypi_text = "\n".join(pypi_steps)
+        assert "actions/download-artifact@" in pypi_text
+        assert "actions/checkout@" not in pypi_text
+        assert "actions/setup-python@" not in pypi_text
+        assert "pip install" not in pypi_text
+        assert "python -m build" not in pypi_text
+        assert "scripts/" not in pypi_text
+        assert "bump-manifest" not in workflow["jobs"]
+        assert "git push origin HEAD:main" not in str(workflow)
+        assert "password:" not in str(pypi)
+        assert "SKIP_SIGNING" not in str(workflow)
+        assert "git push origin \"${VERSION}\" --force" not in str(workflow)
+
+    @pytest.mark.parametrize(
+        "candidate",
+        ("", "bad/value", "bad\nextra=tag", "bad\rvalue", "x" * 106),
+    )
+    def test_candidate_label_rejects_output_and_tag_injection(
+        self,
+        tmp_path: Path,
+        candidate: str,
+    ) -> None:
+        workflow = self._workflow()
+        steps = workflow["jobs"]["publish-image"]["steps"]
+        resolve = next(
+            step for step in steps if step.get("name") == "Resolve candidate label"
+        )
+        output = tmp_path / "output"
+        result = subprocess.run(
+            ["bash", "-c", resolve["run"]],
+            env={
+                **os.environ,
+                "INPUT_VERSION": candidate,
+                "GITHUB_OUTPUT": str(output),
+            },
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode != 0
+
+    def test_candidate_label_produces_exactly_one_candidate_tag(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        workflow = self._workflow()
+        steps = workflow["jobs"]["publish-image"]["steps"]
+        resolve = next(
+            step for step in steps if step.get("name") == "Resolve candidate label"
+        )
+        compose = next(
+            step for step in steps if step.get("name") == "Compose candidate image tag"
+        )
+        resolved = tmp_path / "resolved"
+        result = subprocess.run(
+            ["bash", "-c", resolve["run"]],
+            env={
+                **os.environ,
+                "INPUT_VERSION": "v0.49.0-review1",
+                "GITHUB_OUTPUT": str(resolved),
+            },
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        assert resolved.read_text(encoding="utf-8") == "tag=v0.49.0-review1\n"
+
+        tags = tmp_path / "tags"
+        result = subprocess.run(
+            ["bash", "-c", compose["run"]],
+            env={
+                **os.environ,
+                "IMAGE": "ghcr.io/amittell/coord",
+                "VERSION": "v0.49.0-review1",
+                "COMMIT_SHA": "a" * 40,
+                "GITHUB_OUTPUT": str(tags),
+            },
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        assert tags.read_text(encoding="utf-8") == (
+            "tags=ghcr.io/amittell/coord:"
+            "candidate-v0.49.0-review1-aaaaaaaaaaaa\n"
+        )
+
+    def test_fresh_pypi_gate_ignores_poisoned_build_workspace_classifier(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        workflow = self._workflow()
+        gate_steps = workflow["jobs"]["gate-pypi"]["steps"]
+        classifier = next(
+            step
+            for step in gate_steps
+            if step.get("name") == "Classify existing PyPI release"
+        )
+        trusted = tmp_path / "scripts"
+        poisoned = tmp_path / "release-source" / "scripts"
+        trusted.mkdir()
+        poisoned.mkdir(parents=True)
+        (trusted / "check_pypi_release.py").write_text(
+            "print('conflict')\n",
+            encoding="utf-8",
+        )
+        (poisoned / "check_pypi_release.py").write_text(
+            "print('absent')\n",
+            encoding="utf-8",
+        )
+        output = tmp_path / "output"
+        result = subprocess.run(
+            ["bash", "-e", "-o", "pipefail", "-c", classifier["run"]],
+            cwd=tmp_path,
+            env={
+                **os.environ,
+                "VERSION": "0.49.0",
+                "GITHUB_OUTPUT": str(output),
+            },
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode != 0
+        assert not output.exists()
 
     @pytest.mark.skipif(
         os.name == "nt",
@@ -271,16 +506,12 @@ class TestReleaseWorkflowDispatchGuard:
         ("mode", "expected_returncode", "expected_output"),
         [
             ("existing", 1, "already exists in the registry"),
-            ("missing", 0, "not present in the registry"),
-            ("missing-manifest", 0, "not present in the registry"),
-            ("missing-code", 0, "not present in the registry"),
-            ("ambiguous-missing", 1, "refusing to publish"),
-            ("transient", 1, "refusing to publish"),
-            ("auth", 1, "refusing to publish"),
-            ("server", 1, "refusing to publish"),
+            ("missing", 0, ""),
+            ("transient", 1, "could not prove"),
+            ("auth", 1, "could not prove"),
         ],
     )
-    def test_guard_fails_closed_except_for_specific_missing_manifest(
+    def test_initial_guard_fails_closed_except_for_manifest_unknown(
         self,
         tmp_path: Path,
         mode: str,
@@ -292,32 +523,20 @@ class TestReleaseWorkflowDispatchGuard:
         guard = next(
             step
             for step in steps
-            if "imagetools inspect" in str(step.get("run") or "")
+            if step.get("name") == "Refuse to republish an existing candidate tag"
         )
 
         fake_bin = tmp_path / "bin"
         fake_bin.mkdir()
-        fake_docker = fake_bin / "docker"
-        fake_docker.write_text(
+        fake_crane = fake_bin / "crane"
+        fake_crane.write_text(
             """#!/bin/sh
-case "$FAKE_DOCKER_MODE" in
+case "$FAKE_CRANE_MODE" in
   existing)
     exit 0
     ;;
   missing)
-    echo 'ERROR: ghcr.io/octo/coord:v1: not found' >&2
-    exit 1
-    ;;
-  missing-manifest)
-    echo 'ERROR: manifest unknown: manifest unknown' >&2
-    exit 1
-    ;;
-  missing-code)
     echo '{"errors":[{"code":"MANIFEST_UNKNOWN"}]}' >&2
-    exit 1
-    ;;
-  ambiguous-missing)
-    echo 'ERROR: registry endpoint: not found' >&2
     exit 1
     ;;
   transient)
@@ -328,23 +547,18 @@ case "$FAKE_DOCKER_MODE" in
     echo 'ERROR: unexpected status from HEAD request: 401 Unauthorized' >&2
     exit 1
     ;;
-  server)
-    echo 'ERROR: unexpected status from HEAD request: 503 Service Unavailable' >&2
-    exit 1
-    ;;
 esac
 exit 2
 """,
             encoding="utf-8",
         )
-        fake_docker.chmod(0o755)
+        fake_crane.chmod(0o755)
 
         env = os.environ.copy()
         env.update(
             {
-                "FAKE_DOCKER_MODE": mode,
-                "IMAGE": "ghcr.io/octo/coord",
-                "VERSION": "v1",
+                "FAKE_CRANE_MODE": mode,
+                "CANDIDATE": "ghcr.io/octo/coord:candidate-v1-deadbeef",
                 "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
             }
         )
@@ -464,15 +678,19 @@ class TestCiMatrixCoversClassifiers:
     def test_docker_smoke_starts_authenticated_sqlite_service(self) -> None:
         ci = self._workflow("ci.yml")
         docker = ci["jobs"]["docker-build"]
-        commands = "\n".join(
-            str(step.get("run") or "")
+        sqlite_step = next(
+            step
             for step in docker["steps"]
+            if step.get("name") == "Start image and verify real SQLite readiness"
         )
+        commands = str(sqlite_step.get("run") or "")
         assert "--env COORD_AUTH_TOKEN=ci-smoke" in commands
         assert "/readyz" in commands
         assert "sqlite3.connect" in commands
         assert "import asyncpg" not in commands
         assert 'find_spec("asyncpg") is None' in commands
+        assert "coord:ci-postgres" not in commands
+        assert re.search(r"\bcoord:ci\b", commands)
         assert docker["env"]["DOCKER_BUILD_RECORD_UPLOAD"] == "false"
 
     def test_every_ci_job_has_a_bounded_timeout(self) -> None:
@@ -488,6 +706,20 @@ class TestCiMatrixCoversClassifiers:
                 1 <= int(job["timeout-minutes"]) <= 30
                 for job in workflow["jobs"].values()
             )
+
+    def test_ci_invokes_pytest_as_a_module_from_repo_root(self) -> None:
+        offenders: list[str] = []
+        for workflow_name in ("ci.yml", "compatibility.yml", "postgres.yml"):
+            workflow = self._workflow(workflow_name)
+            for job_name, job in workflow["jobs"].items():
+                for step in job.get("steps", []):
+                    command = str(step.get("run") or "")
+                    if re.search(r"(?m)^\s*pytest\b", command):
+                        offenders.append(f"{workflow_name}:{job_name}")
+        assert not offenders, (
+            "bare pytest can omit the repository root from sys.path and "
+            f"break imports from scripts/: {offenders}"
+        )
 
     def test_postgres_path_gate_has_no_stale_explicit_paths(self) -> None:
         postgres = self._workflow("postgres.yml")
@@ -513,4 +745,24 @@ class TestCiMatrixCoversClassifiers:
             "./.github/workflows/postgres.yml"
         )
         assert jobs["publish-image"]["needs"] == "postgres-gate"
-        assert jobs["publish-pypi"]["needs"] == "postgres-gate"
+        assert jobs["authorize-pypi"]["needs"] == "postgres-gate"
+        assert jobs["publish-pypi"]["needs"] == [
+            "postgres-gate",
+            "authorize-pypi",
+            "gate-pypi",
+        ]
+        assert jobs["gate-pypi"]["needs"] == "authorize-pypi"
+        assert jobs["verify-pypi"]["needs"] == [
+            "authorize-pypi",
+            "publish-pypi",
+        ]
+
+
+def test_release_authority_files_have_codeowners() -> None:
+    codeowners = (REPO_ROOT / ".github" / "CODEOWNERS").read_text(
+        encoding="utf-8"
+    )
+    assert "/.github/CODEOWNERS @amittell" in codeowners
+    assert "/.github/workflows/release.yml @amittell" in codeowners
+    assert "/scripts/release.sh @amittell" in codeowners
+    assert "/release/coord-release.pub @amittell" in codeowners

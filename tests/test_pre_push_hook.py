@@ -88,14 +88,20 @@ def test_script_fails_closed_on_missing_jq() -> None:
     assert "jq not installed; skipping" not in PRE_PUSH_SCRIPT
 
 
-def test_script_fails_closed_on_curl_error() -> None:
-    """v0.7 also closed the silent-bypass on transport errors. Pre-v0.7
-    wrapped the curl call in '|| true', so a transient network glitch
-    produced an empty response and the check passed by default. v0.7
-    explicitly checks curl's exit code and refuses on failure."""
-    assert "conflict check failed for ${file}; refusing to push" in PRE_PUSH_SCRIPT
+def test_transport_errors_route_through_soft_fail() -> None:
+    """v0.48 (better-together): transport errors are the hook's OWN
+    failure, not evidence of a conflict — they route through soft_fail,
+    which warns-and-allows in the default advise mode and refuses only
+    under COORD_PREPUSH_MODE=enforce. The v0.7 property that matters is
+    preserved: no silent '|| true' bypass — the failure is always LOUD,
+    and a CONFIRMED conflict still blocks in both modes."""
+    assert 'soft_fail "conflict check unreachable for ${file}"' in PRE_PUSH_SCRIPT
+    assert 'soft_fail "batch conflict check unreachable"' in PRE_PUSH_SCRIPT
     # The blanket '|| true' on the curl invocation is gone.
     assert "|| true)\"\n  has=" not in PRE_PUSH_SCRIPT
+    # advise is the default; enforce restores fail-closed.
+    assert 'PREPUSH_MODE="${COORD_PREPUSH_MODE:-advise}"' in PRE_PUSH_SCRIPT
+    assert '"${PREPUSH_MODE}" == "enforce"' in PRE_PUSH_SCRIPT
 
 
 def test_script_refuses_when_stdin_redirected_but_empty() -> None:
@@ -106,10 +112,11 @@ def test_script_refuses_when_stdin_redirected_but_empty() -> None:
     which misses non-HEAD pushes, multi-ref pushes, and new-branch
     pushes -- exactly the failure mode astrowars's run_child wrapper
     introduced. Refuse loudly with actionable guidance instead."""
-    # The script must contain the strict refusal message and the
-    # actionable hint about forwarding stdin.
+    # v0.48: unusable stdin is the hook's own failure — soft_fail (warn +
+    # allow by default, refuse under enforce). Never a silent HEAD-diff
+    # fallback either way.
     assert "stdin was redirected but empty" in PRE_PUSH_SCRIPT
-    assert "Refusing rather than" in PRE_PUSH_SCRIPT
+    assert 'soft_fail "stdin was redirected but empty' in PRE_PUSH_SCRIPT
     # The fallback HEAD-based path is gated behind a TTY check now
     # (hand-running for tests is fine).
     assert "[[ -t 0 ]]" in PRE_PUSH_SCRIPT or "[ -t 0 ]" in PRE_PUSH_SCRIPT
@@ -743,3 +750,18 @@ def test_shim_exits_zero_when_helper_missing(tmp_path) -> None:
     # Push allowed: the shim resolves the (now missing) helper and exits 0
     # instead of erroring on a nonexistent exec target.
     assert result.returncode == 0, result.stderr
+
+
+def test_http_errors_route_through_soft_fail() -> None:
+    """v0.48.1: a server that ANSWERS but refuses (401 stale token, 5xx,
+    proxy 502) is an infra/identity gap, not a confirmed conflict. Found
+    live 2026-07-18: a wiped local.env token turned every fleet push into
+    a hard block — exactly the hard-dependency posture better-together
+    forbids. Only a parsed response with has_conflicts=true blocks in
+    advise mode; enforce restores fail-closed for all of these."""
+    assert 'soft_fail "batch conflict check failed with HTTP ${batch_status}"' in PRE_PUSH_SCRIPT
+    assert 'soft_fail "conflict-check response for ${context} was not parseable"' in PRE_PUSH_SCRIPT
+    # No remaining hard exit on the batch HTTP-status branch.
+    assert "returned HTTP ${batch_status}; refusing to push" not in PRE_PUSH_SCRIPT
+    # The 404/405 legacy-server fallback is still a fallback, not a soft_fail.
+    assert 'legacy_conflict_check || exit $?' in PRE_PUSH_SCRIPT

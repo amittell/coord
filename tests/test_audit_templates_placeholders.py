@@ -21,14 +21,26 @@ Three drift classes shipped historically and are pinned here:
 3. README install/upgrade examples pinned ``coord-mcp-server==0.28.2``
    on a v0.45 repo. Every version pin in README.md must match
    ``pyproject.toml``'s ``[project].version``.
+
+4. The GitHub-free release path once pushed an unsigned image with no
+   SBOM/provenance while the README claimed every image was keyless-signed.
+   The release script, committed public key, CI multi-arch build, and deploy
+   verification commands must remain one fail-closed contract.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
+import subprocess
 import tomllib
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 from coordination.assets import PRE_PUSH_SCRIPT
 from coordination.cli_init import (
@@ -39,6 +51,8 @@ from coordination.cli_init import (
     _update_mcp_json,
 )
 from coordination.mcp_server import _PLACEHOLDER_VALUES
+from scripts.check_pypi_release import classify_release
+from scripts.verify_image_attestations import verify_image_attestations
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATES = REPO_ROOT / "templates"
@@ -48,6 +62,20 @@ MCP_JSON_TEMPLATES = (
     TEMPLATES / ".cursor" / "mcp.json.example",
 )
 CODEX_TEMPLATE = TEMPLATES / ".codex" / "config.toml.example"
+CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+RELEASE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "release.yml"
+DEPLOYMENT_DOC = REPO_ROOT / "docs" / "deployment.md"
+GITHUB_FREE_RELEASE_DOC = REPO_ROOT / "docs" / "releasing-without-github.md"
+RELEASE_SCRIPT = REPO_ROOT / "scripts" / "release.sh"
+RELEASE_PUBLIC_KEY = REPO_ROOT / "release" / "coord-release.pub"
+REQUIREMENT_LOCKS = (
+    REPO_ROOT / "requirements-build.txt",
+    REPO_ROOT / "requirements.txt",
+    REPO_ROOT / "requirements-otel.txt",
+    REPO_ROOT / "requirements-postgres.txt",
+)
+REQUIREMENT_INPUTS = tuple(path.with_suffix(".in") for path in REQUIREMENT_LOCKS)
+EXPECTED_BUILDER_ID = "https://mobyproject.org/buildkit@v1"
 
 
 def test_placeholder_constants_are_recognized_by_the_wrapper() -> None:
@@ -152,14 +180,1054 @@ def test_readme_version_pins_match_pyproject() -> None:
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
     pip_pins = re.findall(r"coord-mcp-server==(\d+\.\d+\.\d+)", readme)
-    image_pins = re.findall(r"ghcr\.io/amittell/coord:v(\d+\.\d+\.\d+)", readme)
+    image_pins = re.findall(r"whcr\.io/alexm/coord:v(\d+\.\d+\.\d+)", readme)
     version_outputs = re.findall(r"# coord (\d+\.\d+\.\d+)", readme)
     readyz_outputs = re.findall(r'"version"\s*:\s*"(\d+\.\d+\.\d+)"', readme)
 
     pins = pip_pins + image_pins + version_outputs + readyz_outputs
     assert pins, "expected at least one version pin in README.md"
+    assert "ghcr.io/amittell/coord" not in readme, (
+        "README.md points at the retired GHCR publication path; "
+        "use the canonical whcr.io/alexm/coord image"
+    )
     stale = sorted({p for p in pins if p != version})
     assert not stale, (
         f"README.md pins {stale} but pyproject.toml says {version}; "
         f"update the install/upgrade/verify examples"
     )
+
+
+def test_github_free_release_is_attested_signed_and_verified() -> None:
+    script = RELEASE_SCRIPT.read_text(encoding="utf-8")
+    for required in (
+        "--platform \"${PLATFORMS}\"",
+        '--attest="type=sbom,generator=${SBOM_GENERATOR}"',
+        '--provenance="mode=max,builder-id=${BUILDER_ID}"',
+        "--metadata-file \"$image_metadata\"",
+        "scripts/verify_image_attestations.py",
+        '--builder-id "${BUILDER_ID}"',
+        "cosign sign --yes --key",
+        "cosign verify",
+        "--key release/coord-release.pub",
+        "dist/coord-${TAG}-image-digest.txt",
+        'COSIGN_MIN_VERSION="3.0.6"',
+        'CRANE_VERSION="0.21.7"',
+        "COORD_RELEASE_PYTHON",
+        '"$PYTHON_BIN" -m venv',
+        "release_authorization_statement",
+        "cosign sign-blob --yes",
+        'PYPI_PUBLISHER="${COORD_PYPI_PUBLISHER:-github-oidc}"',
+        "github-oidc:amittell/coord:.github/workflows/release.yml:pypi",
+        "build_python=${BUILD_PYTHON_VERSION}",
+        "gh workflow run release.yml",
+        'git tag --no-sign -a "$LOCK_TAG"',
+        'git tag --no-sign -a "$PYPI_OIDC_TRIGGER_TAG"',
+    ):
+        assert required in script, (
+            f"scripts/release.sh lost required supply-chain fence {required!r}"
+        )
+    assert "COSIGN_SIGNING_KEY" in script
+    assert "COSIGN_PUBLIC_KEY" not in script
+    assert re.search(r"sha256:\[0-9a-f\]\{64\}", script)
+    build = script.index("docker buildx build")
+    preflight = script.index("# ---- preflight")
+    verifier_preflight = script.index(
+        "  verify_github_oidc_verifier", preflight
+    )
+    controls_preflight = script.index(
+        "  audit_github_oidc_controls", verifier_preflight
+    )
+    assert preflight < verifier_preflight < controls_preflight < build
+    verify_attestations = script.index(
+        "scripts/verify_image_attestations.py", build
+    )
+    sign = script.index("cosign sign --yes")
+    verify_signature = script.index("cosign verify", sign)
+    release_lock = script.index("acquire_release_lock", verify_signature)
+    oidc_authorization = script.index(
+        '    ensure_github_oidc_trigger "$image_digest"', release_lock
+    )
+    oidc_dispatch = script.index(
+        "    dispatch_github_oidc_publish", oidc_authorization
+    )
+    pypi_wait = script.index(
+        "    wait_for_github_oidc_publish", oidc_dispatch
+    )
+    promote = script.index("crane tag", pypi_wait)
+    assert (
+        build
+        < verify_attestations
+        < sign
+        < verify_signature
+        < release_lock
+        < oidc_authorization
+        < oidc_dispatch
+        < pypi_wait
+        < promote
+    )
+    token_fallback = script.index('"${twine_command[@]}" upload', oidc_authorization)
+    assert token_fallback < promote
+    build_command = script[build:verify_attestations]
+    assert '-t "$candidate_tag"' in build_command
+    assert '-t "${IMAGE}:${TAG}"' not in build_command
+    assert '-t "${IMAGE}:latest"' not in build_command
+    assert "scripts/check_pypi_release.py" in script
+    assert "--require-hashes" in script
+    assert "--no-isolation" in script
+    assert 'PYPI_STATE" = "partial"' in script
+    assert "post_upload_state" in script
+    assert "require_image_tag_absent" in script
+    assert script.count('require_image_tag_absent "${IMAGE}:${TAG}"') == 1
+    assert "coord-release-lock-${TAG}" in script
+    assert "coord-release-lock-v2" in script
+    assert "operation_id=${RELEASE_OPERATION_ID}" in script
+    assert "image=${IMAGE}@${digest}" in script
+    assert "packages=${PACKAGE_FINGERPRINT}" in script
+    assert "publisher=${PYPI_OIDC_PUBLISHER}" in script
+    assert "build_python=${BUILD_PYTHON_VERSION}" in script
+    assert (
+        'PYPI_OIDC_TRIGGER_TAG="coord-pypi-${TAG}-${RELEASE_OPERATION_ID}"'
+        in script
+    )
+    assert "COORD_RELEASE_RESUME_ID" in script
+    assert "explicit resume requires COORD_RELEASE_RESUME_ID" in script
+    assert "concurrent publisher locked the same exact commit" not in script
+    assert 'candidate-${TAG}-$(git rev-parse --short=12 HEAD)-${RELEASE_OPERATION_ID}' in script
+    dry_exit = script.index('if [ "$PUBLISH" = 0 ]')
+    image_push = script.index("docker buildx build", dry_exit)
+    lock_acquisition = script.index('acquire_release_lock "$image_digest"', image_push)
+    assert dry_exit < image_push < lock_acquisition
+    assert "version_tag_exists=1" in script
+    assert "remote tag ${TAG} does not point to ${head}" in script
+    assert 'SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"' in script
+    assert "CPython 3.11-3.14" in script
+    assert (
+        "not ((3, 11) <= sys.version_info[:2] <= (3, 14))"
+        in script
+    )
+    assert "python3 -m venv" not in script
+
+
+def test_github_oidc_trigger_is_operation_bound_and_signature_checked(
+    tmp_path: Path,
+) -> None:
+    script = RELEASE_SCRIPT.read_text(encoding="utf-8")
+    functions = script[
+        script.index("release_authorization_statement()")
+        : script.index("wait_for_github_oidc_publish()")
+    ]
+    remote = tmp_path / "github.git"
+    repo = tmp_path / "repo"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True)
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True)
+    (repo / "seed").write_text("OIDC authorization fixture\n", encoding="utf-8")
+    (repo / "release").mkdir()
+    (repo / "release" / "coord-release.pub").write_text(
+        "test-public-key\n",
+        encoding="utf-8",
+    )
+    for key, value in (
+        ("user.name", "Release Test"),
+        ("user.email", "release-test@example.invalid"),
+        ("tag.gpgSign", "true"),
+        ("gpg.program", "false"),
+    ):
+        subprocess.run(["git", "config", key, value], cwd=repo, check=True)
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "seed"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "remote", "add", "github", str(remote)],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "push", "-u", "github", "main"],
+        cwd=repo,
+        check=True,
+    )
+
+    git_wrapper = bin_dir / "git"
+    git_wrapper.write_text(
+        """#!/usr/bin/env python3
+import os
+import sys
+
+if sys.argv[1:] == ["remote", "get-url", "github"]:
+    print("https://github.com/amittell/coord.git")
+    raise SystemExit(0)
+os.execv("/usr/bin/git", ["/usr/bin/git", *sys.argv[1:]])
+""",
+        encoding="utf-8",
+    )
+    cosign_wrapper = bin_dir / "cosign"
+    cosign_wrapper.write_text(
+        """#!/usr/bin/env python3
+import hashlib
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+bundle = Path(args[args.index("--bundle") + 1])
+statement = Path(args[-1])
+digest = hashlib.sha256(statement.read_bytes()).hexdigest()
+if args[0] == "sign-blob":
+    bundle.write_text(digest, encoding="utf-8")
+    raise SystemExit(0)
+if args[0] == "verify-blob":
+    raise SystemExit(0 if bundle.read_text(encoding="utf-8") == digest else 1)
+raise SystemExit(2)
+""",
+        encoding="utf-8",
+    )
+    git_wrapper.chmod(0o755)
+    cosign_wrapper.chmod(0o755)
+
+    operation_id = "a" * 32
+    trigger_tag = f"coord-pypi-v0.49.0-{operation_id}"
+    harness = f"""\
+set -euo pipefail
+fail() {{ echo "release: $*" >&2; exit 1; }}
+VERSION=0.49.0
+TAG=v0.49.0
+IMAGE=whcr.io/alexm/coord
+RELEASE_OPERATION_ID={operation_id}
+PACKAGE_FINGERPRINT='{{"coord.whl":"{"1" * 64}"}}'
+BUILD_PYTHON_VERSION=3.12
+PYPI_OIDC_PUBLISHER=github-oidc:amittell/coord:.github/workflows/release.yml:pypi
+PYPI_OIDC_TRIGGER_TAG={trigger_tag}
+PYPI_GITHUB_REMOTE=github
+PYTHON_BIN=python3
+{functions}
+ensure_github_oidc_trigger sha256:{"2" * 64}
+"""
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "COSIGN_SIGNING_KEY": "fake",
+    }
+    first = subprocess.run(
+        ["bash", "-c", harness],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert first.returncode == 0, first.stderr
+    assert "published Vault-authorized GitHub OIDC trigger" in first.stdout
+
+    replay = subprocess.run(
+        ["bash", "-c", harness],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert replay.returncode == 0, replay.stderr
+    assert "already matches the locked release" in replay.stdout
+
+    subprocess.run(
+        ["git", "push", "github", f":refs/tags/{trigger_tag}"],
+        cwd=repo,
+        check=True,
+    )
+    retry = subprocess.run(
+        ["bash", "-c", harness],
+        cwd=repo,
+        env={**env, "COSIGN_SIGNING_KEY": ""},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert retry.returncode == 0, retry.stderr
+    assert "retrying previously verified local" in retry.stdout
+
+    subprocess.run(["git", "tag", "-d", trigger_tag], cwd=repo, check=True)
+    forged_payload = "\n".join(
+        (
+            "coord-pypi-trigger-v1",
+            "statement_base64=YmFk",
+            "bundle_base64=YmFk",
+        )
+    )
+    subprocess.run(
+        ["git", "tag", "--no-sign", "-a", trigger_tag, "-m", forged_payload],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "push", "--force", "github", f"refs/tags/{trigger_tag}"],
+        cwd=repo,
+        check=True,
+    )
+    forged = subprocess.run(
+        ["bash", "-c", harness],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert forged.returncode != 0
+    assert "release authorization signature is invalid" in forged.stderr
+
+
+def test_github_oidc_dispatch_audits_live_protection_before_workflow(
+    tmp_path: Path,
+) -> None:
+    script = RELEASE_SCRIPT.read_text(encoding="utf-8")
+    function = script[
+        script.index("audit_github_oidc_controls()")
+        : script.index("wait_for_github_oidc_publish()")
+    ]
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh_log = tmp_path / "gh-workflow.log"
+    gh_wrapper = bin_dir / "gh"
+    gh_wrapper.write_text(
+        """#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+if args[:2] == ["auth", "status"]:
+    raise SystemExit(0)
+if args[:2] == ["workflow", "run"]:
+    Path(os.environ["GH_LOG"]).write_text(" ".join(args), encoding="utf-8")
+    raise SystemExit(0)
+if args[0] != "api":
+    raise SystemExit(2)
+endpoint = args[1]
+if endpoint.endswith("/deployment-branch-policies"):
+    print(json.dumps({
+        "branch_policies": [{"name": "main", "type": "branch"}],
+    }))
+elif endpoint.endswith("/environments/pypi"):
+    drift = os.environ.get("GH_DRIFT")
+    reviewers = [] if drift == "reviewer" else [
+        {"type": "User", "reviewer": {"login": "amittell"}},
+    ]
+    if drift == "extra-user":
+        reviewers.append({"type": "User", "reviewer": {"login": "mallory"}})
+    if drift == "extra-team":
+        reviewers.append({"type": "Team", "reviewer": {"slug": "release-admins"}})
+    print(json.dumps({
+        "can_admins_bypass": False,
+        "protection_rules": [{
+            "type": "required_reviewers",
+            "reviewers": reviewers,
+        }],
+        "deployment_branch_policy": {
+            "custom_branch_policies": True,
+            "protected_branches": False,
+        },
+    }))
+elif endpoint.endswith("/branches/main/protection"):
+    drift = os.environ.get("GH_DRIFT")
+    print(json.dumps({
+        "required_pull_request_reviews": {
+            "require_code_owner_reviews": True,
+            "dismiss_stale_reviews": drift != "stale-reviews",
+            "require_last_push_approval": True,
+            "required_approving_review_count": 1,
+        },
+        "enforce_admins": {"enabled": drift != "admin-enforcement"},
+        "required_linear_history": {"enabled": True},
+        "allow_force_pushes": {"enabled": False},
+        "allow_deletions": {"enabled": False},
+        "lock_branch": {"enabled": drift != "branch-lock"},
+    }))
+else:
+    raise SystemExit(2)
+""",
+        encoding="utf-8",
+    )
+    gh_wrapper.chmod(0o755)
+    harness = f"""\
+set -euo pipefail
+fail() {{ echo "release: $*" >&2; exit 1; }}
+PYTHON_BIN=python3
+PYPI_OIDC_TRIGGER_TAG=coord-pypi-v0.49.0-{"a" * 32}
+{function}
+dispatch_github_oidc_publish
+"""
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "GH_LOG": str(gh_log),
+    }
+    accepted = subprocess.run(
+        ["bash", "-c", harness],
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert accepted.returncode == 0, accepted.stderr
+    dispatch = gh_log.read_text(encoding="utf-8")
+    assert "--ref main" in dispatch
+    assert "--field oidc_trigger_tag=coord-pypi-v0.49.0-" in dispatch
+
+    for drift in (
+        "reviewer",
+        "extra-user",
+        "extra-team",
+        "stale-reviews",
+        "admin-enforcement",
+        "branch-lock",
+    ):
+        rejected_log = tmp_path / f"rejected-{drift}.log"
+        rejected = subprocess.run(
+            ["bash", "-c", harness],
+            env={
+                **env,
+                "GH_DRIFT": drift,
+                "GH_LOG": str(rejected_log),
+            },
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert rejected.returncode != 0
+        assert "protections do not match the release contract" in rejected.stderr
+        assert not rejected_log.exists()
+
+
+def test_release_lock_rejects_same_commit_competitor_and_validates_resume(
+    tmp_path: Path,
+) -> None:
+    script = RELEASE_SCRIPT.read_text(encoding="utf-8")
+    functions = script[
+        script.index("remote_tag_lines()") : script.index(
+            "# ---- preflight"
+        )
+    ]
+    remote = tmp_path / "remote.git"
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True)
+    subprocess.run(["git", "init", "-b", "main", str(first)], check=True)
+    (first / "seed").write_text("release lock fixture\n", encoding="utf-8")
+    for key, value in (
+        ("user.name", "Release Test"),
+        ("user.email", "release-test@example.invalid"),
+    ):
+        subprocess.run(
+            ["git", "config", key, value],
+            cwd=first,
+            check=True,
+        )
+    subprocess.run(["git", "add", "seed"], cwd=first, check=True)
+    subprocess.run(["git", "commit", "-m", "seed"], cwd=first, check=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(remote)],
+        cwd=first,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "push", "-u", "origin", "main"],
+        cwd=first,
+        check=True,
+    )
+    subprocess.run(["git", "clone", str(remote), str(second)], check=True)
+    subprocess.run(["git", "checkout", "main"], cwd=second, check=True)
+    for repo in (first, second):
+        for key, value in (
+            ("user.name", "Release Test"),
+            ("user.email", "release-test@example.invalid"),
+            ("tag.gpgSign", "true"),
+            ("gpg.program", "false"),
+        ):
+            subprocess.run(
+                ["git", "config", key, value],
+                cwd=repo,
+                check=True,
+            )
+
+    harness = f"""\
+set -euo pipefail
+fail() {{ echo "release: $*" >&2; exit 1; }}
+IMAGE=registry.example/coord
+TAG=v0.49.0
+LOCK_TAG=coord-release-lock-${{TAG}}
+RELEASE_OPERATION_ID="$1"
+PACKAGE_FINGERPRINT="$2"
+{functions}
+case "$3" in
+  acquire) acquire_release_lock sha256:{"1" * 64} ;;
+  resume)
+    load_release_lock_for_resume
+    printf '%s\\n' "$image_digest"
+    ;;
+esac
+"""
+
+    operation_a = "a" * 32
+    operation_b = "b" * 32
+    packages = '{"coord.whl":"abc","coord.tar.gz":"def"}'
+    first_result = subprocess.run(
+        ["bash", "-c", harness, "release-test", operation_a, packages, "acquire"],
+        cwd=first,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert first_result.returncode == 0, first_result.stderr
+
+    competitor = subprocess.run(
+        ["bash", "-c", harness, "release-test", operation_b, packages, "acquire"],
+        cwd=second,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert competitor.returncode != 0
+    assert f"already belongs to operation {operation_a}" in competitor.stderr
+
+    resume = subprocess.run(
+        ["bash", "-c", harness, "release-test", operation_a, packages, "resume"],
+        cwd=second,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert resume.returncode == 0, resume.stderr
+    assert f"sha256:{'1' * 64}" in resume.stdout
+
+    divergent_packages = subprocess.run(
+        [
+            "bash",
+            "-c",
+            harness,
+            "release-test",
+            operation_a,
+            '{"coord.whl":"different"}',
+            "resume",
+        ],
+        cwd=second,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert divergent_packages.returncode != 0
+    assert "package hashes do not match" in divergent_packages.stderr
+
+
+def test_release_dependency_inputs_are_exact_and_locks_are_hash_complete() -> None:
+    for input_path in REQUIREMENT_INPUTS:
+        requirements = [
+            line.strip()
+            for line in input_path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        assert requirements, f"{input_path} has no dependency inputs"
+        assert all(
+            "==" in requirement or requirement.startswith("-r ")
+            for requirement in requirements
+        ), (
+            f"{input_path} contains an unpinned requirement"
+        )
+
+    for lock_path in REQUIREMENT_LOCKS:
+        logical_lines: list[str] = []
+        current = ""
+        for raw_line in lock_path.read_text(encoding="utf-8").splitlines():
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            current = f"{current} {stripped}".strip()
+            if stripped.endswith("\\"):
+                current = current[:-1].rstrip()
+                continue
+            logical_lines.append(current)
+            current = ""
+        assert not current, f"{lock_path} ends in an incomplete continuation"
+        assert logical_lines, f"{lock_path} has no locked requirements"
+        unhashed = [line for line in logical_lines if "--hash=sha256:" not in line]
+        assert not unhashed, f"{lock_path} has unhashed requirements: {unhashed}"
+
+    dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    postgres = (REPO_ROOT / "Dockerfile.postgres").read_text(encoding="utf-8")
+    pyproject = tomllib.loads(
+        (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    assert dockerfile.count("--require-hashes") == 1
+    assert "--no-build-isolation" in dockerfile
+    assert "pip install --upgrade" not in dockerfile
+    assert "snapshot.debian.org/archive/debian/20260713T000000Z" in dockerfile
+    assert "git=1:2.47.3-0+deb13u1" in dockerfile
+    assert "--require-hashes" in postgres
+    assert pyproject["build-system"]["requires"] == ["hatchling==1.31.0"]
+
+
+@pytest.mark.parametrize(
+    ("remote", "expected"),
+    [
+        ({}, ("absent", ["coord.tar.gz", "coord.whl"])),
+        ({"coord.whl": "wheel"}, ("partial", ["coord.tar.gz"])),
+        (
+            {"coord.whl": "wheel", "coord.tar.gz": "sdist"},
+            ("exact", []),
+        ),
+    ],
+)
+def test_pypi_release_classifier_accepts_only_matching_subsets(
+    remote: dict[str, str],
+    expected: tuple[str, list[str]],
+) -> None:
+    local = {"coord.whl": "wheel", "coord.tar.gz": "sdist"}
+    assert classify_release(local, remote) == expected
+
+
+@pytest.mark.parametrize(
+    ("local", "remote"),
+    [
+        ({"coord.whl": "wheel"}, {"coord.whl": "different"}),
+        ({"coord.whl": "wheel"}, {"unexpected.whl": "other"}),
+        ({"../coord.whl": "wheel"}, {}),
+        ({}, {}),
+    ],
+)
+def test_pypi_release_classifier_rejects_unsafe_or_divergent_state(
+    local: dict[str, str],
+    remote: dict[str, str],
+) -> None:
+    with pytest.raises(ValueError):
+        classify_release(local, remote)
+
+
+def test_release_identity_commits_only_a_public_key() -> None:
+    public_key = RELEASE_PUBLIC_KEY.read_text(encoding="utf-8")
+    assert public_key.startswith("-----BEGIN PUBLIC KEY-----\n")
+    assert public_key.endswith("-----END PUBLIC KEY-----\n")
+    assert "PRIVATE KEY" not in public_key
+    private_key_candidates = tuple((REPO_ROOT / "release").glob("*.key"))
+    assert not private_key_candidates, (
+        "release/ must never contain an exportable signing key; "
+        f"found {private_key_candidates}"
+    )
+
+
+def test_ci_and_deploy_docs_exercise_the_signed_multiarch_contract() -> None:
+    workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+    release_workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+    docs = DEPLOYMENT_DOC.read_text(encoding="utf-8")
+    release_docs = GITHUB_FREE_RELEASE_DOC.read_text(encoding="utf-8")
+
+    assert "127.0.0.1:5000/coord:ci" in workflow
+    assert "steps.base-build.outputs.digest" in workflow
+    assert "docker image inspect coord:ci" not in workflow
+    assert workflow.count("platforms: linux/amd64,linux/arm64") >= 1
+    assert "--platform linux/amd64,linux/arm64" in workflow
+    assert "docker/buildkit-syft-scanner@sha256:" in workflow
+    assert "scripts/verify_image_attestations.py" in workflow
+    assert workflow.count("scripts/verify_image_attestations.py") >= 2
+    assert workflow.count(
+        "--builder-id https://writhub.io/alexm/coord/builders/ci/v1"
+    ) >= 2
+    assert "provenance: mode=max,builder-id=" in workflow
+    assert "--provenance=mode=max,builder-id=" in workflow
+    assert "go-containerregistry_Linux_x86_64.tar.gz" in workflow
+    assert "1a57bc98207fa1c0d04bf760699099e26f8383499bfd55b99c1b919a928a7230" in workflow
+    assert "--insecure" in workflow
+    assert "tonistiigi/binfmt:qemu-v10.2.3@sha256:" in workflow
+    assert "tonistiigi/binfmt:latest" not in workflow
+    assert "tonistiigi/binfmt:qemu-v10.2.3@sha256:" in release_workflow
+    assert "tonistiigi/binfmt:latest" not in release_workflow
+    assert "docker/buildkit-syft-scanner@sha256:" in release_workflow
+    assert "--builder-id \"$BUILDER_ID\"" in release_workflow
+
+    assert docs.count("cosign verify") >= 2
+    assert "cosign sign --yes" in docs
+    assert "release/coord-release.pub" in docs
+    assert "docker/buildkit-syft-scanner@sha256:" in docs
+    assert "scripts/verify_image_attestations.py" in docs
+    assert (
+        "--builder-id "
+        "https://writhub.io/alexm/coord/builders/github-free-release/v1"
+    ) in docs
+    assert "--provenance=mode=max,builder-id=" in docs
+    assert docs.count("set -euo pipefail") >= 2
+    assert "COORD_DERIVATIVE_CANDIDATE" in docs
+    assert "crane tag" in docs
+    assert "test \"$(crane version)\" = '0.21.7'" in docs
+    assert "could not prove derivative tag is absent" in docs
+    derivative_probe = docs.index("could not prove derivative tag is absent")
+    derivative_build = docs.index("docker buildx build", derivative_probe)
+    derivative_promote = docs.index("crane tag", derivative_build)
+    assert derivative_probe < derivative_build < derivative_promote
+    assert 'path "transit/sign/coord-release/*"' in release_docs
+    assert "Never give the release process a\n   Vault root token" in release_docs
+    assert "Revoke that token when the release finishes" in release_docs
+    assert "crane 0.21.7 exactly" in release_docs
+    assert "failure therefore cannot publish" in release_docs
+    assert "filename and SHA-256" in release_docs
+    assert "PyPI Trusted Publisher" in release_docs
+    assert "Vault-signed" in release_docs
+    assert "authorization" in release_docs
+    assert "COORD_PYPI_PUBLISHER=github-oidc|token" in release_docs
+    assert "Never put that token in the" in release_docs
+    assert "`main` branch only" in release_docs
+    assert "no repository checkout" in release_docs
+    assert "inert signed" in release_docs
+    assert "github.com/amittell/coord/pkgs/container/coord" not in (
+        REPO_ROOT / "README.md"
+    ).read_text(encoding="utf-8")
+
+
+def _attested_index_fixture() -> tuple[
+    str,
+    dict[str, dict[str, object]],
+    dict[str, bytes],
+]:
+    repository = "registry.example/coord"
+    index_digest = "sha256:" + "0" * 64
+    amd64_digest = "sha256:" + "1" * 64
+    arm64_digest = "sha256:" + "2" * 64
+    amd64_attestation = "sha256:" + "3" * 64
+    arm64_attestation = "sha256:" + "4" * 64
+
+    def platform(digest: str, architecture: str) -> dict[str, object]:
+        return {
+            "digest": digest,
+            "platform": {"os": "linux", "architecture": architecture},
+        }
+
+    def link(subject: str, digest: str) -> dict[str, object]:
+        return {
+            "digest": digest,
+            "platform": {"os": "unknown", "architecture": "unknown"},
+            "annotations": {
+                "vnd.docker.reference.type": "attestation-manifest",
+                "vnd.docker.reference.digest": subject,
+            },
+        }
+
+    blobs: dict[str, bytes] = {}
+
+    def predicate_payload(predicate: str) -> dict[str, object]:
+        if predicate == "https://spdx.dev/Document":
+            return {
+                "spdxVersion": "SPDX-2.3",
+                "dataLicense": "CC0-1.0",
+                "SPDXID": "SPDXRef-DOCUMENT",
+                "name": "coord image SBOM",
+                "documentNamespace": (
+                    "https://example.invalid/spdx/coord-image-00000000"
+                ),
+                "creationInfo": {
+                    "created": "2026-07-23T00:00:00Z",
+                    "creators": ["Tool: buildkit-syft-scanner"],
+                },
+                "packages": [],
+            }
+        if predicate == "https://slsa.dev/provenance/v1":
+            return {
+                "buildDefinition": {
+                    "buildType": "https://mobyproject.org/buildkit@v1",
+                    "externalParameters": {},
+                },
+                "runDetails": {
+                    "builder": {
+                        "id": "https://mobyproject.org/buildkit@v1",
+                    }
+                },
+            }
+        raise AssertionError(f"unexpected fixture predicate: {predicate}")
+
+    def predicates(subject: str) -> dict[str, object]:
+        layers: list[dict[str, object]] = []
+        for predicate in (
+            "https://spdx.dev/Document",
+            "https://slsa.dev/provenance/v1",
+        ):
+            payload = json.dumps(
+                {
+                    "_type": "https://in-toto.io/Statement/v1",
+                    "subject": [
+                        {
+                            "name": "pkg:docker/registry.example/coord",
+                            "digest": {"sha256": subject.removeprefix("sha256:")},
+                        }
+                    ],
+                    "predicateType": predicate,
+                    "predicate": predicate_payload(predicate),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+            digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+            blobs[f"{repository}@{digest}"] = payload
+            layers.append(
+                {
+                    "mediaType": "application/vnd.in-toto+json",
+                    "digest": digest,
+                    "annotations": {"in-toto.io/predicate-type": predicate},
+                }
+            )
+        return {"layers": layers}
+
+    image = f"{repository}@{index_digest}"
+    manifests = {
+        image: {
+            "manifests": [
+                platform(amd64_digest, "amd64"),
+                link(amd64_digest, amd64_attestation),
+                platform(arm64_digest, "arm64"),
+                link(arm64_digest, arm64_attestation),
+            ]
+        },
+        f"{repository}@{amd64_attestation}": predicates(amd64_digest),
+        f"{repository}@{arm64_attestation}": predicates(arm64_digest),
+    }
+    return image, manifests, blobs
+
+
+def _rewrite_fixture_statement(
+    manifests: dict[str, dict[str, object]],
+    blobs: dict[str, bytes],
+    mutate: Callable[[dict[str, Any]], None],
+    *,
+    layer_index: int = 0,
+) -> None:
+    attestation = manifests["registry.example/coord@sha256:" + "3" * 64]
+    layers = attestation["layers"]
+    assert isinstance(layers, list)
+    layer = layers[layer_index]
+    assert isinstance(layer, dict)
+    old_digest = layer["digest"]
+    assert isinstance(old_digest, str)
+    statement = json.loads(blobs[f"registry.example/coord@{old_digest}"])
+    assert isinstance(statement, dict)
+    mutate(statement)
+    payload = json.dumps(
+        statement,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    new_digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+    layer["digest"] = new_digest
+    blobs[f"registry.example/coord@{new_digest}"] = payload
+
+
+def test_attestation_verifier_requires_both_predicates_per_platform() -> None:
+    image, manifests, blobs = _attested_index_fixture()
+    verify_image_attestations(
+        image,
+        {"linux/amd64", "linux/arm64"},
+        builder_id=EXPECTED_BUILDER_ID,
+        inspect_raw=manifests.__getitem__,
+        fetch_blob=lambda reference, _insecure: blobs[reference],
+    )
+
+    arm64_attestation = "registry.example/coord@sha256:" + "4" * 64
+    layers = manifests[arm64_attestation]["layers"]
+    assert isinstance(layers, list)
+    layers.pop(0)
+    with pytest.raises(ValueError, match="linux/arm64.*spdx"):
+        verify_image_attestations(
+            image,
+            {"linux/amd64", "linux/arm64"},
+            builder_id=EXPECTED_BUILDER_ID,
+            inspect_raw=manifests.__getitem__,
+            fetch_blob=lambda reference, _insecure: blobs[reference],
+        )
+
+
+def test_attestation_verifier_rejects_unexpected_builder_identity() -> None:
+    image, manifests, blobs = _attested_index_fixture()
+    _rewrite_fixture_statement(
+        manifests,
+        blobs,
+        lambda statement: statement["predicate"]["runDetails"]["builder"].__setitem__(
+            "id",
+            "https://example.invalid/untrusted-builder",
+        ),
+        layer_index=1,
+    )
+
+    with pytest.raises(ValueError, match="builder id.*does not match expected"):
+        verify_image_attestations(
+            image,
+            {"linux/amd64", "linux/arm64"},
+            builder_id=EXPECTED_BUILDER_ID,
+            inspect_raw=manifests.__getitem__,
+            fetch_blob=lambda reference, _insecure: blobs[reference],
+        )
+
+
+def test_attestation_verifier_rehashes_top_level_index() -> None:
+    image, _manifests, _blobs = _attested_index_fixture()
+    raw_index = b'{"manifests":[]}'
+
+    with pytest.raises(ValueError, match="OCI JSON content hashes to"):
+        verify_image_attestations(
+            image,
+            {"linux/amd64", "linux/arm64"},
+            builder_id=EXPECTED_BUILDER_ID,
+            inspect_raw=lambda _reference: raw_index,
+        )
+
+
+def test_attestation_verifier_rehashes_linked_attestation_manifest() -> None:
+    image, manifests, blobs = _attested_index_fixture()
+    amd64_attestation = "registry.example/coord@sha256:" + "3" * 64
+
+    def inspect(reference: str) -> bytes | dict[str, object]:
+        if reference == amd64_attestation:
+            return b'{"layers":[]}'
+        return manifests[reference]
+
+    with pytest.raises(ValueError, match="OCI JSON content hashes to"):
+        verify_image_attestations(
+            image,
+            {"linux/amd64", "linux/arm64"},
+            builder_id=EXPECTED_BUILDER_ID,
+            inspect_raw=inspect,
+            fetch_blob=lambda reference, _insecure: blobs[reference],
+        )
+
+
+def test_attestation_verifier_rejects_annotation_payload_disagreement() -> None:
+    image, manifests, blobs = _attested_index_fixture()
+    attestation = manifests["registry.example/coord@sha256:" + "3" * 64]
+    layers = attestation["layers"]
+    assert isinstance(layers, list)
+    first = layers[0]
+    assert isinstance(first, dict)
+    annotations = first["annotations"]
+    assert isinstance(annotations, dict)
+    annotations["in-toto.io/predicate-type"] = "https://example.invalid/lie"
+
+    with pytest.raises(ValueError, match="annotation.*disagrees"):
+        verify_image_attestations(
+            image,
+            {"linux/amd64", "linux/arm64"},
+            builder_id=EXPECTED_BUILDER_ID,
+            inspect_raw=manifests.__getitem__,
+            fetch_blob=lambda reference, _insecure: blobs[reference],
+        )
+
+
+def test_attestation_verifier_rejects_mismatched_subject() -> None:
+    image, manifests, blobs = _attested_index_fixture()
+    _rewrite_fixture_statement(
+        manifests,
+        blobs,
+        lambda statement: statement["subject"][0]["digest"].__setitem__(
+            "sha256",
+            "f" * 64,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="subjects do not match"):
+        verify_image_attestations(
+            image,
+            {"linux/amd64", "linux/arm64"},
+            builder_id=EXPECTED_BUILDER_ID,
+            inspect_raw=manifests.__getitem__,
+            fetch_blob=lambda reference, _insecure: blobs[reference],
+        )
+
+
+def test_attestation_verifier_rejects_wrong_statement_type() -> None:
+    image, manifests, blobs = _attested_index_fixture()
+    _rewrite_fixture_statement(
+        manifests,
+        blobs,
+        lambda statement: statement.__setitem__(
+            "_type",
+            "https://in-toto.io/Statement/v0.1",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="must declare _type"):
+        verify_image_attestations(
+            image,
+            {"linux/amd64", "linux/arm64"},
+            builder_id=EXPECTED_BUILDER_ID,
+            inspect_raw=manifests.__getitem__,
+            fetch_blob=lambda reference, _insecure: blobs[reference],
+        )
+
+
+@pytest.mark.parametrize("layer_index", [0, 1])
+def test_attestation_verifier_rejects_empty_predicates(layer_index: int) -> None:
+    image, manifests, blobs = _attested_index_fixture()
+    _rewrite_fixture_statement(
+        manifests,
+        blobs,
+        lambda statement: statement.__setitem__("predicate", {}),
+        layer_index=layer_index,
+    )
+
+    expected = "SPDX predicate" if layer_index == 0 else "SLSA predicate"
+    with pytest.raises(ValueError, match=expected):
+        verify_image_attestations(
+            image,
+            {"linux/amd64", "linux/arm64"},
+            builder_id=EXPECTED_BUILDER_ID,
+            inspect_raw=manifests.__getitem__,
+            fetch_blob=lambda reference, _insecure: blobs[reference],
+        )
+
+
+def test_attestation_verifier_rejects_malformed_or_corrupt_blob() -> None:
+    image, manifests, blobs = _attested_index_fixture()
+    attestation = manifests["registry.example/coord@sha256:" + "3" * 64]
+    layers = attestation["layers"]
+    assert isinstance(layers, list)
+    first = layers[0]
+    assert isinstance(first, dict)
+    old_digest = first["digest"]
+    assert isinstance(old_digest, str)
+    reference = f"registry.example/coord@{old_digest}"
+    blobs[reference] = b"corrupt"
+    with pytest.raises(ValueError, match="hashes to"):
+        verify_image_attestations(
+            image,
+            {"linux/amd64", "linux/arm64"},
+            builder_id=EXPECTED_BUILDER_ID,
+            inspect_raw=manifests.__getitem__,
+            fetch_blob=lambda value, _insecure: blobs[value],
+        )
+
+    malformed = b"{"
+    malformed_digest = "sha256:" + hashlib.sha256(malformed).hexdigest()
+    first["digest"] = malformed_digest
+    blobs[f"registry.example/coord@{malformed_digest}"] = malformed
+    with pytest.raises(ValueError, match="malformed in-toto JSON"):
+        verify_image_attestations(
+            image,
+            {"linux/amd64", "linux/arm64"},
+            builder_id=EXPECTED_BUILDER_ID,
+            inspect_raw=manifests.__getitem__,
+            fetch_blob=lambda value, _insecure: blobs[value],
+        )
+
+
+def test_release_docker_inputs_are_digest_pinned() -> None:
+    dockerfiles = (
+        REPO_ROOT / "Dockerfile",
+        REPO_ROOT / "Dockerfile.postgres",
+    )
+    for path in dockerfiles:
+        first_line = path.read_text(encoding="utf-8").splitlines()[0]
+        assert re.fullmatch(
+            r"# syntax=docker/dockerfile:1\.7@sha256:[0-9a-f]{64}",
+            first_line,
+        ), f"{path.name} has a mutable Dockerfile frontend: {first_line}"
+
+    base = dockerfiles[0].read_text(encoding="utf-8")
+    from_lines = [line for line in base.splitlines() if line.startswith("FROM ")]
+    assert from_lines
+    assert all(
+        re.match(r"FROM python:3\.14-slim@sha256:[0-9a-f]{64}", line)
+        for line in from_lines
+    ), f"Dockerfile has a mutable Python base: {from_lines}"

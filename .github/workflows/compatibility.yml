@@ -52,4 +52,4 @@ jobs:
           python -m pip install ".[dev]"
 
       - name: Run full SQLite suite
-        run: pytest -q
+        run: python -m pytest -q

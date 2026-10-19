@@ -298,23 +298,37 @@ def _write_local_env(
     repo-scoped tokens into this file -- so a re-init must not clobber a
     working token with the ``set-me`` placeholder (remote mode without
     COORD_AUTH_TOKEN exported) or the shared ``~/.coord/token`` (local
-    mode). Only ``--force`` re-mints/backfills over an existing real token.
-    Unmanaged keys and comments are preserved verbatim via the shared
-    envfile updater.
+    mode). ``--force`` re-mints from the shared token file (local mode) or
+    replaces with an exported COORD_AUTH_TOKEN (remote mode); a forced
+    remote re-init with no replacement exported still preserves the real
+    token, because downgrading it to the placeholder would destroy an
+    unrecoverable credential. Unmanaged keys and comments are preserved
+    verbatim via the shared envfile updater.
     """
     path = repo_root / ".coordination" / "local.env"
     existing_token = read_env_file(path).get("COORD_AUTH_TOKEN", "")
-    preserved = bool(
-        existing_token
-        and existing_token != PLACEHOLDER_AUTH_TOKEN
-        and not force
+    existing_real = bool(
+        existing_token and existing_token != PLACEHOLDER_AUTH_TOKEN
     )
-    if preserved:
-        token = existing_token
-    elif mode == "local":
-        token = ensure_token_file(state_paths()["token_file"])
+    if mode == "local":
+        # --force re-reads the shared token file: always a real credential.
+        token = (
+            existing_token
+            if existing_real and not force
+            else ensure_token_file(state_paths()["token_file"])
+        )
     else:
-        token = os.environ.get("COORD_AUTH_TOKEN", PLACEHOLDER_AUTH_TOKEN)
+        # Remote mode cannot mint. --force only replaces a real token when
+        # COORD_AUTH_TOKEN is exported as the replacement; without one,
+        # forcing a hook/owners refresh must not destroy an unrecoverable
+        # pasted credential by downgrading it to the placeholder (both fleet
+        # repos' tokens were wiped exactly this way, live, 2026-07-18).
+        replacement = os.environ.get("COORD_AUTH_TOKEN", "")
+        if existing_real and (not force or not replacement):
+            token = existing_token
+        else:
+            token = replacement or PLACEHOLDER_AUTH_TOKEN
+    preserved = existing_real and token == existing_token
     # COORD_API_URL powers coord-mcp and user shells; COORD_SERVICE_URL is
     # the legacy name the pre-push hook accepts. Emit both so each inert-data
     # reader picks up the right endpoint -- this is what stops a
@@ -407,6 +421,96 @@ def _update_mcp_json(path: Path) -> bool:
     }
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     return True
+
+
+
+_CLAUDE_HOOK_COMMANDS = {
+    "SessionStart": "coord-claude-hook sessionstart",
+    "PreToolUse": "coord-claude-hook pretool",
+    "SessionEnd": "coord-claude-hook sessionend",
+}
+
+# SessionEnd's Claude Code shutdown budget is only 1.5 seconds by default, but
+# the highest per-hook timeout raises that overall budget. Keep cleanup
+# synchronous: an asynchronous SessionEnd process has no later conversation
+# turn to finish in and Claude may cancel it while the process exits.
+_CLAUDE_HOOK_OPTIONS = {
+    "SessionEnd": {"timeout": 15},
+}
+
+# Options managed by older coord releases that are unsafe for the current
+# lifecycle contract. Reconciliation removes only these exact coord-owned
+# fields and leaves every foreign hook and custom field untouched.
+_CLAUDE_HOOK_REMOVED_OPTIONS = {
+    "SessionEnd": {"async"},
+}
+
+
+def _update_claude_settings(path: Path) -> bool:
+    """Merge and reconcile coord hooks in ``.claude/settings.json``.
+
+    Existing exact coord command entries are updated with managed options and
+    obsolete coord-owned options are removed, while compound commands, wrong
+    subcommands, foreign hooks, and other settings are preserved. Same refusal
+    contract as ``_update_mcp_json``: an unparsable or non-object file is left
+    alone rather than clobbered.
+    """
+    settings: dict = {}
+    if path.exists():
+        try:
+            settings = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            print(f"  ! {path} is not valid JSON; not adding coord hooks")
+            return False
+        if not isinstance(settings, dict):
+            print(f"  ! {path} is not a JSON object; not adding coord hooks")
+            return False
+    hooks = settings.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        print(f"  ! {path} 'hooks' is not an object; not adding coord hooks")
+        return False
+    changed = False
+    for event, command in _CLAUDE_HOOK_COMMANDS.items():
+        groups = hooks.setdefault(event, [])
+        if not isinstance(groups, list):
+            print(f"  ! {path} hooks.{event} is not a list; not adding coord hooks")
+            return False
+        managed_options = _CLAUDE_HOOK_OPTIONS.get(event, {})
+        removed_options = _CLAUDE_HOOK_REMOVED_OPTIONS.get(event, set())
+        found = False
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            group_hooks = group.get("hooks", [])
+            if not isinstance(group_hooks, list):
+                continue
+            for hook in group_hooks:
+                if not isinstance(hook, dict):
+                    continue
+                hook_command = hook.get("command")
+                if not isinstance(hook_command, str) or hook_command.strip() != command:
+                    continue
+                found = True
+                for key, value in managed_options.items():
+                    if hook.get(key) != value:
+                        hook[key] = value
+                        changed = True
+                for key in removed_options:
+                    if key in hook:
+                        del hook[key]
+                        changed = True
+        if found:
+            continue
+        hook = {"type": "command", "command": command, **managed_options}
+        entry: dict = {"hooks": [hook]}
+        if event == "PreToolUse":
+            entry["matcher"] = "Edit|Write|MultiEdit|NotebookEdit"
+        groups.append(entry)
+        changed = True
+    if changed:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    return changed
 
 
 def _update_codex_config(path: Path) -> None:
@@ -652,6 +756,8 @@ def run_init(args) -> int:
             wiring_failed = True
         ensure_managed_block(repo_root / "CLAUDE.md", CLAUDE_SNIPPET)
         written.append("CLAUDE.md (managed block)")
+        if _update_claude_settings(repo_root / ".claude" / "settings.json"):
+            written.append(".claude/settings.json (coord enforcement hooks)")
     elif tool == "codex":
         _update_codex_config(repo_root / ".codex" / "config.toml")
         ensure_managed_block(repo_root / "AGENTS.md", AGENTS_SNIPPET)

@@ -50,7 +50,7 @@ jobs:
         run: mypy coordination
 
       - name: Run OpenTelemetry enabled-path tests
-        run: pytest tests/test_otel.py -q
+        run: python -m pytest tests/test_otel.py -q
 
   test:
     name: sqlite (ubuntu py${{ matrix.python-version }})
@@ -82,7 +82,7 @@ jobs:
           python -m pip install ".[dev]"
 
       - name: Run full SQLite suite
-        run: pytest -q
+        run: python -m pytest -q
 
   platform:
     name: platform smoke (${{ matrix.os }} py3.14)
@@ -120,7 +120,7 @@ jobs:
             "pytest-timeout>=2.3.1"
 
       - name: Run platform-specific smoke suite
-        run: pytest -q -m platform
+        run: python -m pytest -q -m platform
 
   lint-workflows:
     name: lint workflows (actionlint)
@@ -152,21 +152,200 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
+      - name: Install pinned crane for attestation blob verification
+        shell: bash
+        run: |
+          archive="$RUNNER_TEMP/go-containerregistry_Linux_x86_64.tar.gz"
+          curl --fail --location --retry 3 \
+            --output "$archive" \
+            https://github.com/google/go-containerregistry/releases/download/v0.21.7/go-containerregistry_Linux_x86_64.tar.gz
+          printf '%s  %s\n' \
+            1a57bc98207fa1c0d04bf760699099e26f8383499bfd55b99c1b919a928a7230 \
+            "$archive" \
+            | sha256sum --check -
+          tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP" crane
+          test "$("$RUNNER_TEMP/crane" version)" = "0.21.7"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Start pinned ephemeral registry
+        run: |
+          docker run --detach \
+            --name coord-ci-registry \
+            --publish 127.0.0.1:5000:5000 \
+            registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+
+      - name: Set up QEMU (multi-arch emulation)
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8  # v4.2.0
+        with:
+          image: docker.io/tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: arm64
+          cache-image: false
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
+        with:
+          driver-opts: network=host
+          buildkitd-config-inline: |
+            [registry."127.0.0.1:5000"]
+              http = true
+              insecure = true
 
-      - name: Build image (no push)
+      - name: Build multi-platform base into the ephemeral registry
+        id: base-build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
         with:
           context: .
           file: ./Dockerfile
-          push: false
-          load: true
-          tags: coord:ci
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: 127.0.0.1:5000/coord:ci
+          sbom: generator=docker.io/docker/buildkit-syft-scanner@sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68
+          provenance: mode=max,builder-id=https://writhub.io/alexm/coord/builders/ci/v1
           cache-from: type=gha,scope=docker-ci
           # PR merge refs are ephemeral and their caches cannot help later
           # branches. Only main refreshes the shared, minimal build cache.
           cache-to: ${{ github.event_name == 'push' && 'type=gha,scope=docker-ci,mode=min' || '' }}
+
+      - name: Build multi-platform PostgreSQL derivative and load native images
+        shell: bash
+        env:
+          BASE_DIGEST: ${{ steps.base-build.outputs.digest }}
+        run: |
+          if docker build \
+            --file Dockerfile.postgres \
+            --build-arg COORD_BASE_REPOSITORY=coord \
+            --build-arg COORD_BASE_DIGEST=not-a-digest \
+            --tag coord:must-not-build \
+            .; then
+            echo "::error::PostgreSQL derivative accepted an invalid base digest" >&2
+            exit 1
+          fi
+          if ! printf '%s\n' "$BASE_DIGEST" \
+            | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::base build returned an invalid registry digest: $BASE_DIGEST" >&2
+            exit 1
+          fi
+          python scripts/verify_image_attestations.py \
+            --image "127.0.0.1:5000/coord@$BASE_DIGEST" \
+            --builder-id https://writhub.io/alexm/coord/builders/ci/v1 \
+            --platform linux/amd64 \
+            --platform linux/arm64 \
+            --insecure
+          metadata_file="$(mktemp)"
+          trap 'rm -f "$metadata_file"' EXIT
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --file Dockerfile.postgres \
+            --build-arg COORD_BASE_REPOSITORY=127.0.0.1:5000/coord \
+            --build-arg "COORD_BASE_DIGEST=${BASE_DIGEST#sha256:}" \
+            --tag 127.0.0.1:5000/coord:ci-postgres \
+            --attest=type=sbom,generator=docker.io/docker/buildkit-syft-scanner@sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68 \
+            --provenance=mode=max,builder-id=https://writhub.io/alexm/coord/builders/ci/v1 \
+            --metadata-file "$metadata_file" \
+            --push \
+            .
+          derivative_digest="$(
+            python -c 'import json, sys; print(json.load(open(sys.argv[1]))["containerimage.digest"])' \
+              "$metadata_file"
+          )"
+          if ! printf '%s\n' "$derivative_digest" \
+            | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::derivative build returned an invalid registry digest: $derivative_digest" >&2
+            exit 1
+          fi
+          python scripts/verify_image_attestations.py \
+            --image "127.0.0.1:5000/coord@$derivative_digest" \
+            --builder-id https://writhub.io/alexm/coord/builders/ci/v1 \
+            --platform linux/amd64 \
+            --platform linux/arm64 \
+            --insecure
+
+          docker pull --platform linux/amd64 \
+            "127.0.0.1:5000/coord:ci@$BASE_DIGEST"
+          docker tag \
+            "127.0.0.1:5000/coord:ci@$BASE_DIGEST" \
+            coord:ci
+          docker pull --platform linux/amd64 \
+            "127.0.0.1:5000/coord:ci-postgres@$derivative_digest"
+          docker tag \
+            "127.0.0.1:5000/coord:ci-postgres@$derivative_digest" \
+            coord:ci-postgres
+          docker run --rm --entrypoint python coord:ci-postgres -c \
+            'import asyncpg, coordination; assert asyncpg.__version__ == "0.31.0"; print(coordination.__version__, asyncpg.__version__)'
+
+      - name: Verify PostgreSQL derivative readiness and session lifecycle
+        shell: bash
+        run: |
+          network=coord-ci-postgres
+          database=coord-ci-postgres-db
+          api=coord-ci-postgres-api
+          cleanup() {
+            docker logs "$api" 2>/dev/null || true
+            docker logs "$database" 2>/dev/null || true
+            docker rm --force "$api" "$database" >/dev/null 2>&1 || true
+            docker network rm "$network" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker network create "$network"
+          docker run --detach \
+            --name "$database" \
+            --network "$network" \
+            --env POSTGRES_USER=coord \
+            --env POSTGRES_PASSWORD=coord \
+            --env POSTGRES_DB=coord \
+            postgres:16.14@sha256:be01cf82fc7dbba824acf0a82e150b4b360f3ff93c6631d7844af431e841a95c
+
+          database_ready=0
+          for _ in {1..30}; do
+            if docker exec "$database" pg_isready --username coord --dbname coord; then
+              database_ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$database_ready" -ne 1 ]; then
+            echo "::error::PostgreSQL did not become ready" >&2
+            exit 1
+          fi
+
+          docker run --detach \
+            --name "$api" \
+            --network "$network" \
+            --publish 127.0.0.1:18081:8080 \
+            --env COORD_AUTH_TOKEN=ci-smoke \
+            --env COORD_DATABASE_URL=postgresql://coord:coord@coord-ci-postgres-db:5432/coord \
+            --env COORD_POSTGRES_SCHEMA=coord \
+            coord:ci-postgres
+
+          api_ready=0
+          for _ in {1..30}; do
+            if body="$(curl --fail --silent http://127.0.0.1:18081/readyz)" \
+              && READY_BODY="$body" python -c 'import json, os; data=json.loads(os.environ["READY_BODY"]); assert data["status"] == "ready"'; then
+              api_ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$api_ready" -ne 1 ]; then
+            echo "::error::PostgreSQL derivative did not become ready" >&2
+            exit 1
+          fi
+
+          curl --fail --silent --request POST \
+            --header "Authorization: Bearer ci-smoke" \
+            http://127.0.0.1:18081/sessions/ci-release/open >/dev/null
+          curl --fail --silent --request POST \
+            --header "Authorization: Bearer ci-smoke" \
+            http://127.0.0.1:18081/sessions/ci-release/release >/dev/null
+          check_status="$(
+            curl --silent --output /tmp/session-check.json --write-out '%{http_code}' \
+              --request POST \
+              --header "Authorization: Bearer ci-smoke" \
+              http://127.0.0.1:18081/sessions/ci-release/check
+          )"
+          CHECK_STATUS="$check_status" python -c \
+            'import json, os; data=json.load(open("/tmp/session-check.json")); assert os.environ["CHECK_STATUS"] == "409"; assert data["code"] == "session_closed"; assert data["session_id"] == "ci-release"'
 
       - name: Start image and verify real SQLite readiness
         shell: bash
