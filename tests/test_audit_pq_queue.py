@@ -34,7 +34,7 @@ import pytest
 from coordination.config import Settings
 from coordination.db import Database
 from coordination.schemas import ClaimItem, CreateClaimsRequest
-from coordination.service import CoordinationService
+from coordination.service import CoordinationService, SessionClosedError
 
 REPO = "amittell/coord"
 
@@ -146,6 +146,318 @@ async def test_release_session_drains_queue(svc: CoordinationService) -> None:
     bob_claims = await _active_for(svc, "bob")
     assert [c["pattern"] for c in bob_claims] == ["src/a.py"]
     assert row["granted_claim_id"] in {c["id"] for c in bob_claims}
+
+
+async def test_release_session_cleanup_is_durable_and_failure_isolated(
+    svc: CoordinationService,
+) -> None:
+    first = await _claim(svc, "alice", "src/first.py", session_id="sess-clean")
+    second = await _claim(svc, "alice", "src/second.py", session_id="sess-clean")
+    first_waiter = await _enqueue(svc, first, pattern="src/first.py")
+    second_waiter = await _enqueue(svc, second, pattern="src/second.py")
+    original_drain = svc._drain_queue_for
+    failed_once = False
+
+    async def fail_one(claim_id: str) -> None:
+        nonlocal failed_once
+        if claim_id == first and not failed_once:
+            failed_once = True
+            raise RuntimeError("injected cleanup failure")
+        await original_drain(claim_id)
+
+    svc._drain_queue_for = fail_one  # type: ignore[method-assign]
+    try:
+        assert await svc.release_session("sess-clean", repo=REPO) == 2
+    finally:
+        svc._drain_queue_for = original_drain  # type: ignore[method-assign]
+
+    # One failure cannot stop a later row, and the failed row remains durable.
+    assert (await svc.db.get_queue_entry(second_waiter["id"]))["state"] == "granted"
+    pending = await svc.db.pending_session_release_cleanup()
+    assert [row["claim_id"] for row in pending] == [first]
+    assert pending[0]["attempts"] == 1
+
+    # A later cleanup tick can finish the stranded row idempotently.
+    async with svc.db.transaction() as conn:
+        await conn.execute(
+            "UPDATE session_release_cleanup SET next_attempt_at = ? "
+            "WHERE claim_id = ?",
+            ("2000-01-01T00:00:00Z", first),
+        )
+    assert await svc.drain_session_release_cleanup() == 1
+    assert (await svc.db.get_queue_entry(first_waiter["id"]))["state"] == "granted"
+    assert await svc.db.pending_session_release_cleanup() == []
+
+
+async def test_concurrent_cleanup_drainers_lease_each_row_once(
+    svc: CoordinationService,
+) -> None:
+    claim_id = await _claim(
+        svc, "alice", "src/leased.py", session_id="lease-cleanup"
+    )
+    await _enqueue(svc, claim_id, pattern="src/leased.py")
+    async with svc.db.transaction() as conn:
+        await svc.db.repo_lock(conn, REPO)
+        await svc.db.session_lock(conn, "lease-cleanup")
+        assert await svc.db.close_session_claim_rows(
+            "lease-cleanup", repo=REPO
+        ) == [claim_id]
+
+    original_drain = svc._drain_queue_for
+    drain_calls = 0
+
+    async def counted(closing_id: str) -> None:
+        nonlocal drain_calls
+        drain_calls += 1
+        await asyncio.sleep(0)
+        await original_drain(closing_id)
+
+    svc._drain_queue_for = counted  # type: ignore[method-assign]
+    try:
+        results = await asyncio.gather(
+            svc.drain_session_release_cleanup(),
+            svc.drain_session_release_cleanup(),
+        )
+    finally:
+        svc._drain_queue_for = original_drain  # type: ignore[method-assign]
+
+    assert sum(results) == 1
+    assert drain_calls == 1
+
+
+async def test_cleanup_delete_retry_does_not_repeat_finished_stages(
+    svc: CoordinationService,
+) -> None:
+    claim_id = await _claim(
+        svc, "alice", "src/checkpoint.py", session_id="checkpoint-cleanup"
+    )
+    await _enqueue(svc, claim_id, pattern="src/checkpoint.py")
+    async with svc.db.transaction() as conn:
+        await svc.db.repo_lock(conn, REPO)
+        await svc.db.session_lock(conn, "checkpoint-cleanup")
+        await svc.db.close_session_claim_rows("checkpoint-cleanup", repo=REPO)
+
+    original_drain = svc._drain_queue_for
+    original_complete = svc.db.complete_session_release_cleanup
+    drain_calls = 0
+    failed_once = False
+
+    async def counted(closing_id: str) -> None:
+        nonlocal drain_calls
+        drain_calls += 1
+        await original_drain(closing_id)
+
+    async def fail_delete_once(closing_id: str, lease_owner: str) -> None:
+        nonlocal failed_once
+        if not failed_once:
+            failed_once = True
+            raise RuntimeError("injected completion delete failure")
+        await original_complete(closing_id, lease_owner)
+
+    svc._drain_queue_for = counted  # type: ignore[method-assign]
+    svc.db.complete_session_release_cleanup = fail_delete_once  # type: ignore[method-assign]
+    try:
+        assert await svc.drain_session_release_cleanup() == 0
+        pending = await svc.db.pending_session_release_cleanup()
+        assert pending[0]["relationships_done"] == 1
+        assert pending[0]["queue_done"] == 1
+        async with svc.db.transaction() as conn:
+            await conn.execute(
+                "UPDATE session_release_cleanup SET next_attempt_at = ?",
+                ("2000-01-01T00:00:00Z",),
+            )
+        assert await svc.drain_session_release_cleanup() == 1
+    finally:
+        svc._drain_queue_for = original_drain  # type: ignore[method-assign]
+        svc.db.complete_session_release_cleanup = original_complete  # type: ignore[method-assign]
+
+    assert drain_calls == 1
+    assert await svc.db.pending_session_release_cleanup() == []
+
+
+async def test_session_close_orders_against_inflight_claim(
+    svc: CoordinationService,
+) -> None:
+    """Either the claim commits first and close releases it, or close wins
+    and admission rejects it; no active row may appear after closure."""
+    entered_insert = asyncio.Event()
+    allow_insert = asyncio.Event()
+    original_insert = svc.db.insert_claims_batch
+
+    async def slow_insert(**kwargs):
+        entered_insert.set()
+        await allow_insert.wait()
+        return await original_insert(**kwargs)
+
+    svc.db.insert_claims_batch = slow_insert  # type: ignore[method-assign]
+    try:
+        body = CreateClaimsRequest(
+            engineer="alice",
+            repo=REPO,
+            session_id="terminal-race",
+            claims=[ClaimItem(type="file", pattern="src/race.py")],
+        )
+        claiming = asyncio.create_task(svc.create_claims(body))
+        await asyncio.wait_for(entered_insert.wait(), timeout=2.0)
+        closing = asyncio.create_task(
+            svc.release_session("terminal-race", repo=REPO)
+        )
+        await asyncio.sleep(0)
+        allow_insert.set()
+        response = await asyncio.wait_for(claiming, timeout=5.0)
+        released = await asyncio.wait_for(closing, timeout=5.0)
+    finally:
+        allow_insert.set()
+        svc.db.insert_claims_batch = original_insert  # type: ignore[method-assign]
+
+    assert response.claim_ids
+    assert released == 1
+    assert not [
+        row
+        for row in await svc.db.list_active_claims_rows()
+        if row.get("session_id") == "terminal-race"
+    ]
+
+    with pytest.raises(SessionClosedError):
+        await svc.create_claims(body)
+
+    await svc.open_session("terminal-race", repo=REPO)
+    resumed = await svc.create_claims(body)
+    assert resumed.claim_ids
+
+
+async def test_closed_requester_cannot_receive_deferred_coexist_claim(
+    svc: CoordinationService,
+) -> None:
+    holder = await _claim(svc, "alice", "src/deferred.py", session_id="holder")
+    await svc.open_session(
+        "requester", repo=REPO, principal="engineer:bob"
+    )
+    request = await svc.file_request(
+        claim_id=holder,
+        requester="bob",
+        requester_session_id="requester",
+        reason="different function",
+        urgency="normal",
+        requested_scope="src/deferred.py",
+        requester_principal="engineer:bob",
+    )
+    assert (
+        await svc.release_session(
+            "requester", repo=REPO, principal="engineer:bob"
+        )
+        == 0
+    )
+
+    with pytest.raises(SessionClosedError):
+        await svc.respond_to_request(
+            request_id=request["id"],
+            decision="coexist",
+            actor_engineer="alice",
+            actor_session_id="holder",
+            coexist_pattern="src/deferred.py",
+        )
+
+    assert await _active_for(svc, "bob") == []
+    persisted = await svc.db.get_request(request["id"])
+    assert persisted is not None
+    assert persisted["decision"] == "pending"
+
+
+async def test_authenticated_deferred_coexist_and_narrowed_succeed(
+    svc: CoordinationService,
+) -> None:
+    coexist_holder = await _claim(
+        svc, "alice", "src/coexist.py", session_id="holder-coexist"
+    )
+    await svc.open_session(
+        "requester-coexist", repo=REPO, principal="engineer:bob"
+    )
+    coexist_request = await svc.file_request(
+        claim_id=coexist_holder,
+        requester="bob",
+        requester_session_id="requester-coexist",
+        reason="parallel edit",
+        urgency="normal",
+        requester_principal="engineer:bob",
+    )
+    coexist = await svc.respond_to_request(
+        request_id=coexist_request["id"],
+        decision="coexist",
+        actor_engineer="alice",
+        actor_session_id="holder-coexist",
+        coexist_pattern="src/coexist.py",
+        actor_principal="engineer:alice",
+    )
+    assert coexist is not None
+    assert [row["pattern"] for row in await _active_for(svc, "bob")] == [
+        "src/coexist.py"
+    ]
+
+    narrow_holder = await _claim(
+        svc, "alice", "lib/**", session_id="holder-narrow"
+    )
+    narrow_request = await svc.file_request(
+        claim_id=narrow_holder,
+        requester="carol",
+        requester_session_id="requester-narrow",
+        reason="need another path",
+        urgency="normal",
+        requester_principal="engineer:carol",
+    )
+    narrowed = await svc.respond_to_request(
+        request_id=narrow_request["id"],
+        decision="narrowed",
+        actor_engineer="alice",
+        actor_session_id="holder-narrow",
+        narrowed_pattern="lib/kept/**",
+        actor_principal="engineer:alice",
+    )
+    assert narrowed is not None
+    alice_patterns = {row["pattern"] for row in await _active_for(svc, "alice")}
+    assert "lib/kept/**" in alice_patterns
+
+
+async def test_deferred_lifecycle_upsert_rolls_back_with_failed_grant(
+    svc: CoordinationService,
+) -> None:
+    holder = await _claim(
+        svc, "alice", "src/rollback.py", session_id="holder-rollback"
+    )
+    request = await svc.file_request(
+        claim_id=holder,
+        requester="bob",
+        requester_session_id="requester-rollback",
+        reason="inject rollback",
+        urgency="normal",
+        requester_principal="engineer:bob",
+    )
+    original_apply = svc.db._apply_coexist
+
+    async def fail_after_lifecycle(*args, **kwargs):
+        raise RuntimeError("injected post-lifecycle failure")
+
+    svc.db._apply_coexist = fail_after_lifecycle  # type: ignore[method-assign]
+    try:
+        with pytest.raises(RuntimeError, match="post-lifecycle"):
+            await svc.respond_to_request(
+                request_id=request["id"],
+                decision="coexist",
+                actor_engineer="alice",
+                actor_session_id="holder-rollback",
+                coexist_pattern="src/rollback.py",
+                actor_principal="engineer:alice",
+            )
+    finally:
+        svc.db._apply_coexist = original_apply  # type: ignore[method-assign]
+
+    assert await svc.db.session_lifecycle_row(
+        "requester-rollback", repo=REPO
+    ) is None
+    persisted = await svc.db.get_request(request["id"])
+    assert persisted is not None
+    assert persisted["decision"] == "pending"
+    assert await _active_for(svc, "bob") == []
 
 
 # --- drain on respond_to_request -------------------------------------------

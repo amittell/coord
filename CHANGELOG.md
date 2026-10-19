@@ -7,7 +7,146 @@ Semantic Versioning.
 
 ## [Unreleased]
 
-(none recorded yet)
+## [0.49.0] - 2026-07-23
+
+### Changed
+
+- The canonical production container moved from the retired
+  `ghcr.io/amittell/coord` path to `whcr.io/alexm/coord`. Official images are
+  now signed by the repository release identity
+  (`release/coord-release.pub`) through the Vault-backed GitHub-free release
+  path. GitHub Actions remains manual candidate validation for images and has
+  one narrow official role: the existing PyPI Trusted Publisher may publish
+  only after verifying a canonical Vault-signed authorization bound to the
+  admitted commit, WritHub release-lock operation, authenticated WHCR digest,
+  exact package hashes, build-Python version, and protected `pypi` environment.
+  The signed operation tag is inert data: an admin-enforced, read-only
+  protected-main verifier authenticates it, checks out the signed source
+  commit separately, and builds without OIDC, while the OIDC job only
+  downloads and rehashes those verified bytes before invoking the pinned
+  publisher. A fresh no-OIDC runner classifies PyPI after package build code
+  has exited, so build code cannot corrupt the environment gate. It cannot
+  publish an official image tag, acquire the WritHub lock, create the WritHub
+  version tag, publish a GitHub Release, or change a production manifest.
+- Release images now use digest-pinned Dockerfile frontends, Python bases,
+  QEMU/binfmt, and SBOM generators; immutable Debian snapshot repositories;
+  exact system-package versions; and hash-complete Python runtime, optional,
+  PostgreSQL, and build-backend locks. Package builds use the locked backend
+  without build isolation. The release script now selects and enforces Python
+  3.11+ instead of accidentally using macOS `/usr/bin/python3` 3.9; operators
+  may set `COORD_RELEASE_PYTHON` explicitly.
+- Image attestation verification now rehashes the top-level OCI index and
+  every in-toto blob, requires the exact release-path builder identity, and
+  verifies both SPDX 2.3 SBOM and SLSA provenance predicates for every
+  required platform. CI exercises this contract for both the base and
+  PostgreSQL derivative images.
+- Official release publication is create-only across WritHub, the registry,
+  and PyPI: an immutable annotated git release-lock tag binds one unique
+  operation ID to the source commit, authenticated image digest, and exact
+  package hashes. Same-commit concurrent publishers are rejected. Explicit
+  post-lock resume revalidates that complete binding and idempotently finishes
+  only matching PyPI, image-tag, receipt, and WritHub-tag state.
+
+### Fixed
+
+- Claude Code SessionEnd cleanup now uses the hook payload's stable
+  `session_id` and the bulk `POST /sessions/{session_id}/release` endpoint
+  instead of replaying an ever-growing claim-ID list inside Claude's
+  1.5-second shutdown window. PreToolUse caches one auto-claim per distinct
+  path with per-path freshness, forwards `session_id` for
+  self-exclusion/liveness, and keeps a one-time legacy-state drain for
+  sessions upgraded in flight. Session closure is now a terminal,
+  repo-scoped server lifecycle: release and claim admission share a
+  per-session transaction lock, post-close claims receive `409
+  session_closed`, and SessionStart reopens a resumed lifecycle idempotently.
+  Lifecycle mutation is bound to the authenticated engineer (with an explicit
+  unscoped-operator recovery path), and post-commit relationship/queue cleanup
+  is durably journalled, leased across replicas, stage-checkpointed,
+  failure-isolated, and retried with backoff by the background leader. Cached
+  edits verify terminal state at the server, and deferred narrowed/coexist
+  grants use the same repo/session admission locks. Every hook request now
+  carries the same repo identity, and the local
+  cache is partitioned by session and repo inside a private per-user directory
+  with symlink-safe lock handling; it is never trusted for cross-process
+  ordering. Missing session IDs no longer create claims that cannot be safely
+  deduplicated or bulk-released, any claim-time 409 blocks the raced edit, and
+  legacy v0.48 claim files are atomically snapshotted before bounded draining
+  so a concurrent legacy writer cannot be unlinked unseen.
+- `coord init` / `coord upgrade` now reconcile existing managed Claude hooks,
+  installing SessionEnd synchronously with a 15-second command timeout while
+  preserving foreign hooks and settings. Synchronous execution is required:
+  Claude Code raises its overall shutdown budget from the per-hook timeout,
+  while an asynchronous SessionEnd process can be cancelled as Claude exits.
+
+## [0.48.1] - 2026-07-18
+
+### Fixed
+
+- `coord init --force` in remote mode no longer downgrades a real pasted
+  `COORD_AUTH_TOKEN` to the `set-me` placeholder when no replacement is
+  exported. Remote mode cannot re-mint, so the forced hook/owners refresh
+  destroyed an unrecoverable credential (both fleet repos, live 2026-07-18).
+- Pre-push hook: a conflict-check response with a non-2xx status (stale
+  token 401, 5xx, proxy errors) and an unparseable response body now route
+  through `soft_fail` like transport errors — warn-and-allow in the default
+  advise mode, blocking only under `COORD_PREPUSH_MODE=enforce`. Confirmed
+  conflicts still block in every mode.
+
+## [0.48.0] - 2026-07-18
+
+**Better-together posture**: `COORD_PREPUSH_MODE=advise` is now the
+pre-push default — the hook's OWN failures (coord unreachable, transport
+errors, unusable stdin from outer wrappers or linked worktrees) warn
+loudly and ALLOW the push; only a confirmed conflict from a healthy coord
+blocks. `enforce` restores strict fail-closed. Coordination is never a
+hard dependency of shipping.
+
+Fleet enforcement (v20 schema), from the 2026-07-17 live audit: two
+fully-initialized repos saw zero claims filed all day, scoped tokens were
+minted for repos the service had never seen, and a pusher's own claims
+blocked their push because the pre-push hook guessed identity from git
+config while claims were filed under the token's engineer.
+
+- **Repos registry + mint validation.** New `repos` table (migration 20),
+  `coord repos register|list`, and `coord tokens create --repo` now refuses
+  an UNREGISTERED repo id (typo protection) unless `--register` is passed to
+  deliberately bootstrap a new repo.
+- **`GET /whoami`.** The authenticated identity behind the presented bearer
+  (engineer, repo scope) so clients stop guessing identity from git config.
+- **Claude Code enforcement hooks** (`coord-claude-hook`, installed into
+  `.claude/settings.json` by `coord init --tool claude`): SessionStart
+  injects active claims + token-scope-mismatch warnings as context;
+  PreToolUse blocks edits to files claimed by OTHERS and auto-claims
+  otherwise-unclaimed files (intent derived from action — no ritual);
+  SessionEnd releases the session's auto-claims. Every network failure and
+  missing-identity case fails OPEN: coord being down never blocks editing.
+- **Pre-push hook identity.** The hook now resolves its engineer from
+  `/whoami` (the token's identity — the same one claims are filed under),
+  falling back to `git config user.name` only when unauthenticated.
+
+## [0.47.0] - 2026-07-17
+
+MCP wrapper hot-reload of `.coordination/local.env`, so a long-lived agent
+session picks up token/scope/URL changes without a restart.
+
+- **Live re-read on change.** The wrapper re-stats the file whenever it is
+  about to use its config and re-applies it on change — unless the new
+  version contains a line that is not blank/comment/`KEY=VALUE`, in which
+  case the last-good config is kept and the bad version is warned about once.
+- **Re-discovery of a config created after startup.** Previously the reload
+  only re-stat'd a file found during the one startup walk; if
+  `.coordination/local.env` was absent then (fresh checkout, or an agent
+  wiring a token mid-session), it stayed invisible until a full restart — an
+  agent that created the file kept `401`-ing all session. The wrapper now
+  re-walks `cwd`→root when nothing is watched yet (throttled to ~2s so it is
+  not a per-call cost while unconfigured) and adopts the file the moment it
+  appears.
+- **`COORD_HOT_RELOAD` toggle.** The whole live-reload path (change-detection
+  and re-discovery) is gated by this env var: on by default; `0`/`false`/
+  `no`/`off` pins the startup config. The one-shot startup load is unaffected.
+
+An explicit value from the shell or `.mcp.json` still wins over a file
+reload, matching the startup ownership rule.
 
 ## [0.46.0] - 2026-07-11
 
@@ -2033,3 +2172,6 @@ The hook redesign was prompted by an agent in astrowars rewriting the hook on it
 ### Added
 
 - Initial release.
+
+[Unreleased]: https://github.com/amittell/coord/compare/v0.49.0...HEAD
+[0.49.0]: https://github.com/amittell/coord/compare/v0.48.1...v0.49.0

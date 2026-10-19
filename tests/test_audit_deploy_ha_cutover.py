@@ -43,14 +43,18 @@ REQ_POSTGRES = REPO_ROOT / "requirements-postgres.txt"
 def test_requirements_postgres_pins_asyncpg() -> None:
     text = REQ_POSTGRES.read_text(encoding="utf-8")
     pins = [
-        line.strip()
+        line.strip().removesuffix("\\").strip()
         for line in text.splitlines()
-        if line.strip() and not line.strip().startswith("#")
+        if line.strip()
+        and not line.strip().startswith(("#", "--hash="))
     ]
     assert any(re.fullmatch(r"asyncpg==\d+\.\d+(\.\d+)?", p) for p in pins), (
         "requirements-postgres.txt must pin asyncpg exactly (asyncpg==X.Y.Z); "
         f"got {pins!r}. Explicit PostgreSQL builds need a reproducible driver "
         "layer even though the default image does not install it."
+    )
+    assert "--hash=sha256:" in text, (
+        "requirements-postgres.txt must hash-lock every asyncpg distribution"
     )
 
 
@@ -187,10 +191,13 @@ def test_runbook_imports_a_fresh_post_drain_snapshot() -> None:
     text = RUNBOOK.read_text(encoding="utf-8")
     assert "set -euo pipefail" in text
     assert "same Bash session" in text
+    assert "COORD_DEPLOYMENT_ARGO_APP=cluster-coord-deployment" in text
     hard_cutover = text.index("## 4. Hard cutover")
     verify = text.index("## 5. Verify")
     cutover = text[hard_cutover:verify]
-    disable_argocd = cutover.index("patch application coord-prod")
+    disable_argocd = cutover.index(
+        'patch application "$COORD_DEPLOYMENT_ARGO_APP"'
+    )
     scale_down = cutover.index("scale deploy/coord --replicas=0")
     pods_deleted = cutover.index("wait_for_no_coord_pods", scale_down)
     final_snapshot = cutover.index("coordination.final-cutover.db")
@@ -204,7 +211,9 @@ def test_runbook_imports_a_fresh_post_drain_snapshot() -> None:
 def test_runbook_waits_for_postgres_pods_to_delete_before_rollback() -> None:
     text = RUNBOOK.read_text(encoding="utf-8")
     rollback = text[text.index("## 6. Rollback") :]
-    disable_argocd = rollback.index("patch application coord-prod")
+    disable_argocd = rollback.index(
+        'patch application "$COORD_DEPLOYMENT_ARGO_APP"'
+    )
     scale_down = rollback.index("scale deploy/coord --replicas=0")
     pods_deleted = rollback.index("wait_for_no_coord_pods", scale_down)
     sqlite_apply = rollback.index('apply -f "$SQLITE_ROLLBACK_MANIFEST"')

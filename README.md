@@ -4,7 +4,6 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/coord-mcp-server.svg)](https://pypi.org/project/coord-mcp-server/)
 [![CI](https://github.com/amittell/coord/actions/workflows/ci.yml/badge.svg)](https://github.com/amittell/coord/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
-[![Container image](https://img.shields.io/badge/ghcr.io-coord-blue)](https://github.com/amittell/coord/pkgs/container/coord)
 
 `coord` is a small coordination layer for teams running multiple agent sessions against the same codebase. It gives Claude Code, Codex CLI, and Cursor a shared source of truth for active file/module claims so agents can check, claim, and release work before they step on each other. Agent sessions keep their claims alive implicitly via activity pings; operators can extend a specific claim over HTTP (`POST /claims/{id}/extend`).
 
@@ -72,7 +71,7 @@ pip install 'coord-mcp-server[symbols]'   # drop [symbols] if you do not need tr
 Pin to a specific release for reproducible installs:
 
 ```bash
-pip install 'coord-mcp-server==0.46.0'
+pip install 'coord-mcp-server==0.49.0'
 ```
 
 ### Option 3: Docker (self-hosted server)
@@ -86,10 +85,15 @@ docker run -d \
   -e COORD_AUTH_TOKEN="$(openssl rand -hex 32)" \
   -p 8080:8080 \
   -v coord-data:/data \
-  ghcr.io/amittell/coord:v0.46.0
+  whcr.io/alexm/coord:v0.49.0
 ```
 
-The image is multi-arch (linux/amd64 + linux/arm64), keyless-signed with cosign, and ships SBOM + SLSA provenance attestations. Kubernetes manifests live under `deploy/k8s/` and `docs/deployment.md` has the full operator notes.
+The image is multi-arch (linux/amd64 + linux/arm64), signed with cosign by the
+Coord release identity, and ships SBOM + SLSA provenance attestations. Production
+operators should verify `release/coord-release.pub` and deploy the resulting
+immutable digest rather than trusting the tag alone. Kubernetes manifests live
+under `deploy/k8s/`; `docs/deployment.md` has the full verification and operator
+notes.
 
 ### Optional PostgreSQL backend (beta)
 
@@ -121,10 +125,10 @@ guide](docs/deployment.md#optional-postgresql-backend-beta) and the separate
 
 ```bash
 coord --version
-# coord 0.46.0
+# coord 0.49.0
 
 curl -fsS http://127.0.0.1:8080/readyz
-# {"status":"ready","version":"0.46.0",...}
+# {"status":"ready","version":"0.49.0",...}
 ```
 
 The CLI surface is intentionally small:
@@ -185,13 +189,13 @@ pipx inject coord-mcp-server 'coord-mcp-server[symbols]'
 pip install --upgrade 'coord-mcp-server[symbols]'
 
 # docker (self-hosted server)
-docker pull ghcr.io/amittell/coord:v0.46.0
+docker pull whcr.io/alexm/coord:v0.49.0
 docker rm -f coord
 docker run -d --name coord \
   -e COORD_AUTH_TOKEN="$EXISTING_TOKEN" \
   -p 8080:8080 \
   -v coord-data:/data \
-  ghcr.io/amittell/coord:v0.46.0
+  whcr.io/alexm/coord:v0.49.0
 ```
 
 When you point at a shared team server, the server operator owns the container upgrade. End users only need to upgrade their local CLI plus MCP wrapper to match.
@@ -212,10 +216,10 @@ coord doctor         # confirms the new wiring is healthy
 
 ```bash
 coord --version
-# coord 0.46.0
+# coord 0.49.0
 
 curl -fsS http://127.0.0.1:8080/readyz | python3 -m json.tool
-#   "version": "0.46.0"
+#   "version": "0.49.0"
 ```
 
 If your CLI and the running server disagree on version, the dashboard footer and the once-per-24h CLI update notice will both flag it. Set `COORD_NO_UPDATE_CHECK=1` if you are intentionally pinned to an older release.
@@ -225,11 +229,11 @@ If your CLI and the running server disagree on version, the dashboard footer and
 For reproducible installs across a team:
 
 ```bash
-pipx install 'coord-mcp-server==0.46.0'
+pipx install 'coord-mcp-server==0.49.0'
 # or
-pip install 'coord-mcp-server==0.46.0'
+pip install 'coord-mcp-server==0.49.0'
 # or, in a Dockerfile / Kubernetes manifest:
-#   image: ghcr.io/amittell/coord:v0.46.0
+#   image: whcr.io/alexm/coord:v0.49.0
 ```
 
 The full release history lives on PyPI (<https://pypi.org/project/coord-mcp-server/#history>) and as GitHub releases (<https://github.com/amittell/coord/releases>). `CHANGELOG.md` has the per-version notes.
@@ -513,6 +517,7 @@ Start with `docs/integrations/claude-code.md` if your team is primarily on Claud
 | `COORD_WARN_UNSCOPED_TOKEN` | Soft-deprecate unscoped per-engineer tokens (v0.43): the request is still honored, but the response carries an `X-Coord-Token-Warning` nudge (surfaced to agents as `coord_notice` and printed by `coord status`). Set `false` to silence. Default: `true` |
 | `COORD_REQUIRE_SCOPED_TOKEN` | Reject any per-engineer token that is not repo-scoped (v0.42); the shared `COORD_AUTH_TOKEN` stays exempt as the operator escape hatch. Default: `false` |
 | `COORD_OIDC_REPO_CLAIM` | Bind an SSO-minted session token to a repo from this ID-token claim, so OIDC dashboard logins can be repo-scoped instead of operator-wide (v0.42). Default: unset |
+| `COORD_HOT_RELOAD` | MCP wrapper only (v0.47): live re-read and re-discovery of `.coordination/local.env`. On by default; a token/scope edit is re-read on change, and a file created *after* the wrapper started is discovered within ~2s — both without a restart. Set to `0`/`false`/`no`/`off` to pin the startup config (immutable/perf-sensitive deployments). |
 | `COORD_HOST` | Bind host for the API server. Default: `0.0.0.0` |
 | `COORD_PORT` | Bind port for the API server. Default: `8080` |
 | `COORD_LOG_LEVEL` | Uvicorn log level. Default: `info` |

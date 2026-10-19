@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -10,7 +11,7 @@ from httpx import ASGITransport, AsyncClient
 
 from conftest import seam_connection
 from coordination.db import Database
-from coordination.main import app
+from coordination.main import _login_page_response, app
 
 
 class _RecordingHandler(logging.Handler):
@@ -76,6 +77,14 @@ async def test_health_no_auth(client: AsyncClient) -> None:
     r = await client.get("/health")
     assert r.status_code == 200
     assert r.text == "ok"
+
+
+def test_login_page_escapes_error_and_command_placeholder() -> None:
+    response = _login_page_response(error='<script>alert("x")</script>')
+    body = response.body.decode()
+    assert "<script>" not in body
+    assert "&lt;script&gt;" in body
+    assert "coord tokens create &lt;engineer&gt;" in body
 
 
 @pytest.mark.asyncio
@@ -738,7 +747,7 @@ async def test_release_session_endpoint_releases_all_session_claims(
         assert r.status_code == 200, r.text
 
     r = await client.post(
-        "/sessions/release-me/release", headers=h
+        "/sessions/release-me/release?repo=amittell%2Fcoord", headers=h
     )
     assert r.status_code == 200, r.text
     assert r.json()["released"] == 2
@@ -748,6 +757,104 @@ async def test_release_session_endpoint_releases_all_session_claims(
     body = r.json()
     in_session = [c for c in body["claims"] if c.get("session_id") == "release-me"]
     assert in_session == []
+
+    # Closure is terminal: a delayed hook cannot recreate a claim after the
+    # bulk release. SessionStart explicitly reopens the repo lifecycle.
+    r = await client.post(
+        "/claims",
+        headers=h,
+        json={
+            "engineer": "codex-late",
+            "repo": "amittell/coord",
+            "session_id": "release-me",
+            "claims": [{"type": "file", "pattern": "src/late.py"}],
+        },
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["code"] == "session_closed"
+
+    checked = await client.post(
+        "/sessions/release-me/check?repo=amittell%2Fcoord", headers=h
+    )
+    assert checked.status_code == 409, checked.text
+
+    r = await client.post(
+        "/sessions/release-me/open?repo=amittell%2Fcoord", headers=h
+    )
+    assert r.status_code == 200, r.text
+    assert r.json() == {"opened": True}
+    checked = await client.post(
+        "/sessions/release-me/check?repo=amittell%2Fcoord", headers=h
+    )
+    assert checked.status_code == 200, checked.text
+
+    r = await client.post(
+        "/claims",
+        headers=h,
+        json={
+            "engineer": "codex-resumed",
+            "repo": "amittell/coord",
+            "session_id": "release-me",
+            "claims": [{"type": "file", "pattern": "src/resumed.py"}],
+        },
+    )
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.asyncio
+async def test_session_lifecycle_rejects_another_scoped_credential(
+    client: AsyncClient,
+) -> None:
+    from coordination.deps import get_service
+
+    repo = "amittell/coord"
+    first = "coordt_" + "1" * 64
+    second = "coordt_" + "2" * 64
+    await get_service().db.create_engineer_token(
+        "alice", hashlib.sha256(first.encode()).hexdigest(), repo=repo
+    )
+    await get_service().db.create_engineer_token(
+        "bob", hashlib.sha256(second.encode()).hexdigest(), repo=repo
+    )
+    first_auth = {"Authorization": f"Bearer {first}"}
+    second_auth = {"Authorization": f"Bearer {second}"}
+
+    opened = await client.post(
+        "/sessions/owned/open", headers=first_auth
+    )
+    assert opened.status_code == 200, opened.text
+    claimed = await client.post(
+        "/claims",
+        headers=first_auth,
+        json={
+            "engineer": "alice",
+            "session_id": "owned",
+            "claims": [{"type": "file", "pattern": "src/owned.py"}],
+        },
+    )
+    assert claimed.status_code == 200, claimed.text
+
+    assert (
+        await client.post("/sessions/owned/open", headers=second_auth)
+    ).status_code == 403
+    assert (
+        await client.post("/sessions/owned/release", headers=second_auth)
+    ).status_code == 403
+    other_claim = await client.post(
+        "/claims",
+        headers=second_auth,
+        json={
+            "engineer": "bob",
+            "session_id": "owned",
+            "claims": [{"type": "file", "pattern": "src/other.py"}],
+        },
+    )
+    assert other_claim.status_code == 403, other_claim.text
+
+    released = await client.post(
+        "/sessions/owned/release", headers=first_auth
+    )
+    assert released.status_code == 200, released.text
 
 
 @pytest.mark.asyncio

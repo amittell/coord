@@ -1,0 +1,62 @@
+---
+# coord-db logical backup (2026-07-17): coord moved to the CNPG pair coord-db.
+# Nightly pg_dump onto the kebabstore CIFS share (QNAP snapshots on top), 30
+# kept. CNPG replication is HA; this is the point-in-time / off-cluster copy.
+# postgres:18 matches the CNPG cluster major (pg_dump aborts on mismatch).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: coord-backups
+  namespace: coord
+spec:
+  accessModes: ["ReadWriteMany"]
+  storageClassName: smb-writhub-repos
+  resources:
+    requests: { storage: 20Gi }
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: coord-db-backup
+  namespace: coord
+spec:
+  schedule: "20 4 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          enableServiceLinks: false
+          containers:
+            - name: dump
+              image: postgres:18
+              envFrom:
+                - secretRef: { name: coord-db-credentials }
+              command: ["sh","-c"]
+              args:
+                - |
+                  set -e
+                  mkdir -p /backups/coord
+                  f=/backups/coord/coord-$(date +%Y%m%d-%H%M%S).sql.gz
+                  PGPASSWORD="$password" pg_dump -h coord-db-rw -U "$username" coord | gzip > "$f"
+                  ls -lh "$f"
+                  ls -1t /backups/coord/coord-*.sql.gz | tail -n +31 | xargs -r rm
+              volumeMounts:
+                - { name: backups, mountPath: /backups }
+          volumes:
+            - name: backups
+              persistentVolumeClaim: { claimName: coord-backups }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: coord-pdb
+  namespace: coord
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: coord
