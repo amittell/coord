@@ -553,7 +553,7 @@ def test_new_branch_diff_honors_explicit_integration_base(tmp_path) -> None:
     assert result.stdout.splitlines() == ["feature.txt"]
 
 
-def test_hook_batches_multiple_files_into_one_curl(tmp_path) -> None:
+def test_hook_batches_multiple_files_after_identity_probe(tmp_path) -> None:
     bash = shutil.which("bash")
     jq = shutil.which("jq")
     if not bash or not jq:
@@ -591,6 +591,12 @@ def test_hook_batches_multiple_files_into_one_curl(tmp_path) -> None:
     fake_curl = fake_bin / "curl"
     fake_curl.write_text(
         "#!/usr/bin/env bash\n"
+        'for arg in "$@"; do\n'
+        '  if [[ "$arg" == */whoami ]]; then\n'
+        '    printf \'{"engineer":"fixture token owner"}\\n\'\n'
+        '    exit 0\n'
+        '  fi\n'
+        'done\n'
         'cat > "${CAPTURE_PAYLOAD}"\n'
         'count=0; [[ -f "${CAPTURE_COUNT}" ]] && count="$(cat "${CAPTURE_COUNT}")"\n'
         'printf "%s" "$((count + 1))" > "${CAPTURE_COUNT}"\n'
@@ -604,6 +610,8 @@ def test_hook_batches_multiple_files_into_one_curl(tmp_path) -> None:
     env.update(
         {
             "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "COORD_TOKEN": "synthetic-batch-token",
+            "COORD_AUTH_TOKEN": "",
             "CAPTURE_PAYLOAD": str(capture_payload),
             "CAPTURE_COUNT": str(capture_count),
         }
@@ -624,6 +632,7 @@ def test_hook_batches_multiple_files_into_one_curl(tmp_path) -> None:
     assert capture_count.read_text(encoding="utf-8") == "1"
     payload = json.loads(capture_payload.read_text(encoding="utf-8"))
     assert payload["patterns"] == ["one.py", "two.py"]
+    assert payload["engineer"] == "fixture token owner"
     assert payload["repo"] == "amittell/coord"
     assert payload["branch"] == "feature"
 

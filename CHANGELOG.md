@@ -7,6 +7,13 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- The managed pre-push hook's `/whoami` request now uses the same private
+  curl config as conflict requests, keeping both supported bearer-token
+  variables out of child-process arguments (#71). Tokens used by an affected
+  hook must be rotated; upgrading the hook does not revoke them.
+
 ## [0.49.0] - 2026-07-23
 
 ### Changed
