@@ -20,10 +20,12 @@ from pathlib import Path
 
 import pytest
 
-from coordination import claude_hooks
 from coordination.cli_init import _update_claude_settings
 from coordination.cli_tokens import _create
 from coordination.db import Database
+
+if os.name == "posix":
+    from coordination import claude_hooks
 
 
 @pytest.fixture
@@ -150,6 +152,7 @@ class _BlockingHookClient(_FakeHookClient):
         return super().post(path, body)
 
 
+@pytest.mark.skipif(os.name != "posix", reason="Claude hooks require POSIX fcntl locks")
 class TestClaudeHookLogic:
     def test_extracts_edit_targets_only(self):
         assert (
