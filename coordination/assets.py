@@ -263,8 +263,9 @@ fi
 # who the token belongs to; fall back to git config only when unauthenticated
 # or the server predates /whoami.
 ENGINEER=""
-if [ -n "${COORD_TOKEN:-}" ]; then
-  ENGINEER="$(curl -fsS --max-time 3 -H "Authorization: Bearer ${COORD_TOKEN}" \
+if [[ -n "${TOKEN}" ]]; then
+  ENGINEER="$(curl -fsS --max-time 3 \\
+    ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} \\
     "${COORD_URL}/whoami" 2>/dev/null | jq -r '.engineer // empty' 2>/dev/null || true)"
 fi
 if [ -z "${ENGINEER}" ]; then

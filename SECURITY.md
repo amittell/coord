@@ -8,6 +8,14 @@ The MCP stdio bridge (`coord-mcp`) reads the same token from its environment and
 
 ## Token rotation
 
+Rotate any token used by a managed pre-push hook that passed an Authorization
+header directly in curl's arguments, including the `/whoami` path described in
+issue #71. Those arguments can be visible to other local processes. Updating
+the hook prevents future argument exposure but does not revoke the old token.
+Have the service operator rotate or revoke the affected repo-scoped token and
+replace it in each client that used it. Do not include token values in issue
+reports, process listings, or diagnostic output.
+
 Token rotation is a config change plus a restart:
 
 1. Edit `.coordination/local.env` (gitignored). Set a fresh `COORD_AUTH_TOKEN=...`.
