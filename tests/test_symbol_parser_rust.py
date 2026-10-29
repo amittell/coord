@@ -318,13 +318,8 @@ def test_mod_itself_not_emitted(backend: str) -> None:
     assert "inner" not in _names(result)
 
 
-def test_items_inside_mod_excluded(backend: str) -> None:
-    """A function declared inside an inline module is not a top-level symbol.
-
-    The tree-sitter backend walks only direct children of ``source_file``; the
-    regex backend filters the indented body by column-zero anchoring. A free
-    function next to the module still surfaces.
-    """
+def test_items_inside_mod_are_qualified(backend: str) -> None:
+    """Inline module contents retain their namespace, alongside root items."""
 
     src = (
         "fn top() {}\n"
@@ -336,7 +331,7 @@ def test_items_inside_mod_excluded(backend: str) -> None:
     result = extract_symbols("sample.rs", src)
     names = _names(result)
     assert "top" in names
-    assert "buried" not in names
+    assert _by_name(result, "buried").parent == "inner"
 
 
 # ---------------------------------------------------------------------------
@@ -405,3 +400,240 @@ def test_mixed_top_level_kinds(backend: str) -> None:
     origin = _by_name(result, "origin")
     assert origin.kind == "function"
     assert origin.parent == "Point"
+
+
+def test_nested_cfg_test_module_paths(backend: str) -> None:
+    src = """
+#[cfg(test)]
+mod tests {
+    fn root_case() {}
+    pub(crate) mod parser {
+        const LIMIT: usize = 3;
+        struct Case;
+        impl Case {
+            fn check(&self) {}
+        }
+        fn nested_case() {}
+    }
+}
+mod external;
+fn after() {}
+"""
+    result = extract_symbols("sample.rs", src)
+    assert [(s.name, s.kind, s.parent) for s in result] == [
+        ("root_case", "function", "tests"),
+        ("LIMIT", "const", "tests::parser"),
+        ("Case", "type", "tests::parser"),
+        ("check", "function", "tests::parser::Case"),
+        ("nested_case", "function", "tests::parser"),
+        ("after", "function", None),
+    ]
+    assert _by_name(result, "nested_case").start_line == 11
+
+
+def test_same_leaf_name_in_sibling_modules_stays_distinct(backend: str) -> None:
+    src = """
+mod first {
+    fn check() {}
+}
+mod second {
+    fn check() {}
+}
+"""
+    result = extract_symbols("sample.rs", src)
+    assert [(s.name, s.parent) for s in result] == [
+        ("check", "first"), ("check", "second")
+    ]
+
+
+def test_nested_function_and_macro_items_stay_excluded(backend: str) -> None:
+    src = """
+mod visible {
+    fn outer() {
+        fn hidden() {}
+        mod local {
+            fn also_hidden() {}
+        }
+    }
+    macro_rules! generated {
+        () => {
+            mod generated_module {
+                fn fake() {}
+            }
+        };
+    }
+    fn after() {}
+}
+"""
+    result = extract_symbols("sample.rs", src)
+    assert [(s.name, s.parent) for s in result] == [
+        ("outer", "visible"), ("after", "visible")
+    ]
+
+
+def test_literal_and_comment_braces_do_not_escape_module(backend: str) -> None:
+    src = r'''
+mod outer {
+    /* } /* nested } */
+    fn comment_fake() {}
+    */
+    const RAW: &str = r##"}
+    fn string_fake() {}
+    "##;
+    fn before<'a>(value: &'a str) {
+        let close = '}';
+        let unicode = '\u{007d}';
+        let escaped = "\"}";
+        // }
+    }
+    fn after() {}
+}
+fn outside() {}
+'''
+    result = extract_symbols("sample.rs", src)
+    assert [(s.name, s.parent) for s in result] == [
+        ("RAW", "outer"), ("before", "outer"),
+        ("after", "outer"), ("outside", None),
+    ]
+
+
+def test_nested_rust_claim_overlap_keeps_namespace_boundaries(backend: str) -> None:
+    from coordination.overlap_symbols import (
+        format_symbol_path,
+        parse_symbol_path,
+        symbol_paths_overlap,
+    )
+
+    result = extract_symbols(
+        "sample.rs", "mod tests {\n    mod parser {\n        fn check() {}\n    }\n}\n"
+    )
+    symbol = _by_name(result, "check")
+    path = parse_symbol_path(format_symbol_path(symbol.parent, symbol.name))
+    assert symbol_paths_overlap(parse_symbol_path("tests"), path)
+    assert symbol_paths_overlap(parse_symbol_path("tests::parser"), path)
+    assert not symbol_paths_overlap(parse_symbol_path("tests::other"), path)
+    assert not symbol_paths_overlap(parse_symbol_path("other::parser::check"), path)
+
+
+def test_extern_abi_and_raw_function_names_preserve_backend_spelling(backend: str) -> None:
+    """Masking ABI strings must not hide functions or change existing raw names."""
+    src = '''extern "C" fn ffi() {}
+pub unsafe extern "C-unwind" fn unwind() {}
+fn r#match() {}
+fn after() {}
+'''
+    result = extract_symbols("sample.rs", src)
+    raw_name = "r#match" if backend == "treesitter" else "match"
+    assert [(s.name, s.parent) for s in result] == [
+        ("ffi", None), ("unwind", None), (raw_name, None), ("after", None),
+    ]
+
+
+def test_raw_module_path_preserves_identifier_prefix(backend: str) -> None:
+    result = extract_symbols("sample.rs", "mod r#type {\n    fn check() {}\n}\n")
+    assert [(s.name, s.parent) for s in result] == [("check", "r#type")]
+
+
+@pytest.mark.parametrize(("opening", "closing"), [("(", ")"), ("[", "]"), ("{", "}")])
+def test_macro_invocation_token_trees_are_not_declaration_scopes(
+    backend: str, opening: str, closing: str
+) -> None:
+    src = f"""
+fn before() {{}}
+macros::discard!{opening}
+    fn phantom_root() {{}}
+{closing};
+mod visible {{
+    fn before() {{}}
+    discard!{opening}
+        fn phantom_module() {{}}
+        mod hidden {{
+            fn phantom_nested() {{}}
+        }}
+    {closing};
+    struct Item;
+    impl Item {{
+        discard!{opening}
+            fn phantom_method(&self) {{}}
+        {closing};
+        fn actual(&self) {{}}
+    }}
+    fn after() {{}}
+}}
+fn outside() {{}}
+"""
+    result = extract_symbols("sample.rs", src)
+    assert [(s.name, s.parent) for s in result] == [
+        ("before", None), ("before", "visible"), ("Item", "visible"),
+        ("actual", "visible::Item"), ("after", "visible"), ("outside", None),
+    ]
+    assert _by_name(result, "outside").start_line == 23
+
+
+def test_macro_nested_delimiters_do_not_end_exclusion_early(backend: str) -> None:
+    src = """
+mod visible {
+    discard!(
+        [{ fn phantom_group() {} }]
+        nested![
+            fn phantom_macro() {}
+        ]
+        fn phantom_after_nested() {}
+    );
+    fn after() {}
+}
+"""
+    result = extract_symbols("sample.rs", src)
+    assert [(s.name, s.parent) for s in result] == [("after", "visible")]
+
+
+def test_macro_header_can_span_comments_and_lines(backend: str) -> None:
+    src = """
+mod visible {
+    macros::r#discard /* a comment with { [ ( */
+        ! // a comment with ) ] }
+        (
+            fn phantom() {}
+        );
+    fn after() {}
+}
+"""
+    result = extract_symbols("sample.rs", src)
+    assert [(s.name, s.parent) for s in result] == [("after", "visible")]
+
+
+@pytest.mark.parametrize(("opening", "closing"), [("(", ")"), ("[", "]"), ("{", "}")])
+def test_macro_definition_token_trees_are_not_declaration_scopes(
+    backend: str, opening: str, closing: str
+) -> None:
+    src = f"""
+mod visible {{
+    macro_rules! discard {opening}
+        (
+            fn phantom() {{}}
+        ) => {{}};
+    {closing};
+    fn after() {{}}
+}}
+"""
+    result = extract_symbols("sample.rs", src)
+    assert [(s.name, s.parent) for s in result] == [("after", "visible")]
+
+
+def test_macro_text_in_literal_does_not_hide_real_items(backend: str) -> None:
+    src = '''mod visible {
+    const TEXT: &str = "discard!(";
+    fn after() {}
+}
+'''
+    result = extract_symbols("sample.rs", src)
+    assert [(s.name, s.parent) for s in result] == [
+        ("TEXT", "visible"), ("after", "visible"),
+    ]
+
+
+def test_regex_unclosed_macro_does_not_emit_its_tokens() -> None:
+    from coordination.symbols import rust_regex
+
+    result = rust_regex.extract("fn before() {}\ndiscard!(\n    fn phantom() {}\n")
+    assert [(s.name, s.parent) for s in result] == [("before", None)]
