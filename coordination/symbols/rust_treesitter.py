@@ -1,11 +1,12 @@
 """Tree-sitter backed Rust symbol extractor.
 
-Walks the top level of the ``source_file`` node produced by
+Walks file and inline-module declarations in the ``source_file`` node produced by
 ``tree-sitter-rust`` and emits one :class:`Symbol` per claimable declaration.
 
-Recognised top-level declarations:
+Recognised declarations:
 
-- ``function_item`` -- ``kind='function'``, ``parent=None``. Generic parameters
+- ``function_item`` -- ``kind='function'``, ``parent`` carries the module path,
+  if any. Generic parameters
   (``fn foo<T>(...)``) are excluded from the captured name because tree-sitter
   exposes the identifier via the ``name`` field, which sits before the
   ``type_parameters`` child.
@@ -27,11 +28,11 @@ Recognised top-level declarations:
   (``Container``); a reference type (``impl &Foo``) and a scoped path
   (``impl foo::Bar``) reduce to ``Foo`` / ``Bar``.
 
-``mod`` is a namespace, not a claimable unit: ``mod_item`` is skipped entirely,
-and the extractor does not recurse into inline module bodies. Like the Go
-backend this is a deliberate top-level-only walk -- declarations inside a
-function body, a nested module, or a macro expansion are not reachable units of
-cross-file coordination and are excluded by structure.
+Inline modules are namespaces. Their declarations carry the complete module
+path in ``parent``, including declarations under ``#[cfg(test)]``. Modules are
+not emitted as separate symbols: the existing claim validator derives every
+ancestor namespace from its descendants. External ``mod name;`` declarations
+have no body in this file. Function bodies and macro expansions remain excluded.
 """
 
 from __future__ import annotations
@@ -150,7 +151,7 @@ def _symbol_from_function(node, parent: str | None = None) -> Symbol | None:
     )
 
 
-def _simple_symbol(node, kind: str) -> Symbol | None:
+def _simple_symbol(node, kind: str, parent: str | None = None) -> Symbol | None:
     """Build a Symbol for a named, non-function declaration."""
 
     name = _name_text(node)
@@ -161,10 +162,11 @@ def _simple_symbol(node, kind: str) -> Symbol | None:
         kind=kind,
         start_line=node.start_point[0] + 1,
         end_line=node.end_point[0] + 1,
+        parent=parent,
     )
 
 
-def _symbols_from_impl(node) -> list[Symbol]:
+def _symbols_from_impl(node, namespace: str | None = None) -> list[Symbol]:
     """Emit one Symbol per ``function_item`` directly inside an impl body.
 
     The impl itself is not a claimable unit; only its associated functions are.
@@ -175,6 +177,10 @@ def _symbols_from_impl(node) -> list[Symbol]:
 
     out: list[Symbol] = []
     parent = _impl_type_name(node)
+    if parent is None:
+        return out
+    if namespace:
+        parent = f"{namespace}::{parent}"
     body = node.child_by_field_name("body")
     if body is None:
         for child in node.children:
@@ -191,45 +197,42 @@ def _symbols_from_impl(node) -> list[Symbol]:
     return out
 
 
-def extract(content: str) -> list[Symbol]:
-    """Return top-level declarations as :class:`Symbol` instances.
-
-    Only the direct children of the ``source_file`` node are walked (plus the
-    associated functions of ``impl_item`` bodies). Declarations nested inside a
-    function body, a module, or a macro expansion are excluded by design.
-    """
-
-    parser = _rust_parser()
-    tree = parser.parse(content.encode("utf-8"))
-    root = tree.root_node
-
+def _declarations(root, parent: str | None = None) -> list[Symbol]:
+    """Walk only declaration lists, never arbitrary nested syntax nodes."""
     out: list[Symbol] = []
     for child in root.children:
         if child.type == "function_item":
-            sym = _symbol_from_function(child)
+            sym = _symbol_from_function(child, parent=parent)
             if sym is not None:
                 out.append(sym)
         elif child.type in {"struct_item", "union_item", "type_item"}:
-            sym = _simple_symbol(child, "type")
+            sym = _simple_symbol(child, "type", parent=parent)
             if sym is not None:
                 out.append(sym)
         elif child.type == "enum_item":
-            sym = _simple_symbol(child, "enum")
+            sym = _simple_symbol(child, "enum", parent=parent)
             if sym is not None:
                 out.append(sym)
         elif child.type == "trait_item":
-            sym = _simple_symbol(child, "interface")
+            sym = _simple_symbol(child, "interface", parent=parent)
             if sym is not None:
                 out.append(sym)
         elif child.type in {"const_item", "static_item"}:
-            sym = _simple_symbol(child, "const")
+            sym = _simple_symbol(child, "const", parent=parent)
             if sym is not None:
                 out.append(sym)
         elif child.type == "impl_item":
-            out.extend(_symbols_from_impl(child))
-        # Everything else (mod_item, use_declaration, attribute_item, macro
-        # invocations, comments) is ignored: modules are namespaces not
-        # claimable units, imports are not symbols, and macro expansions are
-        # not reachable at this layer.
-
+            out.extend(_symbols_from_impl(child, namespace=parent))
+        elif child.type == "mod_item":
+            name = _name_text(child)
+            body = child.child_by_field_name("body")
+            if name is not None and body is not None:
+                namespace = f"{parent}::{name}" if parent else name
+                out.extend(_declarations(body, parent=namespace))
     return out
+
+
+def extract(content: str) -> list[Symbol]:
+    """Return declarations from the file and its inline module bodies."""
+    tree = _rust_parser().parse(content.encode("utf-8"))
+    return _declarations(tree.root_node)

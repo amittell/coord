@@ -2551,3 +2551,57 @@ async def test_claim_files_429_surfaces_token_notice(
     result = await mcp_server.claim_files(engineer="dana", patterns=["src/a.py"])
     assert result["error"] == "rate limited"
     assert result["coord_notice"] == "unscoped token deprecated"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["regex", "treesitter"])
+@pytest.mark.parametrize(
+    ("claim", "accepted"),
+    [("tests", True), ("tests::parser", True), ("tests::parser::check", True),
+     ("check", False), ("parser::check", False), ("tests::other::check", False)],
+)
+async def test_client_validation_rust_module_claims(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: str,
+    claim: str, accepted: bool,
+) -> None:
+    from coordination import symbols as symbol_parser
+
+    if backend == "treesitter":
+        pytest.importorskip("tree_sitter_rust")
+    symbol_parser._CACHE.clear()
+    monkeypatch.setenv("COORD_SYMBOL_PARSER", backend)
+    monkeypatch.setenv("COORD_REPO_ROOT", str(tmp_path))
+    monkeypatch.setenv("COORD_API_URL", "http://svc:8080")
+    monkeypatch.setenv("COORD_AUTH_TOKEN", "synthetic-test-token")
+    (tmp_path / "lib.rs").write_text(
+        "#[cfg(test)]\nmod tests {\n    mod parser {\n        fn check() {}\n    }\n}\n",
+        encoding="utf-8",
+    )
+    captured = _install_mock_transport(
+        monkeypatch, _json_handler(200, {"claim_ids": ["nested"]})
+    )
+    result = await mcp_server.claim_files(
+        engineer="alice", patterns=["lib.rs"], symbols={"lib.rs": [claim]},
+    )
+    assert bool(captured) is accepted
+    if accepted:
+        assert result == {"claim_ids": ["nested"]}
+    else:
+        assert result.get("client_validated") is True
+        assert result.get("claim_ids") == []
+        assert "available: tests, tests::parser, tests::parser::check" in result["warnings"][0]
+
+
+def test_client_validation_available_hint_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COORD_REPO_ROOT", str(tmp_path))
+    monkeypatch.setenv("COORD_SYMBOL_PARSER", "regex")
+    (tmp_path / "lib.rs").write_text(
+        "\n".join(f"fn case_{index:02}() {{}}" for index in range(25)), encoding="utf-8",
+    )
+    error = mcp_server._validate_symbols_locally({"lib.rs": ["absent"]})
+    assert error is not None
+    assert "absent" in error
+    assert "case_00" in error and "case_19" in error
+    assert "case_20" not in error
