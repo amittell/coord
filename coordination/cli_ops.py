@@ -99,17 +99,17 @@ def _read_pid(path: Path) -> int | None:
 
 
 def _pid_belongs_to_coord_posix(pid: int, marker: str) -> bool:
-    """POSIX implementation: shell out to `ps -p <pid> -o command=`.
+    """POSIX implementation: shell out to `ps -ww -p <pid> -o command=`.
 
-    `ps -o command=` returns the full command line on both macOS (BSD)
-    and Linux. If the marker string appears anywhere in the output, the
+    `ps -ww -o command=` requests untruncated output on macOS (BSD)
+    and Linux, including when stdout is captured. If the marker string appears anywhere in the output, the
     PID is considered ours. Any error, timeout, empty output, or non-zero
     exit is treated as "not ours" so we never signal a process we cannot
     identify.
     """
     try:
         completed = subprocess.run(
-            ["ps", "-p", str(int(pid)), "-o", "command="],
+            ["ps", "-ww", "-p", str(int(pid)), "-o", "command="],
             capture_output=True,
             text=True,
             timeout=1.0,
@@ -159,7 +159,7 @@ def _pid_belongs_to_coord_windows(pid: int, marker: str) -> bool:
 def _pid_belongs_to_coord(pid: int, marker: str) -> bool:
     """Verify the process at `pid` is a coord service. Platform dispatch.
 
-    POSIX (linux, darwin, *bsd): `ps -p <pid> -o command=`.
+    POSIX (linux, darwin, *bsd): `ps -ww -p <pid> -o command=`.
     Windows (`sys.platform == "win32"`): PowerShell + Win32_Process.
     Any other platform falls back to the POSIX path (best effort).
     """

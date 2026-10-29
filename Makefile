@@ -1,5 +1,5 @@
 VENV := .venv
-ACTIVATE := . $(VENV)/bin/activate
+ACTIVATE := . "$(VENV)/bin/activate"
 
 .PHONY: install run init doctor mcp lint typecheck test test-fast smoke check verify docker-build docker-smoke clean
 
@@ -34,12 +34,18 @@ typecheck:
 # (and the pre-push hook that calls it) for hours. Fail fast with a
 # clear message instead. pgrep matches only this venv's pytest, so
 # unrelated projects' test runs are ignored; if pgrep is unavailable
-# the guard degrades to a no-op.
+# the guard degrades to a no-op. Resolve VENV before escaping it as an ERE;
+# Include logical and physical venv paths for symlinks. [p] prevents the recipe
+# (including its printed suggestion) matching itself.
 test:
-	@if pgrep -f "$(CURDIR)/$(VENV)/bin/pytest" >/dev/null 2>&1; then \
+	@runner_dir=$$(cd "$(VENV)/bin" && pwd -L) || exit 1; \
+	runner_real=$$(cd "$(VENV)/bin" && pwd -P) || exit 1; \
+	dirs=$$(printf '%s\n' "$$runner_dir" "$$runner_real" | sed 's/[][\\.^$$*+?(){}|]/\\&/g' | sort -u | paste -sd '|' -); \
+	pattern="(^|[[:space:]])($$dirs)/"'[p]ytest([[:space:]]|$$)'; \
+	if pgrep -f "$$pattern" >/dev/null 2>&1; then \
 	  echo "ERROR: another coord pytest run is already active; refusing to start a"; \
 	  echo "second (the integration tests deadlock on shared resources). Wait for it,"; \
-	  echo "or kill it:  pkill -f '$(CURDIR)/$(VENV)/bin/pytest'"; \
+	  printf "or stop it with pkill -f using this pattern: %s\n" "$$pattern"; \
 	  exit 1; \
 	fi
 	$(ACTIVATE) && pytest -q

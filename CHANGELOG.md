@@ -7,6 +7,8 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+- Avoid self-matching test-runner guards and retain full process identities when stopping Coord from long interpreter paths.
+
 ### Fixed
 
 - The managed pre-push hook's `/whoami` request now uses the same private

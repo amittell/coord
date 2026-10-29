@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import signal
+import shutil
+import sys
 import socketserver
 import subprocess
 import threading
@@ -105,7 +107,7 @@ def test_pid_belongs_to_coord_calls_ps(
     assert _pid_belongs_to_coord(12345, "coordination.cli _serve") is True
     cmd = captured["cmd"]
     assert isinstance(cmd, list)
-    assert cmd[:3] == ["ps", "-p", "12345"]
+    assert cmd == ["ps", "-ww", "-p", "12345", "-o", "command="]
     assert captured["timeout"] == 1.0
     assert captured["capture_output"] is True
     assert captured["text"] is True
@@ -191,7 +193,7 @@ def test_pid_belongs_to_coord_posix_dispatches_to_ps(
     assert _pid_belongs_to_coord(12345, "coordination.cli _serve") is True
     cmd = captured["cmd"]
     assert isinstance(cmd, list)
-    assert cmd[:3] == ["ps", "-p", "12345"]
+    assert cmd == ["ps", "-ww", "-p", "12345", "-o", "command="]
 
 
 def test_pid_belongs_to_coord_windows_dispatches_to_powershell(
@@ -1150,3 +1152,20 @@ def test_status_no_token_warning_when_absent(
         exit_code = cli.main(["status"])
     assert exit_code == 0
     assert "Token warning:" not in capsys.readouterr().out
+
+
+@pytest.mark.skipif(sys.platform == "win32" or shutil.which("ps") is None, reason="POSIX ps")
+def test_pid_belongs_to_coord_keeps_long_command_marker() -> None:
+    """Real captured ps output must retain a marker beyond the normal screen width."""
+    marker = "coord-long-command-marker-" + "x" * 160
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(20)", marker],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        assert cli_ops._pid_belongs_to_coord_posix(process.pid, marker)
+        assert not cli_ops._pid_belongs_to_coord_posix(process.pid, marker + "-absent")
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
