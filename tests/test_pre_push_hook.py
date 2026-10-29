@@ -553,7 +553,8 @@ def test_new_branch_diff_honors_explicit_integration_base(tmp_path) -> None:
     assert result.stdout.splitlines() == ["feature.txt"]
 
 
-def test_hook_batches_multiple_files_after_identity_probe(tmp_path) -> None:
+@pytest.mark.parametrize(("file_count", "has_conflicts"), [(2, False), (333, False), (1000, False), (333, True)])
+def test_hook_batches_multiple_files_after_identity_probe(tmp_path, file_count, has_conflicts) -> None:
     bash = shutil.which("bash")
     jq = shutil.which("jq")
     if not bash or not jq:
@@ -569,9 +570,10 @@ def test_hook_batches_multiple_files_after_identity_probe(tmp_path) -> None:
     _git(repo, "commit", "-q", "-m", "seed")
     base_sha = _git(repo, "rev-parse", "HEAD")
     _git(repo, "switch", "-q", "-c", "feature")
-    (repo / "one.py").write_text("one\n", encoding="utf-8")
-    (repo / "two.py").write_text("two\n", encoding="utf-8")
-    _git(repo, "add", "one.py", "two.py")
+    paths = [f"{'long-path-' * 7}{index:05}.py" for index in range(file_count)]
+    for path in paths:
+        (repo / path).write_text("synthetic content\n", encoding="utf-8")
+    _git(repo, "add", ".")
     _git(repo, "commit", "-q", "-m", "two files")
     head_sha = _git(repo, "rev-parse", "HEAD")
 
@@ -603,6 +605,11 @@ def test_hook_batches_multiple_files_after_identity_probe(tmp_path) -> None:
         "printf '{\"has_conflicts\":false,\"conflicts\":[],\"safe_to_proceed\":true,\"safe\":true}\\n200'\n",
         encoding="utf-8",
     )
+    fake_curl.write_text(
+        fake_curl.read_text(encoding="utf-8").replace(
+            '"has_conflicts":false', f'"has_conflicts":{str(has_conflicts).lower()}'
+        ), encoding="utf-8",
+    )
     fake_curl.chmod(0o755)
     capture_payload = tmp_path / "payload.json"
     capture_count = tmp_path / "count"
@@ -627,11 +634,12 @@ def test_hook_batches_multiple_files_after_identity_probe(tmp_path) -> None:
         capture_output=True,
         text=True,
         check=False,
+        timeout=30,
     )
-    assert result.returncode == 0, result.stderr
+    assert result.returncode == (2 if has_conflicts else 0), result.stderr
     assert capture_count.read_text(encoding="utf-8") == "1"
     payload = json.loads(capture_payload.read_text(encoding="utf-8"))
-    assert payload["patterns"] == ["one.py", "two.py"]
+    assert payload["patterns"] == paths
     assert payload["engineer"] == "fixture token owner"
     assert payload["repo"] == "amittell/coord"
     assert payload["branch"] == "feature"
@@ -774,3 +782,85 @@ def test_http_errors_route_through_soft_fail() -> None:
     assert "returned HTTP ${batch_status}; refusing to push" not in PRE_PUSH_SCRIPT
     # The 404/405 legacy-server fallback is still a fallback, not a soft_fail.
     assert 'legacy_conflict_check || exit $?' in PRE_PUSH_SCRIPT
+
+
+@pytest.mark.parametrize("files", ["", " \t\r\n", "src/file with spaces.rs\n", "src/\u00e9.rs\n", "x.rs\n" * 10000])
+def test_modified_file_list_empty_check_is_bounded(tmp_path, files) -> None:
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("bash not available")
+    start = PRE_PUSH_SCRIPT.index('MODIFIED="$(printf')
+    end = PRE_PUSH_SCRIPT.index('\nREPO_QS=', start)
+    fragment = tmp_path / "modified.sh"
+    fragment.write_text(
+        'set -euo pipefail\nMODIFIED="$(cat)"\n' + PRE_PUSH_SCRIPT[start:end]
+        + '\nprintf "checked\\n"\n', encoding="utf-8",
+    )
+    result = subprocess.run(
+        [bash, str(fragment)], input=files, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ("checked\n" if files.strip() else "")
+
+
+@pytest.mark.parametrize("push_input", ["", " \t\r\n", "refs/heads/main abc refs/heads/main def\n"])
+def test_redirected_push_input_blankness_is_preserved(tmp_path, push_input) -> None:
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("bash not available")
+    start = PRE_PUSH_SCRIPT.index('if [[ ${STDIN_IS_TTY} -eq 0')
+    end = PRE_PUSH_SCRIPT.index('\nMODIFIED=', start)
+    fragment = tmp_path / "stdin.sh"
+    fragment.write_text(
+        'set -euo pipefail\nSTDIN_IS_TTY=0\nPUSH_INPUT="$(cat)"\n'
+        'soft_fail() { printf "empty\\n"; exit 17; }\n'
+        + PRE_PUSH_SCRIPT[start:end] + '\nprintf "present\\n"\n', encoding="utf-8",
+    )
+    result = subprocess.run(
+        [bash, str(fragment)], input=push_input, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == (0 if push_input.strip() else 17)
+    assert result.stdout == ("present\n" if push_input.strip() else "empty\n")
+
+
+@pytest.mark.parametrize("base_mode", ["default", "absent", "invalid-override"])
+def test_new_branch_base_uses_concrete_git_files(tmp_path, base_mode) -> None:
+    """Unknown remote bases yield concrete Git paths, never an <unknown> claim."""
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("bash not available")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "seed")
+    base = _git(repo, "rev-parse", "HEAD")
+    if base_mode == "default":
+        _git(repo, "update-ref", "refs/remotes/origin/main", base)
+        _git(repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    _git(repo, "switch", "-qc", "feature")
+    (repo / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "feature")
+    head = _git(repo, "rev-parse", "HEAD")
+    override = "origin/nonexistent" if base_mode == "invalid-override" else ""
+    fragment = tmp_path / "diff-base.sh"
+    fragment.write_text(
+        'set -euo pipefail\nUPSTREAM=origin\n'
+        f'COORD_PUSH_BASE_REF="{override}"\n'
+        'ZERO_SHA="0000000000000000000000000000000000000000"\n'
+        'EMPTY_TREE="$(git hash-object -t tree /dev/null)"\n'
+        + _extract_diff_functions(PRE_PUSH_SCRIPT)
+        + f'diff_for_ref refs/heads/feature "{head}" refs/heads/feature "${{ZERO_SHA}}"\n',
+        encoding="utf-8",
+    )
+    result = subprocess.run([bash, str(fragment)], cwd=repo, capture_output=True, text=True, timeout=30)
+    if base_mode == "invalid-override":
+        assert result.returncode == 1
+        assert "configured push base does not resolve" in result.stderr
+        assert result.stdout == ""
+    else:
+        assert result.returncode == 0, result.stderr
+        expected = ["feature.txt"] if base_mode == "default" else ["feature.txt", "seed.txt"]
+        assert result.stdout.splitlines() == expected

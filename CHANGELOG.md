@@ -8,6 +8,7 @@ Semantic Versioning.
 ## [Unreleased]
 
 - Avoid self-matching test-runner guards and retain full process identities when stopping Coord from long interpreter paths.
+- Avoid quadratic Bash 3.2 substitutions while checking large pre-push filename lists.
 
 ### Fixed
 

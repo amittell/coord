@@ -307,12 +307,12 @@ soft_fail() {
 # deletions -- so we refuse rather than soft-checking the wrong file
 # set. A TTY stdin means "hand-run for testing"; the fallback below
 # only runs in that case.
-if [[ ${STDIN_IS_TTY} -eq 0 && -z "${PUSH_INPUT//[$'\t\r\n ']/}" ]]; then
+if [[ ${STDIN_IS_TTY} -eq 0 && "${PUSH_INPUT}" != *[!$'\t\r\n ']* ]]; then
   soft_fail "stdin was redirected but empty (outer wrapper or linked-worktree quirk) -- cannot determine the pushed ref set"
 fi
 
 MODIFIED=""
-if [[ -n "${PUSH_INPUT//[$'\t\r\n ']/}" ]]; then
+if [[ "${PUSH_INPUT}" == *[!$'\t\r\n ']* ]]; then
   while read -r local_ref local_sha remote_ref remote_sha; do
     [[ -z "${local_ref}" ]] && continue
     files="$(diff_for_ref "${local_ref}" "${local_sha}" "${remote_ref}" "${remote_sha}")" || exit 1
@@ -338,7 +338,9 @@ else
   MODIFIED="$(diff_names "${BASE}" HEAD)" || exit 1
 fi
 MODIFIED="$(printf '%s\n' "${MODIFIED}" | sed '/^[[:space:]]*$/d' | sort -u)"
-if [[ -z "${MODIFIED//[$'\t\r\n ']/}" ]]; then
+# Blank lines have already been removed. Global pattern substitution on the
+# complete list is quadratic on bash 3.2, so check the filtered string directly.
+if [[ -z "${MODIFIED}" ]]; then
   exit 0
 fi
 
