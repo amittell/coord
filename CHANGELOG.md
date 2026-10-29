@@ -9,6 +9,7 @@ Semantic Versioning.
 
 - Avoid self-matching test-runner guards and retain full process identities when stopping Coord from long interpreter paths.
 - Avoid quadratic Bash 3.2 substitutions while checking large pre-push filename lists.
+- Stream large pre-push arrays through jq input to avoid Windows command-line limits.
 
 ### Fixed
 

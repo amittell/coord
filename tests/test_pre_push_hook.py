@@ -553,8 +553,30 @@ def test_new_branch_diff_honors_explicit_integration_base(tmp_path) -> None:
     assert result.stdout.splitlines() == ["feature.txt"]
 
 
+def _install_jq_argv_guard(directory: Path, jq: str) -> None:
+    # Forward accepted calls to real jq, with a bounded argv budget even
+    # on hosts whose native command-line limit exceeds Windows'.
+    guard = directory / "jq"
+    guard.write_text(
+        "#!/usr/bin/env python3\n"
+        "import subprocess, sys\n"
+        "size = sum(len(arg.encode('utf-8')) + 1 for arg in sys.argv[1:])\n"
+        "if size > 32767:\n"
+        "    print('synthetic jq argv ceiling exceeded', file=sys.stderr)\n"
+        "    raise SystemExit(126)\n"
+        f"raise SystemExit(subprocess.run([{json.dumps(jq)}, *sys.argv[1:]], "
+        "check=False).returncode)\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    guard.chmod(0o755)
+
+
 @pytest.mark.parametrize(("file_count", "has_conflicts"), [(2, False), (333, False), (1000, False), (333, True)])
-def test_hook_batches_multiple_files_after_identity_probe(tmp_path, file_count, has_conflicts) -> None:
+@pytest.mark.parametrize("argv_ceiling", [False, True])
+def test_hook_batches_multiple_files_after_identity_probe(
+    tmp_path, file_count, has_conflicts, argv_ceiling
+) -> None:
     bash = shutil.which("bash")
     jq = shutil.which("jq")
     if not bash or not jq:
@@ -590,6 +612,8 @@ def test_hook_batches_multiple_files_after_identity_probe(tmp_path, file_count, 
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
+    if argv_ceiling:
+        _install_jq_argv_guard(fake_bin, jq)
     fake_curl = fake_bin / "curl"
     fake_curl.write_text(
         "#!/usr/bin/env bash\n"
@@ -643,6 +667,44 @@ def test_hook_batches_multiple_files_after_identity_probe(tmp_path, file_count, 
     assert payload["engineer"] == "fixture token owner"
     assert payload["repo"] == "amittell/coord"
     assert payload["branch"] == "feature"
+    assert payload["session_ids"] == []
+
+
+@pytest.mark.parametrize(("repo", "branch"), [("", "HEAD"), ("", ""), ("owner/repo", "feature")])
+def test_batch_payload_preserves_large_arrays_and_optional_fields(tmp_path, repo, branch) -> None:
+    bash = shutil.which("bash")
+    jq = shutil.which("jq")
+    if not bash or not jq:
+        pytest.skip("bash and jq are required")
+    patterns = [f'path with spaces/quoted-"-\u00e9-{"x" * 50}-{i}.py' for i in range(1000)]
+    sessions = [f'session-"-{"y" * 40}-{i}' for i in range(1000)]
+    (tmp_path / "patterns.json").write_text(json.dumps(patterns), encoding="utf-8")
+    (tmp_path / "sessions.json").write_text(json.dumps(sessions), encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _install_jq_argv_guard(fake_bin, jq)
+    start = PRE_PUSH_SCRIPT.index('BATCH_PAYLOAD=')
+    end = PRE_PUSH_SCRIPT.index('\n\nif ! batch_raw=', start)
+    script = tmp_path / "payload.sh"
+    script.write_text(
+        'set -euo pipefail\nPATTERNS_JSON="$(cat patterns.json)"\n'
+        'SESSION_IDS_JSON="$(cat sessions.json)"\n'
+        + PRE_PUSH_SCRIPT[start:end] + '\nprintf "%s" "${BATCH_PAYLOAD}"\n',
+        encoding="utf-8",
+        newline="\n",
+    )
+    result = subprocess.run(
+        [bash, str(script)], cwd=tmp_path, capture_output=True, encoding="utf-8", timeout=10,
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}",
+             "ENGINEER": 'fixture "owner"', "REPO_ID": repo, "BRANCH": branch},
+    )
+    assert result.returncode == 0, result.stderr
+    expected = {"patterns": patterns, "engineer": 'fixture "owner"', "session_ids": sessions}
+    if repo:
+        expected["repo"] = repo
+    if branch and branch != "HEAD":
+        expected["branch"] = branch
+    assert json.loads(result.stdout) == expected
 
 
 def test_shim_resolves_helper_from_main_root_in_linked_worktree(tmp_path) -> None:

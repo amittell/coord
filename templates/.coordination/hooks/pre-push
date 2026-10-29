@@ -511,13 +511,12 @@ legacy_conflict_check() {
 # COORD_PREPUSH_MODE=enforce.
 PATTERNS_JSON="$(printf '%s\n' "${MODIFIED}" | jq -Rsc 'split("\n") | map(select(length > 0))')"
 SESSION_IDS_JSON="$(printf '%s' "${SESSION_IDS}" | jq -Rsc 'split("\n") | map(select(length > 0))')"
-BATCH_PAYLOAD="$(jq -cn \
-  --argjson patterns "${PATTERNS_JSON}" \
+# Stream both arrays so a large push does not exceed the process argv limit.
+BATCH_PAYLOAD="$(printf '%s\n' "${PATTERNS_JSON}" "${SESSION_IDS_JSON}" | jq -cs \
   --arg engineer "${ENGINEER}" \
   --arg repo "${REPO_ID}" \
   --arg branch "${BRANCH}" \
-  --argjson session_ids "${SESSION_IDS_JSON}" \
-  '{patterns: $patterns, engineer: $engineer, session_ids: $session_ids}
+  '{patterns: .[0], engineer: $engineer, session_ids: .[1]}
    + (if $repo == "" then {} else {repo: $repo} end)
    + (if $branch == "" or $branch == "HEAD" then {} else {branch: $branch} end)')"
 
