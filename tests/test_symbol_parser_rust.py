@@ -532,3 +532,108 @@ fn after() {}
 def test_raw_module_path_preserves_identifier_prefix(backend: str) -> None:
     result = extract_symbols("sample.rs", "mod r#type {\n    fn check() {}\n}\n")
     assert [(s.name, s.parent) for s in result] == [("check", "r#type")]
+
+
+@pytest.mark.parametrize(("opening", "closing"), [("(", ")"), ("[", "]"), ("{", "}")])
+def test_macro_invocation_token_trees_are_not_declaration_scopes(
+    backend: str, opening: str, closing: str
+) -> None:
+    src = f"""
+fn before() {{}}
+macros::discard!{opening}
+    fn phantom_root() {{}}
+{closing};
+mod visible {{
+    fn before() {{}}
+    discard!{opening}
+        fn phantom_module() {{}}
+        mod hidden {{
+            fn phantom_nested() {{}}
+        }}
+    {closing};
+    struct Item;
+    impl Item {{
+        discard!{opening}
+            fn phantom_method(&self) {{}}
+        {closing};
+        fn actual(&self) {{}}
+    }}
+    fn after() {{}}
+}}
+fn outside() {{}}
+"""
+    result = extract_symbols("sample.rs", src)
+    assert [(s.name, s.parent) for s in result] == [
+        ("before", None), ("before", "visible"), ("Item", "visible"),
+        ("actual", "visible::Item"), ("after", "visible"), ("outside", None),
+    ]
+    assert _by_name(result, "outside").start_line == 23
+
+
+def test_macro_nested_delimiters_do_not_end_exclusion_early(backend: str) -> None:
+    src = """
+mod visible {
+    discard!(
+        [{ fn phantom_group() {} }]
+        nested![
+            fn phantom_macro() {}
+        ]
+        fn phantom_after_nested() {}
+    );
+    fn after() {}
+}
+"""
+    result = extract_symbols("sample.rs", src)
+    assert [(s.name, s.parent) for s in result] == [("after", "visible")]
+
+
+def test_macro_header_can_span_comments_and_lines(backend: str) -> None:
+    src = """
+mod visible {
+    macros::r#discard /* a comment with { [ ( */
+        ! // a comment with ) ] }
+        (
+            fn phantom() {}
+        );
+    fn after() {}
+}
+"""
+    result = extract_symbols("sample.rs", src)
+    assert [(s.name, s.parent) for s in result] == [("after", "visible")]
+
+
+@pytest.mark.parametrize(("opening", "closing"), [("(", ")"), ("[", "]"), ("{", "}")])
+def test_macro_definition_token_trees_are_not_declaration_scopes(
+    backend: str, opening: str, closing: str
+) -> None:
+    src = f"""
+mod visible {{
+    macro_rules! discard {opening}
+        (
+            fn phantom() {{}}
+        ) => {{}};
+    {closing};
+    fn after() {{}}
+}}
+"""
+    result = extract_symbols("sample.rs", src)
+    assert [(s.name, s.parent) for s in result] == [("after", "visible")]
+
+
+def test_macro_text_in_literal_does_not_hide_real_items(backend: str) -> None:
+    src = '''mod visible {
+    const TEXT: &str = "discard!(";
+    fn after() {}
+}
+'''
+    result = extract_symbols("sample.rs", src)
+    assert [(s.name, s.parent) for s in result] == [
+        ("TEXT", "visible"), ("after", "visible"),
+    ]
+
+
+def test_regex_unclosed_macro_does_not_emit_its_tokens() -> None:
+    from coordination.symbols import rust_regex
+
+    result = rust_regex.extract("fn before() {}\ndiscard!(\n    fn phantom() {}\n")
+    assert [(s.name, s.parent) for s in result] == [("before", None)]

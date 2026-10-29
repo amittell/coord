@@ -8,8 +8,9 @@ are not declaration scopes. Modules themselves are not emitted as symbols.
 This is a conservative, line-oriented fallback, not a Rust parser. Declaration
 keywords and names, and module/impl headers and opening braces, must share a
 line. Multiple declarations on one line and macro-generated items are omitted.
-Strings and comments are masked before counting braces so they cannot change a
-namespace. Install the ``symbols`` extra for tree-sitter's full syntax support.
+Comments, literals and macro token trees are masked before counting braces so
+they cannot change a namespace. Install the ``symbols`` extra for tree-sitter's
+full syntax support.
 Raw function names retain the fallback's existing spelling without ``r#``;
 module paths preserve that prefix. ``end_line`` is approximated as ``start_line``;
 claim matching uses names/parents.
@@ -38,6 +39,9 @@ _IMPL_HEADER_RE = re.compile(
 )
 _RAW_STRING_RE = re.compile(r'(?:br|cr|r)(#{0,255})"')
 _CHAR_RE = re.compile(r"'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|[^\n])|[^'\\\n])'")
+_MACRO_START_RE = re.compile(
+    r"\b(?:macro_rules\s*!\s+(?:r#)?\w+|(?:r#)?\w+\s*!)\s*([({\[])"
+)
 
 
 def _code_only(content: str) -> str:
@@ -90,13 +94,42 @@ def _code_only(content: str) -> str:
     return "".join(chars)
 
 
+def _without_macro_token_trees(code: str) -> str:
+    """Mask complete macro token trees while preserving line numbers.
+
+    Brace depth alone cannot exclude declarations inside ``m!(...)`` or
+    ``m![...]``. Match nested delimiter pairs, including braces, so an inner
+    token group cannot end the excluded region early. Comments and literals
+    have already been masked by ``_code_only``.
+    """
+    chars = list(code)
+    closing = {"(": ")", "[": "]", "{": "}"}
+    index = 0
+    while match := _MACRO_START_RE.search(code, index):
+        start = match.start()
+        expected = [closing[match.group(1)]]
+        index = match.end()
+        while index < len(code) and expected:
+            char = code[index]
+            if char in closing:
+                expected.append(closing[char])
+            elif char == expected[-1]:
+                expected.pop()
+            index += 1
+        for position in range(start, index):
+            if chars[position] != "\n":
+                chars[position] = " "
+    return "".join(chars)
+
+
 def extract(content: str) -> list[Symbol]:
     """Return declarations in source order with qualified module/impl parents."""
     found: list[Symbol] = []
     # Each scope is (body depth, qualified parent, is_impl).
     scopes: list[tuple[int, str, bool]] = []
     depth = 0
-    for line_number, line in enumerate(_code_only(content).splitlines(), 1):
+    code = _without_macro_token_trees(_code_only(content))
+    for line_number, line in enumerate(code.splitlines(), 1):
         stripped = line.lstrip()
         scope = scopes[-1] if scopes else (0, "", False)
         if depth == scope[0]:
