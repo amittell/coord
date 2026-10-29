@@ -153,6 +153,27 @@ def test_auth_block_e2e_empty_token_leaves_curl_auth_empty(tmp_path) -> None:
     assert "--config" not in result.stdout
 
 
+def _wait_for_spy_receipt(receipt, proc, deadline, *, clock=time.monotonic, sleep=time.sleep):
+    """Wait for a readable receipt while both fixture deadlines remain valid."""
+    while True:
+        assert proc.poll() is None, f"hook exited before {receipt.stem} request"
+        assert clock() < deadline, f"{receipt.stem} receipt not readable before deadline"
+        try:
+            text = receipt.read_text(encoding="utf-8")
+        except (FileNotFoundError, PermissionError):
+            sleep(0.01)
+            continue
+        # A published receipt is complete. Malformed JSON must fail immediately.
+        record = json.loads(text)
+        assert proc.poll() is None, f"hook exited while reading {receipt.stem} receipt"
+        now = clock()
+        assert now < deadline, f"{receipt.stem} receipt read exceeded deadline"
+        # The hook can outlive a timed-out /whoami spy, so hook.poll() alone
+        # does not prove this observation was made during the spy's hold.
+        assert now < record["hold_until"], f"{receipt.stem} spy hold expired"
+        return record
+
+
 @pytest.mark.parametrize("token_key", ["COORD_TOKEN", "COORD_AUTH_TOKEN", None])
 @pytest.mark.parametrize("scenario", ["batch", "legacy", "conflict", "unreachable", "old-server"])
 def test_complete_hook_keeps_auth_private_and_cleans_up(tmp_path, token_key, scenario) -> None:
@@ -221,9 +242,10 @@ record = {"pid": os.getpid(), "argv": sys.argv, "configs": [str(p) for p in conf
           "config_contents": [p.read_text() for p in configs],
           "payload": sys.stdin.read() if kind == "batch" else ""}
 temporary = root / (kind + ".tmp")
+deadline = time.monotonic() + 10
+record["hold_until"] = deadline
 temporary.write_text(json.dumps(record))
 temporary.replace(root / (kind + ".json"))
-deadline = time.monotonic() + 10
 while not (root / (kind + ".release")).exists():
     if time.monotonic() > deadline:
         raise SystemExit(98)
@@ -259,11 +281,7 @@ else:
         for kind in expected:
             receipt = trace_dir / (kind + ".json")
             deadline = time.monotonic() + 15
-            while not receipt.exists():
-                assert proc.poll() is None, f"hook exited before {kind} request"
-                assert time.monotonic() < deadline, f"hook never issued {kind}"
-                time.sleep(0.01)
-            record = json.loads(receipt.read_text())
+            record = _wait_for_spy_receipt(receipt, proc, deadline)
             records.append(record)
             assert not token or all(token not in arg for arg in record["argv"])
             if os.name != "nt":
@@ -307,6 +325,245 @@ else:
     assert not token or token not in stdout + stderr
     assert all(not Path(path).exists() for record in records for path in record["configs"])
     assert not list(private_tmp.glob("coord-pre-push.*"))
+
+
+def test_complete_hook_retries_one_receipt_permission_error(tmp_path, monkeypatch) -> None:
+    receipt = tmp_path / "trace" / "whoami.json"
+    read_text = Path.read_text
+    denied = []
+    successful_reads = []
+
+    def read(path, *args, **kwargs):
+        if path == receipt and path.exists() and not denied:
+            denied.append(path)
+            raise PermissionError("synthetic receipt denial")
+        text = read_text(path, *args, **kwargs)
+        if path == receipt:
+            successful_reads.append(path)
+        return text
+
+    monkeypatch.setattr(Path, "read_text", read)
+    test_complete_hook_keeps_auth_private_and_cleans_up(tmp_path, "COORD_TOKEN", "batch")
+    assert denied == [receipt]
+    assert successful_reads == [receipt]
+
+
+def test_complete_hook_persistent_receipt_denial_fails_and_cleans_up(tmp_path, monkeypatch) -> None:
+    receipt = tmp_path / "trace" / "whoami.json"
+    read_text = Path.read_text
+    wait = _wait_for_spy_receipt
+    denied = []
+
+    def read(path, *args, **kwargs):
+        if path == receipt and path.exists():
+            denied.append(path)
+            raise PermissionError("synthetic persistent receipt denial")
+        return read_text(path, *args, **kwargs)
+
+    def bounded_wait(path, proc, deadline):
+        # Advance only this helper's clock after two actual receipt attempts;
+        # allow the real hook/spy to start normally, without a 15-second test.
+        def clock():
+            return deadline if len(denied) >= 2 else time.monotonic()
+
+        return wait(path, proc, deadline, clock=clock)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    monkeypatch.setitem(globals(), "_wait_for_spy_receipt", bounded_wait)
+    with pytest.raises(AssertionError, match="receipt not readable before deadline"):
+        test_complete_hook_keeps_auth_private_and_cleans_up(tmp_path, "COORD_TOKEN", "batch")
+    assert denied == [receipt, receipt]
+    record = json.loads(read_text(receipt))
+    assert all(not Path(path).exists() for path in record["configs"])
+    assert not list((tmp_path / "tmp").glob("coord-pre-push.*"))
+    assert all(
+        (tmp_path / "trace" / f"{kind}.release").exists()
+        for kind in ("whoami", "batch", "legacy")
+    )
+
+
+class _ReceiptHook:
+    returncode = None
+
+    def poll(self):
+        return self.returncode
+
+
+class _ReceiptClock:
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps = []
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+@pytest.mark.parametrize("denial", [FileNotFoundError, PermissionError])
+def test_receipt_retries_only_readiness_errors(tmp_path, monkeypatch, denial) -> None:
+    receipt = tmp_path / "whoami.json"
+    expected = {"hold_until": 10, "observed": "synthetic"}
+    receipt.write_text(json.dumps(expected), encoding="utf-8")
+    read_text = Path.read_text
+    attempts = []
+
+    def read(path, *args, **kwargs):
+        if path == receipt:
+            attempts.append(path)
+            if len(attempts) == 1:
+                raise denial("synthetic readiness failure")
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    clock = _ReceiptClock()
+    assert _wait_for_spy_receipt(receipt, _ReceiptHook(), 15, clock=clock, sleep=clock.sleep) == expected
+    assert attempts == [receipt, receipt]
+    assert clock.sleeps == [0.01]
+
+
+@pytest.mark.parametrize("content", ["not json", "{"])
+def test_receipt_malformed_json_fails_without_retry(tmp_path, content) -> None:
+    receipt = tmp_path / "whoami.json"
+    receipt.write_text(content, encoding="utf-8")
+    clock = _ReceiptClock()
+    with pytest.raises(json.JSONDecodeError):
+        _wait_for_spy_receipt(receipt, _ReceiptHook(), 15, clock=clock, sleep=clock.sleep)
+    assert clock.sleeps == []
+
+
+def test_receipt_unrelated_read_error_is_not_retried(tmp_path, monkeypatch) -> None:
+    receipt = tmp_path / "whoami.json"
+    failure = OSError("synthetic unrelated read error")
+    read_text = Path.read_text
+
+    def read(path, *args, **kwargs):
+        if path == receipt:
+            raise failure
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    clock = _ReceiptClock()
+    with pytest.raises(OSError) as caught:
+        _wait_for_spy_receipt(receipt, _ReceiptHook(), 15, clock=clock, sleep=clock.sleep)
+    assert caught.value is failure
+    assert clock.sleeps == []
+
+
+@pytest.mark.parametrize(
+    "expired",
+    ["hook-before", "consumer-before", "spy-before",
+     "hook-during-read", "consumer-during-read", "spy-during-read"],
+)
+def test_receipt_rejects_expired_lifetimes(tmp_path, monkeypatch, expired) -> None:
+    receipt = tmp_path / "whoami.json"
+    receipt.write_text(json.dumps({"hold_until": 10}), encoding="utf-8")
+    hook = _ReceiptHook()
+    clock = _ReceiptClock()
+    if expired == "hook-before":
+        hook.returncode = 0
+    elif expired == "consumer-before":
+        clock.now = 15
+    elif expired == "spy-before":
+        clock.now = 10
+    read_text = Path.read_text
+    attempts = []
+
+    def read(path, *args, **kwargs):
+        text = read_text(path, *args, **kwargs)
+        if path == receipt:
+            attempts.append(path)
+            if expired == "hook-during-read":
+                hook.returncode = 0
+            elif expired == "consumer-during-read":
+                clock.now = 15
+            elif expired == "spy-during-read":
+                clock.now = 10
+        return text
+
+    monkeypatch.setattr(Path, "read_text", read)
+    if expired.startswith("hook"):
+        message = "hook exited"
+    elif expired.startswith("consumer"):
+        message = "deadline"
+    else:
+        message = "spy hold expired"
+    with pytest.raises(AssertionError, match=message):
+        _wait_for_spy_receipt(receipt, hook, 15, clock=clock, sleep=clock.sleep)
+    assert attempts == ([] if expired in {"hook-before", "consumer-before"} else [receipt])
+    assert clock.sleeps == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows CreateFileW sharing semantics")
+def test_receipt_recovers_after_native_windows_sharing_denial(tmp_path, monkeypatch) -> None:
+    import ctypes
+    import errno
+    from ctypes import wintypes
+
+    # Models the documented shared-open condition, not the historical CI cause:
+    # https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create = kernel32.CreateFileW
+    create.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    create.restype = wintypes.HANDLE
+    close = kernel32.CloseHandle
+    close.argtypes = [wintypes.HANDLE]
+    close.restype = wintypes.BOOL
+    receipt = tmp_path / "whoami.json"
+    expected = {"hold_until": time.monotonic() + 10, "observed": "synthetic"}
+    receipt.write_text(json.dumps(expected), encoding="utf-8")
+    # GENERIC_READ, no sharing, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL.
+    handle = create(str(receipt), 0x80000000, 0, None, 3, 0x80, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    read_text = Path.read_text
+    denials = []
+
+    def release():
+        nonlocal handle
+        if handle is not None:
+            if not close(handle):
+                raise ctypes.WinError(ctypes.get_last_error())
+            handle = None
+
+    def read(path, *args, **kwargs):
+        try:
+            return read_text(path, *args, **kwargs)
+        except PermissionError as error:
+            if path == receipt:
+                assert error.errno == errno.EACCES
+                # FileIO's CRT open may report errno13 without winerror.
+                # Require a native sharing-violation code from a real open
+                # while the same exclusive handle is still held.
+                assert getattr(error, "winerror", None) in (None, 32)
+                probe = create(str(receipt), 0x80000000, 7, None, 3, 0x80, None)
+                code = ctypes.get_last_error()
+                if probe != ctypes.c_void_p(-1).value:
+                    try:
+                        raise AssertionError("exclusive fixture file allowed a second open")
+                    finally:
+                        if not close(probe):
+                            raise ctypes.WinError(ctypes.get_last_error())
+                assert code == 32  # ERROR_SHARING_VIOLATION
+                denials.append(code)
+                # Release only after the actual read was denied. The next
+                # helper attempt reaches the real filesystem again.
+                release()
+            raise
+
+    try:
+        monkeypatch.setattr(Path, "read_text", read)
+        actual = _wait_for_spy_receipt(receipt, _ReceiptHook(), time.monotonic() + 15)
+        assert actual == expected
+        assert denials == [32]
+        assert handle is None
+    finally:
+        release()
 
 
 # ---------------------------------------------------------------------------
