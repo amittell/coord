@@ -685,13 +685,14 @@ def _validate_symbols_locally(
     Returns ``None`` when every claimed symbol resolves (or every file
     is skipped); returns a human-readable error string otherwise. The
     error string truncates to the first 5 problem files and the first
-    20 missing symbols per file so a single typo doesn't produce an
-    unreadable wall of text.
+    20 missing symbols per file, plus up to 20 available qualified paths,
+    so a single typo doesn't produce an unreadable wall of text.
     """
     if os.environ.get("COORD_DISABLE_CLIENT_VALIDATION", "").strip() == "1":
         return None
     root = _client_repo_root()
     missing_by_file: dict[str, list[str]] = {}
+    available_by_file: dict[str, list[str]] = {}
     for raw_path, syms in symbols.items():
         if not syms:
             continue
@@ -725,6 +726,7 @@ def _validate_symbols_locally(
         missing = [s for s in syms if s not in valid]
         if missing:
             missing_by_file[raw_path] = missing
+            available_by_file[raw_path] = sorted(valid)[:20]
     if not missing_by_file:
         return None
     file_items = list(missing_by_file.items())
@@ -736,7 +738,8 @@ def _validate_symbols_locally(
         joined = ", ".join(shown)
         if more > 0:
             joined += f" (+{more} more)"
-        rendered.append(f"{fpath}: {joined}")
+        available = ", ".join(available_by_file[fpath])
+        rendered.append(f"{fpath}: {joined} (available: {available})")
     extra_files = len(file_items) - len(truncated_files)
     suffix = f" (+{extra_files} more files)" if extra_files > 0 else ""
     return (

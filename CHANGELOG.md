@@ -8,6 +8,7 @@ Semantic Versioning.
 ## [Unreleased]
 
 - Avoid self-matching test-runner guards and retain full process identities when stopping Coord from long interpreter paths.
+- Qualify nested inline Rust module symbols and report bounded matching file hints.
 
 ### Fixed
 
